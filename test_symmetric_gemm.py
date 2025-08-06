@@ -3,7 +3,7 @@ import pytest
 import sys
 import os
 
-from symmetric_dense_gemm_sm90 import symmetric_dense_gemm
+from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
 
 
 class TestSymmetricGemm:
