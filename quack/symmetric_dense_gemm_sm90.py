@@ -2004,14 +2004,14 @@ def _symmetric_dense_gemm(
     # Convert tensors to CUTE format using the utils function
     import quack.utils as utils
     
-    # For 3D tensors (M, K, L) or (M, M, L), use leading_dim=1 
-    # This ensures proper stride layout for CUTLASS
+    # For 3D tensors (M, K, L) or (M, M, L), use leading_dim=2 (batch dimension L)
+    # This should have stride=1 for standard PyTorch tensor layout
     divisibility = 128 // cutlass_dtype.width
     
-    mA = utils.convert_from_dlpack(a.detach(), leading_dim=1, divisibility=divisibility)
-    mB = utils.convert_from_dlpack(b.detach(), leading_dim=1, divisibility=divisibility)  
-    mD = utils.convert_from_dlpack(d.detach(), leading_dim=1, divisibility=divisibility)
-    mC = utils.convert_from_dlpack(c.detach(), leading_dim=1, divisibility=divisibility) if c is not None else None
+    mA = utils.convert_from_dlpack(a.detach(), leading_dim=2, divisibility=divisibility)
+    mB = utils.convert_from_dlpack(b.detach(), leading_dim=2, divisibility=divisibility)  
+    mD = utils.convert_from_dlpack(d.detach(), leading_dim=2, divisibility=divisibility)
+    mC = utils.convert_from_dlpack(c.detach(), leading_dim=2, divisibility=divisibility) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
