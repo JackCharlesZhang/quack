@@ -14,7 +14,7 @@ class TestSymmetricGemm:
         """Test different data types."""
         return request.param
     
-    @pytest.fixture(params=[(64, 32, 4), (128, 64, 2), (256, 128, 8)])
+    @pytest.fixture(params=[(512, 256, 4), (768, 384, 2), (1024, 512, 1)])
     def shapes(self, request):
         """Test different matrix shapes (M, K, L)."""
         return request.param
