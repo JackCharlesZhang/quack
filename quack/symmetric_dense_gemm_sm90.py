@@ -2001,18 +2001,17 @@ def _symmetric_dense_gemm(
     d = torch.empty((M, M, L), dtype=dtype, device=device)
     b = a 
     
-    def convert_tensor_to_cute(tensor, is_major_dim_first=True):
-        """Convert PyTorch tensor to CUTE tensor with proper layout."""
-        tensor_view = tensor.detach()
-        cute_tensor = from_dlpack(tensor_view, assumed_align=16)
-        cute_tensor.element_type = cutlass_dtype
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=1)
-        return cute_tensor
+    # Convert tensors to CUTE format using the utils function
+    import quack.utils as utils
     
-    mA = convert_tensor_to_cute(a)
-    mB = convert_tensor_to_cute(b)  
-    mD = convert_tensor_to_cute(d)
-    mC = convert_tensor_to_cute(c) if c is not None else None
+    # For 3D tensors (M, K, L) or (M, M, L), use leading_dim=1 
+    # This ensures proper stride layout for CUTLASS
+    divisibility = 128 // cutlass_dtype.width
+    
+    mA = utils.convert_from_dlpack(a.detach(), leading_dim=1, divisibility=divisibility)
+    mB = utils.convert_from_dlpack(b.detach(), leading_dim=1, divisibility=divisibility)  
+    mD = utils.convert_from_dlpack(d.detach(), leading_dim=1, divisibility=divisibility)
+    mC = utils.convert_from_dlpack(c.detach(), leading_dim=1, divisibility=divisibility) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
