@@ -2001,12 +2001,18 @@ def _symmetric_dense_gemm(
     d = torch.empty((M, M, L), dtype=dtype, device=device)
     b = a 
     
-    convert_from_dlpack = lambda tensor: from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=0)
+    def convert_tensor_to_cute(tensor, is_major_dim_first=True):
+        """Convert PyTorch tensor to CUTE tensor with proper layout."""
+        tensor_view = tensor.detach()
+        cute_tensor = from_dlpack(tensor_view, assumed_align=16)
+        cute_tensor.element_type = cutlass_dtype
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=1)
+        return cute_tensor
     
-    mA = convert_from_dlpack(a)
-    mB = convert_from_dlpack(b)
-    mD = convert_from_dlpack(d)
-    mC = convert_from_dlpack(c) if c is not None else None
+    mA = convert_tensor_to_cute(a)
+    mB = convert_tensor_to_cute(b)  
+    mD = convert_tensor_to_cute(d)
+    mC = convert_tensor_to_cute(c) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
