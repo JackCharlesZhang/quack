@@ -2001,35 +2001,19 @@ def _symmetric_dense_gemm(
     d = torch.empty((M, M, L), dtype=dtype, device=device)
     b = a 
     
-    def get_leading_dim_and_ensure_contiguous(tensor):
-        strides = tensor.stride()
-        for i, stride in enumerate(strides):
-            if stride == 1:
-                return tensor, i
-        tensor_contiguous = tensor.contiguous()
-        return tensor_contiguous, len(tensor_contiguous.shape) - 1
-    
-    a, a_leading_dim = get_leading_dim_and_ensure_contiguous(a)
     mA = from_dlpack(a.detach(), assumed_align=16)
     mA.element_type = cutlass_dtype
-    mA = mA.mark_layout_dynamic(leading_dim=a_leading_dim)
     
-    b, b_leading_dim = get_leading_dim_and_ensure_contiguous(b)
-    mB = from_dlpack(b.detach(), assumed_align=16)  
+    mB = from_dlpack(b.detach(), assumed_align=16)
     mB.element_type = cutlass_dtype
-    mB = mB.mark_layout_dynamic(leading_dim=b_leading_dim)
     
-    d, d_leading_dim = get_leading_dim_and_ensure_contiguous(d)
     mD = from_dlpack(d.detach(), assumed_align=16)
     mD.element_type = cutlass_dtype
-    mD = mD.mark_layout_dynamic(leading_dim=d_leading_dim)
     
     mC = None
     if c is not None:
-        c, c_leading_dim = get_leading_dim_and_ensure_contiguous(c)
         mC = from_dlpack(c.detach(), assumed_align=16)
         mC.element_type = cutlass_dtype
-        mC = mC.mark_layout_dynamic(leading_dim=c_leading_dim)
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
