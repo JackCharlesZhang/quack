@@ -1998,57 +1998,14 @@ def _symmetric_dense_gemm(
     dtype = a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-    # Helper function to determine if tensor is mode0_major from its strides
-    def get_tensor_major_mode(tensor):
-        """Determine if tensor is mode0_major based on stride pattern"""
-        strides = tensor.stride()
-        if len(strides) >= 2:
-            # If stride[0] < stride[1], then mode0 (first dimension) is more contiguous -> mode0_major
-            # If stride[1] < stride[0], then mode1 (second dimension) is more contiguous -> mode1_major
-            return strides[0] < strides[1]
-        return False  # Default fallback
+    b = a
     
-    # Helper function to convert torch tensor to cute tensor following the exact pattern from create_and_permute_tensor
-    def torch_to_cute_tensor(torch_tensor, cutlass_dtype, is_mode0_major):
-        """Convert torch tensor to cute tensor using the same logic as create_and_permute_tensor"""
-        # Create dtype cute tensor (gpu)
-        torch_tensor_view = (
-            torch_tensor
-            if cutlass_dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-            else torch_tensor.view(torch.uint8)
-        )
-        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
-        cute_tensor.element_type = cutlass_dtype
-        # is_dynamic_layout is always True
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
-        
-        # Convert to float32 for the reference tensor
-        f32_torch_tensor = torch_tensor.to(dtype=torch.float32)
-        
-        cute_tensor = cutlass.torch.convert_cute_tensor(
-            f32_torch_tensor,
-            cute_tensor,
-            cutlass_dtype,
-            is_dynamic_layout=True,
-        )
-        
-        return cute_tensor
+    convert_from_dlpack = lambda x: (
+        from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic()
+    )
     
-    # Determine actual major modes from the input tensors' stride patterns
-    a_is_mode0_major = get_tensor_major_mode(a)  # For A: mode0=M, mode1=K -> M-major vs K-major
-    d_is_mode0_major = get_tensor_major_mode(d)  # For D: mode0=M, mode1=M -> M-major vs N-major
-    
-    # Convert tensors to cute tensors using their actual layouts
-    mA = torch_to_cute_tensor(a, cutlass_dtype, a_is_mode0_major)
-    mB = mA  # Since we're doing A @ A^T, B is the same as A
-    mD = torch_to_cute_tensor(d, cutlass_dtype, d_is_mode0_major)
-    
-    if c is not None:
-        c_is_mode0_major = get_tensor_major_mode(c)  # For C: mode0=M, mode1=M -> M-major vs N-major
-        mC = torch_to_cute_tensor(c, cutlass_dtype, c_is_mode0_major)
-    else:
-        mC = None
-       
+    mA, mB, mD = [convert_from_dlpack(t) for t in (a, b, d)]
+    mC = convert_from_dlpack(c) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
