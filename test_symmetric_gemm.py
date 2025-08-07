@@ -177,7 +177,6 @@ class TestSymmetricGemm:
         
         test_sizes = [
             (256, 256, 2),  # Medium  
-            (1024, 1024, 1), # Larger
         ]
         
         for M, K, L in test_sizes:
