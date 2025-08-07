@@ -176,9 +176,9 @@ class TestSymmetricGemm:
         dtype = torch.float16
         
         test_sizes = [
-            (32, 16, 1),   # Small
-            (128, 64, 2),  # Medium  
-            (256, 128, 1), # Larger
+            (128, 128, 1),   # Small
+            (256, 256, 2),  # Medium  
+            (1024, 1024, 1), # Larger
         ]
         
         for M, K, L in test_sizes:
