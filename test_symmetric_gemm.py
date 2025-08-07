@@ -176,9 +176,10 @@ class TestSymmetricGemm:
         dtype = torch.float16
         
         test_sizes = [
-            (128, 128, 1),   # Small
-            (256, 256, 2),  # Medium  
-            (1024, 1024, 1), # Larger
+            (128, 128, 3),  
+            (256, 256, 5),  
+            (1024, 1024, 5), 
+            (4096, 4096, 5),
         ]
         
         for M, K, L in test_sizes:
@@ -204,12 +205,12 @@ def run_tests():
     try:
         # Test basic functionality
         print("Testing basic symmetric GEMM...")
-        test_class.test_basic_symmetric_gemm(torch.float16, (64, 32, 4))
+        test_class.test_basic_symmetric_gemm(torch.float16, (8192, 8192, 1))
         print("✓ Basic test passed")
         
         # Test with bias
         print("Testing with bias...")
-        test_class.test_symmetric_gemm_with_bias(torch.float16, (64, 32, 4))
+        test_class.test_symmetric_gemm_with_bias(torch.float16, (8192, 8192, 1))
         print("✓ Bias test passed")
         
         # Test scaling
