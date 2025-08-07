@@ -151,7 +151,7 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = 32, 16, 2
+        M, K, L = 1024, 1024, 1
         device = 'cuda'
         
         # Create input tensor

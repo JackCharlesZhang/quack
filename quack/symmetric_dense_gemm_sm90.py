@@ -45,17 +45,17 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, const_expr
 
-from tile_scheduler import (
+from quack.tile_scheduler import (
     TileSchedulerArguments,
     ParamsBase,
     RasterOrderOption,
     TriangularStaticTileScheduler
 )
-from reduction_base import torch2cute_dtype_map
+from quack.reduction_base import torch2cute_dtype_map
 
 # return PipelineStateWAdvance instead of PipelineState
-from pipeline import make_pipeline_state
-import utils as utils
+from quack.pipeline import make_pipeline_state
+import quack.utils as utils
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -1792,7 +1792,14 @@ def run(
             ),
         ).to(torch_dtype)
 
-        torch_tensor_cpu = torch.matmul(base_tensor, base_tensor.transpose(-2, -1))
+        # Create symmetric matrix: A @ A^T, one layer at a time to prevent OOM
+        symmetric_matrices = []
+        for batch_idx in range(l):
+            matrix_slice = base_tensor[batch_idx] 
+            # Create symmetric matrix: A @ A^T (shape: mode0 x mode0)
+            symmetric_matrix = torch.matmul(matrix_slice, matrix_slice.transpose(-2, -1))
+            symmetric_matrices.append(symmetric_matrix)
+        torch_tensor_cpu = torch.stack(symmetric_matrices, dim=0) 
         assert mode0 == mode1, f"For symmetric matrices, mode0 ({mode0}) must equal mode1 ({mode1})"
         torch_tensor_cpu = torch_tensor_cpu.permute(1, 2, 0)
         
@@ -1970,12 +1977,8 @@ def _symmetric_dense_gemm(
             leading_dim = 1
         else:
             raise ValueError(f"Neither dimension 0 nor 1 has stride 1. Strides: {x.stride()}")
-        
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
-
-        return cutlass_torch.convert_cute_tensor(
-            cpu_ref, t, cutlass_dtype, is_dynamic_layout=True
-        )
+        return cutlass_torch.convert_cute_tensor(cpu_ref, t, cutlass_dtype, is_dynamic_layout=True)
     
     mA = make_cute_tensor(a)
     mB = make_cute_tensor(a) 
