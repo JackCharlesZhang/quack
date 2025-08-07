@@ -1904,6 +1904,11 @@ def _symmetric_dense_gemm(
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     def make_cute_tensor(x: torch.Tensor):
+        # Handle tensors with stride 1 along dimension 2
+        if x.stride()[2] == 1 and not (x.stride()[0] == 1 or x.stride()[1] == 1):
+            # If dim 2 has stride 1, permute to make it contiguous along different dim
+            x = x.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+        
         cpu_ref = x.cpu().to(torch.float32)
         t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
@@ -1986,7 +1991,7 @@ def symmetric_dense_gemm(
     
     Computes D = alpha * A @ A^T + beta * C using the symmetric dense GEMM kernel.
     
-    NOTE: The strides of a and c must be 1 along either dim 0 or 1, as opposed to dim 2.
+    NOTE: The strides of a and c should be 1 along either dim 0 or 1, as opposed to dim 2.
 
     Args:
         a: Input tensor A of shape (M, K, L) where L is batch dimension
