@@ -2016,7 +2016,7 @@ def _symmetric_dense_gemm(
         a_cpu_f32,        # CPU f32 reference
         cute_a,           # DLPack-backed GPU tensor
         cutlass_dtype,    # e.g. cutlass.Float16 / BFloat16 / Float32
-        is_dynamic_layout=True
+        is_dynamic_layout=False
     )
 
     # ────────────────────────────────────────────────────────────────
@@ -2032,7 +2032,7 @@ def _symmetric_dense_gemm(
         b_cpu_f32,
         cute_b,
         cutlass_dtype,
-        is_dynamic_layout=True
+        is_dynamic_layout=False
     )
 
     # ────────────────────────────────────────────────────────────────
@@ -2048,7 +2048,7 @@ def _symmetric_dense_gemm(
         d_cpu_f32,
         cute_d,
         cutlass_dtype,
-        is_dynamic_layout=True
+        is_dynamic_layout=False
     )
 
     # ────────────────────────────────────────────────────────────────
@@ -2063,7 +2063,7 @@ def _symmetric_dense_gemm(
             c_cpu_f32,
             cute_c,
             cutlass_dtype,
-            is_dynamic_layout=True
+            is_dynamic_layout=False
         )
     else:
         mC = None
