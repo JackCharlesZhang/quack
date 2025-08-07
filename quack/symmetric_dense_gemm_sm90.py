@@ -1998,14 +1998,40 @@ def _symmetric_dense_gemm(
     dtype = a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-    b = a
+    def torch_to_cute_tensor(torch_tensor, cutlass_dtype):
+        """Convert torch tensor to cute tensor using the same logic as create_and_permute_tensor"""
+        # Create dtype cute tensor (gpu)
+        torch_tensor_view = (
+            torch_tensor
+            if cutlass_dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
+            else torch_tensor.view(torch.uint8)
+        )
+        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
+        cute_tensor.element_type = cutlass_dtype
+        # Let CUTE auto-detect the leading dimension by not specifying it
+        cute_tensor = cute_tensor.mark_layout_dynamic()
+        
+        # Convert to float32 for the reference tensor
+        f32_torch_tensor = torch_tensor.to(dtype=torch.float32)
+        
+        cute_tensor = cutlass.torch.convert_cute_tensor(
+            f32_torch_tensor,
+            cute_tensor,
+            cutlass_dtype,
+            is_dynamic_layout=True,
+        )
+        
+        return cute_tensor
     
-    convert_from_dlpack = lambda x: (
-        from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic()
-    )
+    # Convert tensors to cute tensors using auto-detected layouts
+    mA = torch_to_cute_tensor(a, cutlass_dtype)
+    mB = mA  # Since we're doing A @ A^T, B is the same as A
+    mD = torch_to_cute_tensor(d, cutlass_dtype)
     
-    mA, mB, mD = [convert_from_dlpack(t) for t in (a, b, d)]
-    mC = convert_from_dlpack(c) if c is not None else None
+    if c is not None:
+        mC = torch_to_cute_tensor(c, cutlass_dtype)
+    else:
+        mC = None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
