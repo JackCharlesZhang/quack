@@ -1976,7 +1976,7 @@ def _symmetric_dense_gemm(
         elif x.stride()[1] == 1:
             leading_dim = 1
         else:
-            raise ValueError(f"Neither dimension 0 nor 1 has stride 1. Strides: {x.stride()}")
+            raise ValueError(f"GEMM requires that A and C have stride 1 along dim 0 or 1, as opposed to dim 2. Strides: {x.stride()}")
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
         return cutlass_torch.convert_cute_tensor(cpu_ref, t, cutlass_dtype, is_dynamic_layout=True)
     
@@ -2046,7 +2046,7 @@ def symmetric_dense_gemm(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> torch.Tensor:
-    """High-performance batched symmetric dense GEMM using symmetricHopper WGMMA.
+    """Batched symmetric dense GEMM.
     
     Computes D = alpha * A @ A^T + beta * C using the symmetric dense GEMM kernel.
     
