@@ -1998,49 +1998,79 @@ def _symmetric_dense_gemm(
     dtype = a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-    
+    b = a
 
-    def torch_to_cute_tensor(torch_tensor, cutlass_dtype, is_mode0_major):
-        """Convert torch tensor to cute tensor using the same logic as create_and_permute_tensor"""
-        # Handle Float8 types
-        torch_tensor_view = (
-            torch_tensor
-            if cutlass_dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-            else torch_tensor.view(torch.uint8)
-        )
-        
-        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
-        cute_tensor.element_type = cutlass_dtype
-        
-        # IMPORTANT: Use leading_dim 0 or 1, NOT auto-detection (which gives 2)
-        # This matches the sample kernel pattern
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
-        
-        # Convert to float32 for the reference tensor
-        f32_torch_tensor = torch_tensor.to(dtype=torch.float32)
-        
-        cute_tensor = cutlass.torch.convert_cute_tensor(
-            f32_torch_tensor,
-            cute_tensor,
-            cutlass_dtype,
-            is_dynamic_layout=True,
-        )
-        
-        return cute_tensor
-    
-    # Use the same defaults as the sample kernel:
-    # A: K-major (is_mode0_major=False) 
-    # D: N-major (is_mode0_major=False)
-    # C: N-major (is_mode0_major=False)
-    mA = torch_to_cute_tensor(a, cutlass_dtype, is_mode0_major=False)  # K-major
-    mB = mA  # Since we're doing A @ A^T, B is the same as A
-    mD = torch_to_cute_tensor(d, cutlass_dtype, is_mode0_major=False)  # N-major
-    
+        # ────────────────────────────────────────────────────────────────
+    # Build mA (from user-provided `a: (M,K,L)`)
+    # ────────────────────────────────────────────────────────────────
+    # 1) CPU-side float32 copy for ref-checks (not strictly needed here,
+    #    but required by convert_cute_tensor API)
+    a_cpu_f32 = a.cpu().to(torch.float32)
+
+    # 2) DLPack → CuTe tensor
+    cute_a = from_dlpack(a, assumed_align=16)
+    cute_a.element_type = cutlass_dtype
+
+    # 3) Wrap
+    mA = cutlass_torch.convert_cute_tensor(
+        a_cpu_f32,        # CPU f32 reference
+        cute_a,           # DLPack-backed GPU tensor
+        cutlass_dtype,    # e.g. cutlass.Float16 / BFloat16 / Float32
+        is_dynamic_layout=True
+    )
+
+    # ────────────────────────────────────────────────────────────────
+    # Build mB = A (symmetry)
+    # ────────────────────────────────────────────────────────────────
+    b = a  # symmetric GEMM uses A both as LHS and RHS
+
+    b_cpu_f32 = b.cpu().to(torch.float32)
+    cute_b = from_dlpack(b, assumed_align=16)
+    cute_b.element_type = cutlass_dtype
+
+    mB = cutlass_torch.convert_cute_tensor(
+        b_cpu_f32,
+        cute_b,
+        cutlass_dtype,
+        is_dynamic_layout=True
+    )
+
+    # ────────────────────────────────────────────────────────────────
+    # Build mD (output buffer), then convert back to a Python tensor `d`
+    # ────────────────────────────────────────────────────────────────
+    d = torch.empty((M, M, L), dtype=dtype, device=device)
+
+    d_cpu_f32 = d.cpu().to(torch.float32)
+    cute_d = from_dlpack(d, assumed_align=16)
+    cute_d.element_type = cutlass_dtype
+
+    mD = cutlass_torch.convert_cute_tensor(
+        d_cpu_f32,
+        cute_d,
+        cutlass_dtype,
+        is_dynamic_layout=True
+    )
+
+    # ────────────────────────────────────────────────────────────────
+    # Build mC if user provided C, else None
+    # ────────────────────────────────────────────────────────────────
     if c is not None:
-        mC = torch_to_cute_tensor(c, cutlass_dtype, is_mode0_major=False)  # N-major
+        c_cpu_f32 = c.cpu().to(torch.float32)
+        cute_c = from_dlpack(c, assumed_align=16)
+        cute_c.element_type = cutlass_dtype
+
+        mC = cutlass_torch.convert_cute_tensor(
+            c_cpu_f32,
+            cute_c,
+            cutlass_dtype,
+            is_dynamic_layout=True
+        )
     else:
         mC = None
 
+    
+
+    # Get mA, mB, mD, mC
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
