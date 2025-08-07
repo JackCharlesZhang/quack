@@ -1985,12 +1985,20 @@ def _symmetric_dense_gemm(
 
         t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
-        t = t.mark_layout_dynamic()   # auto‐detect the 1-stride axis ∈ {0,1}
+        
+        # Determine leading dimension explicitly to handle stride collisions
+        if x.stride()[0] == 1:
+            leading_dim = 0
+        elif x.stride()[1] == 1:
+            leading_dim = 1
+        else:
+            raise ValueError(f"Neither dimension 0 nor 1 has stride 1. Strides: {x.stride()}")
+        
+        t = t.mark_layout_dynamic(leading_dim=leading_dim)
 
         return cutlass_torch.convert_cute_tensor(
             cpu_ref, t, cutlass_dtype, is_dynamic_layout=False
         )
-
     # ── 3) Build mA, mB, mC ────────────────────────────────────────
     mA = make_cute_tensor(a)
     mB = make_cute_tensor(a)   # symmetric
