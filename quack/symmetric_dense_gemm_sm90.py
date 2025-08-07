@@ -1979,32 +1979,33 @@ def _symmetric_dense_gemm(
     device, dtype = a.device, a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
-    # 2) Realign (M,K,L) so that stride[1] == 1 (row-major on dims 0–1)
-    def _realign_for_row_major(x: torch.Tensor) -> torch.Tensor:
-        # x: (M,K,L) → (L,M,K) pack K-contiguous → back to (M,K,L)
-        t = x.permute(2, 0, 1).contiguous()
-        return t.permute(1, 2, 0)
+    def make_cute_tensor(x: torch.Tensor):
+        # x must already have either x.stride()[0]==1 or x.stride()[1]==1
+        cpu_ref = x.cpu().to(torch.float32)
 
-    # 3) Builder: from a realigned torch.Tensor → a valid 2D row-major cute.Tensor
-    def make_cute(x: torch.Tensor):
-        xr = _realign_for_row_major(x)
-        cpu_ref = xr.cpu().to(torch.float32)
-
-        t = from_dlpack(xr, assumed_align=16)
+        t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
-        # auto-pick the true stride-1 axis (now it’s dim=1)
-        t = t.mark_layout_dynamic()
+        t = t.mark_layout_dynamic()   # auto‐detect the 1-stride axis ∈ {0,1}
 
         return cutlass_torch.convert_cute_tensor(
             cpu_ref, t, cutlass_dtype, is_dynamic_layout=False
         )
 
-    # 4) Build all four tensors
-    mA = make_cute(a)
-    mB = make_cute(a)               # symmetric: B = A
-    d = torch.empty((M, M, L), dtype=dtype, device=device)
-    mD = make_cute(d)
-    mC = make_cute(c) if c is not None else None
+    # ── 3) Build mA, mB, mC ────────────────────────────────────────
+    mA = make_cute_tensor(a)
+    mB = make_cute_tensor(a)   # symmetric
+
+    if c is not None:
+        mC = make_cute_tensor(c)
+    else:
+        mC = None
+
+    # ── 4) Build & pack the output buffer so its stride[1]==1 ─────
+    # Default torch.empty((M,M,L)) has stride()[2]==1, which CUTE rejects.
+    d = torch.empty((M, M, L), dtype=a.dtype, device=a.device)
+    # pack so dim 1 is fastest:
+    d_r = d.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+    mD = make_cute_tensor(d_r)
 
     # 5) Compile / fetch from cache
     tile_shape_mnk = (128, 256, 64)
@@ -2049,7 +2050,7 @@ def _symmetric_dense_gemm(
 
     # 7) `d` was realigned before the call, so it now contains D in row-major (dims 0–1)
     #    and shape (M,M,L). Return it directly.
-    return d
+    return d_r
 
 _symmetric_dense_gemm.compile_cache = {}
 
