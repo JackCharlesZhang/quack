@@ -45,17 +45,17 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, const_expr
 
-from quack.tile_scheduler import (
+from tile_scheduler import (
     TileSchedulerArguments,
     ParamsBase,
     RasterOrderOption,
     TriangularStaticTileScheduler
 )
-from quack.reduction_base import torch2cute_dtype_map
+from reduction_base import torch2cute_dtype_map
 
 # return PipelineStateWAdvance instead of PipelineState
-from quack.pipeline import make_pipeline_state
-import quack.utils as utils
+from pipeline import make_pipeline_state
+import utils as utils
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
