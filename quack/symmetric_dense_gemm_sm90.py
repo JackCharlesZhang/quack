@@ -2000,71 +2000,42 @@ def _symmetric_dense_gemm(
     d = torch.empty((M, M, L), dtype=dtype, device=device)
     b = a
 
-        # ────────────────────────────────────────────────────────────────
-    # Build mA (from user-provided `a: (M,K,L)`)
     # ────────────────────────────────────────────────────────────────
-    # 1) CPU-side float32 copy for ref-checks (not strictly needed here,
-    #    but required by convert_cute_tensor API)
+    # Build mA, mB, mD, mC with explicit 2D layout on dims 0–1
+    # ────────────────────────────────────────────────────────────────
+    def make_cute_tensor(torch_t: torch.Tensor, cpu_ref: torch.Tensor):
+        # 1) DLPack → CuTe
+        t = from_dlpack(torch_t, assumed_align=16)
+        # 2) set the cutlass element type
+        t.element_type = cutlass_dtype
+        # 3) force dims (0,1) to be treated as a 2D matrix:
+        #    leading_dim=1 → row-major on (M,K)
+        #    or leading_dim=0 → column-major if you want that
+        t = t.mark_layout_dynamic(leading_dim=1)
+        # 4) wrap in the PyTorch→CuTe helper
+        return cutlass_torch.convert_cute_tensor(
+            cpu_ref,  # the float32 CPU version for ref-checks
+            t,
+            cutlass_dtype,
+            is_dynamic_layout=False,  # (only matters for Float8 in convert fn)
+        )
+
+    # mA: from `a: (M,K,L)`
     a_cpu_f32 = a.cpu().to(torch.float32)
+    mA = make_cute_tensor(a, a_cpu_f32)
 
-    # 2) DLPack → CuTe tensor
-    cute_a = from_dlpack(a, assumed_align=16)
-    cute_a.element_type = cutlass_dtype
+    # mB: same data as A
+    mB = make_cute_tensor(a, a_cpu_f32)
 
-    # 3) Wrap
-    mA = cutlass_torch.convert_cute_tensor(
-        a_cpu_f32,        # CPU f32 reference
-        cute_a,           # DLPack-backed GPU tensor
-        cutlass_dtype,    # e.g. cutlass.Float16 / BFloat16 / Float32
-        is_dynamic_layout=False
-    )
-
-    # ────────────────────────────────────────────────────────────────
-    # Build mB = A (symmetry)
-    # ────────────────────────────────────────────────────────────────
-    b = a  # symmetric GEMM uses A both as LHS and RHS
-
-    b_cpu_f32 = b.cpu().to(torch.float32)
-    cute_b = from_dlpack(b, assumed_align=16)
-    cute_b.element_type = cutlass_dtype
-
-    mB = cutlass_torch.convert_cute_tensor(
-        b_cpu_f32,
-        cute_b,
-        cutlass_dtype,
-        is_dynamic_layout=False
-    )
-
-    # ────────────────────────────────────────────────────────────────
-    # Build mD (output buffer), then convert back to a Python tensor `d`
-    # ────────────────────────────────────────────────────────────────
+    # mD: the (uninitialized) output buffer `d: (M,M,L)`
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-
     d_cpu_f32 = d.cpu().to(torch.float32)
-    cute_d = from_dlpack(d, assumed_align=16)
-    cute_d.element_type = cutlass_dtype
+    mD = make_cute_tensor(d, d_cpu_f32)
 
-    mD = cutlass_torch.convert_cute_tensor(
-        d_cpu_f32,
-        cute_d,
-        cutlass_dtype,
-        is_dynamic_layout=False
-    )
-
-    # ────────────────────────────────────────────────────────────────
-    # Build mC if user provided C, else None
-    # ────────────────────────────────────────────────────────────────
+    # mC: only if C is provided
     if c is not None:
         c_cpu_f32 = c.cpu().to(torch.float32)
-        cute_c = from_dlpack(c, assumed_align=16)
-        cute_c.element_type = cutlass_dtype
-
-        mC = cutlass_torch.convert_cute_tensor(
-            c_cpu_f32,
-            cute_c,
-            cutlass_dtype,
-            is_dynamic_layout=False
-        )
+        mC = make_cute_tensor(c, c_cpu_f32)
     else:
         mC = None
 
