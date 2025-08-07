@@ -2031,7 +2031,9 @@ def _symmetric_dense_gemm(
     convert_from_dlpack = lambda x: (
         from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     )
-    mA, mB, mD = [convert_from_dlpack(t) for t in (a, b, d)]
+    mA = convert_from_dlpack(a)
+    mB = convert_from_dlpack(b)
+    mD = convert_from_dlpack(d)
     mC = convert_from_dlpack(c) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
