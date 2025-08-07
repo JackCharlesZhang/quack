@@ -57,7 +57,6 @@ class TestSymmetricGemm:
         # Create input tensor
         torch.manual_seed(42)  # For reproducible results
         a = torch.randn(M, K, L, dtype=dtype, device=device)
-        a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
 
         print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
         
@@ -88,15 +87,13 @@ class TestSymmetricGemm:
         torch.manual_seed(42)
         a = torch.randn(M, K, L, dtype=dtype, device=device)
         c = torch.randn(M, M, L, dtype=dtype, device=device)
-        a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
         
         # Make C symmetric for each batch
         for i in range(L):
             c_slice = c[:, :, i]
             c[:, :, i] = (c_slice + c_slice.T) / 2
         
-        c = c.permute(2, 0, 1).contiguous().permute(1, 2, 0)
-        
+    
         # Compute with our wrapper
         result_quack = symmetric_dense_gemm(a, c=c)
         
@@ -125,14 +122,12 @@ class TestSymmetricGemm:
         torch.manual_seed(42)
         a = torch.randn(M, K, L, dtype=dtype, device=device)
         c = torch.randn(M, M, L, dtype=dtype, device=device)
-        a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
         
         # Make C symmetric
         for i in range(L):
             c_slice = c[:, :, i]
             c[:, :, i] = (c_slice + c_slice.T) / 2
         
-        c = c.permute(2, 0, 1).contiguous().permute(1, 2, 0)
         
         # Compute with our wrapper
         result_quack = symmetric_dense_gemm(a, c=c, alpha=alpha, beta=beta)
@@ -157,7 +152,7 @@ class TestSymmetricGemm:
         # Create input tensor
         torch.manual_seed(42)
         a = torch.randn(M, K, L, dtype=dtype, device=device)
-        a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+      
         # Compute symmetric GEMM
         result = symmetric_dense_gemm(a)
         
@@ -185,7 +180,7 @@ class TestSymmetricGemm:
         for M, K, L in test_sizes:
             torch.manual_seed(42)
             a = torch.randn(M, K, L, dtype=dtype, device=device)
-            a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+    
             result = symmetric_dense_gemm(a)
             expected = self.torch_reference(a)
             
