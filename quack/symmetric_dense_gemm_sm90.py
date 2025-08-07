@@ -2010,10 +2010,13 @@ def _symmetric_dense_gemm(
 
     # ── 4) Build & pack the output buffer so its stride[1]==1 ─────
     # Default torch.empty((M,M,L)) has stride()[2]==1, which CUTE rejects.
-    d = torch.empty((M, M, L), dtype=a.dtype, device=a.device)
-    # pack so dim 1 is fastest:
-    d_r = d.permute(2, 0, 1).contiguous().permute(1, 2, 0)
-    mD = make_cute_tensor(d_r)
+    d = torch.empty_strided(
+        (M, M, L), 
+        (M, 1, M*M),  # strides: dim 1 fastest, then dim 0, then dim 2
+        dtype=a.dtype, 
+        device=a.device
+    )
+    mD = make_cute_tensor(d)
 
     # 5) Compile / fetch from cache
     tile_shape_mnk = (128, 256, 64)
@@ -2058,7 +2061,7 @@ def _symmetric_dense_gemm(
 
     # 7) `d` was realigned before the call, so it now contains D in row-major (dims 0–1)
     #    and shape (M,M,L). Return it directly.
-    return d_r
+    return d
 
 _symmetric_dense_gemm.compile_cache = {}
 
