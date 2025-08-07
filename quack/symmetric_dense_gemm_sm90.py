@@ -2036,7 +2036,7 @@ def _symmetric_dense_gemm(
             is_persistent=persistent,
             fp8_fast_accum=False,
         )
-        cache[compile_key] = cutlass_torch.compile(
+        cache[compile_key] = cute.compile(
             gemm, mA, mB, mD, mC, alpha_s, beta_s, max_active,
             cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         )
