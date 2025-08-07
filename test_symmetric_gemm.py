@@ -203,7 +203,7 @@ def run_tests():
     try:
         # Test basic functionality
         print("Testing basic symmetric GEMM...")
-        test_class.test_basic_symmetric_gemm(torch.float16, (64, 32, 4))
+        test_class.test_basic_symmetric_gemm(torch.float16, (256, 256, 2))
         print("✓ Basic test passed")
         
         # Test with bias
