@@ -1968,120 +1968,88 @@ def _symmetric_dense_gemm(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> torch.Tensor:
-    """Symmetric Dense GEMM forward pass.
-    
-    Computes D = alpha * A @ A^T + beta * C using the symmetricHopper WGMMA kernel.
-    
-    Args:
-        a: Input tensor A of shape (M, K, L) where L is batch dimension
-        c: Optional tensor C of shape (M, M, L), defaults to None - MUST BE SYMMETRIC
-        alpha: Scaling factor for A @ A^T, defaults to 1.0
-        beta: Scaling factor for C, defaults to 1.0
-    
-    Returns:
-        Symmetric output tensor D of shape (M, M, L)
-    """
-    assert a.dim() == 3, "Input A must be 3D (M, K, L)"
-    assert a.is_cuda, "Tensor must be on CUDA device"
-    assert a.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype for A"
-    
-    M, _, L = a.shape
-    
+    # 1) Sanity checks
+    assert a.dim() == 3 and a.is_cuda, "A must be a 3D CUDA tensor"
+    M, K, L = a.shape
+    assert a.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
     if c is not None:
-        assert c.dim() == 3, "C must be 3D (M, M, L)"
-        assert c.is_cuda, "C tensor must be on CUDA device"
-        M_c, N_c, L_c = c.shape
-        assert M_c == M and N_c == M and L_c == L, f"C shape {c.shape} must match output shape ({M}, {M}, {L})"
-        assert c.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype for C"
+        assert c.shape == (M, M, L) and c.is_cuda, "C must be (M,M,L) CUDA"
+        assert c.dtype == a.dtype, "C must have same dtype as A"
 
-    device = a.device
-    dtype = a.dtype
-    cutlass_dtype = torch2cute_dtype_map[dtype]
-    d = torch.empty((M, M, L), dtype=dtype, device=device)
-    b = a
+    device, dtype = a.device, a.dtype
+    cutlass_dtype = getattr(cutlass, torch2cute_dtype_map[dtype])
 
-    # ────────────────────────────────────────────────────────────────
-    # Build mA, mB, mD, mC with explicit 2D layout on dims 0–1
-    # ────────────────────────────────────────────────────────────────
-    def make_cute_tensor(torch_t: torch.Tensor, cpu_ref: torch.Tensor):
-        # 1) DLPack → CuTe
-        t = from_dlpack(torch_t, assumed_align=16)
-        # 2) set the cutlass element type
+    # 2) Realign (M,K,L) so that stride[1] == 1 (row-major on dims 0–1)
+    def _realign_for_row_major(x: torch.Tensor) -> torch.Tensor:
+        # x: (M,K,L) → (L,M,K) pack K-contiguous → back to (M,K,L)
+        t = x.permute(2, 0, 1).contiguous()
+        return t.permute(1, 2, 0)
+
+    # 3) Builder: from a realigned torch.Tensor → a valid 2D row-major cute.Tensor
+    def make_cute(x: torch.Tensor):
+        xr = _realign_for_row_major(x)
+        cpu_ref = xr.cpu().to(torch.float32)
+
+        t = from_dlpack(xr, assumed_align=16)
         t.element_type = cutlass_dtype
-        # 3) force dims (0,1) to be treated as a 2D matrix:
-        #    leading_dim=1 → row-major on (M,K)
-        #    or leading_dim=0 → column-major if you want that
-        t = t.mark_layout_dynamic(leading_dim=1)
-        # 4) wrap in the PyTorch→CuTe helper
+        # auto-pick the true stride-1 axis (now it’s dim=1)
+        t = t.mark_layout_dynamic()
+
         return cutlass_torch.convert_cute_tensor(
-            cpu_ref,  # the float32 CPU version for ref-checks
-            t,
-            cutlass_dtype,
-            is_dynamic_layout=False,  # (only matters for Float8 in convert fn)
+            cpu_ref, t, cutlass_dtype, is_dynamic_layout=False
         )
 
-    # mA: from `a: (M,K,L)`
-    a_cpu_f32 = a.cpu().to(torch.float32)
-    mA = make_cute_tensor(a, a_cpu_f32)
-
-    # mB: same data as A
-    mB = make_cute_tensor(a, a_cpu_f32)
-
-    # mD: the (uninitialized) output buffer `d: (M,M,L)`
+    # 4) Build all four tensors
+    mA = make_cute(a)
+    mB = make_cute(a)               # symmetric: B = A
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-    d_cpu_f32 = d.cpu().to(torch.float32)
-    mD = make_cute_tensor(d, d_cpu_f32)
+    mD = make_cute(d)
+    mC = make_cute(c) if c is not None else None
 
-    # mC: only if C is provided
-    if c is not None:
-        c_cpu_f32 = c.cpu().to(torch.float32)
-        mC = make_cute_tensor(c, c_cpu_f32)
-    else:
-        mC = None
-
-    
-
-    # Get mA, mB, mD, mC
-    
+    # 5) Compile / fetch from cache
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
     persistent = True
-    
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    
-    cluster_shape_mnk = (*cluster_shape_mn, 1)
-    compile_key = (cutlass_dtype, tuple(tile_shape_mnk), tuple(cluster_shape_mnk), c is not None, persistent, M)
-    
+    cluster_shape_mnk3 = (*cluster_shape_mn, 1)
+    compile_key = (
+        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk3, c is not None, persistent, M
+    )
+
     if persistent:
-        max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+        max_active = cutlass.utils.HardwareInfo().get_max_active_clusters(
             cluster_shape_mn[0] * cluster_shape_mn[1]
         )
     else:
-        max_active_clusters = 0
-    
-    alpha_scalar = cutlass.Float32(alpha)
-    beta_scalar = cutlass.Float32(beta)
+        max_active = 0
 
-    if compile_key not in _symmetric_dense_gemm.compile_cache:
+    alpha_s = cutlass.Float32(alpha)
+    beta_s  = cutlass.Float32(beta)
+
+    cache = _symmetric_dense_gemm.compile_cache
+    if compile_key not in cache:
         gemm = HopperSymmetricGemmKernel(
             acc_dtype=cutlass.Float32,
             a_dtype=cutlass_dtype,
             tile_shape_mnk=tile_shape_mnk,
-            cluster_shape_mnk=cluster_shape_mnk,
+            cluster_shape_mnk=cluster_shape_mnk3,
             pingpong=False,
             is_persistent=persistent,
             fp8_fast_accum=False,
         )
-        _symmetric_dense_gemm.compile_cache[compile_key] = cute.compile(
-            gemm, mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, current_stream
-        )  
-    
-    _symmetric_dense_gemm.compile_cache[compile_key](
-        mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, current_stream
-    )
-    
-    return d
+        cache[compile_key] = cutlass_torch.compile(
+            gemm, mA, mB, mD, mC, alpha_s, beta_s, max_active,
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        )
 
+    # 6) Run it!
+    cache[compile_key](
+        mA, mB, mD, mC, alpha_s, beta_s, max_active,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    # 7) `d` was realigned before the call, so it now contains D in row-major (dims 0–1)
+    #    and shape (M,M,L). Return it directly.
+    return d
 
 _symmetric_dense_gemm.compile_cache = {}
 
