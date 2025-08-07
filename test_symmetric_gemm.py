@@ -57,6 +57,8 @@ class TestSymmetricGemm:
         # Create input tensor
         torch.manual_seed(42)  # For reproducible results
         a = torch.randn(M, K, L, dtype=dtype, device=device)
+
+        print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
         
         # Compute with our wrapper
         result_quack = symmetric_dense_gemm(a)
