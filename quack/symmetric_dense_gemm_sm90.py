@@ -1999,21 +1999,40 @@ def _symmetric_dense_gemm(
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     d = torch.empty((M, M, L), dtype=dtype, device=device)
-    b = a 
+    b = a
     
-    mA = from_dlpack(a.detach(), assumed_align=16)
-    mA.element_type = cutlass_dtype
+    def torch_to_cute_tensor(torch_tensor, cutlass_dtype, is_mode0_major=True):
+        """Convert torch tensor to cute tensor using the same logic as create_and_permute_tensor"""
+        torch_tensor_view = (
+            torch_tensor
+            if cutlass_dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
+            else torch_tensor.view(torch.uint8)
+        )
+        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
+        cute_tensor.element_type = cutlass_dtype
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
+        
+        f32_torch_tensor = torch_tensor.to(dtype=torch.float32)
+        
+        cute_tensor = cutlass.torch.convert_cute_tensor(
+            f32_torch_tensor,
+            cute_tensor,
+            cutlass_dtype,
+            is_dynamic_layout=True,
+        )
+        return cute_tensor
     
-    mB = from_dlpack(b.detach(), assumed_align=16)
-    mB.element_type = cutlass_dtype
+    # mA = torch_to_cute_tensor(a, cutlass_dtype,) 
+    # mB = mA 
+    # mD = torch_to_cute_tensor(d, cutlass_dtype,)
     
-    mD = from_dlpack(d.detach(), assumed_align=16)
-    mD.element_type = cutlass_dtype
-    
-    mC = None
-    if c is not None:
-        mC = from_dlpack(c.detach(), assumed_align=16)
-        mC.element_type = cutlass_dtype
+    # mC = torch_to_cute_tensor(c, cutlass_dtype,) if c is not None else None 
+
+    convert_from_dlpack = lambda x: (
+        from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    )
+    mA, mB, mD = [convert_from_dlpack(t) for t in (a, b, d)]
+    mC = convert_from_dlpack(c) if c is not None else None
     
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)

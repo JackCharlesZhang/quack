@@ -10,22 +10,8 @@ torch2cute_dtype_map = {
     torch.float32: "Float32"
 }
 
-# You'll need to replace this with actual imports from your cutlass/quack modules
-# This is just a placeholder for testing
-try:
-    from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
-except ImportError:
-    print("Warning: Could not import symmetric_dense_gemm, using mock implementation")
-    def symmetric_dense_gemm(a, c=None, alpha=1.0, beta=1.0):
-        # Mock implementation for testing the test structure
-        M, K, L = a.shape
-        result = torch.zeros(M, M, L, dtype=a.dtype, device=a.device)
-        for i in range(L):
-            a_slice = a[:, :, i]
-            result[:, :, i] = alpha * torch.matmul(a_slice, a_slice.T)
-            if c is not None:
-                result[:, :, i] += beta * c[:, :, i]
-        return result
+from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
+
 
 
 class TestSymmetricGemm:
