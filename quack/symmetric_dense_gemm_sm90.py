@@ -1740,8 +1740,6 @@ def run(
             init_config=cutlass.torch.RandomInitConfig(
                 min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
             ),
-            # init_type=cutlass.torch.TensorInitType.GAUSSIAN,
-            # init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
         ).to(torch_dtype)
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
@@ -1768,6 +1766,7 @@ def run(
 
         return f32_torch_tensor, cute_tensor, torch_tensor
     
+    # Create symmetric C matrix
     def create_and_permute_tensor_C(l, mode0, mode1, is_mode0_major, dtype, is_dynamic_layout=True):
         # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
         # else : (l, mode0, mode1) -> (mode0, mode1, l)
@@ -1793,25 +1792,8 @@ def run(
             ),
         ).to(torch_dtype)
 
-        # Create symmetric matrix by multiplying each matrix slice by its transpose
-        # Process each batch separately to avoid memory issues
-        symmetric_matrices = []
-        for batch_idx in range(l):
-            # Get the matrix for this batch (shape: mode0 x mode1)
-            matrix_slice = base_tensor[batch_idx]  # shape: (mode0, mode1)
-            # Create symmetric matrix: A @ A^T (shape: mode0 x mode0)
-            symmetric_matrix = torch.matmul(matrix_slice, matrix_slice.transpose(-2, -1))
-            symmetric_matrices.append(symmetric_matrix)
-        
-        # Stack all symmetric matrices back together
-        torch_tensor_cpu = torch.stack(symmetric_matrices, dim=0)  # shape: (l, mode0, mode0)
-        
-        # Note: Since we're creating symmetric matrices (mode0 x mode0), 
-        # we need to adjust the final tensor to match expected output shape (mode0, mode1, l)
-        # where mode1 should equal mode0 for symmetric matrices
+        torch_tensor_cpu = torch.matmul(base_tensor, base_tensor.transpose(-2, -1))
         assert mode0 == mode1, f"For symmetric matrices, mode0 ({mode0}) must equal mode1 ({mode1})"
-        
-        # Permute to final layout: (l, mode0, mode0) -> (mode0, mode0, l)
         torch_tensor_cpu = torch_tensor_cpu.permute(1, 2, 0)
         
         # Create dtype torch tensor (gpu)
@@ -1968,7 +1950,6 @@ def _symmetric_dense_gemm(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> torch.Tensor:
-    # 1) Sanity checks
     assert a.dim() == 3 and a.is_cuda, "A must be a 3D CUDA tensor"
     M, K, L = a.shape
     assert a.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
@@ -1976,17 +1957,13 @@ def _symmetric_dense_gemm(
         assert c.shape == (M, M, L) and c.is_cuda, "C must be (M,M,L) CUDA"
         assert c.dtype == a.dtype, "C must have same dtype as A"
 
-    device, dtype = a.device, a.dtype
+    dtype = a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     def make_cute_tensor(x: torch.Tensor):
-        # x must already have either x.stride()[0]==1 or x.stride()[1]==1
         cpu_ref = x.cpu().to(torch.float32)
-
         t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
-        
-        # Determine leading dimension explicitly to handle stride collisions
         if x.stride()[0] == 1:
             leading_dim = 0
         elif x.stride()[1] == 1:
@@ -1997,28 +1974,26 @@ def _symmetric_dense_gemm(
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
 
         return cutlass_torch.convert_cute_tensor(
-            cpu_ref, t, cutlass_dtype, is_dynamic_layout=False
+            cpu_ref, t, cutlass_dtype, is_dynamic_layout=True
         )
-    # ── 3) Build mA, mB, mC ────────────────────────────────────────
+    
     mA = make_cute_tensor(a)
-    mB = make_cute_tensor(a)   # symmetric
+    mB = make_cute_tensor(a) 
 
     if c is not None:
         mC = make_cute_tensor(c)
     else:
         mC = None
 
-    # ── 4) Build & pack the output buffer so its stride[1]==1 ─────
-    # Default torch.empty((M,M,L)) has stride()[2]==1, which CUTE rejects.
+    # Kernel requires output tensor with stride 1 along dim 0 or 1 as opposed to dim 2
     d = torch.empty_strided(
         (M, M, L), 
-        (M, 1, M*M),  # strides: dim 1 fastest, then dim 0, then dim 2
+        (M, 1, M*M), 
         dtype=a.dtype, 
         device=a.device
     )
     mD = make_cute_tensor(d)
 
-    # 5) Compile / fetch from cache
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
     persistent = True
@@ -2052,15 +2027,11 @@ def _symmetric_dense_gemm(
             gemm, mA, mB, mD, mC, alpha_s, beta_s, max_active,
             cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         )
-
-    # 6) Run it!
     cache[compile_key](
         mA, mB, mD, mC, alpha_s, beta_s, max_active,
         cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
-    # 7) `d` was realigned before the call, so it now contains D in row-major (dims 0–1)
-    #    and shape (M,M,L). Return it directly.
     return d
 
 _symmetric_dense_gemm.compile_cache = {}
