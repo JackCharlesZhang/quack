@@ -57,70 +57,6 @@ from quack.reduction_base import torch2cute_dtype_map
 from quack.pipeline import make_pipeline_state
 import quack.utils as utils
 
-"""
-A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
-using CUTE DSL.
-- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M")
-- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K")
-- Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
-
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes Hopper's WGMMA for matrix multiply-accumulate (MMA) operations
-    - Implements TMA multicast with cluster to reduce L2 memory traffic
-    - Supports multi-stage pipeline to overlap computation and memory access
-
-This GEMM works as follows:
-1. Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. Perform matrix multiply-accumulate (MMA) operations using WGMMA instruction.
-3. Store results from registers (RMEM) to shared memory (SMEM), then to global memory (GMEM) with TMA operations.
-
-Hopper WGMMA instructions operate as follows:
-- Read matrix A from SMEM
-- Read matrix B from SMEM
-- Perform MMA operation and store the result in Accumulator(register)
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/hopper/dense_gemm.py                                   \
-      --mnkl 8192,8192,8192,1 --tile_shape_mnk 128,256,64                  \
-      --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
-      --d_dtype Float16 --acc_dtype Float32                                \
-      --a_major k --b_major k --d_major n
-
-The above example command compute batched gemm with M=8192, N=8192, K=8192,
-batch_count=1. The Hopper WGMMA tile shape is 128x256x64 and the cluster shape
-is (1,1). The input, mma accumulator and output data type are set as fp16, fp32
-and fp16, respectively.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/hopper/dense_gemm.py                               \
-      --mnkl 8192,8192,8192,1 --tile_shape_mnk 128,256,64                  \
-      --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
-      --d_dtype Float16 --acc_dtype Float32                                \
-      --a_major k --b_major k --d_major n
-
-Constraints:
-* Supported input data types: fp16, fp8 (e4m3fn, e5m2)
-* For fp16 types, A and B must have the same data type
-* For fp8 types, A and B can have different types (e4m3fn or e5m2) but both must be 8-bit
-* Fp8 types only support k-major layout
-* Only fp32 accumulation is supported in this example
-* CTA tile shape M must be 64/128
-* CTA tile shape N must be 64/128/256
-* CTA tile shape K must be 64
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 4
-* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
-  i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
-* OOB tiles are not allowed when TMA store is disabled
-"""
-
-
 # /////////////////////////////////////////////////////////////////////////////
 #  Helpers to parse args
 # /////////////////////////////////////////////////////////////////////////////
@@ -167,8 +103,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--cluster_shape_mn",
         type=parse_comma_separated_ints,
-        choices=[(1, 1), (2, 1), (1, 2), (2, 2)],
-        default=(1, 1),
+        choices=[(2,1)],
+        default=(2, 1),
         help="Cluster shape (comma-separated)",
     )
     parser.add_argument(
@@ -243,8 +179,8 @@ class NamedBarrierGemm(enum.IntEnum):
 
 class HopperSymmetricGemmKernel:
     """
-    This class implements batched matrix multiplication (C = A x B) with support for various data types
-    and architectural features specific to Hopper GPUs.
+    This class implements batched matrix multiplication for matrix outputs that are guaranteed
+    to be symmetric, with C addition. (D = alpha * A x B + beta * C, where B = A^T).
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
@@ -289,7 +225,7 @@ class HopperSymmetricGemmKernel:
         fp8_fast_accum: bool = False,
     ):
         """
-        Initializes the configuration for a Hopper dense GEMM kernel.
+        Initializes the configuration for the Hopper symmetric dense GEMM kernel.
 
         This configuration includes data types for operands, tile shape, cluster configuration,
         and thread layout.
@@ -1968,6 +1904,11 @@ def _symmetric_dense_gemm(
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     def make_cute_tensor(x: torch.Tensor):
+        # Handle tensors with stride 1 along dimension 2
+        if x.stride()[2] == 1 and not (x.stride()[0] == 1 or x.stride()[1] == 1):
+            # If dim 2 has stride 1, permute to make it contiguous along different dim
+            x = x.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+        
         cpu_ref = x.cpu().to(torch.float32)
         t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
@@ -1976,7 +1917,7 @@ def _symmetric_dense_gemm(
         elif x.stride()[1] == 1:
             leading_dim = 1
         else:
-            raise ValueError(f"GEMM requires that A and C have stride 1 along dim 0 or 1, as opposed to dim 2. Strides: {x.stride()}")
+            raise ValueError(f"Neither dimension 0 nor 1 has stride 1. Strides: {x.stride()}")
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
         return cutlass_torch.convert_cute_tensor(cpu_ref, t, cutlass_dtype, is_dynamic_layout=True)
     
@@ -2046,10 +1987,12 @@ def symmetric_dense_gemm(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> torch.Tensor:
-    """Batched symmetric dense GEMM.
+    """High-performance batched symmetric dense GEMM.
     
     Computes D = alpha * A @ A^T + beta * C using the symmetric dense GEMM kernel.
     
+    NOTE: The strides of a and c should be 1 along either dim 0 or 1, as opposed to dim 2.
+
     Args:
         a: Input tensor A of shape (M, K, L) where L is batch dimension
         c: Optional tensor C of shape (M, M, L), defaults to None - MUST BE SYMMETRIC
