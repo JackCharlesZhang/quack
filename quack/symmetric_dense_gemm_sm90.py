@@ -1977,7 +1977,7 @@ def _symmetric_dense_gemm(
         assert c.dtype == a.dtype, "C must have same dtype as A"
 
     device, dtype = a.device, a.dtype
-    cutlass_dtype = getattr(cutlass, torch2cute_dtype_map[dtype])
+    cutlass_dtype = torch2cute_dtype_map[dtype]
 
     # 2) Realign (M,K,L) so that stride[1] == 1 (row-major on dims 0–1)
     def _realign_for_row_major(x: torch.Tensor) -> torch.Tensor:
