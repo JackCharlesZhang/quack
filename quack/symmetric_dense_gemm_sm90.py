@@ -1941,9 +1941,9 @@ def _symmetric_dense_gemm(
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
     persistent = True
-    cluster_shape_mnk3 = (*cluster_shape_mn, 1)
+    cluster_shape_mnk = (*cluster_shape_mn, 1)
     compile_key = (
-        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk3, c is not None, persistent, M
+        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk, c is not None, persistent, M
     )
 
     if persistent:
@@ -1962,7 +1962,7 @@ def _symmetric_dense_gemm(
             acc_dtype=cutlass.Float32,
             a_dtype=cutlass_dtype,
             tile_shape_mnk=tile_shape_mnk,
-            cluster_shape_mnk=cluster_shape_mnk3,
+            cluster_shape_mnk=cluster_shape_mnk,
             pingpong=False,
             is_persistent=persistent,
             fp8_fast_accum=False,
