@@ -79,23 +79,16 @@ class TestSymmetricGemm:
     
     def create_symmetric_tensor(self, M, L, dtype, device, seed=None):
         """Create a symmetric tensor of shape (M, M, L)."""
-        # Create with stride 1 along M dimension: (M, M, L) with strides (1, M, M*M)
-        tensor = torch.empty_strided(
-            (M, M, L), 
-            (1, M, M*M), 
-            dtype=dtype, 
-            device=device
-        )
-        
         if seed is not None:
             torch.manual_seed(seed)
-        # Fill each batch slice symmetrically
+            
+        tensor = torch.randn(M, M, L, dtype=dtype, device=device)
+        
         for l in range(L):
-            # Generate random upper triangular matrix
-            upper = torch.triu(torch.randn(M, M, dtype=dtype, device=device))
-            # Make symmetric by adding transpose
-            symmetric = upper + upper.T
-            tensor[:, :, l] = symmetric
+            matrix = tensor[:, :, l]
+            tensor[:, :, l] = (matrix + matrix.T) / 2
+
+        tensor = tensor.permute(2, 0, 1).contiguous().permute(1, 2, 0)
             
         return tensor
     
