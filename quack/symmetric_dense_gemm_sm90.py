@@ -1730,12 +1730,7 @@ def run(
 
         # Create symmetric matrix
         assert mode0 == mode1, f"For symmetric C, mode0 ({mode0}) must equal mode1 ({mode1})"
-        if is_mode0_major:
-            E = base_tensor.permute(2, 1, 0)
-        else:
-            E = base_tensor.permute(1, 2, 0)
-        
-        torch_tensor_cpu = E + E.transpose(0, 1)
+        torch_tensor_cpu = base_tensor + base_tensor.transpose(0, 1)
         
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
