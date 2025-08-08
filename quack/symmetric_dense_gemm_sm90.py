@@ -1983,20 +1983,27 @@ def symmetric_dense_gemm(
     
     Computes D = alpha * A @ B + beta * C using the symmetric dense GEMM kernel, with the assumption that
     A @ B is symmetric and C is symmetric.
-    
-    NOTE: The strides of a and c should be 1 along either dim 0 or 1, as opposed to dim 2.
 
     Args:
-        a: Input tensor A of shape (M, K, L) where L is batch dimension
-        b: Input tensor B of shape (M, K, L) where L is batch dimension
-        c: Optional tensor C of shape (M, M, L), defaults to None - MUST BE SYMMETRIC
+        a: Input tensor A of shape (L, M, K) where L is batch dimension
+        b: Input tensor B of shape (L, M, K) where L is batch dimension
+        c: Optional tensor C of shape (L, M, M), defaults to None - MUST BE SYMMETRIC
         alpha: Scaling factor for A @ B, defaults to 1.0
         beta: Scaling factor for C (ignored if c is None), defaults to 1.0
-    
+
     Returns:
         Symmetric output tensor D of shape (M, M, L)
     """
-    return _symmetric_dense_gemm(a, b, c, alpha, beta)
+    a_permuted = a.permute(1, 2, 0)
+    b_permuted = b.permute(1, 2, 0)
+
+    c_permuted = None
+    if c is not None:
+        c_permuted = c.permute(1, 2, 0)
+
+    d = _symmetric_dense_gemm(a_permuted, b_permuted, c_permuted, alpha, beta)
+
+    return d.permute(2, 0, 1)
 
 
 if __name__ == "__main__":
