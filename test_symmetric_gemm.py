@@ -1,7 +1,6 @@
 import torch
 import pytest
 
-from quack.reduction_base import torch2cute_dtype_map
 from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
 
 class TestSymmetricGemm:
@@ -14,57 +13,57 @@ class TestSymmetricGemm:
     
     @property
     def default_shape(self):
-        """Default shape for most tests (M, K, L)."""
-        return (1024, 512, 2)
+        """Default shape for most tests (L, M, K)."""
+        return (2, 1024, 512)
     
     def torch_reference(self, a, b=None, c=None, alpha=1.0, beta=1.0):
         """Reference implementation using PyTorch operations.
         
         Args:
-            a: Input tensor A of shape (M, K, L)
-            b: Input tensor B of shape (M, K, L) - if None, uses A (symmetric case)
-            c: Optional bias tensor C of shape (M, M, L)
+            a: Input tensor A of shape (L, M, K)
+            b: Input tensor B of shape (L, M, K) - if None, uses A (symmetric case)
+            c: Optional bias tensor C of shape (L, M, M)
             alpha: Scaling factor for A @ B^T
             beta: Scaling factor for C
             
         Returns:
-            Result tensor of shape (M, M, L)
+            Result tensor of shape (L, M, M)
         """
         if b is None:
             b = a
             
         # Use einsum for batched matrix multiplication: A @ B^T
-        # a: (M, K, L), b: (M, K, L) -> result: (M, M, L)
-        result = alpha * torch.einsum('mkl,nkl->mnl', a, b)
+        # a: (L, M, K), b: (L, M, K) -> result: (L, M, M)
+        result = alpha * torch.einsum('lmk,lnk->lmn', a, b)
         
         if c is not None:
             result = result + beta * c
                 
         return result
     
-    def create_test_tensor(self, M, K, L, dtype, device, stride_pattern="mkl", seed=None):
+    def create_test_tensor(self, L, M, K, dtype, device, stride_pattern="m_major", seed=None):
         """Create test tensor with specified stride pattern.
         
         Args:
-            M, K, L: Tensor dimensions
+            L, M, K: Tensor dimensions
             dtype: Data type
             device: Device ('cuda' or 'cpu')
-            stride_pattern: How to arrange strides - 'mkl' means M has stride 1
+            stride_pattern: How to arrange strides - 'm_major' means M has stride 1, 'k_major' means K has stride 1
             seed: Random seed for reproducibility
         """
-        if stride_pattern == "mkl":
-            # M has stride 1: (M, K, L) with strides (1, M, M*K)
+        if stride_pattern == "m_major":
+            # M has stride 1: (L, M, K) with strides (M*K, 1, M)
             tensor = torch.empty_strided(
-                (M, K, L), 
-                (1, M, M*K), 
+                (L, M, K), 
+                (M*K, 1, M), 
                 dtype=dtype, 
                 device=device
             )
-        elif stride_pattern == "kml":
-            # K has stride 1: (M, K, L) with strides (K, 1, M*K)
+        elif stride_pattern == "k_major":
+            # K has stride 1: (L, M, K) with strides (M*K, K, 1)
             tensor = torch.empty_strided(
-                (M, K, L), 
-                (K, 1, M*K), 
+                (L, M, K), 
+                (M*K, K, 1), 
                 dtype=dtype, 
                 device=device
             )
@@ -77,18 +76,16 @@ class TestSymmetricGemm:
         tensor.uniform_(-2, 2)
         return tensor
     
-    def create_symmetric_tensor(self, M, L, dtype, device, seed=None):
-        """Create a symmetric tensor of shape (M, M, L)."""
+    def create_symmetric_tensor(self, L, M, dtype, device, seed=None):
+        """Create a symmetric tensor of shape (L, M, M)."""
         if seed is not None:
             torch.manual_seed(seed)
             
-        tensor = torch.randn(M, M, L, dtype=dtype, device=device)
+        tensor = torch.randn(L, M, M, dtype=dtype, device=device)
         
         for l in range(L):
-            matrix = tensor[:, :, l]
-            tensor[:, :, l] = (matrix + matrix.T) / 2
-
-        tensor = tensor.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+            matrix = tensor[l, :, :]
+            tensor[l, :, :] = (matrix + matrix.T) / 2
             
         return tensor
     
@@ -97,11 +94,11 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = self.default_shape
+        L, M, K = self.default_shape
         device = 'cuda'
         
         # Create input tensor A with stride 1 along M dimension
-        a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
+        a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
         
         print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
         
@@ -109,7 +106,7 @@ class TestSymmetricGemm:
         result_quack = symmetric_dense_gemm(a, a)
         result_torch = self.torch_reference(a, a)
         
-        assert result_quack.shape == result_torch.shape == (M, M, L)
+        assert result_quack.shape == result_torch.shape == (L, M, M)
 
         if dtype == torch.float32:
             torch.testing.assert_close(result_quack, result_torch, atol=1e-4, rtol=1e-4)
@@ -121,12 +118,12 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = self.default_shape
+        L, M, K = self.default_shape
         device = 'cuda'
         
         # Create input tensors
-        a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
-        c = self.create_symmetric_tensor(M, L, dtype, device, seed=123)
+        a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
+        c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
         
         # Compute with our wrapper
         result_quack = symmetric_dense_gemm(a, a, c=c)
@@ -135,7 +132,7 @@ class TestSymmetricGemm:
         result_torch = self.torch_reference(a, a, c=c)
         
         # Check shapes match
-        assert result_quack.shape == result_torch.shape == (M, M, L)
+        assert result_quack.shape == result_torch.shape == (L, M, M)
         
         # Check values match
         if dtype == torch.float32:
@@ -148,13 +145,13 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = self.default_shape
+        L, M, K = self.default_shape
         device = 'cuda'
         alpha, beta = 2.5, 0.5
         
         # Create input tensors
-        a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
-        c = self.create_symmetric_tensor(M, L, dtype, device, seed=123)
+        a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
+        c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
         
         # Compute with our wrapper
         result_quack = symmetric_dense_gemm(a, a, c=c, alpha=alpha, beta=beta)
@@ -173,18 +170,18 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = self.default_shape
+        L, M, K = self.default_shape
         device = 'cuda'
         
         # Create input tensor
-        a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
+        a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
       
         # Compute symmetric GEMM
         result = symmetric_dense_gemm(a, a)
         
         # Check symmetry for each batch
         for l in range(L):
-            matrix = result[:, :, l]
+            matrix = result[l, :, :]
             torch.testing.assert_close(matrix, matrix.T, atol=1e-6, rtol=1e-6)
     
     def test_different_sizes(self):
@@ -196,25 +193,25 @@ class TestSymmetricGemm:
         dtype = torch.float16
         
         test_sizes = [
-            (128, 128, 3),  
-            (256, 256, 5),  
-            (1024, 1024, 5), 
-            (2048, 2048, 3),  
-            (4096, 4096, 1),
+            (3, 128, 128),  
+            (5, 256, 256),  
+            (5, 1024, 1024), 
+            (3, 2048, 2048),  
+            (1, 4096, 4096),
         ]
         
-        for M, K, L in test_sizes:
-            a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
+        for L, M, K in test_sizes:
+            a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
     
             result = symmetric_dense_gemm(a, a)
             expected = self.torch_reference(a, a)
             
-            assert result.shape == (M, M, L)
+            assert result.shape == (L, M, M)
             torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
             
             # Verify symmetry
             for l in range(L):
-                matrix = result[:, :, l]
+                matrix = result[l, :, :]
                 torch.testing.assert_close(matrix, matrix.T, atol=1e-6, rtol=1e-6)
 
 def run_tests():
