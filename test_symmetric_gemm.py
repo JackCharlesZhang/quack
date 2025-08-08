@@ -1,6 +1,7 @@
 import torch
 import pytest
 
+from quack.reduction_base import torch2cute_dtype_map
 from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
 
 class TestSymmetricGemm:
@@ -41,7 +42,7 @@ class TestSymmetricGemm:
                 
         return result
     
-    def create_test_tensor(self, M, K, L, dtype, device, stride_pattern="mkl"):
+    def create_test_tensor(self, M, K, L, dtype, device, stride_pattern="mkl", seed=None):
         """Create test tensor with specified stride pattern.
         
         Args:
@@ -49,6 +50,7 @@ class TestSymmetricGemm:
             dtype: Data type
             device: Device ('cuda' or 'cpu')
             stride_pattern: How to arrange strides - 'mkl' means M has stride 1
+            seed: Random seed for reproducibility
         """
         if stride_pattern == "mkl":
             # M has stride 1: (M, K, L) with strides (1, M, M*K)
@@ -70,7 +72,8 @@ class TestSymmetricGemm:
             raise ValueError(f"Unsupported stride pattern: {stride_pattern}")
             
         # Fill with random data
-        torch.manual_seed(42)
+        if seed is not None:
+            torch.manual_seed(seed)
         tensor.uniform_(-2, 2)
         return tensor
     
@@ -152,7 +155,7 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = 64, 32, 2
+        M, K, L = self.default_shape
         device = 'cuda'
         alpha, beta = 2.5, 0.5
         
@@ -177,7 +180,7 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = 1024, 1024, 1
+        M, K, L = self.default_shape
         device = 'cuda'
         
         # Create input tensor
@@ -196,7 +199,7 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = 128, 64, 2
+        M, K, L = self.default_shape
         device = 'cuda'
         
         # Test both stride patterns
@@ -224,7 +227,8 @@ class TestSymmetricGemm:
             (128, 128, 3),  
             (256, 256, 5),  
             (1024, 1024, 5), 
-            (2048, 2048, 3), 
+            (2048, 2048, 3),  
+            (4096, 4096, 1),
         ]
         
         for M, K, L in test_sizes:
@@ -246,7 +250,7 @@ class TestSymmetricGemm:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
             
-        M, K, L = 256, 128, 3
+        M, K, L = self.default_shape
         device = 'cuda'
         
         # Create different A and B tensors
@@ -270,12 +274,12 @@ def run_tests():
     try:
         # Test basic functionality
         print("Testing basic symmetric GEMM...")
-        test_class.test_basic_symmetric_gemm(torch.float16, (1024, 1024, 1))
+        test_class.test_basic_symmetric_gemm(torch.float16)
         print("✓ Basic test passed")
         
         # Test with bias
         print("Testing with bias...")
-        test_class.test_symmetric_gemm_with_bias(torch.float16, (1024, 1024, 1))
+        test_class.test_symmetric_gemm_with_bias(torch.float16)
         print("✓ Bias test passed")
         
         # Test scaling
