@@ -65,7 +65,7 @@ class TestSymmetricGemm:
         result_quack = symmetric_dense_gemm(a, a)
         
         # Compute reference
-        result_torch = self.torch_reference(a, a)
+        result_torch = self.torch_reference(a)
         
         # Check shapes match
         assert result_quack.shape == result_torch.shape == (M, M, L)
