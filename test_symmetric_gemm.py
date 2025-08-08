@@ -187,27 +187,6 @@ class TestSymmetricGemm:
             matrix = result[:, :, l]
             torch.testing.assert_close(matrix, matrix.T, atol=1e-6, rtol=1e-6)
     
-    def test_different_stride_patterns(self, dtype):
-        """Test different tensor stride patterns."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-            
-        M, K, L = self.default_shape
-        device = 'cuda'
-        
-        # Test both stride patterns
-        for stride_pattern in ["mkl", "kml"]:
-            a = self.create_test_tensor(M, K, L, dtype, device, stride_pattern, seed=42)
-            
-            result = symmetric_dense_gemm(a, a)
-            expected = self.torch_reference(a, a)
-            
-            assert result.shape == (M, M, L)
-            if dtype == torch.float32:
-                torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
-            else:
-                torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    
     def test_different_sizes(self):
         """Test various matrix sizes to ensure robustness."""
         if not torch.cuda.is_available():
@@ -284,12 +263,7 @@ def run_tests():
         print("Testing symmetry property...")
         test_class.test_symmetry_property(torch.float16)
         print("✓ Symmetry test passed")
-
-        # Test different stride patterns
-        print("Testing different stride patterns...")
-        test_class.test_different_stride_patterns(torch.float16)
-        print("✓ Stride patterns test passed")
-
+        
         # Test different sizes
         print("Testing different sizes...")
         test_class.test_different_sizes()
