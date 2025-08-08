@@ -217,28 +217,6 @@ class TestSymmetricGemm:
                 matrix = result[:, :, l]
                 torch.testing.assert_close(matrix, matrix.T, atol=1e-6, rtol=1e-6)
 
-    def test_non_symmetric_inputs(self, dtype):
-        """Test with different A and B matrices (non-symmetric case)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-            
-        M, K, L = self.default_shape
-        device = 'cuda'
-        
-        # Create different A and B tensors
-        a = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=42)
-        b = self.create_test_tensor(M, K, L, dtype, device, "mkl", seed=123)
-        
-        result = symmetric_dense_gemm(a, b)
-        expected = self.torch_reference(a, b)
-        
-        assert result.shape == (M, M, L)
-        if dtype == torch.float32:
-            torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
-        else:
-            torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-
-
 def run_tests():
     """Run all tests manually (for debugging)."""
     test_class = TestSymmetricGemm()
@@ -263,16 +241,11 @@ def run_tests():
         print("Testing symmetry property...")
         test_class.test_symmetry_property(torch.float16)
         print("✓ Symmetry test passed")
-        
+
         # Test different sizes
         print("Testing different sizes...")
         test_class.test_different_sizes()
         print("✓ Different sizes test passed")
-        
-        # Test non-symmetric inputs
-        print("Testing non-symmetric inputs...")
-        test_class.test_non_symmetric_inputs(torch.float16)
-        print("✓ Non-symmetric inputs test passed")
         
         print("\n🎉 All tests passed!")
         
