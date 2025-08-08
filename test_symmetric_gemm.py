@@ -102,9 +102,12 @@ class TestSymmetricGemm:
         
         print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
         
-        # Test symmetric case (B = A)
         result_quack = symmetric_dense_gemm(a, a)
         result_torch = self.torch_reference(a, a)
+        
+        print(f"result_quack.shape = {result_quack.shape}")
+        print(f"result_torch.shape = {result_torch.shape}")
+        print(f"expected shape = {(L, M, M)}")
         
         assert result_quack.shape == result_torch.shape == (L, M, M)
 
