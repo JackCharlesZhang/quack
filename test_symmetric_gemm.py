@@ -57,14 +57,15 @@ class TestSymmetricGemm:
         # Create input tensor
         torch.manual_seed(42)  # For reproducible results
         a = torch.randn(M, K, L, dtype=dtype, device=device)
+        a = a.permute(2, 0, 1).contiguous().permute(1, 2, 0)
 
         print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
         
         # Compute with our wrapper
-        result_quack = symmetric_dense_gemm(a)
+        result_quack = symmetric_dense_gemm(a, a)
         
         # Compute reference
-        result_torch = self.torch_reference(a)
+        result_torch = self.torch_reference(a, a)
         
         # Check shapes match
         assert result_quack.shape == result_torch.shape == (M, M, L)

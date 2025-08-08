@@ -1728,16 +1728,9 @@ def run(
             ),
         ).to(torch_dtype)
 
-        # Create symmetric matrix: A @ A^T, one layer at a time to prevent OOM
-        symmetric_matrices = []
-        for batch_idx in range(l):
-            matrix_slice = base_tensor[batch_idx] 
-            # Create symmetric matrix: A @ A^T (shape: mode0 x mode0)
-            symmetric_matrix = torch.matmul(matrix_slice, matrix_slice.transpose(-2, -1))
-            symmetric_matrices.append(symmetric_matrix)
-        torch_tensor_cpu = torch.stack(symmetric_matrices, dim=0) 
-        assert mode0 == mode1, f"For symmetric matrices, mode0 ({mode0}) must equal mode1 ({mode1})"
-        torch_tensor_cpu = torch_tensor_cpu.permute(1, 2, 0)
+        # Create symmetric matrix
+        assert mode0 == mode1, f"For symmetric C, mode0 ({mode0}) must equal mode1 ({mode1})"
+        torch_tensor_cpu = base_tensor + base_tensor.transpose(0, 1)
         
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
@@ -1889,6 +1882,7 @@ def run(
 
 def _symmetric_dense_gemm(
     a: torch.Tensor,
+    b: torch.Tensor,
     c: torch.Tensor = None,
     alpha: float = 1.0,
     beta: float = 1.0,
@@ -1896,19 +1890,16 @@ def _symmetric_dense_gemm(
     assert a.dim() == 3 and a.is_cuda, "A must be a 3D CUDA tensor"
     M, K, L = a.shape
     assert a.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
+    assert b.dim() == 3 and b.is_cuda, "B must be a 3D CUDA tensor"
+    M, K, L = b.shape
+    assert b.dtype in torch2cute_dtype_map, "Unsupported dtype for B"
     if c is not None:
         assert c.shape == (M, M, L) and c.is_cuda, "C must be (M,M,L) CUDA"
-        assert c.dtype == a.dtype, "C must have same dtype as A"
 
     dtype = a.dtype
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     def make_cute_tensor(x: torch.Tensor):
-        # Handle tensors with stride 1 along dimension 2
-        if x.stride()[2] == 1 and not (x.stride()[0] == 1 or x.stride()[1] == 1):
-            # If dim 2 has stride 1, permute to make it contiguous along different dim
-            x = x.permute(2, 0, 1).contiguous().permute(1, 2, 0)
-        
         cpu_ref = x.cpu().to(torch.float32)
         t = from_dlpack(x, assumed_align=16)
         t.element_type = cutlass_dtype
@@ -1917,12 +1908,12 @@ def _symmetric_dense_gemm(
         elif x.stride()[1] == 1:
             leading_dim = 1
         else:
-            raise ValueError(f"Neither dimension 0 nor 1 has stride 1. Strides: {x.stride()}")
+            raise ValueError(f"Input tesnor should have stride 1 along either dim 0 or 1. Strides: {x.stride()}")
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
         return cutlass_torch.convert_cute_tensor(cpu_ref, t, cutlass_dtype, is_dynamic_layout=True)
     
     mA = make_cute_tensor(a)
-    mB = make_cute_tensor(a) 
+    mB = make_cute_tensor(b) 
 
     if c is not None:
         mC = make_cute_tensor(c)
@@ -1941,9 +1932,9 @@ def _symmetric_dense_gemm(
     tile_shape_mnk = (128, 256, 64)
     cluster_shape_mn = (2, 1)
     persistent = True
-    cluster_shape_mnk3 = (*cluster_shape_mn, 1)
+    cluster_shape_mnk = (*cluster_shape_mn, 1)
     compile_key = (
-        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk3, c is not None, persistent, M
+        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk, c is not None, persistent, M
     )
 
     if persistent:
@@ -1962,7 +1953,7 @@ def _symmetric_dense_gemm(
             acc_dtype=cutlass.Float32,
             a_dtype=cutlass_dtype,
             tile_shape_mnk=tile_shape_mnk,
-            cluster_shape_mnk=cluster_shape_mnk3,
+            cluster_shape_mnk=cluster_shape_mnk,
             pingpong=False,
             is_persistent=persistent,
             fp8_fast_accum=False,
@@ -1983,26 +1974,29 @@ _symmetric_dense_gemm.compile_cache = {}
 
 def symmetric_dense_gemm(
     a: torch.Tensor,
+    b: torch.Tensor,
     c: torch.Tensor = None,
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> torch.Tensor:
     """High-performance batched symmetric dense GEMM.
     
-    Computes D = alpha * A @ A^T + beta * C using the symmetric dense GEMM kernel.
+    Computes D = alpha * A @ B + beta * C using the symmetric dense GEMM kernel, with the assumption that
+    A @ B is symmetric and C is symmetric.
     
     NOTE: The strides of a and c should be 1 along either dim 0 or 1, as opposed to dim 2.
 
     Args:
         a: Input tensor A of shape (M, K, L) where L is batch dimension
+        b: Input tensor B of shape (M, K, L) where L is batch dimension
         c: Optional tensor C of shape (M, M, L), defaults to None - MUST BE SYMMETRIC
-        alpha: Scaling factor for A @ A^T, defaults to 1.0
+        alpha: Scaling factor for A @ B, defaults to 1.0
         beta: Scaling factor for C (ignored if c is None), defaults to 1.0
     
     Returns:
         Symmetric output tensor D of shape (M, M, L)
     """
-    return _symmetric_dense_gemm(a, c, alpha, beta)
+    return _symmetric_dense_gemm(a, b, c, alpha, beta)
 
 
 if __name__ == "__main__":
