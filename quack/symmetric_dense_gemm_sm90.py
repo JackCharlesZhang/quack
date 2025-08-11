@@ -1884,8 +1884,6 @@ def run(
 
 @lru_cache(maxsize=32)
 def get_max_active_clusters_cached(cluster_shape_mn_tuple):
-    """Cached version of max_active_clusters calculation"""
-    print(f"CACHE MISS: Computing max_active_clusters for {cluster_shape_mn_tuple}")
     cluster_shape_mn = tuple(cluster_shape_mn_tuple)
     return cutlass.utils.HardwareInfo().get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
