@@ -57,6 +57,8 @@ from quack.reduction_base import torch2cute_dtype_map
 from quack.pipeline import make_pipeline_state
 import quack.utils as utils
 
+from functools import lru_cache
+
 # /////////////////////////////////////////////////////////////////////////////
 #  Helpers to parse args
 # /////////////////////////////////////////////////////////////////////////////
@@ -1880,6 +1882,13 @@ def run(
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
+@lru_cache(maxsize=32)
+def get_max_active_clusters_cached(cluster_shape_mn_tuple):
+    cluster_shape_mn = tuple(cluster_shape_mn_tuple)
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
 def _symmetric_dense_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1900,17 +1909,17 @@ def _symmetric_dense_gemm(
     cutlass_dtype = torch2cute_dtype_map[dtype]
 
     def make_cute_tensor(x: torch.Tensor):
-        cpu_ref = x.cpu().to(torch.float32)
-        t = from_dlpack(x, assumed_align=16)
+        x_fp32 = x.to(torch.float32)
+        t = from_dlpack(x_fp32, assumed_align=16)
         t.element_type = cutlass_dtype
         if x.stride()[0] == 1:
             leading_dim = 0
         elif x.stride()[1] == 1:
             leading_dim = 1
         else:
-            raise ValueError(f"Input tesnor should have stride 1 along either dim 0 or 1. Strides: {x.stride()}")
+            raise ValueError(f"Input tensor should have stride 1 along either dim 0 or 1. Strides: {x.stride()}")
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
-        return cutlass_torch.convert_cute_tensor(cpu_ref, t, cutlass_dtype, is_dynamic_layout=True)
+        return cutlass_torch.convert_cute_tensor(x_fp32, t, cutlass_dtype, is_dynamic_layout=True)
     
     mA = make_cute_tensor(a)
     mB = make_cute_tensor(b) 
@@ -1938,9 +1947,7 @@ def _symmetric_dense_gemm(
     )
 
     if persistent:
-        max_active = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            cluster_shape_mn[0] * cluster_shape_mn[1]
-        )
+        max_active = get_max_active_clusters_cached(cluster_shape_mn)
     else:
         max_active = 0
 
