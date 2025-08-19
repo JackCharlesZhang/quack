@@ -213,6 +213,40 @@ class TestSymmetricGemm:
             for l in range(L):
                 matrix = result[l, :, :]
                 torch.testing.assert_close(matrix, matrix.T, atol=1e-6, rtol=1e-6)
+    
+    def test_different_stride_patterns(self, dtype):
+        """Test symmetric GEMM with different stride patterns (m_major vs k_major)."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+            
+        L, M, K = self.default_shape
+        device = 'cuda'
+        
+        # Create tensors with identical data but different stride patterns
+        a_m_major = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
+        a_k_major = self.create_test_tensor(L, M, K, dtype, device, "k_major", seed=42)
+        
+        assert torch.equal(a_m_major, a_k_major), "Input tensors should have identical values"
+        assert a_m_major.stride() != a_k_major.stride(), "Stride patterns should be different"
+        
+        result_m_major = symmetric_dense_gemm(a_m_major, a_m_major)
+        result_k_major = symmetric_dense_gemm(a_k_major, a_k_major)
+        
+        assert result_m_major.shape == result_k_major.shape == (L, M, M)
+        
+        if dtype == torch.float32:
+            torch.testing.assert_close(result_m_major, result_k_major, atol=1e-6, rtol=1e-6)
+        else: 
+            torch.testing.assert_close(result_m_major, result_k_major, atol=1e-4, rtol=1e-4)
+        
+        expected = self.torch_reference(a_m_major, a_m_major)
+        
+        if dtype == torch.float32:
+            torch.testing.assert_close(result_m_major, expected, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(result_k_major, expected, atol=1e-4, rtol=1e-4)
+        else:
+            torch.testing.assert_close(result_m_major, expected, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(result_k_major, expected, atol=1e-2, rtol=1e-2)
 
 def run_tests():
     """Run all tests manually (for debugging)."""
@@ -243,6 +277,11 @@ def run_tests():
         print("Testing different sizes...")
         test_class.test_different_sizes()
         print("✓ Different sizes test passed")
+        
+        # Test different stride patterns
+        print("Testing different stride patterns...")
+        test_class.test_different_stride_patterns(torch.float16)
+        print("✓ Different stride patterns test passed")
         
         print("\n🎉 All tests passed!")
         

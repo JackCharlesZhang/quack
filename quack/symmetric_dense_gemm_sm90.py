@@ -1942,8 +1942,54 @@ def _symmetric_dense_gemm(
     cluster_shape_mn = (2, 1)
     persistent = True
     cluster_shape_mnk = (*cluster_shape_mn, 1)
+    
+    def get_tensor_major_order(tensor, expected_dims):
+        """
+        Determine if a tensor is in major order based on its strides.
+        
+        For A/B tensors (M,K,L): 
+        - k_major: K dimension has stride 1
+        - m_major: M dimension has stride 1
+        
+        For C/D tensors (M,M,L):
+        - m_major: first M dimension has stride 1
+        - n_major: second M dimension has stride 1
+        """
+        strides = tensor.stride()
+        
+        if expected_dims == "mk": 
+            if strides[1] == 1:
+                return "k" 
+            elif strides[0] == 1:
+                return "m"
+            else:
+                raise ValueError(f"Tensor must have stride 1 along either M or K dimension. Strides: {strides}")
+        
+        elif expected_dims == "mm":  
+            if strides[0] == 1:
+                return "m"
+            elif strides[1] == 1:
+                return "n"
+            else:
+                raise ValueError(f"Tensor must have stride 1 along either M or N dimension. Strides: {strides}")
+        
+        else:
+            raise ValueError(f"Unknown expected_dims: {expected_dims}")
+        
+    a_major = get_tensor_major_order(a, "mk")
+    b_major = get_tensor_major_order(b, "mk") 
+    c_major = get_tensor_major_order(c, "mm") if c is not None else None
+
     compile_key = (
-        cutlass_dtype, tile_shape_mnk, cluster_shape_mnk, c is not None, persistent, M
+        cutlass_dtype,          
+        tile_shape_mnk,        
+        cluster_shape_mnk,       
+        c is not None,          
+        persistent,           
+        (M, K, L), 
+        a_major,
+        b_major,
+        c_major,
     )
 
     if persistent:
