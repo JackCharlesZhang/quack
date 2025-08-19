@@ -2001,6 +2001,7 @@ def _symmetric_dense_gemm(
     beta_s  = cutlass.Float32(beta)
 
     cache = _symmetric_dense_gemm.compile_cache
+    print("HERE")
     if compile_key not in cache:
         print("compile")
         gemm = HopperSymmetricGemmKernel(
