@@ -1950,7 +1950,7 @@ def _symmetric_dense_gemm(
         c is not None,          
         persistent,           
         (M, K, L),
-        (a.stride(1) == 1, b.stride(1) == 1, c.stride(1) == 1 if c is not None else None)
+        (a.stride(1) == 1, b.stride(1) == 1, c.stride(1) == 1 if c is not None else None, d.stride(1) == 1)
     )
 
     if persistent:
