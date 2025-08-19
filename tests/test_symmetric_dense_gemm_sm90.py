@@ -222,10 +222,24 @@ class TestSymmetricGemm:
         L, M, K = self.default_shape
         device = 'cuda'
         
-        # Create tensors with identical data but different stride patterns
+        # Create one tensor with m_major stride pattern
         a_m_major = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
-        a_k_major = self.create_test_tensor(L, M, K, dtype, device, "k_major", seed=42)
         
+        # Create k_major version by reshaping the same data
+        # First make contiguous, then create new strided view
+        data_contiguous = a_m_major.contiguous()
+        a_k_major = torch.empty_strided(
+            (L, M, K), 
+            (M*K, K, 1), 
+            dtype=dtype, 
+            device=device
+        )
+        a_k_major.copy_(data_contiguous)
+        
+        print(f"M-major strides: {a_m_major.stride()}")
+        print(f"K-major strides: {a_k_major.stride()}")
+        
+        # Verify tensors have identical values but different strides
         assert torch.equal(a_m_major, a_k_major), "Input tensors should have identical values"
         assert a_m_major.stride() != a_k_major.stride(), "Stride patterns should be different"
         
