@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
+from symmetric_dense_gemm_sm90 import symmetric_dense_gemm
 
 class TestSymmetricGemm:
     """Unit tests for symmetric dense GEMM wrapper."""
