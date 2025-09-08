@@ -231,3 +231,98 @@ def test_rmsnorm_compile_cache():
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
     out4 = rmsnorm_fwd(x4, weight4, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 3
+
+def test_rmsnorm_with_bias():
+    """Test RMSNorm with bias parameter - both forward and backward."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.float16
+    weight_dtype = torch.float32
+    bias_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
+    bias = torch.randn(N, device=device, dtype=bias_dtype, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    bias_ref = bias.detach().clone().requires_grad_()
+
+    out, residual_out, rstd = rmsnorm_fwd(x, weight, bias=bias, eps=eps, store_rstd=True)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, bias=bias_ref, eps=eps)
+
+    assert out.shape == x.shape
+    assert out.dtype == input_dtype
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+
+    dx, dw, db, dresidual = rmsnorm_bwd(x.detach(), weight.detach(), grad_out, rstd)
+    
+    dx_ref, dw_ref, db_ref, dresidual_ref = rmsnorm_bwd_ref(
+        x.detach(), weight.detach(), grad_out, rstd, bias=bias.detach(), eps=eps
+    )
+    
+    torch.testing.assert_close(dx, dx_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(dw, dw_ref, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(db, db_ref, atol=1e-4, rtol=1e-3)
+    assert dresidual is None
+
+
+def test_rmsnorm_with_residual():
+    """Test RMSNorm with residual connection - both forward and backward."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.float16
+    weight_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
+    residual = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    residual_ref = residual.detach().clone().requires_grad_()
+
+    out, residual_out, rstd = rmsnorm_fwd(x, weight, residual=residual, eps=eps, store_rstd=True)
+    out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
+
+    assert out.shape == x.shape
+    assert out.dtype == input_dtype
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-2, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+
+    dx, dw, db, dresidual = rmsnorm_bwd(residual_out.detach(), weight.detach(), grad_out, rstd)
+    
+    dx_ref, dw_ref, db_ref, dresidual_ref = rmsnorm_bwd_ref(
+        residual_out.detach(), weight.detach(), grad_out, rstd, residual=residual.detach(), eps=eps
+    )
+    
+    torch.testing.assert_close(dx, dx_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(dw, dw_ref, atol=1e-4, rtol=1e-3)
+    assert db is None
+    torch.testing.assert_close(dresidual, dresidual_ref, atol=1e-2, rtol=1e-3)
+
+def test_amp_bf16_training():
+    """
+    Test amp bf16 training works
+    """
+    device = "cuda"
+    M, N = 32768, 1024
+    eps = 1e-6
+
+    dy = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(M, N, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    rstd = torch.randn(M, device=device, dtype=torch.float32, requires_grad=True)
+
+    dx, dw, _, _ = rmsnorm_bwd(x, weight, dy, rstd)
+
+    assert dx is not None
+    assert dw is not None
