@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'quack'))
+
+from rmsnorm import rmsnorm, rmsnorm_ref, rmsnorm_bwd_ref, _rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
 
 
 torch._dynamo.config.cache_size_limit = 1024
@@ -298,10 +302,10 @@ def test_rmsnorm_with_residual():
 
     grad_out = torch.randn_like(out)
 
-    dx, dw, db, dresidual = rmsnorm_bwd(residual_out.detach(), weight.detach(), grad_out, rstd)
+    dx, dw, db, dresidual = rmsnorm_bwd(x.detach(), weight.detach(), grad_out, rstd, dresidual_out=residual_out.detach())
     
     dx_ref, dw_ref, db_ref, dresidual_ref = rmsnorm_bwd_ref(
-        residual_out.detach(), weight.detach(), grad_out, rstd, residual=residual.detach(), eps=eps
+        x.detach(), weight.detach(), grad_out, rstd, residual=residual.detach(), eps=eps
     )
     
     torch.testing.assert_close(dx, dx_ref, atol=1e-2, rtol=1e-3)
