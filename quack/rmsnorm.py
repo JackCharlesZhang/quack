@@ -1036,7 +1036,9 @@ def _rmsnorm_bwd(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (N, x_tensor.element_type, weight_tensor.element_type)
+    compile_key = (N, x_tensor.element_type, weight_tensor.element_type, db_partial.dtype if db_partial is not None else None,
+        dresidual.dtype if dresidual is not None else None,
+        dresidual_out.dtype if dresidual_out is not None else None)
     if compile_key not in _rmsnorm_bwd.compile_cache:
         rmsnorm_backward_op = RMSNormBackward(x_tensor.element_type, N)
         _rmsnorm_bwd.compile_cache[compile_key] = cute.compile(
