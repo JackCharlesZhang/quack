@@ -362,7 +362,7 @@ class RMSNorm(ReductionBase):
     mutates_args=("out", "rstd", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor weight, Tensor(a!) out, Tensor(a!)? rstd, Tensor? residual, Tensor(a!)? residual_out, float eps=1e-6) -> ()",
+    schema="(Tensor x, Tensor weight, Tensor(a!) out, Tensor? bias, Tensor(a!)? rstd, Tensor? residual, Tensor(a!)? residual_out, float eps=1e-6) -> ()",
 )
 def _rmsnorm_fwd(
     x: Tensor,
