@@ -1048,7 +1048,7 @@ def _rmsnorm_bwd(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (N, x_tensor.element_type, weight_tensor.element_type, db_partial_tensor is not None)
+    compile_key = (N, x_tensor.element_type, weight_tensor.element_type)
     if compile_key not in _rmsnorm_bwd.compile_cache:
         rmsnorm_backward_op = RMSNormBackward(x_tensor.element_type, N)
         _rmsnorm_bwd.compile_cache[compile_key] = cute.compile(
@@ -1132,7 +1132,8 @@ class RMSNormFunction(torch.autograd.Function):
             eps=eps,
             store_rstd=need_grad,
         )
-        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd, bias)
+        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd)
+        ctx.has_bias = bias is not None
         ctx.eps = eps
         ctx.x_shape_og = x_shape_og
         ctx.residual_dtype = residual.dtype if residual is not None else None
@@ -1143,12 +1144,13 @@ class RMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        x, weight, rstd, bias = ctx.saved_tensors
+        x, weight, rstd = ctx.saved_tensors
+        has_bias = ctx.has_bias
         dresidual_out = args[0] if ctx.residual_dtype is not None else None
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, bias is not None)
+        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias)
         dx = dx.view(x_shape_og)
         return dx, dw, db, dresidual, *([None] * 4)
 
