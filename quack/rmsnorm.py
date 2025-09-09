@@ -1149,8 +1149,7 @@ class RMSNormFunction(torch.autograd.Function):
         dout = dout.view(-1, dout.shape[-1])
         dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out)
         dx = dx.view(x_shape_og)
-        dresidual = dresidual if ctx.residual_dtype is not None else None
-        return dx, dw, db, dresidual, *([None] * 4)
+        return dx, dw, db, dresidual, *([None] * 5)
 
 
 def rmsnorm(
