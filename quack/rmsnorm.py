@@ -361,8 +361,8 @@ class RMSNorm(ReductionBase):
 def _rmsnorm_fwd(
     x: Tensor,
     weight: Tensor,
-    bias: Optional[Tensor] = None,
     out: Tensor,
+    bias: Optional[Tensor] = None,
     rstd: Optional[Tensor] = None,
     residual: Optional[Tensor] = None,
     residual_out: Optional[Tensor] = None,
@@ -489,7 +489,7 @@ def rmsnorm_fwd(
         )
     else:
         residual_out = None
-    _rmsnorm_fwd(x, weight, bias, out, rstd, residual, residual_out, eps=eps)
+    _rmsnorm_fwd(x, weight, out, bias, rstd, residual, residual_out, eps=eps)
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
