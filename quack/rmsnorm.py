@@ -750,6 +750,13 @@ class RMSNormBackward(ReductionBase):
             if not is_even_N
             else None
         )
+        if const_expr(mdB is not None):
+            db_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
+            tXpdB = (
+                utils.predicate_k(thr_copy_X.partition_S(db_coord), limit=shape[1])
+                if not is_even_N
+                else None
+            )
 
         gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
         tXgdW = thr_copy_X.partition_S(gdW)
