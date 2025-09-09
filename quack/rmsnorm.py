@@ -594,7 +594,7 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: cute.Tensor,
-        mdB: cute.Tensor,
+        mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         sm_count: Int32,
         stream: cuda.CUstream,
