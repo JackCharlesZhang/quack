@@ -454,6 +454,7 @@ def _rmsnorm_fwd(
             res_out_tensor,
             rstd_tensor,
             current_stream,
+            eps,
         )
     _rmsnorm_fwd.compile_cache[compile_key](
         x_tensor,
