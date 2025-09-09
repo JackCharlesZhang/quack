@@ -604,10 +604,7 @@ class RMSNormBackward(ReductionBase):
             cute.assume(t.stride[0], divby=128 // t.element_type.width),
             t.stride[1],
         )
-        i = 0
         mX, mdO, mdResO, mdX, mdRes = [
-            print(i)
-            i += 1
             cute.make_tensor(t.iterator, cute.make_layout(semistatic_shape, stride=new_stride(t)))
             if const_expr(t is not None)
             else None
