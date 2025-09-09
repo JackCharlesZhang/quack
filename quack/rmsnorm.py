@@ -17,14 +17,7 @@ from torch import Tensor
 import quack.utils as utils
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
-#from quack.cute_dsl_utils import torch2cute_dtype_map
-
-
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+from quack.cute_dsl_utils import torch2cute_dtype_map
 
 class RMSNorm(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
@@ -516,14 +509,9 @@ def rmsnorm_ref(x, w, bias=None, residual=None, eps=1e-6):
     else:
         return out.to(x.dtype), x_f32.to(residual.dtype)
 
-
-def rmsnorm_bwd_ref(x, w, dout, rstd, bias=None, residual=None, eps=1e-6):
+def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
     """Reference implementation for RMSNorm backward pass."""
     x_f32 = x.float()
-    
-    if residual is not None:
-        x_f32 = x_f32 + residual.float()
-    
     x_hat = x_f32 * rstd.unsqueeze(1)
     wdy = dout * w
     c1 = (x_hat * wdy).mean(dim=-1, keepdim=True)
@@ -531,14 +519,7 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, bias=None, residual=None, eps=1e-6):
 
     # dL/dW
     dw = (dout * x_hat).sum(dim=0)
-
-    # dL/dBias (if bias is provided)
-    db = dout.sum(dim=0) if bias is not None else None
-    # dL/dResidual (if residual is provided, same as dx)
-    dresidual = dx if residual is not None else None
-    
-    return dx.to(x.dtype), dw.to(w.dtype), db.to(bias.dtype) if db is not None else None, dresidual.to(x.dtype) if dresidual is not None else None
-
+    return dx.to(x.dtype), dw.to(w.dtype)
 
 class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
