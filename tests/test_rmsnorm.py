@@ -3,8 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd
-
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -33,7 +32,6 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
         131072,
         262144,
     ],
-    # [262144]
 )
 @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
 # @pytest.mark.parametrize("M", [1])
@@ -231,3 +229,91 @@ def test_rmsnorm_compile_cache():
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
     out4 = rmsnorm_fwd(x4, weight4, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 3
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_bias(use_compile):
+    """Test RMSNorm with bias parameter - both forward and backward."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.float16
+    weight_dtype = torch.float32
+    bias_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
+    bias = torch.randn(N, device=device, dtype=bias_dtype, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    bias_ref = bias.detach().clone().requires_grad_()
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out = function(x, weight, bias=bias, eps=eps)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, bias=bias_ref, eps=eps)
+
+    assert out.shape == x.shape
+    assert out.dtype == input_dtype
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_residual(use_compile):
+    """Test RMSNorm with residual connection - both forward and backward."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.float16
+    weight_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
+    residual = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    residual_ref = residual.detach().clone().requires_grad_()
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out, residual_out = function(x, weight, residual=residual, eps=eps)
+    out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
+
+    assert out.shape == x.shape
+    assert out.dtype == input_dtype
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-2, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
+
+def test_amp_bf16_training():
+    """
+    Test amp bf16 training works
+    """
+    device = "cuda"
+    M, N = 32768, 1024
+    eps = 1e-6
+
+    dy = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(M, N, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    rstd = torch.randn(M, device=device, dtype=torch.float32, requires_grad=True)
+
+    dx, dw, _, _ = rmsnorm_bwd(x, weight, dy, rstd)
+
+    assert dx is not None
+    assert dw is not None
