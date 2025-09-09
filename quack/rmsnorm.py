@@ -594,8 +594,8 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: cute.Tensor,
-        mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
+        mdB: Optional[cute.Tensor],
         sm_count: Int32,
         stream: cuda.CUstream,
     ):
@@ -1070,7 +1070,7 @@ def _rmsnorm_bwd(
         x_tensor,
         weight_tensor,
         dout_tensor,
-        dresidual_out,
+        dres_out_tensor,
         rstd_tensor,
         dx_tensor,
         dw_partial_tensor,
