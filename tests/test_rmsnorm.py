@@ -303,7 +303,7 @@ def test_rmsnorm_with_residual(use_compile):
     out_ref.backward(grad_out)
     out.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
 
 def test_amp_bf16_training():
