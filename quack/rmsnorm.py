@@ -111,7 +111,7 @@ class RMSNorm(ReductionBase):
     ):
         semistatic_shape = (*mX.shape[:-1], self.N)  # Set last dimension to be statically N
         new_stride = lambda t: (
-            cute.assume(t.stride[0], divby=128 // t.element_type.width),
+            t.stride[0] // (128 // t.element_type.width) * (128 // t.element_type.width),
             t.stride[1],
         )
         mX, mRes, mO, mResO = [
@@ -601,7 +601,7 @@ class RMSNormBackward(ReductionBase):
     ):
         semistatic_shape = (*mX.shape[:-1], self.N)  # Set last dimension to be statically N
         new_stride = lambda t: (
-            cute.assume(t.stride[0], divby=128 // t.element_type.width),
+            t.stride[0] // (128 // t.element_type.width) * (128 // t.element_type.width),
             t.stride[1],
         )
         mX, mdO, mdResO, mdX, mdRes = [
