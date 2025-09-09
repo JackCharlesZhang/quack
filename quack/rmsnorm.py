@@ -147,7 +147,7 @@ class RMSNorm(ReductionBase):
             )
             mRstd = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
         self.kernel(
-            mX, mW, mRes, mO, mResO, mRstd, eps, tv_layout, tiler_mn, self.reload_from
+            mX, mW, mB, mRes, mO, mResO, mRstd, eps, tv_layout, tiler_mn, self.reload_from
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
