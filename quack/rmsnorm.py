@@ -17,8 +17,14 @@ from torch import Tensor
 import quack.utils as utils
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
-from quack.cute_dsl_utils import torch2cute_dtype_map
+#from quack.cute_dsl_utils import torch2cute_dtype_map
 
+
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
 
 class RMSNorm(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
