@@ -236,7 +236,8 @@ def test_rmsnorm_compile_cache():
     out4 = rmsnorm_fwd(x4, weight4, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 3
 
-def test_rmsnorm_with_bias():
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_bias(use_compile):
     """Test RMSNorm with bias parameter - both forward and backward."""
     device = "cuda"
     M, N = 32, 1024
@@ -254,7 +255,8 @@ def test_rmsnorm_with_bias():
     weight_ref = weight.detach().clone().requires_grad_()
     bias_ref = bias.detach().clone().requires_grad_()
 
-    out, residual_out, rstd = rmsnorm_fwd(x, weight, bias=bias, eps=eps, store_rstd=True)
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out = function(x, weight, bias=bias, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, bias=bias_ref, eps=eps)
 
     assert out.shape == x.shape
@@ -262,20 +264,15 @@ def test_rmsnorm_with_bias():
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
 
     grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
 
-    dx, dw, db, dresidual = rmsnorm_bwd(x.detach(), weight.detach(), grad_out, rstd)
-    
-    dx_ref, dw_ref, db_ref, dresidual_ref = rmsnorm_bwd_ref(
-        x.detach(), weight.detach(), grad_out, rstd, bias=bias.detach(), eps=eps
-    )
-    
-    torch.testing.assert_close(dx, dx_ref, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(dw, dw_ref, atol=1e-4, rtol=1e-3)
-    torch.testing.assert_close(db, db_ref, atol=1e-4, rtol=1e-3)
-    assert dresidual is None
-
-
-def test_rmsnorm_with_residual():
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_residual(use_compile):
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
     M, N = 32, 1024
@@ -292,7 +289,8 @@ def test_rmsnorm_with_residual():
     weight_ref = weight.detach().clone().requires_grad_()
     residual_ref = residual.detach().clone().requires_grad_()
 
-    out, residual_out, rstd = rmsnorm_fwd(x, weight, residual=residual, eps=eps, store_rstd=True)
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out, residual_out = function(x, weight, residual=residual, eps=eps)
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
 
     assert out.shape == x.shape
@@ -301,17 +299,12 @@ def test_rmsnorm_with_residual():
     torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-2, rtol=1e-3)
 
     grad_out = torch.randn_like(out)
-
-    dx, dw, db, dresidual = rmsnorm_bwd(x.detach(), weight.detach(), grad_out, rstd, dresidual_out=residual_out.detach())
-    
-    dx_ref, dw_ref, db_ref, dresidual_ref = rmsnorm_bwd_ref(
-        x.detach(), weight.detach(), grad_out, rstd, residual=residual.detach(), eps=eps
-    )
-    
-    torch.testing.assert_close(dx, dx_ref, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(dw, dw_ref, atol=1e-4, rtol=1e-3)
-    assert db is None
-    torch.testing.assert_close(dresidual, dresidual_ref, atol=1e-2, rtol=1e-3)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
 
 def test_amp_bf16_training():
     """
