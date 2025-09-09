@@ -1107,7 +1107,9 @@ def rmsnorm_bwd(
     dw = dw_partial.sum(dim=0).to(weight.dtype)
     db = db_partial.sum(dim=0).to(weight.dtype)
     # dresidual is the same as dx in this case
-    if dresidual_out is not None and dresidual_out.dtype == dx.dtype:
+    if dresidual_out is None:
+        dresidual = None
+    elif dresidual_out.dtype == dx.dtype:
         dresidual = dx
     return dx, dw, db, dresidual
 
@@ -1149,8 +1151,6 @@ class RMSNormFunction(torch.autograd.Function):
         dout = dout.view(-1, dout.shape[-1])
         dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out)
         dx = dx.view(x_shape_og)
-        if not ctx.needs_input_grad[3]:
-            dresidual = None
         return dx, dw, db, dresidual, *([None] * 3)
 
 
