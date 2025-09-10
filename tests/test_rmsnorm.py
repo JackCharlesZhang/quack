@@ -290,7 +290,7 @@ def test_rmsnorm_with_residual(use_compile):
     residual_ref = residual.detach().clone().requires_grad_()
 
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
-    out, residual_out = function(x, weight, residual=residual, eps=eps)
+    out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
 
     assert out.shape == x.shape
