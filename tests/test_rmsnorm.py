@@ -55,8 +55,9 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
-    out, residual_out = function(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
@@ -284,7 +285,7 @@ def test_rmsnorm_with_residual(use_compile):
     residual_ref = residual.detach().clone().requires_grad_()
 
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
-    out, residual_out = function(x, weight, residual=residual, eps=eps)
+    out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
 
     assert out.shape == x.shape
