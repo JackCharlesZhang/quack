@@ -18,6 +18,7 @@ from quack.gemm_interface import (
     gemm_act_tuned,
     gemm_dact,
     gemm_dact_tuned,
+    gemm_add
 )
 
 
@@ -28,13 +29,16 @@ def linear_fwd_convert_type(*tensors):
     return tensors
 
 
-def linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad):
+def linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad, bias=None):
     needs_input_grad, needs_weight_grad = needs_x_w_grad
     if not needs_input_grad:
         weight, weight_og = None, None
     if not needs_weight_grad:
         x = None
-    ctx.save_for_backward(x, weight, weight_og if ctx.fuse_grad_accum else None)
+    if len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2] and bias is not None:
+        ctx.save_for_backward(x, weight, weight_og if ctx.fuse_grad_accum else None, bias)
+    else:
+        ctx.save_for_backward(x, weight, weight_og if ctx.fuse_grad_accum else None)
 
 
 def linear_bwd_compute_input_grad(ctx, dout, weight, matmul_fn):
@@ -68,25 +72,33 @@ class LinearFunc(torch.autograd.Function):
     matmul_fwd_fn = gemm
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
+    matmul_add_fwd_fn = partial(gemm_add.fn, config=None)
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
     @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight, fuse_grad_accum=False):
+    def forward(cls, ctx, x, weight, bias=None, fuse_grad_accum=False):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
+        bias: (out_features,)
         out: (..., out_features)
         """
         ctx.weight_dtype = weight.dtype
         ctx.fuse_grad_accum = fuse_grad_accum
         weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
+        bias = linear_fwd_convert_type(bias)[0] if bias is not None else None
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
+        bias = bias.unsqueeze(0).expand(x.shape[0], -1) if bias is not None else None
+       
         # out = F.linear(x, weight)
-        out = cls.matmul_fwd_fn(x, weight.T)
-        linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
+        if bias is not None:
+            out = cls.matmul_add_fwd_fn(x, weight.T, bias)
+        else:
+            out = cls.matmul_fwd_fn(x, weight.T)
+        linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2], bias=bias)
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
@@ -95,14 +107,20 @@ class LinearFunc(torch.autograd.Function):
         """
         dout: (..., out_features)
         """
-        x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
+        x, weight, weight_og = ctx.saved_tensors[0:3]  # weight_og is None if not ctx.fuse_grad_accum
+        bias = ctx.saved_tensors[3] if len(ctx.saved_tensors) > 3 else None
+
         batch_shape = dout.shape[:-1]
         dout = dout.reshape(-1, dout.shape[-1])
         dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
         dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
         dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw)
+        if len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2] and bias is not None:
+            dbias = dout.sum(dim=0)
+        else:
+            dbias = None
         # return extra Nones for other classes that inherit from LinearFunc
-        return dx, dweight, *([None] * 10)
+        return dx, dweight, dbias, *([None] * 9)
 
 
 class LinearUntunedFunc(LinearFunc):
@@ -110,13 +128,14 @@ class LinearUntunedFunc(LinearFunc):
     matmul_fwd_fn = partial(gemm_tuned.fn, config=None)
     matmul_bwd_dx = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
     matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
+    matmul_add_fwd_fn = partial(gemm_add.fn, config=None)
 
 
-def linear_func(x, weight, fuse_grad_accum=False, tuned=True):
+def linear_func(x, weight, bias=None, fuse_grad_accum=False, tuned=True):
     if tuned:
-        return LinearFunc.apply(x, weight, fuse_grad_accum)
+        return LinearFunc.apply(x, weight, bias, fuse_grad_accum)
     else:
-        return LinearUntunedFunc.apply(x, weight, fuse_grad_accum)
+        return LinearUntunedFunc.apply(x, weight, bias, fuse_grad_accum)
 
 
 class LinearActFunc(LinearFunc):
@@ -239,7 +258,7 @@ class Linear(nn.Linear):
         self.fuse_grad_accum = fuse_grad_accum
 
     def forward(self, input: Tensor) -> Tensor:
-        if self.bias is None and input.is_cuda:
-            return linear_func(input, self.weight, fuse_grad_accum=self.fuse_grad_accum)
+        if input.is_cuda:
+            return linear_func(input, self.weight, self.bias, fuse_grad_accum=self.fuse_grad_accum)
         else:
             return F.linear(input, self.weight, self.bias)
