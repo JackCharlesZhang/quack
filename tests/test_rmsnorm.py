@@ -317,3 +317,42 @@ def test_amp_bf16_training():
 
     assert dx is not None
     assert dw is not None
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_prenorm_false(use_compile):
+    """Test RMSNorm with prenorm=False - residual input but no residual output."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.float16
+    weight_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
+    residual = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    residual_ref = residual.detach().clone().requires_grad_()
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out = function(x, weight, residual=residual, eps=eps, prenorm=False)
+    
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == x.shape
+    assert out.dtype == input_dtype
+
+    out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
+    
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
+    assert residual.grad is None

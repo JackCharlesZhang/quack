@@ -1105,7 +1105,7 @@ def rmsnorm_bwd(
 
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias=None, residual=None, out_dtype=None, residual_dtype=None, eps=1e-6):
+    def forward(ctx, x, weight, bias=None, residual=None, out_dtype=None, residual_dtype=None, eps=1e-6, prenorm=True):
         x_shape_og = x.shape
         # Flatten input
         x = x.reshape(-1, x.shape[-1])
@@ -1127,7 +1127,8 @@ class RMSNormFunction(torch.autograd.Function):
         ctx.eps = eps
         ctx.x_shape_og = x_shape_og
         ctx.residual_dtype = residual.dtype if residual is not None else None
-        if residual is None:
+        ctx.prenorm = prenorm
+        if residual is None or prenorm == False:
             return out.reshape(x_shape_og)
         else:
             return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
@@ -1136,7 +1137,10 @@ class RMSNormFunction(torch.autograd.Function):
     def backward(ctx, dout, *args):
         x, weight, rstd = ctx.saved_tensors
         has_bias = ctx.has_bias
-        dresidual_out = args[0] if ctx.residual_dtype is not None else None
+        if ctx.prenorm and ctx.residual_dtype is not None:
+            dresidual_out = args[0]
+        else:
+            dresidual_out = None
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
@@ -1153,6 +1157,7 @@ def rmsnorm(
     out_dtype: Optional[torch.dtype] = None,
     residual_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
+    prenorm: bool = True,
 ) -> Tensor:
     """RMSNorm with automatic differentiation support.
 
@@ -1164,7 +1169,7 @@ def rmsnorm(
     Returns:
         Normalized output tensor of same shape as x
     """
-    return RMSNormFunction.apply(x, weight, bias, residual, out_dtype, residual_dtype, eps)
+    return RMSNormFunction.apply(x, weight, bias, residual, out_dtype, residual_dtype, eps, prenorm)
 
 
 class QuackRMSNorm(torch.nn.Module):
