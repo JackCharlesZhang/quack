@@ -3,6 +3,11 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+import sys
+import os
+
+# Add the parent directory to the path to import quack modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from quack.linear import linear_func, linear_act_func
 from quack.gemm_interface import gemm_dact, gemm_dact_tuned, gemm_act_ref, gemm_dact_ref
