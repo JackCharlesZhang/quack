@@ -1128,7 +1128,7 @@ class RMSNormFunction(torch.autograd.Function):
         ctx.x_shape_og = x_shape_og
         ctx.residual_dtype = residual.dtype if residual is not None else None
         ctx.prenorm = prenorm
-        if residual is None or prenorm == False:
+        if residual_out is None or prenorm == False:
             return out.reshape(x_shape_og)
         else:
             return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
