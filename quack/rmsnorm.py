@@ -1106,7 +1106,7 @@ def rmsnorm_bwd(
 
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias=None, residual=None, out_dtype=None, residual_dtype=None, eps=1e-6, prenorm=True):
+    def forward(ctx, x, weight, bias=None, residual=None, out_dtype=None, residual_dtype=None, eps=1e-6, prenorm=False):
         x_shape_og = x.shape
         # Flatten input
         x = x.reshape(-1, x.shape[-1])
