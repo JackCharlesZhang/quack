@@ -2,6 +2,11 @@
 
 import pytest
 import torch
+import sys
+import os
+
+# Add the parent directory to the path to import quack modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
 
@@ -57,6 +62,9 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+
+    print(out)
+    print(out_ref)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
