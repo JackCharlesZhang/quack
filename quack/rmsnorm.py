@@ -1086,6 +1086,7 @@ def rmsnorm_bwd(
     N = x.size(1)
     sm_count = _get_sm_count(N, device)
     dx = torch.empty_like(x)
+
     if dresidual_out is not None and dresidual_out.dtype != dx.dtype:
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
@@ -1139,13 +1140,20 @@ class RMSNormFunction(torch.autograd.Function):
         has_bias = ctx.has_bias
         if ctx.prenorm and ctx.residual_dtype is not None:
             dresidual_out = args[0]
+            dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
         else:
             dresidual_out = None
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
+
         dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias)
         dx = dx.view(x_shape_og)
+        if dresidual_out is not None:
+            dresidual_out = dresidual_out.reshape(x_shape_og)
+        if dresidual is not None:
+            dresidual = dresidual.reshape(x_shape_og)
+
         return dx, dw, db, dresidual, *([None] * 4)
 
 
