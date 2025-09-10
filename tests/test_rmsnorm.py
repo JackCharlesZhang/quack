@@ -55,7 +55,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
-    out = function(x, weight, eps=eps)
+    out, residual_out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
