@@ -1165,7 +1165,7 @@ def rmsnorm(
     out_dtype: Optional[torch.dtype] = None,
     residual_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
-    prenorm: bool = True,
+    prenorm: bool = False,
 ) -> Tensor:
     """RMSNorm with automatic differentiation support.
 
