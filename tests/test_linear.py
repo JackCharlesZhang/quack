@@ -39,6 +39,37 @@ def test_linear(in_features, out_features, input_dtype):
     assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-6
     assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
 
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("out_features", [1504, 2048])
+@pytest.mark.parametrize("in_features", [736, 4096])
+# @pytest.mark.parametrize("out_features", [2048])
+# @pytest.mark.parametrize("in_features", [4096])
+def test_linear_with_bias(in_features, out_features, input_dtype):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 1920
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
+    x = x[::2]  # Testing non-contiguous
+    w = (
+        torch.randn((out_features, in_features), device=device, dtype=input_dtype)
+        / math.sqrt(in_features)
+    ).requires_grad_()
+    b = torch.randn((out_features,), device=device, dtype=input_dtype).requires_grad_()
+    
+    out = linear_func(x, w, bias=b, tuned=False)  # Disable tuning for faster test
+    out_ref = F.linear(x.float(), w.float(), b.float())
+    out_pt = F.linear(x, w, b)
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
+    
+    # Test backward pass with bias
+    dout = torch.randn_like(out)
+    dx, dw, db = torch.autograd.grad(out, (x, w, b), dout)
+    dx_ref, dw_ref, db_ref = torch.autograd.grad(out_ref, (x, w, b), dout)
+    dx_pt, dw_pt, db_pt = torch.autograd.grad(out_pt, (x, w, b), dout)
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-6
+    assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
+    assert (db - db_ref).abs().max() < 2 * (db_pt - db_ref).abs().max() + 1e-6
+
 
 @pytest.mark.parametrize("store_preact", [False, True])
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
