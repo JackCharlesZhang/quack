@@ -1,5 +1,7 @@
 # Copyright (c) 2025, Tri Dao
 from functools import partial
+import sys
+import os
 
 import torch
 import torch.nn as nn
@@ -7,6 +9,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.amp import custom_fwd, custom_bwd
 
+# Add the current directory to the path to import quack modules
+sys.path.insert(0, os.path.dirname(__file__))
 
 # from gemm_cublas import gemm as gemm_cb, gemm_add_ as gemm_add_cb_
 # from gemm_cublas.interface import gemm_tuned as gemm_cb, gemm_add_tuned_ as gemm_add_cb_

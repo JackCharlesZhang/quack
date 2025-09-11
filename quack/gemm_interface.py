@@ -1,10 +1,15 @@
 # Copyright (c) 2025, Tri Dao
 from typing import Optional, Tuple, Literal
 from functools import partial
+import sys
+import os
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+# Add the current directory to the path to import quack modules
+sys.path.insert(0, os.path.dirname(__file__))
 
 from quack.gemm_config import GemmConfig, get_all_configs
 
