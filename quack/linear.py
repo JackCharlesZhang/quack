@@ -76,7 +76,7 @@ class LinearFunc(torch.autograd.Function):
     matmul_fwd_fn = gemm
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
-    matmul_add_fwd_fn = partial(gemm_add.fn, config=None)
+    matmul_add_fwd_fn = partial(gemm_add, config=None)
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
@@ -132,7 +132,7 @@ class LinearUntunedFunc(LinearFunc):
     matmul_fwd_fn = partial(gemm_tuned.fn, config=None)
     matmul_bwd_dx = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
     matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
-    matmul_add_fwd_fn = partial(gemm_add.fn, config=None)
+    matmul_add_fwd_fn = partial(gemm_add, config=None)
 
 
 def linear_func(x, weight, bias=None, fuse_grad_accum=False, tuned=True):
