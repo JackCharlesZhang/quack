@@ -71,6 +71,12 @@ def linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, matmul_fn):
         dweight = None
     return dweight
 
+def linear_bwd_compute_bias_grad(ctx, dout):
+    if len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2]:
+        return dout.sum(dim=0)
+    else:
+        return None
+
 
 class LinearFunc(torch.autograd.Function):
     matmul_fwd_fn = gemm
@@ -119,10 +125,7 @@ class LinearFunc(torch.autograd.Function):
         dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
         dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
         dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw)
-        if len(ctx.needs_input_grad) > 2 and ctx.needs_input_grad[2] and bias is not None:
-            dbias = dout.sum(dim=0)
-        else:
-            dbias = None
+        dbias = linear_bwd_compute_bias_grad(ctx, dout)
         # return extra Nones for other classes that inherit from LinearFunc
         return dx, dweight, dbias, *([None] * 9)
 
