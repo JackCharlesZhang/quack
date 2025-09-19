@@ -36,28 +36,36 @@ gated_to_pytorch_fn_map = {
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    # TODO: filter config depending on varlen
     key=["dynamic_scheduler"],
 )
 def gemm_tuned(
-    A: Tensor,  # (M, K)
-    B: Tensor,  # (K, N)
-    out: Tensor,  # (M, N) - required output tensor
-    C: Optional[Tensor] = None,  # (M, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,  # (1,)
     beta: float | Tensor = 1.0,  # (1,)
+    cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
 ) -> None:
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
-    A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
-    if C is not None:
+    varlen_m = cu_seqlens_m is not None
+    if varlen_m:
+        assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if A.ndim == 2 and not varlen_m:
+        A = A.unsqueeze(0)  # (1, M, K)
+    B = B.mT  # (N, K) or (L, N, K)
+    if B.ndim == 2:
+        B = B.unsqueeze(0)  # (1, N, K)
+    if C is not None and C.ndim == 2 and not varlen_m:
         C = C.unsqueeze(0)  # (1, M, N)
-    assert out.shape == (
-        A.shape[1],
-        B.shape[1],
-    ), f"out shape mismatch: {out.shape} vs {(A.shape[1], B.shape[1])}"
-    out = out.unsqueeze(0)
+    if out.ndim == 2 and not varlen_m:
+        out = out.unsqueeze(0)
+    out_shape = (A.shape[0], A.shape[1], B.shape[1]) if not varlen_m else (A.shape[0], B.shape[1])
+    assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
@@ -74,6 +82,7 @@ def gemm_tuned(
         config.pingpong,
         alpha=alpha,
         beta=beta,
+        cu_seqlens_m=cu_seqlens_m,
     )
 
 
@@ -159,18 +168,22 @@ def gemm_dact_tuned(
 
 
 def gemm(
-    A: Tensor,
-    B: Tensor,
-    out: Optional[Tensor] = None,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, K) if varlen_m
     alpha: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
-        out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+        out_shape = (
+            (A.shape[-2], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
+        )
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     gemm_out(
@@ -179,6 +192,7 @@ def gemm(
         out,
         alpha=alpha,
         alpha_tensor=alpha_tensor,
+        cu_seqlens_m=cu_seqlens_m,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -194,30 +208,58 @@ def gemm(
     # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
-    A: Tensor,
-    B: Tensor,
-    out: Tensor,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
-    fn(A, B, out, C=None, alpha=alpha, dynamic_scheduler=dynamic_scheduler)
+    fn(
+        A,
+        B,
+        out,
+        C=None,
+        alpha=alpha,
+        cu_seqlens_m=cu_seqlens_m,
+        dynamic_scheduler=dynamic_scheduler,
+    )
 
 
 def gemm_ref(
-    A: Tensor,
-    B: Tensor,
-    out: Optional[Tensor] = None,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
+    cu_seqlens_m: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with pre-allocated output."""
     # The out_dtype argument requires torch >= 2.8
-    out = torch.mm(A, B, out_dtype=out_dtype, out=out)
+    if cu_seqlens_m is None:
+        fn = torch.bmm if A.ndim == 3 else torch.mm
+        out = fn(A, B, out_dtype=out_dtype, out=out)
+    else:
+        if out is None:
+            out = torch.cat(
+                [
+                    torch.mm(A[cu_seqlens_m[i] : cu_seqlens_m[i + 1]], B[i])
+                    for i in range(cu_seqlens_m.shape[0] - 1)
+                ],
+                dim=0,
+            )
+        else:
+            for i in range(cu_seqlens_m.shape[0] - 1):
+                torch.mm(
+                    A[cu_seqlens_m[i] : cu_seqlens_m[i + 1]],
+                    B[i],
+                    out=out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]],
+                )
     if not isinstance(alpha, float) or alpha != 1.0:
         out = out * alpha
     return out

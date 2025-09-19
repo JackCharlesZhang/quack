@@ -19,6 +19,8 @@ import quack.activation
 
 
 class GemmActSm90(GemmSm90):
+    num_epi_tensormaps: int = 1
+
     @dataclass
     class EpilogueArguments(ArgumentsBase):
         mPostAct: cute.Tensor
@@ -73,6 +75,24 @@ class GemmActSm90(GemmSm90):
             args.alpha,
             args.beta,
         )
+
+    def epi_get_tma_atoms(
+        self, params: EpilogueParams, *, loc=None, ip=None
+    ) -> list[cute.CopyAtom]:
+        return [params.tma_atom_postact]
+
+    def epi_get_tensormap_update_shapes_orders(
+        self,
+        params: EpilogueParams,
+        cu_seqlens_m: cute.Tensor,
+        batch_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> tuple[list[Int32], list[int]]:
+        shapes = [cu_seqlens_m[batch_idx + 1]]
+        orders = [0 if const_expr(self.postact_layout.is_m_major_c()) else 1]
+        return shapes, orders
 
     @staticmethod
     def epi_smem_bytes_per_stage(
@@ -133,7 +153,6 @@ class GemmActSm90(GemmSm90):
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
-        assert cu_seqlens_m is None, "GemmActSm90 doesn't support varlen_m for now"
 
         tma_atom_postact = params.tma_atom_postact
         mPostAct_mnl = params.mPostAct_mnl

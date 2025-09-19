@@ -14,9 +14,3 @@ class VarlenArguments(ArgumentsBase):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mTensormaps: Optional[cute.Tensor] = None
-
-    def __post_init__(self):
-        if self.mCuSeqlensM is not None or self.mCuSeqlensK is not None:
-            assert (
-                self.mTensormaps is not None
-            ), "mTensormaps must be provided if mCuSeqlensM or mCuSeqlensK is provided"

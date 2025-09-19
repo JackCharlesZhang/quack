@@ -2,7 +2,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
 import enum
-from typing import Tuple, Type, Callable, Optional, Union
+from typing import Tuple, Type, Callable, Optional, Union, Literal
 from dataclasses import dataclass
 from functools import partial
 import math
@@ -125,7 +125,9 @@ class GemmSm90:
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
     """
 
+    arch = 90
     bytes_per_tensormap = 128
+    num_epi_tensormaps: int = 0
 
     @dataclass
     class EpilogueArguments(ArgumentsBase):
@@ -421,6 +423,7 @@ class GemmSm90:
 
         self._setup_attributes(epilogue_args)
 
+        tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
                 mA,
@@ -428,29 +431,22 @@ class GemmSm90:
                 (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
             )
-        else:
-            tma_atom_a, tma_tensor_a = None, None
-
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             mB,
             self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             self.cluster_shape_mnk[0],
         )
-
+        tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
                 mD, self.epi_smem_layout_staged, self.epi_tile, store_or_load="store"
             )
-        else:
-            tma_atom_d, tma_tensor_d = None, None
-
+        tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
                 mC, self.epi_c_smem_layout_staged, self.epi_tile, store_or_load="load"
             )
-        else:
-            tma_atom_c, tma_tensor_c = None, None
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
 
@@ -684,6 +680,7 @@ class GemmSm90:
         # Get tensormap buffer address
         tensormap_manager = None
         tensormap_a_ptr, tensormap_b_ptr, tensormap_d_ptr = None, None, None
+        tensormap_epi_ptrs = [None] * self.num_epi_tensormaps
         if const_expr(varlen_m or varlen_k):
             tensormap_manager = TensorMapManagerSm90(
                 cutlass.utils.TensorMapUpdateMode.GMEM, GemmSm90.bytes_per_tensormap
@@ -692,9 +689,22 @@ class GemmSm90:
             tensormap_workspace_idx = cute.make_layout(cute.arch.grid_dim())(cute.arch.block_idx())
             if const_expr(varlen_m):
                 tensormap_d_idx = warp_idx // 4 if const_expr(self.pingpong) else 0
-                tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
-                    tensormaps[tensormap_workspace_idx, tensormap_d_idx, None].iterator
-                )
+                tensormap_epi_offset = tensormap_d_idx
+                if const_expr(has_D):
+                    tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
+                        tensormaps[tensormap_workspace_idx, tensormap_d_idx, None].iterator
+                    )
+                    tensormap_epi_offset += 1 if not self.pingpong else 2
+                tensormap_epi_ptrs = [
+                    tensormap_manager.get_tensormap_ptr(
+                        tensormaps[
+                            tensormap_workspace_idx,
+                            tensormap_epi_offset + i * (1 if not self.pingpong else 2),
+                            None,
+                        ].iterator
+                    )
+                    for i in range(self.num_epi_tensormaps)
+                ]
             else:
                 assert varlen_k
                 tensormap_a_ptr = tensormap_manager.get_tensormap_ptr(
@@ -936,11 +946,20 @@ class GemmSm90:
             )
             if const_expr(varlen_m):
                 # initialize tensormap for D
-                tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_d,
-                    tensormap_d_ptr,
-                    is_manager_warp=is_tma_warp,
-                )
+                if const_expr(has_D):
+                    tensormap_manager.init_tensormap_from_atom(
+                        tma_atom_d,
+                        tensormap_d_ptr,
+                        is_manager_warp=is_tma_warp,
+                    )
+                for tma_atom, tensormap_epi_ptr in zip(
+                    self.epi_get_tma_atoms(epilogue_params), tensormap_epi_ptrs
+                ):
+                    tensormap_manager.init_tensormap_from_atom(
+                        tma_atom,
+                        tensormap_epi_ptr,
+                        is_manager_warp=is_tma_warp,
+                    )
             # //////////////////////////////////////////////////////////////////////////////
             #  Partition global tensor for TiledMMA_A/B/C
             # //////////////////////////////////////////////////////////////////////////////
@@ -1015,16 +1034,28 @@ class GemmSm90:
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
+
                 if const_expr(varlen_m):
                     is_group_changed = batch_idx != last_batch_idx
                     last_batch_idx = batch_idx
                     if is_group_changed:
                         # construct tensor D based on real address, shape and stride information
+                        tensormap_ptrs, shapes, orders = [], [], []
+                        if const_expr(has_D):
+                            tensormap_ptrs.append(tensormap_d_ptr)
+                            shapes.append(cu_seqlens_m[batch_idx + 1])
+                            orders.append(0 if const_expr(self.d_layout.is_m_major_c()) else 1)
+                        epi_shapes, epi_orders = self.epi_get_tensormap_update_shapes_orders(
+                            epilogue_params, cu_seqlens_m, batch_idx
+                        )
+                        tensormap_ptrs.extend(tensormap_epi_ptrs)
+                        shapes.extend(epi_shapes)
+                        orders.extend(epi_orders)
                         tensormap_manager.update_tensormap_shape(
-                            (tensormap_d_ptr,),
+                            tensormap_ptrs,
                             is_manager_warp=is_tma_warp,
-                            shapes=(cu_seqlens_m[batch_idx + 1],),
-                            orders=(0 if const_expr(self.d_layout.is_m_major_c()) else 1,),
+                            shapes=shapes,
+                            orders=orders,
                             tensormap_smem_ptr=None,
                         )
 
@@ -1059,15 +1090,24 @@ class GemmSm90:
                     barrier_id=int(NamedBarrierGemm.Epilogue), num_threads=self.num_epi_threads
                 )
 
+                tma_desc_d_ptr, tma_desc_epi_ptrs = None, [None] * self.num_epi_tensormaps
                 if const_expr(varlen_m):
                     # ensure the update to tensormap has completed before using it
                     if is_group_changed and is_tma_warp:
-                        tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
-                    tma_desc_d_ptr = tensormap_manager.get_tensormap_ptr(
-                        tensormap_d_ptr, cute.AddressSpace.generic
-                    )
-                else:
-                    tma_desc_d_ptr = None
+                        if const_expr(has_D):
+                            tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
+                        for tensormap_epi_ptr in tensormap_epi_ptrs:
+                            tensormap_manager.fence_tensormap_update(tensormap_epi_ptr)
+                    if const_expr(has_D):
+                        tma_desc_d_ptr = tensormap_manager.get_tensormap_ptr(
+                            tensormap_d_ptr, cute.AddressSpace.generic
+                        )
+                    tma_desc_epi_ptrs = [
+                        tensormap_manager.get_tensormap_ptr(
+                            tensormap_epi_ptr, cute.AddressSpace.generic
+                        )
+                        for tensormap_epi_ptr in tensormap_epi_ptrs
+                    ]
 
                 if const_expr(has_D):
                     bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
@@ -1575,6 +1615,24 @@ class GemmSm90:
     ) -> EpilogueParams:
         return GemmSm90.EpilogueParams(alpha=args.alpha, beta=args.beta)
 
+    def epi_get_tma_atoms(
+        self, params: EpilogueParams, *, loc=None, ip=None
+    ) -> list[cute.CopyAtom]:
+        """Subclasses can override this"""
+        return []
+
+    def epi_get_tensormap_update_shapes_orders(
+        self,
+        params: EpilogueParams,
+        cu_seqlens_m: cute.Tensor,
+        batch_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> tuple[list[Int32], list[int]]:
+        """Subclasses can override this"""
+        return [], []
+
     @staticmethod
     def epi_smem_bytes_per_stage(
         args: Optional[EpilogueArguments],
@@ -1983,7 +2041,7 @@ class GemmSm90:
         tensor_d: cute.Tensor,
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_tile: Tuple[int, int],
-        store_or_load: str,
+        store_or_load: Literal["store", "load"],
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for storing D or loading C.
 
@@ -2142,10 +2200,10 @@ class GemmSm90:
 
 
 def gemm_sm90(
-    A: Tensor,  # (l, m, k)
+    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m
     B: Tensor,  # (l, n, k)
-    D: Tensor,  # (l, m, n)
-    C: Optional[Tensor],  # (l, m, n)
+    D: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
+    C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
     tile_count_semaphore: Optional[Tensor],  # (1,)
     tile_M: int,
     tile_N: int,
@@ -2155,9 +2213,16 @@ def gemm_sm90(
     persistent: bool = True,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
 ) -> None:
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(A, B, D, C)
-    GemmWrapperBase.permute_tensors(tensor_infos)
+    # When using varlen_m, must use persistent scheduler
+    if cu_seqlens_m is not None:
+        assert persistent, "varlen_m requires persistent=True"
+
+    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, D, C, cu_seqlens_m=cu_seqlens_m
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
@@ -2194,6 +2259,17 @@ def gemm_sm90(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
+
+    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
+    varlen_args = GemmWrapperBase.create_varlen_args(
+        cu_seqlens_m,
+        max_active_clusters,
+        cluster_shape_mnk,
+        tensor_infos,
+        GemmSm90.num_epi_tensormaps,
+        pingpong,
+    )
+
     current_stream = cutlass_torch.current_stream()
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
@@ -2205,6 +2281,7 @@ def gemm_sm90(
         tile_count_semaphore is not None,
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
+        cu_seqlens_m is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache
@@ -2225,7 +2302,7 @@ def gemm_sm90(
             tensor_infos["C"].cute_tensor,
             epi_args,
             scheduler_args,
-            None,  # varlen_args
+            varlen_args,
             None,  # mAIdx
             current_stream,
         )
@@ -2236,7 +2313,7 @@ def gemm_sm90(
         tensor_infos["C"].cute_tensor,
         epi_args,
         scheduler_args,
-        None,
+        varlen_args,
         None,
         current_stream,
     )

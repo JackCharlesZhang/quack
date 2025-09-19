@@ -5,7 +5,14 @@ import torch
 import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func
-from quack.gemm_interface import gemm_dact, gemm_act_ref, gemm_dact_ref, gemm_add_inplace
+from quack.gemm_interface import (
+    gemm,
+    gemm_ref,
+    gemm_dact,
+    gemm_act_ref,
+    gemm_dact_ref,
+    gemm_add_inplace,
+)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -129,3 +136,53 @@ def test_gemm_add_inplace_alpha_beta(m, k, n, input_dtype, alpha, beta, alpha_be
     C_ref = alpha_val * torch.mm(A.float(), B.float()) + beta_val * C_og.float()
     C_pt = alpha_val * torch.mm(A, B) + beta_val * C_og
     assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-4
+
+
+@pytest.mark.parametrize("alpha_is_tensor", [False, True])
+@pytest.mark.parametrize("alpha", [1.0, 1.7])
+# @pytest.mark.parametrize("alpha_is_tensor", [False])
+# @pytest.mark.parametrize("alpha", [1.0])
+@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+# @pytest.mark.parametrize("dynamic_scheduler", [False])
+@pytest.mark.parametrize("B_major", ["k", "n"])
+# @pytest.mark.parametrize("B_major", ["k"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504, 2048])
+@pytest.mark.parametrize("k", [736, 1024])
+# @pytest.mark.parametrize("n", [2048])
+# @pytest.mark.parametrize("k", [736])
+@pytest.mark.parametrize("num_groups", [3, 5])
+# @pytest.mark.parametrize("num_groups", [3])
+def test_gemm_varlen_m(
+    num_groups, k, n, input_dtype, B_major, dynamic_scheduler, alpha, alpha_is_tensor
+):
+    """Test GEMM with variable length M dimension using cu_seqlens_m."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    seq_lens = torch.randint(100, 500, (num_groups,), device="cpu")
+    total_m = seq_lens.sum().item()
+    # Create cumulative sequence lengths (num_groups + 1)
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    cu_seqlens_m = cu_seqlens_m.to(device)
+    A = torch.randn((total_m, k), device=device, dtype=input_dtype)
+    B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
+    if B_major == "k":
+        B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    if alpha_is_tensor:
+        alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
+    out = gemm(
+        A,
+        B,
+        alpha=alpha,
+        cu_seqlens_m=cu_seqlens_m,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=False,
+    )
+    out_ref = gemm_ref(A.float(), B.float(), alpha=alpha, cu_seqlens_m=cu_seqlens_m)
+    out_pt = gemm_ref(A, B, alpha=alpha, cu_seqlens_m=cu_seqlens_m)
+    assert out.shape == (total_m, n), (
+        f"Output shape mismatch: {out.shape} vs expected ({total_m}, {n})"
+    )
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
