@@ -360,7 +360,7 @@ class RMSNorm(ReductionBase):
     mutates_args=("out", "rstd", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor weight, Tensor(a!) out, Tensor? bias, Tensor(a!)? rstd, Tensor? residual, Tensor(a!)? residual_out, float eps=1e-6) -> ()",
+    schema="(Tensor x, Tensor weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor? residual, Tensor(a6!)? residual_out, float eps=1e-6) -> ()",
 )
 def _rmsnorm_fwd(
     x: Tensor,
@@ -783,8 +783,10 @@ class RMSNormBackward(ReductionBase):
         tXrX, tXrdO, tXrdX = [
             cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)
         ]
+        tXrdResO = None
         if const_expr(mdResO is not None):
             tXrdResO = cute.make_fragment_like(tXgdResO[None, None, None, 0])
+        tXrdRes = None
         if const_expr(mdRes is not None):
             tXrdRes = cute.make_fragment_like(tXgdRes[None, None, None, 0])
 
@@ -976,7 +978,7 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor weight, Tensor dout, Tensor rstd, Tensor(a!) dx, Tensor(a!) dw_partial, Tensor(a!)? db_partial, Tensor? dresidual_out, Tensor(a!)? dresidual) -> ()",
+    schema="(Tensor x, Tensor weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!) dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
