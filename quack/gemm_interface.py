@@ -266,20 +266,27 @@ def gemm_ref(
 
 
 def gemm_add(
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    out: Optional[Tensor] = None,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
     """GEMM with addition and optional output tensor."""
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
-        out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+        varlen_m = cu_seqlens_m is not None
+        out_shape = (
+            (A.shape[0], B.shape[-1])
+            if varlen_m or A.ndim == 2
+            else (A.shape[0], A.shape[-2], B.shape[-1])
+        )
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
@@ -293,6 +300,7 @@ def gemm_add(
         beta,
         alpha_tensor,
         beta_tensor,
+        cu_seqlens_m=cu_seqlens_m,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -305,17 +313,18 @@ def gemm_add(
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
     # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_out(
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    out: Tensor,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -323,47 +332,78 @@ def gemm_add_out(
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
     beta = beta_tensor if beta_tensor is not None else beta
-    fn(A, B, out, C, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
+    fn(
+        A,
+        B,
+        out,
+        C,
+        alpha=alpha,
+        beta=beta,
+        cu_seqlens_m=cu_seqlens_m,
+        dynamic_scheduler=dynamic_scheduler,
+    )
 
 
 def gemm_add_ref(
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    out: Optional[Tensor] = None,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    cu_seqlens_m: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with addition and pre-allocated output."""
-    if isinstance(alpha, float) and isinstance(beta, float):
-        return torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
+    if cu_seqlens_m is None:
+        if isinstance(alpha, float) and isinstance(beta, float):
+            return torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
+        else:
+            out_dtype = (
+                out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
+            )
+            result = (alpha * (A @ B) + beta * C).to(out_dtype)
+            if out is not None:
+                out.copy_(result)
+            return result
     else:
-        out_dtype = (
-            out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
-        )
-        result = (alpha * (A @ B) + beta * C).to(out_dtype)
-        if out is not None:
-            out.copy_(result)
-        return result
+        # Handle varlen_m case
+        if out is None:
+            out_list = []
+            for i in range(cu_seqlens_m.shape[0] - 1):
+                A_i = A[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
+                C_i = C[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
+                out_i = alpha * torch.mm(A_i, B[i]) + beta * C_i
+                out_list.append(out_i)
+            out = torch.cat(out_list, dim=0)
+        else:
+            for i in range(cu_seqlens_m.shape[0] - 1):
+                A_i = A[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
+                C_i = C[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
+                out_i = out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
+                result = alpha * torch.mm(A_i, B[i]) + beta * C_i
+                out_i.copy_(result)
+        return out
 
 
 def gemm_add_inplace(
-    A: Tensor,
-    B: Tensor,
-    out: Tensor,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """In-place GEMM with addition: out = alpha * A @ B + beta * out.
     Args:
-        A: (M, K) input tensor
-        B: (K, N) input tensor
-        out: (M, N) tensor to accumulate into (modified in-place)
+        A: (M, K) or (L, M, K) or (total_M, K) if varlen_m - input tensor
+        B: (K, N) or (L, K, N) - input tensor
+        out: (M, N) or (L, M, N) or (total_M, N) if varlen_m - tensor to accumulate into (modified in-place)
         alpha: Scalar multiplier for A @ B
         beta: Scalar multiplier for out
+        cu_seqlens_m: Optional cumulative sequence lengths for variable M
         dynamic_scheduler: Whether to use dynamic scheduler
         tuned: Whether to use autotuned configuration
     """
@@ -371,7 +411,9 @@ def gemm_add_inplace(
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
     beta = beta if isinstance(beta, float) else 1.0
-    gemm_add_inplace_op(A, B, out, alpha, beta, alpha_tensor, beta_tensor, dynamic_scheduler, tuned)
+    gemm_add_inplace_op(
+        A, B, out, alpha, beta, alpha_tensor, beta_tensor, cu_seqlens_m, dynamic_scheduler, tuned
+    )
 
 
 @torch.library.custom_op(
@@ -380,24 +422,34 @@ def gemm_add_inplace(
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
     # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_inplace_op(
-    A: Tensor,
-    B: Tensor,
-    out: Tensor,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
     beta = beta_tensor if beta_tensor is not None else beta
-    # Use C as both input bias and output
-    fn(A, B, out, out, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
+    # Use out as both input bias and output
+    fn(
+        A,
+        B,
+        out,
+        out,
+        alpha=alpha,
+        beta=beta,
+        cu_seqlens_m=cu_seqlens_m,
+        dynamic_scheduler=dynamic_scheduler,
+    )
 
 
 def gemm_act(
