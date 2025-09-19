@@ -1158,6 +1158,7 @@ class GemmSm90:
                 epi_read_state, epi_producer_state = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
+                    tma_desc_epi_ptrs,
                     epi_pipeline,
                     epi_read_state,
                     epi_producer_state,
@@ -1456,6 +1457,7 @@ class GemmSm90:
         self,
         params: EpilogueParams,
         epi_smem_tensors: Tuple[cute.Tensor, ...],
+        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,

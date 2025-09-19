@@ -52,11 +52,11 @@ dact_fn_map = {
 
 
 def gemm_dact_sm90(
-    A: Tensor,  # (l, m, k)
+    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m
     B: Tensor,  # (l, n, k)
-    Out: Tensor,  # (l, m, n)
-    PreAct: Tensor,  # (l, m, n)
-    PostAct: Tensor,  # (l, m, n)
+    Out: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
+    PreAct: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
+    PostAct: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
     tile_count_semaphore: Optional[Tensor],  # (1,)
     activation: Optional[str],
     tile_M: int,
@@ -65,12 +65,17 @@ def gemm_dact_sm90(
     cluster_N: int,
     pingpong: bool = True,
     persistent: bool = True,
+    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
 ) -> None:
+    # When using varlen_m, must use persistent scheduler
+    if cu_seqlens_m is not None:
+        assert persistent, "varlen_m requires persistent=True"
+
     assert activation in dact_fn_map, f"Unsupported activation {activation}"
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, Out, PreAct, additional_tensors={"PostAct": PostAct}
+        A, B, Out, PreAct, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m
     )
-    GemmWrapperBase.permute_tensors(tensor_infos)
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
@@ -101,6 +106,17 @@ def gemm_dact_sm90(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
+
+    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
+    varlen_args = GemmWrapperBase.create_varlen_args(
+        cu_seqlens_m,
+        max_active_clusters,
+        cluster_shape_mnk,
+        tensor_infos,
+        GemmDActSm90.num_epi_tensormaps,
+        pingpong,
+    )
+
     current_stream = cutlass_torch.current_stream()
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
@@ -110,6 +126,7 @@ def gemm_dact_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        cu_seqlens_m is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dact_sm90.compile_cache
@@ -130,7 +147,7 @@ def gemm_dact_sm90(
             tensor_infos["C"].cute_tensor,
             epi_args,
             scheduler_args,
-            None,  # varlen_args
+            varlen_args,
             None,  # mAIdx
             current_stream,
         )
@@ -141,7 +158,7 @@ def gemm_dact_sm90(
         tensor_infos["C"].cute_tensor,
         epi_args,
         scheduler_args,
-        None,
+        varlen_args,
         None,
         current_stream,
     )
