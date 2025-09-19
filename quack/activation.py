@@ -6,23 +6,12 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 
 @dsl_user_op
-def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "tanh.approx.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
+def sigmoid(x: Float32, *, loc=None, ip=None) -> Float32:
+    return 0.5 + 0.5 * cute.math.tanh(0.5 * x, fastmath=True)
 
 
 @dsl_user_op
@@ -67,7 +56,10 @@ def gelu_tanh_approx(x: Float32, *, loc=None, ip=None) -> Float32:
     """
     sqrt_2_over_pi = math.sqrt(2 / math.pi)  # ~0.797885
     sqrt_2_over_pi_coeff = 0.044715 * sqrt_2_over_pi  # ~0.0356774
-    return 0.5 * (x * (1 + tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x)))))
+    return 0.5 * (
+        x
+        * (1 + cute.math.tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x)), fastmath=True))
+    )
 
 
 @dsl_user_op
@@ -88,7 +80,7 @@ def dgelu_tanh_approx(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[
 
     # Compute z = x * (c1 + c2 * x^2)
     x_sq = x * x
-    tanh_z = tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * x_sq))
+    tanh_z = cute.math.tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * x_sq), fastmath=True)
     half_tanh_z_plus_one = 0.5 + 0.5 * tanh_z
     gelu_out = x * half_tanh_z_plus_one
 
@@ -111,7 +103,7 @@ def silu(x: Float32, *, loc=None, ip=None) -> Float32:
     This compiles down to 3 SASS instructions: FMUL to get 0.5 * x, MUFU.TANH, and FFMA.
     """
     x_half = 0.5 * x
-    return x_half * tanh(x_half) + x_half
+    return x_half * cute.math.tanh(x_half, fastmath=True) + x_half
 
 
 @dsl_user_op
@@ -134,8 +126,8 @@ def dswiglu(
     to use FFMA instead of FADD and FMUL).
     """
     # Compute sigmoid(x) using tanh: sigmoid(x) = 0.5 * (1 + tanh(0.5 * x))
-    x_half = 0.5 * x  # FMUL
-    sigmoid_x = 0.5 + 0.5 * tanh(x_half)  # MUFU.TANH, then FFMA
+    # FMUL, MUFU.TANH, then FFMA
+    sigmoid_x = sigmoid(x)
     silu_x = x * sigmoid_x  # FMUL
     silu_x_dout = silu_x * dout  # FMUL
     #   d_silu(x) * dout
@@ -161,7 +153,7 @@ def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.702, *, loc=None, ip=Non
     """
     # Compute sigmoid(alpha * x) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
     x_half = 0.5 * x
-    silu_x = x_half * tanh(alpha * x_half) + x_half
+    silu_x = x_half * cute.math.tanh(alpha * x_half, fastmath=True) + x_half
     return silu_x * y + silu_x
 
 
@@ -179,7 +171,8 @@ def dswiglu_oai(
     """
     # Compute sigmoid(alpha * x) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
     alpha_x_half = (0.5 * alpha) * x  # FMUL
-    sigmoid_alpha_x = 0.5 + 0.5 * tanh(alpha_x_half)  # MUFU.TANH, then FFMA
+    # MUFU.TANH, then FFMA
+    sigmoid_alpha_x = 0.5 + 0.5 * cute.math.tanh(alpha_x_half, fastmath=True)
     silu_x = x * sigmoid_alpha_x  # FMUL
     silu_x_dout = silu_x * dout  # FMUL
     # FFMA, FFMA, FMUL
@@ -197,8 +190,7 @@ def glu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
     glu(x, y) = sigmoid(x) * y
     Using tanh to compute sigmoid: sigmoid(x) = 0.5 * (1 + tanh(x/2))
     """
-    x_half = 0.5 * x  # FMUL
-    sigmoid_x = 0.5 + 0.5 * tanh(x_half)  # MUFU.TANH, then FFMA
+    sigmoid_x = sigmoid(x)  # FMUL, MUFU.TANH, then FFMA
     return sigmoid_x * y  # FMUL
 
 
@@ -215,8 +207,7 @@ def dglu(
     - glu_out = sigmoid(x) * y
     """
     # Compute sigmoid(x) using tanh: sigmoid(x) = 0.5 * (1 + tanh(x/2))
-    x_half = 0.5 * x  # FMUL
-    sigmoid_x = 0.5 + 0.5 * tanh(x_half)  # MUFU.TANH, then FFMA
+    sigmoid_x = sigmoid(x)  # FMUL, MUFU.TANH, then FFMA
     sigmoid_x_dout = sigmoid_x * dout  # FMUL
     glu_out = sigmoid_x * y  # FMUL
     # dx = y * sigmoid(x) * (1 - sigmoid(x)) * dout

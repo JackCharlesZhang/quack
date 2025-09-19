@@ -199,11 +199,8 @@ class CrossEntropy(ReductionBase):
                 cute.autovec_copy(tXsX, tXrX)
                 x = tXrX.load().to(Float32)
             log2_e = math.log2(math.e)
-            # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
-            # a bit faster, probably because it's calling ex2.approx.ftz instead of ex2.approx?
-            # exp_x = utils.exp2f((x - max_x) * log2_e)
             # This would use ffma instead of fadd then fmul
-            exp_x = utils.exp2f(x * log2_e - (max_x * log2_e))
+            exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=False)
             denom = row_reduce(
                 exp_x,
                 cute.ReductionOp.ADD,
@@ -228,8 +225,7 @@ class CrossEntropy(ReductionBase):
             and row < shape[0]
             and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
         ):
-            ln_2 = math.log(2.0)
-            lse = max_x + utils.log2f(denom) * ln_2
+            lse = max_x + cute.math.log(denom, fastmath=True)
             # Set loss to 0 if this index should be ignored, otherwise compute normally
             loss_val = (lse - target_logit) if not should_ignore else Float32.zero
             mLoss[row] = mLoss.element_type(loss_val)
@@ -552,7 +548,7 @@ class CrossEntropyBackward:
             lse = Float32(mLSE[row])
 
         log2_e = math.log2(math.e)
-        probs = utils.exp2f(x * log2_e - lse * log2_e)
+        probs = cute.math.exp2(x * log2_e - (lse * log2_e), fastmath=True)
         prob_shifted = probs - 1.0
         mask = cute.make_fragment_like(tXrX, cutlass.Boolean)
         for i in cutlass.range(cute.size(tXcFull), unroll_full=True):
@@ -594,9 +590,9 @@ def _cross_entropy_backward(
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.shape[0] == dloss.shape[0], "Batch dimensions must match"
     assert x.shape[0] == lse.shape[0], "Batch dimensions must match"
-    assert (
-        x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda
-    ), "Tensors must be on CUDA device"
+    assert x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda, (
+        "Tensors must be on CUDA device"
+    )
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
 

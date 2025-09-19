@@ -100,69 +100,6 @@ def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
     )
 
 
-@cute.jit
-def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
-    """exp2f calculation for both vector and scalar.
-    :param x: input value
-    :type x: cute.TensorSSA or Float32
-    :return: exp2 value
-    :rtype: cute.TensorSSA or Float32
-    """
-    if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
-        res = cute.make_fragment(x.shape, Float32)
-        res.store(x)
-        for i in cutlass.range(cute.size(x.shape), unroll_full=True):
-            res[i] = cute.arch.exp2(res[i])
-        return res.load()
-    else:
-        return cute.arch.exp2(x)
-
-
-@dsl_user_op
-def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "lg2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "sqrt.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def rsqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "rsqrt.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 @dsl_user_op
 def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
     return Int32(

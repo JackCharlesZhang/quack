@@ -217,7 +217,7 @@ class LayerNorm(ReductionBase):
             mbar_ptr + 1 if cutlass.const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
         )
-        rstd = utils.rsqrt(sum_sq_x_sub_mean / shape[1] + eps)
+        rstd = cute.math.rsqrt(sum_sq_x_sub_mean / shape[1] + eps, fastmath=True)
         if cutlass.const_expr(mRstd is not None):
             # Only the thread corresponding to column 0 writes out the rstd to gmem
             if (

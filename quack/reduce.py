@@ -159,8 +159,7 @@ def online_softmax_reduce(
         width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     log2_e = math.log2(math.e)
-    exp_x = utils.exp2f(x * log2_e - (max_x * log2_e))
-    # exp_x = exp2f((x - max_x) * log2_e)
+    exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
     sum_exp_x = warp_reduce(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
@@ -190,10 +189,10 @@ def online_softmax_reduce(
                         reduction_buffer[row_idx, lane_idx]
                     )
                 max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
-                sum_exp_x *= utils.exp2f((max_x_single_warp - max_x_final) * log2_e)
+                sum_exp_x *= cute.math.exp(max_x_single_warp - max_x_final, fastmath=True)
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
                 if cutlass.const_expr(return_exp_x):
-                    exp_x *= utils.exp2f((max_x - max_x_final) * log2_e)
+                    exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
             else:
                 cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
@@ -231,11 +230,11 @@ def online_softmax_reduce(
                 max_x_final = warp_reduce(max_x_final, cute.arch.fmax)
                 sum_exp_x = 0.0
                 for i in cutlass.range_constexpr(num_iter):
-                    sum_exp_x += sum_exp_x_single_warp[i] * utils.exp2f(
-                        (max_x_single_warp[i] - max_x_final) * log2_e
+                    sum_exp_x += sum_exp_x_single_warp[i] * cute.math.exp(
+                        max_x_single_warp[i] - max_x_final, fastmath=True
                     )
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
                 if cutlass.const_expr(return_exp_x):
-                    exp_x *= utils.exp2f((max_x - max_x_final) * log2_e)
+                    exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
     return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)

@@ -19,6 +19,7 @@ from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
+
 class RMSNorm(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
         super().__init__(dtype, N, stage=1)
@@ -132,7 +133,9 @@ class RMSNorm(ReductionBase):
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
         if const_expr(mB is not None):
-            mB_expanded_layout = cute.prepend(mB.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
+            mB_expanded_layout = cute.prepend(
+                mB.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
+            )
             mB = cute.make_tensor(mB.iterator, mB_expanded_layout)
         if const_expr(mRstd is not None):
             mRstd_expanded_layout = cute.append(
@@ -202,11 +205,7 @@ class RMSNorm(ReductionBase):
         ]
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
-        gB = (
-            cute.local_tile(mB, tiler_mn, (0, cluster_y))
-            if const_expr(mB is not None)
-            else None
-        )
+        gB = cute.local_tile(mB, tiler_mn, (0, cluster_y)) if const_expr(mB is not None) else None
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
             if const_expr(mRstd is not None)
@@ -226,12 +225,18 @@ class RMSNorm(ReductionBase):
         copy_atom_load_W = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_copy_bits_W
         )
-        num_bits_per_copy_B = cutlass.const_expr(
-            min(128, num_copy_elems_X * mB.element_type.width)
-        ) if const_expr(mB is not None) else 0
-        copy_atom_load_B = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=num_bits_per_copy_B
-        ) if const_expr(mB is not None) else None
+        num_bits_per_copy_B = (
+            cutlass.const_expr(min(128, num_copy_elems_X * mB.element_type.width))
+            if const_expr(mB is not None)
+            else 0
+        )
+        copy_atom_load_B = (
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=num_bits_per_copy_B
+            )
+            if const_expr(mB is not None)
+            else None
+        )
         if const_expr(mRes is not None):
             num_copy_bits_Res = const_expr(min(128, num_copy_elems_X * mRes.element_type.width))
             copy_atom_load_Res_async = cute.make_copy_atom(
@@ -317,7 +322,7 @@ class RMSNorm(ReductionBase):
             init_val=0.0,
             hook_fn=(cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None),
         )
-        rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
+        rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
         if const_expr(mRstd is not None):
             # Only the thread corresponding to column 0 writes out the rstd to gmem
             if (
@@ -509,6 +514,7 @@ def rmsnorm_ref(x, w, bias=None, residual=None, eps=1e-6):
     else:
         return out.to(x.dtype), x_f32.to(residual.dtype)
 
+
 def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
     """Reference implementation for RMSNorm backward pass."""
     x_f32 = x.float()
@@ -520,6 +526,7 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
     # dL/dW
     dw = (dout * x_hat).sum(dim=0)
     return dx.to(x.dtype), dw.to(w.dtype)
+
 
 class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
@@ -744,7 +751,11 @@ class RMSNormBackward(ReductionBase):
         # Always compute partial weight gradients in fp32
         tXrdW = cute.make_fragment_like(tXgdW, Float32)
 
-        gdB = cute.local_tile(mdB, (1, tiler_mn[1]), (bidx_start, cluster_y)) if const_expr(mdB is not None) else None
+        gdB = (
+            cute.local_tile(mdB, (1, tiler_mn[1]), (bidx_start, cluster_y))
+            if const_expr(mdB is not None)
+            else None
+        )
         tXgdB = thr_copy_X.partition_S(gdB) if const_expr(mdB is not None) else None
         tXrdB = cute.make_fragment_like(tXgdB, Float32) if const_expr(mdB is not None) else None
 
@@ -930,7 +941,9 @@ class RMSNormBackward(ReductionBase):
                 if row == 0:
                     for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
                         tXrdB_other = cute.make_fragment_like(tXrdB)
-                        tXsdB_other = cute.make_tensor(tXsdB.iterator + i * sdB.stride[0], tXsdB.layout)
+                        tXsdB_other = cute.make_tensor(
+                            tXsdB.iterator + i * sdB.stride[0], tXsdB.layout
+                        )
                         cute.autovec_copy(tXsdB_other, tXrdB_other)
                         tXrdB.store(tXrdB.load() + tXrdB_other.load())
                     cute.copy(copy_atom_store_dB, tXrdB, tXgdB, pred=tXpdB)
@@ -1031,14 +1044,23 @@ def _rmsnorm_bwd(
     )
 
     dw_partial_tensor = from_dlpack(dw_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    db_partial_tensor = from_dlpack(db_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0) if db_partial is not None else None
+    db_partial_tensor = (
+        from_dlpack(db_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
+        if db_partial is not None
+        else None
+    )
     rstd_tensor = from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (N, x_tensor.element_type, weight_tensor.element_type, db_partial.dtype if db_partial is not None else None,
+    compile_key = (
+        N,
+        x_tensor.element_type,
+        weight_tensor.element_type,
+        db_partial.dtype if db_partial is not None else None,
         dresidual.dtype if dresidual is not None else None,
-        dresidual_out.dtype if dresidual_out is not None else None)
+        dresidual_out.dtype if dresidual_out is not None else None,
+    )
     if compile_key not in _rmsnorm_bwd.compile_cache:
         rmsnorm_backward_op = RMSNormBackward(x_tensor.element_type, N)
         _rmsnorm_bwd.compile_cache[compile_key] = cute.compile(
@@ -1106,7 +1128,17 @@ def rmsnorm_bwd(
 
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias=None, residual=None, out_dtype=None, residual_dtype=None, eps=1e-6, prenorm=False):
+    def forward(
+        ctx,
+        x,
+        weight,
+        bias=None,
+        residual=None,
+        out_dtype=None,
+        residual_dtype=None,
+        eps=1e-6,
+        prenorm=False,
+    ):
         x_shape_og = x.shape
         # Flatten input
         x = x.reshape(-1, x.shape[-1])
@@ -1129,7 +1161,7 @@ class RMSNormFunction(torch.autograd.Function):
         ctx.x_shape_og = x_shape_og
         ctx.residual_dtype = residual.dtype if residual is not None else None
         ctx.prenorm = prenorm
-        if residual_out is None or prenorm == False:
+        if residual_out is None or not prenorm:
             return out.reshape(x_shape_og)
         else:
             return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)

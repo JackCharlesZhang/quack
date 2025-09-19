@@ -5,5 +5,5 @@ repos:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]
         files: ^(quack|tests)/.*\.py$
-      - id: ruff-format
-        files: ^(quack|tests)/.*\.py$
+      # - id: ruff-format
+      #   files: ^(quack|tests)/.*\.py$
