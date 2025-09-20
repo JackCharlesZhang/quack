@@ -133,6 +133,7 @@ class GemmSm90:
     class EpilogueArguments(ArgumentsBase):
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
+        add_to_output: bool = False
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -440,12 +441,17 @@ class GemmSm90:
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
-                mD, self.epi_smem_layout_staged, self.epi_tile, store_or_load="store"
+                mD,
+                self.epi_smem_layout_staged,
+                self.epi_tile,
+                op_type="store"
+                if not (hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output)
+                else "add",
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, self.epi_tile, store_or_load="load"
+                mC, self.epi_c_smem_layout_staged, self.epi_tile, op_type="load"
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
@@ -2064,7 +2070,7 @@ class GemmSm90:
         tensor_d: cute.Tensor,
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_tile: Tuple[int, int],
-        store_or_load: Literal["store", "load"],
+        op_type: Literal["store", "load", "add"],
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for storing D or loading C.
 
@@ -2078,13 +2084,15 @@ class GemmSm90:
         :return: TMA atom and tensor for C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
         """
-        assert store_or_load in ["load", "store"]
+        assert op_type in ["load", "store", "add"]
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         d_cta_v_layout = cute.composition(cute.make_identity_layout(tensor_d.shape), epi_tile)
         op = (
             cpasync.CopyBulkTensorTileG2SOp()
-            if store_or_load == "load"
+            if op_type == "load"
             else cpasync.CopyBulkTensorTileS2GOp()
+            if op_type == "store"
+            else cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD)
         )
         tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
             op, tensor_d, epi_smem_layout, d_cta_v_layout
@@ -2240,6 +2248,7 @@ def gemm_sm90(
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
+    add_to_output: bool = False,
 ) -> None:
     varlen = cu_seqlens_m is not None or cu_seqlens_k is not None
     assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
@@ -2251,6 +2260,8 @@ def gemm_sm90(
         assert cluster_N == 1, "gather_A requires cluster_N=1"
     if varlen:
         assert persistent, "varlen requires persistent=True"
+    if add_to_output:
+        assert cu_seqlens_m is None, "Add to output not supported with varlen_m"
     if cu_seqlens_m is not None:
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
@@ -2300,7 +2311,7 @@ def gemm_sm90(
             assert isinstance(scalar, Tensor)
             return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
 
-    epi_args = GemmSm90.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta))
+    epi_args = GemmSm90.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta), add_to_output)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -2327,9 +2338,10 @@ def gemm_sm90(
         tile_count_semaphore is not None,
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
+        add_to_output,
         cu_seqlens_m is not None,
         cu_seqlens_k is not None,
-        gather_A,  # Add gather_A to compile key
+        gather_A,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache

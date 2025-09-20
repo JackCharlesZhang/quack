@@ -66,7 +66,7 @@ class GemmActSm90(GemmSm90):
             args.mPostAct,
             epi_postact_smem_layout_staged,
             self.epi_tile_postact,
-            store_or_load="store",
+            op_type="store",
         )
         return GemmActSm90.EpilogueParams(
             tma_atom_postact,

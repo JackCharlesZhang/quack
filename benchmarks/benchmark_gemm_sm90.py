@@ -136,6 +136,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
     parser.add_argument("--permute_batch", action="store_true", help="Permute batch in varlen_k")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
+    parser.add_argument("--add_to_output", action="store_true", help="Add to output")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
@@ -175,6 +176,7 @@ def run(
     varlen_k: bool,
     permute_batch: bool,
     gather_A: bool,
+    add_to_output: bool,
     fp8_fast_accum: bool,
     **kwargs,
 ):
@@ -409,7 +411,7 @@ def run(
         batch_idx_permute=batch_idx_permute_tensor
     )
 
-    epi_args = gemm.EpilogueArguments()
+    epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
     varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
@@ -426,7 +428,7 @@ def run(
         current_stream,
     )
 
-    if not skip_ref_check:
+    if not skip_ref_check and not add_to_output:
         # execution
         compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
         if tile_count_semaphore is not None and varlen_m:
@@ -594,6 +596,7 @@ if __name__ == "__main__":
         args.varlen_k,
         args.permute_batch,
         args.gather_A,
+        args.add_to_output,
         args.fp8_fast_accum,
     )
     print("PASS")

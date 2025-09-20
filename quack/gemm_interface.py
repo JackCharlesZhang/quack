@@ -50,6 +50,7 @@ def gemm_tuned(
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
 ) -> None:
@@ -100,6 +101,7 @@ def gemm_tuned(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        add_to_output=add_to_output,
     )
 
 
@@ -382,6 +384,7 @@ def gemm_add(
                 (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
             )
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    add_to_output = C is out and isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
@@ -389,7 +392,7 @@ def gemm_add(
     gemm_add_out(
         A,
         B,
-        C,
+        C if not add_to_output else None,
         out,
         alpha,
         beta,
@@ -398,6 +401,7 @@ def gemm_add(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -425,6 +429,7 @@ def gemm_add_out(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -442,6 +447,7 @@ def gemm_add_out(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
     )
 
@@ -577,17 +583,19 @@ def gemm_add_inplace_op(
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
     beta = beta_tensor if beta_tensor is not None else beta
+    add_to_output = isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
     # Use out as both input bias and output
     fn(
         A,
         B,
         out,
-        out,
+        out if not add_to_output else None,
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
     )
 
