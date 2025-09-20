@@ -1290,7 +1290,10 @@ class GemmSm90:
     ) -> cutlass.pipeline.PipelineState:
         # (atom_v, CPY_M, 1, RestK)
         limit_m, limit_k = limit_A
-        limit_m = min(limit_m, self.tile_shape_mnk[0])  # To avoid writing beyond smem limit
+        # Do we need to check if we overshoot tile_M when we load A?
+        is_even_m_smem = self.tile_shape_mnk[0] % thr_copy_A.tiler_mn[0].shape == 0
+        if const_expr(not is_even_m_smem):
+            limit_m = min(limit_m, self.tile_shape_mnk[0])
         cA = cute.make_identity_tensor(cute.select(self.tile_shape_mnk, [0, 2]))
         tAcA = thr_copy_A.partition_S(cA)
         t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
@@ -1307,7 +1310,7 @@ class GemmSm90:
                 if t0AcA[0, m, 0][0] < limit_m:
                     m_idx[m] = gAIdx[row_idx]
                 else:
-                    m_idx[m] = -1
+                    m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
         else:
             m_idx = None
         elems_per_load = cute.size(tAsA.shape[0][0])
@@ -1348,7 +1351,7 @@ class GemmSm90:
                 mA_row = cute.tiled_divide(
                     cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
                 )[None, None, 0]
-                if t0AcA[0, m, 0][0] < limit_m:
+                if const_expr(is_even_m_smem) or t0AcA[0, m, 0][0] < limit_m:
                     # There's only 1 load per row
                     assert cute.size(tAcA.shape, mode=[2]) == 1
                     ki = tAcA[0, 0, 0][1] // elems_per_load
@@ -1383,7 +1386,7 @@ class GemmSm90:
                 mA_row = cute.tiled_divide(
                     cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
                 )[None, None, 0]
-                if t0AcA[0, m, 0][0] < limit_m:
+                if const_expr(is_even_m_smem) or t0AcA[0, m, 0][0] < limit_m:
                     # There's only 1 load per row
                     assert cute.size(tAcA.shape, mode=[2]) == 1
                     ki = tAcA[0, 0, 0][1] // elems_per_load
