@@ -19,7 +19,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
+from cutlass.cute.runtime import from_dlpack, make_ptr
 
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
@@ -1280,6 +1280,7 @@ class GemmSm90:
         tBsB: cute.Tensor,
         k_tile_cnt: Int32,
         limit_A: Tuple[Int32, Int32],
+        varlen_m: bool = True,
     ) -> cutlass.pipeline.PipelineState:
         # (atom_v, CPY_M, 1, RestK)
         limit_m, limit_k = limit_A
@@ -1292,14 +1293,17 @@ class GemmSm90:
         # This is so that when we do the comparison, t0AcA is known at compile time.
         limit_m = limit_m - tAcA[0][0]
         # Read indices for A
-        rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
-        m_idx = cute.make_fragment(rows_per_thread, Int32)
-        for m in cutlass.range(rows_per_thread):
-            row_idx = tAcA[0, m, 0][0]
-            if t0AcA[0, m, 0][0] < limit_m:
-                m_idx[m] = gAIdx[row_idx]
-            else:
-                m_idx[m] = -1
+        if const_expr(varlen_m):
+            rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+            m_idx = cute.make_fragment(rows_per_thread, Int32)
+            for m in cutlass.range(rows_per_thread):
+                row_idx = tAcA[0, m, 0][0]
+                if t0AcA[0, m, 0][0] < limit_m:
+                    m_idx[m] = gAIdx[row_idx]
+                else:
+                    m_idx[m] = -1
+        else:
+            m_idx = None
         elems_per_load = cute.size(tAsA.shape[0][0])
         # (m, (bK, RestK))
         mA_k = cute.logical_divide(mA, (None, self.tile_shape_mnk[2]))
@@ -1331,8 +1335,13 @@ class GemmSm90:
             # (m, bK)
             mA_cur = mA_k[None, (None, k_tile)]
             for m in cutlass.range_constexpr(tAcA.shape[1]):
-                # (elems_per_load, thread_per_row)
-                mA_row = cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,))
+                # cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,)) would give shape
+                # ((elems_per_load), thread_per_row)
+                # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
+                # So we append 1s to the last dimension and then do tiled_divide, then slice.
+                mA_row = cute.tiled_divide(
+                    cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+                )[None, None, 0]
                 if t0AcA[0, m, 0][0] < limit_m:
                     # There's only 1 load per row
                     assert cute.size(tAcA.shape, mode=[2]) == 1
@@ -1364,15 +1373,15 @@ class GemmSm90:
             # (m, bK)
             mA_cur = mA_k[None, (None, k_tile)]
             for m in cutlass.range_constexpr(tAcA.shape[1]):
-                # (elems_per_load, thread_per_row)
-                mA_row = cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,))
+                # ((elems_per_load, 1), thread_per_row)
+                mA_row = cute.tiled_divide(
+                    cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+                )[None, None, 0]
                 if t0AcA[0, m, 0][0] < limit_m:
                     # There's only 1 load per row
                     assert cute.size(tAcA.shape, mode=[2]) == 1
                     ki = tAcA[0, 0, 0][1] // elems_per_load
-                    # copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index], pred=tApA)
-                    # TODO
-                    copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index])
+                    copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index], pred=tApA)
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
         return ab_producer_state
@@ -2214,7 +2223,8 @@ class GemmSm90:
 
 
 def gemm_sm90(
-    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k
+    # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
+    A: Tensor,
     B: Tensor,  # (l, n, k) or (n, total_k) if varlen_k
     D: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
@@ -2229,11 +2239,16 @@ def gemm_sm90(
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
+    A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
 ) -> None:
     varlen = cu_seqlens_m is not None or cu_seqlens_k is not None
     assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
         "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
     )
+    gather_A = A_idx is not None
+    if gather_A:
+        assert varlen, "gather_A requires varlen (cu_seqlens_m or cu_seqlens_k must be specified)"
+        assert cluster_N == 1, "gather_A requires cluster_N=1"
     if varlen:
         assert persistent, "varlen requires persistent=True"
     if cu_seqlens_m is not None:
@@ -2244,7 +2259,7 @@ def gemm_sm90(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k
+        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx
     )
     GemmWrapperBase.permute_tensors(
         tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
@@ -2273,6 +2288,10 @@ def gemm_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    if gather_A:
+        A_idx_cute = from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    else:
+        A_idx_cute = None
 
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
@@ -2310,6 +2329,7 @@ def gemm_sm90(
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         cu_seqlens_m is not None,
         cu_seqlens_k is not None,
+        gather_A,  # Add gather_A to compile key
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache
@@ -2321,6 +2341,7 @@ def gemm_sm90(
             cluster_shape_mnk,
             pingpong=pingpong,
             is_persistent=persistent,
+            gather_A=gather_A,
         )
         cache[compile_key] = cute.compile(
             gemm,
@@ -2331,7 +2352,7 @@ def gemm_sm90(
             epi_args,
             scheduler_args,
             varlen_args,
-            None,  # mAIdx
+            A_idx_cute,
             current_stream,
         )
     cache[compile_key](
@@ -2342,7 +2363,7 @@ def gemm_sm90(
         epi_args,
         scheduler_args,
         varlen_args,
-        None,
+        A_idx_cute,
         current_stream,
     )
 

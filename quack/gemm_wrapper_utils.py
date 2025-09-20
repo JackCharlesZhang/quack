@@ -65,17 +65,35 @@ class GemmWrapperBase:
         additional_tensors: Optional[Dict[str, Tensor]] = None,
         cu_seqlens_m: Optional[Tensor] = None,
         cu_seqlens_k: Optional[Tensor] = None,
+        A_idx: Optional[Tensor] = None,
     ) -> Tuple[int, int, int, int, Dict[str, GemmTensorInfo]]:
         assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
             "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
         )
         assert B.dtype == A.dtype, "A and B must have the same dtype"
+
+        # Validate A_idx if provided (for gather_A case)
+        gather_A = A_idx is not None
+        if gather_A:
+            assert cu_seqlens_m is not None or cu_seqlens_k is not None, (
+                "gather_A requires either varlen_m or varlen_k"
+            )
+            assert A_idx.dtype == torch.int32, f"A_idx must be int32, got {A_idx.dtype}"
+            assert A_idx.dim() == 1, f"A_idx must be 1D, got {A_idx.dim()}D"
+
         # Determine mode and extract dimensions
         if cu_seqlens_m is not None:
-            # varlen_m: A is (total_m, k), B is (l, n, k), D/C are (total_m, n)
+            # varlen_m: A is (total_m, k) or (whatever, k) if gather_A, B is (l, n, k), D/C are (total_m, n)
             assert A.dim() == 2, f"A must be 2D when using varlen_m, got {A.dim()}D"
             assert B.dim() == 3, f"B must be 3D with varlen_m, got {B.dim()}D"
-            total_M, K = A.shape
+
+            if gather_A:
+                # When gather_A, A can have any number of rows, we use A_idx.shape[0] as total_M
+                total_M = A_idx.shape[0]
+                _, K = A.shape
+            else:
+                total_M, K = A.shape
+
             L, N, K_B = B.shape
             assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
             assert cu_seqlens_m.shape == (L + 1,), (
@@ -85,12 +103,19 @@ class GemmWrapperBase:
             dc_shape = (total_M, N)
             dc_ndim = 2
         elif cu_seqlens_k is not None:
-            # varlen_k: A is (m, total_k), B is (n, total_k), D/C are (l, m, n)
+            # varlen_k: A is (m, total_k) or (m, whatever) if gather_A, B is (n, total_k), D/C are (l, m, n)
             assert A.dim() == 2, f"A must be 2D when using varlen_k, got {A.dim()}D"
             assert B.dim() == 2, f"B must be 2D with varlen_k, got {B.dim()}D"
-            M, total_K = A.shape
+
+            if gather_A:
+                # When gather_A with varlen_k, A can have any number of columns, we use A_idx.shape[0] as total_K
+                M, _ = A.shape
+                total_K = A_idx.shape[0]
+            else:
+                M, total_K = A.shape
+
             N, K_B = B.shape
-            assert total_K == K_B, f"K dimension mismatch: A has {total_K}, B has {K_B}"
+            assert total_K == K_B, f"K dimension mismatch: expected {total_K}, B has {K_B}"
             L = cu_seqlens_k.shape[0] - 1
             assert cu_seqlens_k.shape == (L + 1,), (
                 f"cu_seqlens_k must have shape ({L + 1},), got {cu_seqlens_k.shape}"
@@ -162,7 +187,7 @@ class GemmWrapperBase:
 
     @staticmethod
     def extract_dtypes(tensors: Dict[str, GemmTensorInfo]) -> None:
-        for info in tensors.values():
+        for name, info in tensors.items():
             if info.tensor is not None:
                 info.dtype = torch2cute_dtype_map[info.tensor.dtype]
 

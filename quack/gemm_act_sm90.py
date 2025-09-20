@@ -10,6 +10,7 @@ from cutlass.cute.nvgpu import warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
+from cutlass.cute.runtime import from_dlpack
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.dense_gemm_sm90 import GemmSm90
@@ -283,7 +284,7 @@ act_fn_map = {
 
 
 def gemm_act_sm90(
-    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m
+    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
     D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
@@ -297,6 +298,7 @@ def gemm_act_sm90(
     pingpong: bool = False,
     persistent: bool = True,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
+    A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -304,10 +306,14 @@ def gemm_act_sm90(
         if D is not None:
             assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
+    gather_A = A_idx is not None
+    if gather_A:
+        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
+        assert cluster_N == 1, "gather_A requires cluster_N=1"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m
+        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
@@ -335,6 +341,10 @@ def gemm_act_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    if gather_A:
+        A_idx_cute = from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    else:
+        A_idx_cute = None
     act_fn = act_fn_map[activation]
     epi_args = GemmActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
@@ -361,6 +371,7 @@ def gemm_act_sm90(
         persistent,
         tile_count_semaphore is not None,
         cu_seqlens_m is not None,
+        A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_act_sm90.compile_cache
@@ -372,6 +383,7 @@ def gemm_act_sm90(
             cluster_shape_mnk,
             pingpong=pingpong,
             is_persistent=persistent,
+            gather_A=gather_A,
         )
         cache[compile_key] = cute.compile(
             gemm,
@@ -382,7 +394,7 @@ def gemm_act_sm90(
             epi_args,
             scheduler_args,
             varlen_args,
-            None,  # mAIdx
+            A_idx_cute,
             current_stream,
         )
     cache[compile_key](
@@ -393,7 +405,7 @@ def gemm_act_sm90(
         epi_args,
         scheduler_args,
         varlen_args,
-        None,
+        A_idx_cute,
         current_stream,
     )
 
