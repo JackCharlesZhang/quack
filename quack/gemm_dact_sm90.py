@@ -67,11 +67,14 @@ def gemm_dact_sm90(
     persistent: bool = True,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
 ) -> None:
-    # When using varlen_m, must use persistent scheduler
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
-
+        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
+        assert Out.stride(-1) == 1, "varlen_m requires Out to be n-major"
+        assert PreAct.stride(-1) == 1, "varlen_m requires PreAct to be n-major"
+        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
     assert activation in dact_fn_map, f"Unsupported activation {activation}"
+
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
         A, B, Out, PreAct, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m
     )

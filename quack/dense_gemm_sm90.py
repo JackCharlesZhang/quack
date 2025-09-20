@@ -617,6 +617,8 @@ class GemmSm90:
         varlen_m = const_expr(cu_seqlens_m is not None)
         varlen_k = const_expr(cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
+        if const_expr(self.gather_A):
+            assert varlen_m or varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -707,11 +709,14 @@ class GemmSm90:
                 ]
             else:
                 assert varlen_k
-                tensormap_a_ptr = tensormap_manager.get_tensormap_ptr(
-                    tensormaps[tensormap_workspace_idx, 0, None].iterator
-                )
+                if const_expr(not self.gather_A):
+                    tensormap_a_ptr = tensormap_manager.get_tensormap_ptr(
+                        tensormaps[tensormap_workspace_idx, 0, None].iterator
+                    )
                 tensormap_b_ptr = tensormap_manager.get_tensormap_ptr(
-                    tensormaps[tensormap_workspace_idx, 1, None].iterator
+                    tensormaps[
+                        tensormap_workspace_idx, 1 if not self.gather_A else 0, None
+                    ].iterator
                 )
 
         TileSchedulerCls = partial(
@@ -727,11 +732,12 @@ class GemmSm90:
                 is_tma_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
                 if const_expr(varlen_k):
                     # initialize tensormap for A & B
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_atom_a,
-                        tensormap_a_ptr,
-                        is_tma_warp,
-                    )
+                    if const_expr(not self.gather_A):
+                        tensormap_manager.init_tensormap_from_atom(
+                            tma_atom_a,
+                            tensormap_a_ptr,
+                            is_tma_warp,
+                        )
                     tensormap_manager.init_tensormap_from_atom(
                         tma_atom_b,
                         tensormap_b_ptr,
@@ -773,14 +779,20 @@ class GemmSm90:
                         last_batch_idx = batch_idx
                         if is_group_changed:
                             # construct tensor A/B based on real address, shape and stride information
+                            tensormap_ptrs = [tensormap_b_ptr]
+                            shapes = [cu_seqlens_k[batch_idx + 1]]
+                            orders = [0 if const_expr(self.b_layout == LayoutEnum.ROW_MAJOR) else 1]
+                            if const_expr(not self.gather_A):
+                                tensormap_ptrs.insert(0, tensormap_a_ptr)
+                                shapes.insert(0, cu_seqlens_k[batch_idx + 1])
+                                orders.insert(
+                                    0, 0 if const_expr(self.a_layout == LayoutEnum.ROW_MAJOR) else 1
+                                )
                             tensormap_manager.update_tensormap_shape(
-                                (tensormap_a_ptr, tensormap_b_ptr),
+                                tensormap_ptrs,
                                 is_manager_warp=is_tma_warp,
-                                shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
-                                orders=(
-                                    0 if const_expr(self.a_layout == LayoutEnum.ROW_MAJOR) else 1,
-                                    0 if const_expr(self.b_layout == LayoutEnum.ROW_MAJOR) else 1,
-                                ),
+                                shapes=shapes,
+                                orders=orders,
                                 tensormap_smem_ptr=None,
                             )
                     # ///////////////////////////////////////////////////////////////////////////
@@ -803,13 +815,12 @@ class GemmSm90:
                         mA_mk = mA_mkl
                         if const_expr(varlen_m):
                             mAIdx_mk = cute.domain_offset((cu_seqlens_m[batch_idx],), mAIdx)
-                        elif const_expr(varlen_k):
-                            mAIdx_mk = cute.domain_offset((cu_seqlens_k[batch_idx],), mAIdx)
+                            gAIdx = cute.local_tile(
+                                mAIdx_mk, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
+                            )
                         else:
-                            mAIdx_mk = mAIdx[None, batch_idx]
-                        gAIdx = cute.local_tile(
-                            mAIdx_mk, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
-                        )
+                            assert varlen_k
+                            gAIdx = cute.domain_offset((cu_seqlens_k[batch_idx],), mAIdx)
                     if const_expr(varlen_k):
                         mB_nk = cute.domain_offset((0, cu_seqlens_k[batch_idx]), mB_nkl)
                     else:
@@ -821,19 +832,20 @@ class GemmSm90:
                     # //////////////////////////////////////////////////////////////////////////
                     #  Partition shared tensor for TMA load A/B
                     # //////////////////////////////////////////////////////////////////////////
+                    tma_desc_a_ptr, tma_desc_b_ptr = None, None
                     if const_expr(varlen_k):
                         # ensure the update to tensormap has completed before using it
                         if is_group_changed and is_tma_warp:
-                            tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
+                            if const_expr(not self.gather_A):
+                                tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
                             tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
-                        tma_desc_a_ptr = tensormap_manager.get_tensormap_ptr(
-                            tensormap_a_ptr, cute.AddressSpace.generic
-                        )
+                        if const_expr(not self.gather_A):
+                            tma_desc_a_ptr = tensormap_manager.get_tensormap_ptr(
+                                tensormap_a_ptr, cute.AddressSpace.generic
+                            )
                         tma_desc_b_ptr = tensormap_manager.get_tensormap_ptr(
                             tensormap_b_ptr, cute.AddressSpace.generic
                         )
-                    else:
-                        tma_desc_a_ptr, tma_desc_b_ptr = None, None
                     #  TMA load A partition_S/D
                     a_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
@@ -921,7 +933,7 @@ class GemmSm90:
                             k_tile_cnt,
                             limit_A=(
                                 limit_m - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
-                                mA_mk.shape[1],
+                                k_len,
                             ),
                         )
                     tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
@@ -1262,7 +1274,7 @@ class GemmSm90:
         thr_copy_A: cute.core.ThrCopy,
         mA: cute.Tensor,
         tAsA: cute.Tensor,
-        gAIdx: cute.Tensor,
+        gAIdx: cute.Tensor,  # (tile_M,) if varlen_m, (K,) if varlen_k
         copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
@@ -2202,8 +2214,8 @@ class GemmSm90:
 
 
 def gemm_sm90(
-    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m
-    B: Tensor,  # (l, n, k)
+    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k
+    B: Tensor,  # (l, n, k) or (n, total_k) if varlen_k
     D: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
     tile_count_semaphore: Optional[Tensor],  # (1,)
@@ -2216,15 +2228,27 @@ def gemm_sm90(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
+    cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
 ) -> None:
-    # When using varlen_m, must use persistent scheduler
+    varlen = cu_seqlens_m is not None or cu_seqlens_k is not None
+    assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
+        "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
+    )
+    if varlen:
+        assert persistent, "varlen requires persistent=True"
     if cu_seqlens_m is not None:
-        assert persistent, "varlen_m requires persistent=True"
+        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
+        assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
+    if cu_seqlens_k is not None:
+        assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
+        assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m
+        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k
     )
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
+    GemmWrapperBase.permute_tensors(
+        tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
+    )
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
@@ -2262,7 +2286,7 @@ def gemm_sm90(
         max_active_clusters, tile_count_semaphore
     )
 
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
+    # Create varlen arguments if needed (assumes persistent=True when varlen)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         max_active_clusters,
@@ -2270,6 +2294,7 @@ def gemm_sm90(
         tensor_infos,
         GemmSm90.num_epi_tensormaps,
         pingpong,
+        cu_seqlens_k=cu_seqlens_k,
     )
 
     current_stream = cutlass_torch.current_stream()
@@ -2284,6 +2309,7 @@ def gemm_sm90(
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         cu_seqlens_m is not None,
+        cu_seqlens_k is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache

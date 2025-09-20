@@ -40,31 +40,37 @@ gated_to_pytorch_fn_map = {
     key=["dynamic_scheduler"],
 )
 def gemm_tuned(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,  # (1,)
     beta: float | Tensor = 1.0,  # (1,)
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
+    cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
 ) -> None:
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
     varlen_m = cu_seqlens_m is not None
-    if varlen_m:
+    varlen_k = cu_seqlens_k is not None
+    varlen = varlen_m or varlen_k
+    if varlen:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not varlen_m:
+    if A.ndim == 2 and not varlen:
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
+    B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
+    if B.ndim == 2 and not varlen_k:
         B = B.unsqueeze(0)  # (1, N, K)
     if C is not None and C.ndim == 2 and not varlen_m:
         C = C.unsqueeze(0)  # (1, M, N)
     if out.ndim == 2 and not varlen_m:
         out = out.unsqueeze(0)
-    out_shape = (A.shape[0], A.shape[1], B.shape[1]) if not varlen_m else (A.shape[0], B.shape[1])
+    batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
+    out_shape = (
+        (batch_size, A.shape[-2], B.shape[-2]) if not varlen_m else (A.shape[0], B.shape[-2])
+    )
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
@@ -83,6 +89,7 @@ def gemm_tuned(
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
     )
 
 
@@ -199,21 +206,30 @@ def gemm_dact_tuned(
 
 
 def gemm(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, K) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
-        out_shape = (
-            (A.shape[-2], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
-        )
+        varlen_m = cu_seqlens_m is not None
+        varlen_k = cu_seqlens_k is not None
+        if varlen_m:
+            out_shape = (A.shape[0], B.shape[-1])
+        elif varlen_k:
+            L = cu_seqlens_k.shape[0] - 1
+            out_shape = (L, A.shape[0], B.shape[-1])
+        else:
+            out_shape = (
+                (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
+            )
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
@@ -224,6 +240,7 @@ def gemm(
         alpha=alpha,
         alpha_tensor=alpha_tensor,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -239,12 +256,13 @@ def gemm(
     # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -258,25 +276,27 @@ def gemm_out(
         C=None,
         alpha=alpha,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         dynamic_scheduler=dynamic_scheduler,
     )
 
 
 def gemm_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with pre-allocated output."""
     # The out_dtype argument requires torch >= 2.8
     out_dtype = A.dtype if out_dtype is None else out_dtype
-    if cu_seqlens_m is None:
+    if cu_seqlens_m is None and cu_seqlens_k is None:
         fn = torch.bmm if A.ndim == 3 else torch.mm
         out = fn(A, B, out_dtype=out_dtype, out=out)
-    else:
+    elif cu_seqlens_m is not None:
         if out is None:
             out = torch.cat(
                 [
@@ -292,20 +312,31 @@ def gemm_ref(
                     B[i],
                     out=out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]],
                 )
+    else:  # cu_seqlens_k is not None
+        L = cu_seqlens_k.shape[0] - 1
+        if out is None:
+            out = torch.empty((L, A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+        for i in range(L):
+            torch.mm(
+                A[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]],
+                B[cu_seqlens_k[i] : cu_seqlens_k[i + 1], :],
+                out=out[i],
+            )
     if not isinstance(alpha, float) or alpha != 1.0:
         out = out * alpha
     return out
 
 
 def gemm_add(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
@@ -313,11 +344,16 @@ def gemm_add(
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
         varlen_m = cu_seqlens_m is not None
-        out_shape = (
-            (A.shape[0], B.shape[-1])
-            if varlen_m or A.ndim == 2
-            else (A.shape[0], A.shape[-2], B.shape[-1])
-        )
+        varlen_k = cu_seqlens_k is not None
+        if varlen_m:
+            out_shape = (A.shape[0], B.shape[-1])
+        elif varlen_k:
+            L = cu_seqlens_k.shape[0] - 1
+            out_shape = (L, A.shape[0], B.shape[-1])
+        else:
+            out_shape = (
+                (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
+            )
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
@@ -333,6 +369,7 @@ def gemm_add(
         alpha_tensor,
         beta_tensor,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -348,15 +385,16 @@ def gemm_add(
     # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_out(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -372,22 +410,24 @@ def gemm_add_out(
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         dynamic_scheduler=dynamic_scheduler,
     )
 
 
 def gemm_add_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with addition and pre-allocated output."""
-    if cu_seqlens_m is None:
+    if cu_seqlens_m is None and cu_seqlens_k is None:
         if isinstance(alpha, float) and isinstance(beta, float):
             return torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
         else:
@@ -398,7 +438,7 @@ def gemm_add_ref(
             if out is not None:
                 out.copy_(result)
             return result
-    else:
+    elif cu_seqlens_m is not None:
         # Handle varlen_m case
         if out is None:
             out_list = []
@@ -415,27 +455,40 @@ def gemm_add_ref(
                 out_i = out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
                 result = alpha * torch.mm(A_i, B[i]) + beta * C_i
                 out_i.copy_(result)
-        return out
+    else:  # cu_seqlens_k is not None
+        # Handle varlen_k case
+        L = cu_seqlens_k.shape[0] - 1
+        out_dtype = out_dtype if out_dtype is not None else A.dtype
+        if out is None:
+            out = torch.empty((L, A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+        for i in range(L):
+            A_i = A[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]]
+            B_i = B[cu_seqlens_k[i] : cu_seqlens_k[i + 1], :]
+            result = alpha * torch.mm(A_i, B_i) + beta * C[i]
+            out[i].copy_(result)
+    return out
 
 
 def gemm_add_inplace(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """In-place GEMM with addition: out = alpha * A @ B + beta * out.
     Args:
-        A: (M, K) or (L, M, K) or (total_M, K) if varlen_m - input tensor
-        B: (K, N) or (L, K, N) - input tensor
-        out: (M, N) or (L, M, N) or (total_M, N) if varlen_m - tensor to accumulate into (modified in-place)
+        A: (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k - input tensor
+        B: (K, N) or (L, K, N) or (total_K, N) if varlen_k - input tensor
+        out: (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k - tensor to accumulate into (modified in-place)
         alpha: Scalar multiplier for A @ B
         beta: Scalar multiplier for out
         cu_seqlens_m: Optional cumulative sequence lengths for variable M
+        cu_seqlens_k: Optional cumulative sequence lengths for variable K
         dynamic_scheduler: Whether to use dynamic scheduler
         tuned: Whether to use autotuned configuration
     """
@@ -444,7 +497,17 @@ def gemm_add_inplace(
     beta_tensor = beta if not isinstance(beta, float) else None
     beta = beta if isinstance(beta, float) else 1.0
     gemm_add_inplace_op(
-        A, B, out, alpha, beta, alpha_tensor, beta_tensor, cu_seqlens_m, dynamic_scheduler, tuned
+        A,
+        B,
+        out,
+        alpha,
+        beta,
+        alpha_tensor,
+        beta_tensor,
+        cu_seqlens_m,
+        cu_seqlens_k,
+        dynamic_scheduler,
+        tuned,
     )
 
 
@@ -457,14 +520,15 @@ def gemm_add_inplace(
     # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_inplace_op(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -480,6 +544,7 @@ def gemm_add_inplace_op(
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
         dynamic_scheduler=dynamic_scheduler,
     )
 
@@ -540,8 +605,8 @@ def gemm_act_out(
 
 
 def gemm_act_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     cu_seqlens_m: Optional[Tensor] = None,
@@ -614,9 +679,9 @@ def gemm_dact_out(
 
 
 def gemm_dact_ref(
-    A: Tensor,
-    B: Tensor,
-    PreAct: Tensor,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,

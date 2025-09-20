@@ -24,8 +24,8 @@ class GemmTensorInfo:
 
 class GemmWrapperBase:
     @staticmethod
-    def validate_tensor_3d(tensor: Tensor, name: str) -> None:
-        assert tensor.dim() == 3 and tensor.is_cuda, f"{name} must be a 3D CUDA tensor"
+    def validate_tensor(tensor: Tensor, name: str, ndim: int) -> None:
+        assert tensor.dim() == ndim and tensor.is_cuda, f"{name} must be a {ndim}D CUDA tensor"
         assert tensor.dtype in torch2cute_dtype_map, f"Unsupported dtype for {name}"
 
     @staticmethod
@@ -64,44 +64,60 @@ class GemmWrapperBase:
         C: Optional[Tensor] = None,
         additional_tensors: Optional[Dict[str, Tensor]] = None,
         cu_seqlens_m: Optional[Tensor] = None,
+        cu_seqlens_k: Optional[Tensor] = None,
     ) -> Tuple[int, int, int, int, Dict[str, GemmTensorInfo]]:
+        assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
+            "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
+        )
+        assert B.dtype == A.dtype, "A and B must have the same dtype"
+        # Determine mode and extract dimensions
         if cu_seqlens_m is not None:
-            # Handle variable length M case
-            # A is (total_m, k), B is (l, n, k), D is (total_m, n), C is (total_m, n)
+            # varlen_m: A is (total_m, k), B is (l, n, k), D/C are (total_m, n)
             assert A.dim() == 2, f"A must be 2D when using varlen_m, got {A.dim()}D"
-            total_M, K = A.shape
             assert B.dim() == 3, f"B must be 3D with varlen_m, got {B.dim()}D"
+            total_M, K = A.shape
             L, N, K_B = B.shape
             assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
             assert cu_seqlens_m.shape == (L + 1,), (
                 f"cu_seqlens_m must have shape ({L + 1},), got {cu_seqlens_m.shape}"
             )
-            assert B.dtype == A.dtype, "A and B must have the same dtype"
-            if D is not None:
-                assert D.dim() == 2, f"D must be 2D when using varlen_m, got {D.dim()}D"
-                assert D.shape == (total_M, N), (
-                    f"D shape {D.shape} doesn't match expected ({total_M}, {N})"
-                )
-            if C is not None:
-                assert C.dim() == 2, f"C must be 2D when using varlen_m, got {C.dim()}D"
-                assert C.shape == (total_M, N), (
-                    f"C shape {C.shape} doesn't match expected ({total_M}, {N})"
-                )
-            M = total_M  # Return total_M as M dimension
+            M = total_M
+            dc_shape = (total_M, N)
+            dc_ndim = 2
+        elif cu_seqlens_k is not None:
+            # varlen_k: A is (m, total_k), B is (n, total_k), D/C are (l, m, n)
+            assert A.dim() == 2, f"A must be 2D when using varlen_k, got {A.dim()}D"
+            assert B.dim() == 2, f"B must be 2D with varlen_k, got {B.dim()}D"
+            M, total_K = A.shape
+            N, K_B = B.shape
+            assert total_K == K_B, f"K dimension mismatch: A has {total_K}, B has {K_B}"
+            L = cu_seqlens_k.shape[0] - 1
+            assert cu_seqlens_k.shape == (L + 1,), (
+                f"cu_seqlens_k must have shape ({L + 1},), got {cu_seqlens_k.shape}"
+            )
+            K = total_K
+            dc_shape = (L, M, N)
+            dc_ndim = 3
         else:
             # Normal case - all tensors must be 3D
-            GemmWrapperBase.validate_tensor_3d(A, "A")
+            GemmWrapperBase.validate_tensor(A, "A", 3)
+            GemmWrapperBase.validate_tensor(B, "B", 3)
             L, M, K = A.shape
-            GemmWrapperBase.validate_tensor_3d(B, "B")
-            _, N, _ = B.shape
-            assert B.dtype == A.dtype, "A and B must have the same dtype"
+            _, N, K_B = B.shape
+            assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
             GemmWrapperBase.validate_shape(B, (L, N, K), "B")
-            if D is not None:
-                GemmWrapperBase.validate_tensor_3d(D, "D")
-                GemmWrapperBase.validate_shape(D, (L, M, N), "D")
-            if C is not None:
-                GemmWrapperBase.validate_tensor_3d(C, "C")
-                GemmWrapperBase.validate_shape(C, (L, M, N), "C")
+            dc_shape = (L, M, N)
+            dc_ndim = 3
+
+        # Validate D and C shapes uniformly
+        for tensor, name in [(D, "D"), (C, "C")]:
+            if tensor is not None:
+                assert tensor.dim() == dc_ndim, (
+                    f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
+                )
+                assert tensor.shape == dc_shape, (
+                    f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
+                )
 
         tensors = {
             "A": GemmTensorInfo(A),
@@ -113,28 +129,35 @@ class GemmWrapperBase:
         if additional_tensors:
             for name, tensor in additional_tensors.items():
                 if tensor is not None:
-                    if cu_seqlens_m is not None:
-                        assert tensor.dim() == 2, f"{name} must be 2D when using varlen_m"
-                        assert tensor.shape == (total_M, N), f"{name} shape mismatch"
-                    else:
-                        GemmWrapperBase.validate_tensor_3d(tensor, name)
-                        GemmWrapperBase.validate_shape(tensor, (L, M, N), name)
+                    assert tensor.dim() == dc_ndim, (
+                        f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
+                    )
+                    assert tensor.shape == dc_shape, (
+                        f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
+                    )
                 tensors[name] = GemmTensorInfo(tensor)
 
         return L, M, K, N, tensors
 
     @staticmethod
-    def permute_tensors(tensors: Dict[str, GemmTensorInfo], varlen_m: bool = False) -> None:
+    def permute_tensors(
+        tensors: Dict[str, GemmTensorInfo], varlen_m: bool = False, varlen_k: bool = False
+    ) -> None:
+        # Determine which tensors need permutation
         if varlen_m:
-            # In varlen_m case: A, D, C are 2D (already in right shape), B is 3D
-            for name, info in tensors.items():
-                if info.tensor is not None and name == "B":
-                    # Permute B from (L, N, K) -> (N, K, L)
-                    info.tensor = info.tensor.permute(1, 2, 0)
+            # Only B needs permutation (3D tensor)
+            tensors_to_permute = ["B"]
+        elif varlen_k:
+            # Only D and C need permutation (3D tensors)
+            tensors_to_permute = ["D", "C"]
         else:
-            # Normal case: permute all 3D tensors from (L, M, K/N) to (M, K/N, L)
-            for info in tensors.values():
-                if info.tensor is not None:
+            # All tensors need permutation
+            tensors_to_permute = None
+
+        # Apply permutation from (L, *, *) -> (*, *, L) for selected tensors
+        for name, info in tensors.items():
+            if info.tensor is not None and info.tensor.ndim == 3:
+                if tensors_to_permute is None or name in tensors_to_permute:
                     info.tensor = info.tensor.permute(1, 2, 0)
 
     @staticmethod
@@ -182,25 +205,31 @@ class GemmWrapperBase:
         tensors: Dict[str, GemmTensorInfo],
         num_epi_tensormaps: int = 0,
         pingpong: bool = False,
+        cu_seqlens_k: Optional[Tensor] = None,
     ) -> Optional[Any]:
-        if cu_seqlens_m is None:
+        if cu_seqlens_m is None and cu_seqlens_k is None:
             return None
         # When varlen_m, we assume persistent=True
         # Grid size depends on num_active_clusters and cluster size
         cluster_size = cluster_shape_mnk[0] * cluster_shape_mnk[1]
         num_blocks = max_active_clusters * cluster_size
         # Calculate number of tensormaps needed
-        # For varlen_m: need tensormaps for D and epilogue tensors
-        num_tensormaps = num_epi_tensormaps * (1 if not pingpong else 2)
-        if tensors["D"].tensor is not None:
-            num_tensormaps += 1 if not pingpong else 2  # D tensormap
+        if cu_seqlens_m is not None:
+            # For varlen_m: need tensormaps for D and epilogue tensors
+            num_tensormaps = num_epi_tensormaps * (1 if not pingpong else 2)
+            if tensors["D"].tensor is not None:
+                num_tensormaps += 1 if not pingpong else 2  # D tensormap
+        else:
+            # For varlen_k: need tensormaps for A & B
+            num_tensormaps = 2
         # Create tensormap buffer (each tensormap is 128 bytes = 16 int64s)
         tensormap_size = 128 // 8  # 16 int64s
         if num_tensormaps > 0:
+            device = cu_seqlens_m.device if cu_seqlens_m is not None else cu_seqlens_k.device
             tensormaps = torch.empty(
                 (num_blocks, num_tensormaps, tensormap_size),
                 dtype=torch.int64,
-                device=cu_seqlens_m.device,
+                device=device,
             )
             tensormaps_cute = from_dlpack(tensormaps, assumed_align=128).mark_compact_shape_dynamic(
                 mode=0, stride_order=(0, 1, 2)
@@ -209,10 +238,16 @@ class GemmWrapperBase:
             tensormaps_cute = None
 
         return VarlenArguments(
-            mCuSeqlensM=from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(
-                leading_dim=0
+            mCuSeqlensM=(
+                from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+                if cu_seqlens_m is not None
+                else None
             ),
-            mCuSeqlensK=None,  # No variable K for now
+            mCuSeqlensK=(
+                from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+                if cu_seqlens_k is not None
+                else None
+            ),
             mTensormaps=tensormaps_cute,
         )
 
