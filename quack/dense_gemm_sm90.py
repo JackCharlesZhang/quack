@@ -91,7 +91,7 @@ class NamedBarrierGemm(enum.IntEnum):
 class GemmSm90:
     """
     This class implements batched matrix multiplication (C = A x B) with support for various data types
-    and architectural features specific to Hopper GPUs.
+    and architectural features specific to Hopper GPUs with persistent tile scheduling and warp specialization.
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
@@ -369,7 +369,7 @@ class GemmSm90:
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        epilogue_args: Optional[ArgumentsBase],
+        epilogue_args: ArgumentsBase,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
@@ -536,6 +536,7 @@ class GemmSm90:
 
         # Launch the kernel synchronously
         self.kernel(
+            self.tiled_mma,
             tma_atom_a,
             tma_tensor_a if const_expr(not self.gather_A) else mA,
             tma_atom_b,
@@ -549,7 +550,6 @@ class GemmSm90:
             varlen_args.mCuSeqlensK,
             varlen_args.mTensormaps,
             varlen_args.mAIdx,
-            self.tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -571,6 +571,7 @@ class GemmSm90:
     @cute.kernel
     def kernel(
         self,
+        tiled_mma: cute.TiledMma,
         tma_atom_a: Optional[cute.CopyAtom],
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
@@ -584,7 +585,6 @@ class GemmSm90:
         cu_seqlens_k: Optional[cute.Tensor],
         tensormaps: Optional[cute.Tensor],
         mAIdx: Optional[cute.Tensor],
-        tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
@@ -1409,7 +1409,6 @@ class GemmSm90:
         if 0 < k_tile_cnt:
             k_tile = k_tile_cnt - 1
             tApA_k = cute.make_fragment(cols_per_thread, Boolean)
-            # if const_expr(not varlen_m):  # If varlen, limit_k is already adjusted
             limit_k -= k_tile * self.tile_shape_mnk[2]
             for k in cutlass.range_constexpr(cols_per_thread):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k
@@ -1748,7 +1747,7 @@ class GemmSm90:
     def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
         return tuple()
 
-    def pingpong_barrier_sync(self, warp_group_idx: Int32, stage: str):
+    def pingpong_barrier_sync(self, warp_group_idx: Int32, stage: Literal["mma", "epi"]):
         assert stage in ["mma", "epi"]
         barrier = NamedBarrierGemm.MmaWG0 if stage == "mma" else NamedBarrierGemm.EpiWG0
         cute.arch.barrier(
@@ -1756,7 +1755,7 @@ class GemmSm90:
             number_of_threads=2 * self.num_threads_per_warp_group,
         )
 
-    def pingpong_barrier_arrive(self, warp_group_idx: Int32, stage: str):
+    def pingpong_barrier_arrive(self, warp_group_idx: Int32, stage: Literal["mma", "epi"]):
         assert stage in ["mma", "epi"]
         barrier = NamedBarrierGemm.MmaWG0 if stage == "mma" else NamedBarrierGemm.EpiWG0
         cute.arch.barrier_arrive(
