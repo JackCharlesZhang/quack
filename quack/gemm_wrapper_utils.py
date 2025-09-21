@@ -211,7 +211,9 @@ class GemmWrapperBase:
 
     @staticmethod
     def create_scheduler_args(
-        max_active_clusters: int, tile_count_semaphore: Optional[Tensor] = None
+        max_active_clusters: int,
+        tile_count_semaphore: Optional[Tensor] = None,
+        batch_idx_permute: Optional[Tensor] = None,
     ) -> TileSchedulerOptions:
         return TileSchedulerOptions(
             Int32(max_active_clusters),
@@ -219,6 +221,11 @@ class GemmWrapperBase:
                 Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
             )
             if tile_count_semaphore is not None
+            else None,
+            batch_idx_permute=(
+                from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            )
+            if batch_idx_permute is not None
             else None,
         )
 

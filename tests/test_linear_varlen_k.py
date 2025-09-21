@@ -42,6 +42,7 @@ def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
     return A, A_idx
 
 
+@pytest.mark.parametrize("permute_batch", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
 # @pytest.mark.parametrize("gather_A", [True])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
@@ -66,6 +67,7 @@ def test_gemm_varlen_k(
     alpha_is_tensor,
     dynamic_scheduler,
     gather_A,
+    permute_batch,
 ):
     device = "cuda"
     torch.random.manual_seed(42)
@@ -82,12 +84,17 @@ def test_gemm_varlen_k(
     if alpha_is_tensor:
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
     alpha_val = alpha.item() if torch.is_tensor(alpha) else alpha
+    if permute_batch:
+        batch_idx_permute = torch.randperm(num_groups, device=device).to(torch.int32)
+    else:
+        batch_idx_permute = None
     out = gemm(
         A,
         B,
         alpha=alpha,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )

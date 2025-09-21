@@ -50,6 +50,7 @@ def gemm_tuned(
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     cu_seqlens_k: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
@@ -101,6 +102,7 @@ def gemm_tuned(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
     )
 
@@ -231,6 +233,7 @@ def gemm(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
@@ -262,6 +265,7 @@ def gemm(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
@@ -286,6 +290,7 @@ def gemm_out(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -301,6 +306,7 @@ def gemm_out(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
     )
 
@@ -363,6 +369,7 @@ def gemm_add(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
@@ -401,6 +408,7 @@ def gemm_add(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
@@ -429,6 +437,7 @@ def gemm_add_out(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -447,6 +456,7 @@ def gemm_add_out(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
     )
@@ -522,6 +532,7 @@ def gemm_add_inplace(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -551,9 +562,10 @@ def gemm_add_inplace(
         beta_tensor,
         cu_seqlens_m,
         cu_seqlens_k,
-        A_idx,
-        dynamic_scheduler,
-        tuned,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
     )
 
 
@@ -577,6 +589,7 @@ def gemm_add_inplace_op(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
@@ -595,6 +608,7 @@ def gemm_add_inplace_op(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
     )

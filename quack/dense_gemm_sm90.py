@@ -2321,6 +2321,7 @@ def gemm_sm90(
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
+    batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
 ) -> None:
     varlen = cu_seqlens_m is not None or cu_seqlens_k is not None
@@ -2382,7 +2383,9 @@ def gemm_sm90(
 
     epi_args = GemmSm90.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta), add_to_output)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore
+        max_active_clusters,
+        tile_count_semaphore,
+        batch_idx_permute,
     )
 
     # Create varlen arguments if needed (assumes persistent=True when varlen)
@@ -2412,6 +2415,7 @@ def gemm_sm90(
         cu_seqlens_m is not None,
         cu_seqlens_k is not None,
         gather_A,
+        batch_idx_permute is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache
