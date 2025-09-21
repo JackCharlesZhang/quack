@@ -11,7 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 from functools import cached_property, partial
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional, Any
 
 import torch
 from torch import Tensor
@@ -53,7 +53,22 @@ def _base32(key):
 
 
 class Autotuner:
-    def __init__(self, fn, key, configs, restore_value=None, do_bench=None, cache_results=False):
+    def __init__(
+        self,
+        fn,
+        key,
+        configs,
+        restore_value=None,
+        prune_configs_by: Optional[Dict] = None,
+        do_bench=None,
+        cache_results=False,
+    ):
+        """
+        :param prune_configs_by: a dict of functions that are used to prune configs, fields:
+            'perf_model': performance model used to predicate running time with different configs, returns running time
+            'top_k': number of configs to bench
+            'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
+        """
         if not configs:
             self.configs = [AutotuneConfig()]
         else:
@@ -89,6 +104,16 @@ class Autotuner:
             self.post_hook = _post_hook
         else:
             self.post_hook = None
+
+        self.perf_model = None
+        self.configs_top_k = 1.0
+        self.early_config_prune = None
+        if prune_configs_by:
+            self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
+            self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
+            self.early_config_prune = prune_configs_by.get(
+                "early_config_prune", self.early_config_prune
+            )
 
         self.fn = fn
         self._do_bench = do_bench
@@ -198,13 +223,14 @@ class Autotuner:
             key = tuple(key)
             if key not in self.cache:
                 used_cached_result = False
+                pruned_configs = self.prune_configs(kwargs)
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
                     bench_start = time.time()
                     timings = {
                         config: self._bench(*args, config=config, **kwargs)
-                        for config in self.configs
+                        for config in pruned_configs
                     }
                     bench_end = time.time()
                     if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
@@ -215,7 +241,7 @@ class Autotuner:
                     self.configs_timings = timings
 
                 if self.cache_results:
-                    self.check_disk_cache(key, self.configs, benchmark)
+                    self.check_disk_cache(key, pruned_configs, benchmark)
                 else:
                     benchmark()
 
@@ -238,6 +264,32 @@ class Autotuner:
         )
         self.nargs = None
         return ret
+
+    def prune_configs(self, kwargs: Dict) -> List[Any]:
+        pruned_configs = self.configs
+        if self.early_config_prune:
+            pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
+        if self.perf_model:
+            top_k = self.configs_top_k
+            if isinstance(top_k, float) and top_k <= 1.0:
+                top_k = int(len(self.configs) * top_k)
+            elif not isinstance(top_k, int):
+                # Slice index must be an integer
+                raise TypeError(
+                    "Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int"
+                )
+
+            if len(pruned_configs) > top_k:
+                est_timing = {
+                    config: self.perf_model(
+                        **self.nargs,
+                        **kwargs,
+                        **config.all_kwargs(),
+                    )
+                    for config in pruned_configs
+                }
+                pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
+        return pruned_configs
 
 
 class AutotuneConfig:
@@ -272,7 +324,9 @@ class AutotuneConfig:
         return self_tuple == other_tuple
 
 
-def autotune(configs, key=None, restore_value=None, do_bench=None, cache_results=True):
+def autotune(
+    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True
+):
     f"""
     Decorator for auto-tuning a function function.
 
@@ -286,6 +340,10 @@ def autotune(configs, key=None, restore_value=None, do_bench=None, cache_results
     :type configs: list[AutotuneConfig]
     :param key: a list of argument names whose change in value will trigger the evaluation of all provided configs.
     :type key: list[str]
+    :param prune_configs_by: a dict of functions that are used to prune configs, fields:
+        'perf_model': performance model used to predicate running time with different configs, returns running time
+        'top_k': number of configs to bench
+        'early_config_prune'(optional): a function used to do early prune (eg, num_stages). It takes configs:List[Config] as its input, and returns pruned configs.
     :param restore_value: a list of argument names whose value will be restored after evaluating any configs.
     :type restore_value: list[str]
     :param do_bench: a benchmark function to measure the time of each run.
@@ -303,6 +361,7 @@ def autotune(configs, key=None, restore_value=None, do_bench=None, cache_results
             key,
             configs,
             restore_value=restore_value,
+            prune_configs_by=prune_configs_by,
             do_bench=do_bench,
             cache_results=cache_results,
         )

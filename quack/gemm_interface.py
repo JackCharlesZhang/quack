@@ -34,10 +34,26 @@ gated_to_pytorch_fn_map = {
 }
 
 
+def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
+    kwargs = named_args | kwargs
+    gather_A = kwargs.get("A_idx", None) is not None
+    varlen_m = kwargs.get("cu_seqlens_m", None) is not None
+    if varlen_m or gather_A:  # Doesn't support swap_ab
+        configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    if gather_A:
+        # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
+        configs = [
+            conf
+            for conf in configs
+            if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_n != 208
+        ]
+    return configs
+
+
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    # TODO: filter config depending on varlen
     key=["dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_tuned(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -110,6 +126,7 @@ def gemm_tuned(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_act_tuned(
     A: Tensor,  # (M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -168,6 +185,7 @@ def gemm_act_tuned(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_dact_tuned(
     A: Tensor,  # (M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
