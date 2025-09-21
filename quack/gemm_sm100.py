@@ -318,8 +318,6 @@ class GemmSm100(GemmSm90):
             self.d_layout,
             self.d_dtype,
         )
-        # This returns layout, we just want tuple of ints
-        self.epi_tile = (self.epi_tile[0].shape, self.epi_tile[1].shape)
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         (
@@ -695,6 +693,7 @@ class GemmSm100(GemmSm90):
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
+            self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
         ).launch(
@@ -738,6 +737,7 @@ class GemmSm100(GemmSm90):
         sfb_smem_layout: Optional[cute.Layout],
         epi_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_c_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
+        epi_tile: cute.Tile,
         tile_sched_params: ParamsBase,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
@@ -1122,7 +1122,7 @@ class GemmSm100(GemmSm90):
                     tCgC = thr_mma.partition_C(gC_mnl)
                     # bGS_gC has shape ((ATOM_V, REST_V), EPI_M, EPI_N)
                     bGS_sC, bGS_gC = self.epilog_gmem_copy_and_partition(
-                        tma_atom_c, tCgC, self.epi_tile, sC
+                        tma_atom_c, tCgC, epi_tile, sC
                     )
                     bGS_gC = cute.group_modes(bGS_gC, 1, cute.rank(bGS_gC))
                     if do_epi_load_barrier_wait:
@@ -1274,7 +1274,7 @@ class GemmSm100(GemmSm90):
             # Partition for epilogue
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = self.epilog_tmem_copy_and_partition(
-                epi_tidx, tCtAcc_base, self.epi_tile, use_2cta_instrs
+                epi_tidx, tCtAcc_base, epi_tile, use_2cta_instrs
             )
 
             tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
@@ -1328,9 +1328,7 @@ class GemmSm100(GemmSm90):
                 # (MMA, MMA_M, MMA_N)
                 tDgD = thr_mma.partition_C(gD_mnl)
                 # bSG_gD has shape ((ATOM_V, REST_V), EPI_M, EPI_N)
-                bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
-                    tma_atom_d, tDgD, self.epi_tile, sD
-                )
+                bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(tma_atom_d, tDgD, epi_tile, sD)
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
