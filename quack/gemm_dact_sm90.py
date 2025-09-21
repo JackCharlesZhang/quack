@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import const_expr
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 
 from quack.gemm_act_sm90 import GemmActSm90
 from quack.cute_dsl_utils import get_max_active_clusters
@@ -116,10 +115,6 @@ def gemm_dact_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    if gather_A:
-        A_idx_cute = from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    else:
-        A_idx_cute = None
     act_fn = dact_fn_map[activation]
     epi_args = GemmDActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
@@ -129,12 +124,13 @@ def gemm_dact_sm90(
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
+        None,  # cu_seqlens_k
+        A_idx,
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
         GemmDActSm90.num_epi_tensormaps,
         pingpong,
-        gather_A=gather_A,
     )
 
     current_stream = cutlass_torch.current_stream()
@@ -170,7 +166,6 @@ def gemm_dact_sm90(
             epi_args,
             scheduler_args,
             varlen_args,
-            A_idx_cute,
             current_stream,
         )
     cache[compile_key](
@@ -181,7 +176,6 @@ def gemm_dact_sm90(
         epi_args,
         scheduler_args,
         varlen_args,
-        A_idx_cute,
         current_stream,
     )
 

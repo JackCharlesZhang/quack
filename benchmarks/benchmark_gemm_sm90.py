@@ -424,7 +424,7 @@ def run(
     )
 
     epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
-    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor)
+    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor, mAIdx)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -436,13 +436,12 @@ def run(
         epi_args,
         scheduler_args,
         varlen_args,
-        mAIdx,
         current_stream,
     )
 
     if not skip_ref_check and not add_to_output and not (gather_A and varlen_k):
         # execution
-        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
+        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 
@@ -552,7 +551,7 @@ def run(
     time.sleep(0.5)
 
     def fn():
-        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
+        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 

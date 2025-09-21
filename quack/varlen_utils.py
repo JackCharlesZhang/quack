@@ -14,3 +14,4 @@ class VarlenArguments(ArgumentsBase):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mTensormaps: Optional[cute.Tensor] = None
+    mAIdx: Optional[cute.Tensor] = None

@@ -19,7 +19,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass.cute.runtime import make_ptr
 
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
@@ -372,7 +372,6 @@ class GemmSm90:
         epilogue_args: Optional[ArgumentsBase],
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
-        mAIdx: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
@@ -408,7 +407,10 @@ class GemmSm90:
             raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
         if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
-        assert (mAIdx is not None) == self.gather_A
+
+        if const_expr(varlen_args is None):
+            varlen_args = VarlenArguments()
+        assert (varlen_args.mAIdx is not None) == self.gather_A
 
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: tuple(
@@ -456,8 +458,6 @@ class GemmSm90:
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
 
-        if const_expr(varlen_args is None):
-            varlen_args = VarlenArguments()
         if const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
                 mD.shape[2]
@@ -485,7 +485,7 @@ class GemmSm90:
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
+                total_m=mD.shape[0] if mD is not None else varlen_args.mAIdx.shape[0],
                 cu_seqlens_m=varlen_args.mCuSeqlensM,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
@@ -545,10 +545,10 @@ class GemmSm90:
             tma_atom_c,
             tma_tensor_c,
             epilogue_params,
-            mAIdx,
             varlen_args.mCuSeqlensM,
             varlen_args.mCuSeqlensK,
             varlen_args.mTensormaps,
+            varlen_args.mAIdx,
             self.tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
@@ -580,10 +580,10 @@ class GemmSm90:
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
         epilogue_params: ParamsBase,
-        mAIdx: Optional[cute.Tensor],
         cu_seqlens_m: Optional[cute.Tensor],
         cu_seqlens_k: Optional[cute.Tensor],
         tensormaps: Optional[cute.Tensor],
+        mAIdx: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
@@ -2372,10 +2372,6 @@ def gemm_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    if gather_A:
-        A_idx_cute = from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    else:
-        A_idx_cute = None
 
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
@@ -2392,13 +2388,13 @@ def gemm_sm90(
     # Create varlen arguments if needed (assumes persistent=True when varlen)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
+        cu_seqlens_k,
+        A_idx,
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
         GemmSm90.num_epi_tensormaps,
         pingpong,
-        cu_seqlens_k=cu_seqlens_k,
-        gather_A=gather_A,
     )
 
     current_stream = cutlass_torch.current_stream()
@@ -2438,7 +2434,6 @@ def gemm_sm90(
             epi_args,
             scheduler_args,
             varlen_args,
-            A_idx_cute,
             current_stream,
         )
     cache[compile_key](
@@ -2449,7 +2444,6 @@ def gemm_sm90(
         epi_args,
         scheduler_args,
         varlen_args,
-        A_idx_cute,
         current_stream,
     )
 
