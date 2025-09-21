@@ -231,6 +231,7 @@ class GemmWrapperBase:
         num_epi_tensormaps: int = 0,
         pingpong: bool = False,
         cu_seqlens_k: Optional[Tensor] = None,
+        gather_A: bool = False,
     ) -> Optional[Any]:
         if cu_seqlens_m is None and cu_seqlens_k is None:
             return None
@@ -246,7 +247,7 @@ class GemmWrapperBase:
                 num_tensormaps += 1 if not pingpong else 2  # D tensormap
         else:
             # For varlen_k: need tensormaps for A & B
-            num_tensormaps = 2
+            num_tensormaps = 2 if not gather_A else 1
         # Create tensormap buffer (each tensormap is 128 bytes = 16 int64s)
         tensormap_size = 128 // 8  # 16 int64s
         if num_tensormaps > 0:

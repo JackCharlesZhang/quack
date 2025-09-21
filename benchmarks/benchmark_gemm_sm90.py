@@ -301,14 +301,23 @@ def run(
 
     a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
     if gather_A:
-        assert a_major == "k"
-        a_idx = torch.randperm(l * m, dtype=torch.int32, device="cuda")
+        assert varlen_m or varlen_k
         from einops import rearrange
 
-        a = rearrange(rearrange(a, "m k l -> (m l) k")[a_idx.cpu()], "(m l) k -> m k l", m=m)
-        a_torch = rearrange(a_torch, "m k l -> (m l) k")
-        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        a_idx_reshaped = rearrange(a_idx, "(m l) -> l m", m=m).contiguous().transpose(0, 1)
+        if varlen_m:
+            assert a_major == "k"
+            a_idx = torch.randperm(l * m, dtype=torch.int32, device="cuda")
+            a = rearrange(rearrange(a, "m k l -> (m l) k")[a_idx.cpu()], "(m l) k -> m k l", m=m)
+            a_torch = rearrange(a_torch, "m k l -> (m l) k")
+            mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            a_idx_reshaped = rearrange(a_idx, "(m l) -> l m", m=m).contiguous().transpose(0, 1)
+        else:
+            assert a_major == "m"
+            a_idx = torch.randperm(l * k, dtype=torch.int32, device="cuda")
+            a = rearrange(rearrange(a, "m k l -> (k l) m ")[a_idx.cpu()], "(k l) m -> m k l", k=k)
+            a_torch = rearrange(rearrange(a_torch, "m k l -> (k l) m").contiguous(), "kl m -> m kl")
+            mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+            a_idx_reshaped = rearrange(a_idx, "(k l) -> l k", k=k).contiguous().transpose(0, 1)
         mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
         mAIdx = None
@@ -342,18 +351,21 @@ def run(
 
     if varlen_k:
         from einops import rearrange
-        assert not gather_A
 
-        a, a_torch = [rearrange(t, "m k l -> m (l k)") for t in (a, a_torch)]
+        a, = [rearrange(t, "m k l -> m (l k)") for t in (a,)]
+        if not gather_A:
+            a_torch, = [rearrange(t, "m k l -> m (l k)") for t in (a_torch,)]
         b, b_torch = [rearrange(t, "n k l -> n (l k)") for t in (b, b_torch)]
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if a_major == "k" else 0)
         mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if b_major == "k" else 0)
         # TODO: generate random cu_seqlens_k
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
         mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if gather_A:
+            a_idx_reshaped = rearrange(a_idx_reshaped, "k l -> (k l)")
+            mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
         cu_seqlens_k, mCuSeqlensK = None, None
-
 
     if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
         if not persistent:
@@ -365,7 +377,7 @@ def run(
             total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
         else:
             total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
-        num_tensormaps = 2 if varlen_k else (1 if not pingpong else 2)
+        num_tensormaps = (2 if not gather_A else 2) if varlen_k else (1 if not pingpong else 2)
         # 128 bytes per tensormap
         tensormaps_torch = torch.empty(total_ctas, num_tensormaps, 128 // 8, dtype=torch.int64, device="cuda")
         tensormaps_tensor = from_dlpack(
@@ -428,7 +440,7 @@ def run(
         current_stream,
     )
 
-    if not skip_ref_check and not add_to_output:
+    if not skip_ref_check and not add_to_output and not (gather_A and varlen_k):
         # execution
         compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
         if tile_count_semaphore is not None and varlen_m:

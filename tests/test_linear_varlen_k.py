@@ -12,6 +12,38 @@ from quack.gemm_interface import (
 )
 
 
+def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
+    """Generate A matrix and optionally A_idx for gather_A case with varlen_k.
+
+    Args:
+        m: Number of rows
+        total_k: Number of columns needed
+        device: Device to create tensors on
+        dtype: Data type of tensors
+        gather_A: Whether to create gather indices
+
+    Returns:
+        A: Matrix of shape (m, larger_k) if gather_A else (m, total_k)
+        A_idx: Index tensor of shape (total_k,) if gather_A else None
+    """
+    if gather_A:
+        # Create random indices for gathering from a larger A matrix
+        larger_k = total_k * 2  # Make A larger than needed
+        A = torch.randn((m, larger_k), device=device, dtype=dtype)
+        # Make A m-major
+        A = A.T.contiguous().T
+        # Create random indices to gather from A
+        A_idx = torch.randperm(larger_k, device=device, dtype=torch.int32)[:total_k]
+    else:
+        A = torch.randn((m, total_k), device=device, dtype=dtype)
+        # Make A m-major
+        A = A.T.contiguous().T
+        A_idx = None
+    return A, A_idx
+
+
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [True])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 # @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
@@ -20,7 +52,7 @@ from quack.gemm_interface import (
 # @pytest.mark.parametrize("alpha", [1.0])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1024, 1504])
-@pytest.mark.parametrize("m", [2048, 1024])
+@pytest.mark.parametrize("m", [2048, 1064])
 # @pytest.mark.parametrize("n", [1024])
 # @pytest.mark.parametrize("m", [2048])
 @pytest.mark.parametrize("num_groups", [2, 4])
@@ -33,6 +65,7 @@ def test_gemm_varlen_k(
     alpha,
     alpha_is_tensor,
     dynamic_scheduler,
+    gather_A,
 ):
     device = "cuda"
     torch.random.manual_seed(42)
@@ -43,9 +76,7 @@ def test_gemm_varlen_k(
         [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
     )
     cu_seqlens_k = cu_seqlens_k.to(device)
-    A = torch.randn((m, total_k), device=device, dtype=input_dtype)
-    # Make A m-major
-    A = A.T.contiguous().T
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
     avg_k = total_k / num_groups
     B = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(avg_k)
     if alpha_is_tensor:
@@ -56,6 +87,7 @@ def test_gemm_varlen_k(
         B,
         alpha=alpha,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
@@ -65,11 +97,13 @@ def test_gemm_varlen_k(
         B.float(),
         alpha=alpha_val,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
     )
-    out_pt = gemm_ref(A, B, alpha=alpha_val, cu_seqlens_k=cu_seqlens_k)
+    out_pt = gemm_ref(A, B, alpha=alpha_val, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
+@pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("C_major", ["m", "n"])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
@@ -91,6 +125,7 @@ def test_gemm_add_varlen_k(
     beta_is_tensor,
     C_major,
     dynamic_scheduler,
+    gather_A,
 ):
     device = "cuda"
     torch.random.manual_seed(42)
@@ -101,7 +136,7 @@ def test_gemm_add_varlen_k(
         [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
     )
     cu_seqlens_k = cu_seqlens_k.to(device)
-    A = torch.randn((m, total_k), device=device, dtype=input_dtype)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
     # Make A m-major
     A = A.T.contiguous().T
     avg_k = total_k / num_groups
@@ -122,6 +157,7 @@ def test_gemm_add_varlen_k(
         alpha=alpha,
         beta=beta,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
@@ -133,11 +169,15 @@ def test_gemm_add_varlen_k(
         alpha=alpha_val,
         beta=beta_val,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
     )
-    out_pt = gemm_add_ref(A, B, C, alpha=alpha_val, beta=beta_val, cu_seqlens_k=cu_seqlens_k)
+    out_pt = gemm_add_ref(
+        A, B, C, alpha=alpha_val, beta=beta_val, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx
+    )
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
+@pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("beta_is_tensor", [False, True])
@@ -157,6 +197,7 @@ def test_gemm_add_inplace_varlen_k(
     alpha_is_tensor,
     beta_is_tensor,
     dynamic_scheduler,
+    gather_A,
 ):
     device = "cuda"
     torch.random.manual_seed(42)
@@ -167,7 +208,7 @@ def test_gemm_add_inplace_varlen_k(
         [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
     )
     cu_seqlens_k = cu_seqlens_k.to(device)
-    A = torch.randn((m, total_k), device=device, dtype=input_dtype)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
     # Make A m-major
     A = A.T.contiguous().T
     avg_k = total_k / num_groups
@@ -186,6 +227,7 @@ def test_gemm_add_inplace_varlen_k(
         alpha=alpha,
         beta=beta,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
@@ -199,9 +241,17 @@ def test_gemm_add_inplace_varlen_k(
         alpha=alpha_val,
         beta=beta_val,
         cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
     )
     out_pt = gemm_add_ref(
-        A, B, out_og, out=None, alpha=alpha_val, beta=beta_val, cu_seqlens_k=cu_seqlens_k
+        A,
+        B,
+        out_og,
+        out=None,
+        alpha=alpha_val,
+        beta=beta_val,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
     )
     assert out.shape == (num_groups, m, n), (
         f"Output shape mismatch: {out.shape} vs expected ({num_groups}, {m}, {n})"

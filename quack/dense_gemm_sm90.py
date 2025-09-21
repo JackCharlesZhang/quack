@@ -818,15 +818,22 @@ class GemmSm90:
                             (tile_coord_mnkl[0], None),
                         )
                     else:
-                        mA_mk = mA_mkl
                         if const_expr(varlen_m):
                             mAIdx_mk = cute.domain_offset((cu_seqlens_m[batch_idx],), mAIdx)
                             gAIdx = cute.local_tile(
                                 mAIdx_mk, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
                             )
+                            # (M, K)
+                            mA_mk = mA_mkl
                         else:
                             assert varlen_k
-                            gAIdx = cute.domain_offset((cu_seqlens_k[batch_idx],), mAIdx)
+                            mAIdx_mk = cute.domain_offset((cu_seqlens_k[batch_idx],), mAIdx)
+                            # (tile_K, RestK)
+                            gAIdx = cute.flat_divide(mAIdx_mk, (self.tile_shape_mnk[2],))
+                            # (tile_M, K)
+                            mA_mk = cute.local_tile(
+                                mA_mkl, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
+                            )
                     if const_expr(varlen_k):
                         mB_nk = cute.domain_offset((0, cu_seqlens_k[batch_idx]), mB_nkl)
                     else:
@@ -883,8 +890,11 @@ class GemmSm90:
                         thr_copy_A = tiled_copy_A.get_slice(tidx)
                         # (atom_v, CPY_M, 1, STAGE)
                         tAsA = thr_copy_A.partition_D(sA)
-                        assert tAsA.shape[2] == 1
-                        tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+                        if const_expr(varlen_m):  # k-major
+                            assert tAsA.shape[2] == 1
+                            tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+                        else:  # varlen_k, m-major
+                            tAsA = cute.group_modes(tAsA, 0, 3)
                         copy_A = partial(cute.copy, tiled_copy_A)
                     # TMA load B partition_S/D
                     b_cta_layout = cute.make_layout(
@@ -905,7 +915,7 @@ class GemmSm90:
                     k_len = (
                         cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
                         if const_expr(varlen_k)
-                        else mA_mkl.shape[1]
+                        else Int32(mA_mkl.shape[1])
                     )
                     k_tile_cnt = cute.ceil_div(k_len, self.tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
@@ -922,7 +932,7 @@ class GemmSm90:
                         )
                     else:
                         limit_m = (
-                            mAIdx.shape[0]
+                            Int32(mA_mkl.shape[0])
                             if const_expr(cu_seqlens_m is None)
                             else cu_seqlens_m[batch_idx + 1] - cu_seqlens_m[batch_idx]
                         )
@@ -941,6 +951,7 @@ class GemmSm90:
                                 limit_m - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
                                 k_len,
                             ),
+                            varlen_m=varlen_m,
                         )
                     tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
@@ -1278,22 +1289,22 @@ class GemmSm90:
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_producer_state: cutlass.pipeline.PipelineState,
         thr_copy_A: cute.core.ThrCopy,
-        mA: cute.Tensor,
+        mA: cute.Tensor,  # (M, K) if varlen_m, (tile_M, K) if varlen_k
         tAsA: cute.Tensor,
-        gAIdx: cute.Tensor,  # (tile_M,) if varlen_m, (K,) if varlen_k
+        gAIdx: cute.Tensor,  # (tile_M,) if varlen_m, (tile_K, RestK) if varlen_k
         copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
         k_tile_cnt: Int32,
         limit_A: Tuple[Int32, Int32],
-        varlen_m: bool = True,
+        varlen_m: bool,
     ) -> cutlass.pipeline.PipelineState:
-        # (atom_v, CPY_M, 1, RestK)
         limit_m, limit_k = limit_A
         # Do we need to check if we overshoot tile_M when we load A?
         is_even_m_smem = self.tile_shape_mnk[0] % thr_copy_A.tiler_mn[0].shape == 0
         if const_expr(not is_even_m_smem):
             limit_m = min(limit_m, self.tile_shape_mnk[0])
+        elems_per_load = cute.size(tAsA.shape[0][0])
         cA = cute.make_identity_tensor(cute.select(self.tile_shape_mnk, [0, 2]))
         tAcA = thr_copy_A.partition_S(cA)
         t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
@@ -1301,19 +1312,32 @@ class GemmSm90:
         # since we know that tAcA[m][0] = t0AcA[m][0] + tAcA[0][0].
         # This is so that when we do the comparison, t0AcA is known at compile time.
         limit_m = limit_m - tAcA[0][0]
+        limit_k = limit_k - tAcA[0][1]
         # Read indices for A
+        rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+        cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
+        tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+        for m in cutlass.range_constexpr(rows_per_thread):
+            tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
+        m_idx, k_idx, tAmA = None, None, None
         if const_expr(varlen_m):
-            rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
             m_idx = cute.make_fragment(rows_per_thread, Int32)
             for m in cutlass.range(rows_per_thread):
                 row_idx = tAcA[0, m, 0][0]
-                if t0AcA[0, m, 0][0] < limit_m:
+                if tApA_m[m]:
                     m_idx[m] = gAIdx[row_idx]
                 else:
                     m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
         else:
-            m_idx = None
-        elems_per_load = cute.size(tAsA.shape[0][0])
+            k_idx = cute.make_fragment(cols_per_thread, Int32)  # Will be read later
+            threads_per_col = const_expr(thr_copy_A.tiler_mn[0].shape // elems_per_load)
+            # This is very convoluted but idk a better way
+            # for tile_M=128, flat_divide gives (8, 16, K),
+            # then logical_divide gives ((8, 1), (8, 2), K).
+            tidx = thr_copy_A.thr_idx
+            tAmA = cute.logical_divide(
+                cute.flat_divide(mA, (elems_per_load,)), (elems_per_load, threads_per_col)
+            )[None, (tidx % threads_per_col, None), None]  # ((8, 1), 2, K)
         # (m, (bK, RestK))
         mA_k = cute.logical_divide(mA, (None, self.tile_shape_mnk[2]))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1328,34 +1352,52 @@ class GemmSm90:
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
+            # A tiny bit faster to rotate the warp that does TMA
+            # However, for varlen_k, we must use the warp_idx == self.ab_load_warp_id
+            # since that's the warp that does the tensormap update.
+            tma_warp_id = self.ab_load_warp_id + (
+                (k_tile % self.num_ab_load_warps) if const_expr(varlen_m) else 0
+            )
             ab_pipeline.producer_acquire(
                 ab_producer_state,
                 peek_ab_empty_status,
-                # A tiny bit faster to rotate the warp that does TMA
-                is_tma_warp=warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps),
+                is_tma_warp=warp_idx == tma_warp_id,
             )
             # A bit faster to load B first while we calculate the predicate for A
-            if warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps):
+            if warp_idx == tma_warp_id:
                 copy_B(
                     tBgB[None, k_tile],
                     tBsB[None, ab_producer_state.index],
                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                 )
             # (m, bK)
-            mA_cur = mA_k[None, (None, k_tile)]
-            for m in cutlass.range_constexpr(tAcA.shape[1]):
-                # cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,)) would give shape
-                # ((elems_per_load), thread_per_row)
-                # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
-                # So we append 1s to the last dimension and then do tiled_divide, then slice.
-                mA_row = cute.tiled_divide(
-                    cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
-                )[None, None, 0]
-                if const_expr(is_even_m_smem) or t0AcA[0, m, 0][0] < limit_m:
-                    # There's only 1 load per row
-                    assert cute.size(tAcA.shape, mode=[2]) == 1
-                    ki = tAcA[0, 0, 0][1] // elems_per_load
-                    copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index])
+            if const_expr(varlen_m):
+                mA_cur = mA_k[None, (None, k_tile)]
+                for m in cutlass.range_constexpr(tAcA.shape[1]):
+                    # cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,)) would give shape
+                    # ((elems_per_load), thread_per_row)
+                    # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
+                    # So we append 1s to the last dimension and then do tiled_divide, then slice.
+                    mA_row = cute.tiled_divide(
+                        cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+                    )[None, None, 0]
+                    if const_expr(is_even_m_smem) or tApA_m[m]:
+                        # There's only 1 load per row
+                        assert cute.size(tAcA.shape, mode=[2]) == 1
+                        ki = tAcA[0, 0, 0][1] // elems_per_load
+                        copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index])
+            else:
+                gAIdx_cur = gAIdx[None, k_tile]
+                for k in cutlass.range(cols_per_thread):
+                    col_idx = tAcA[0, 0, k][1]
+                    k_idx[k] = gAIdx_cur[col_idx]
+                for k in cutlass.range_constexpr(tAcA.shape[2]):
+                    # copy_A(tAmA[None, None, k_idx[k]], tAsA[(None, None, k), ab_producer_state.index], pred=cute.prepend_ones(tApA_m, up_to_rank=2))
+                    for m in cutlass.range_constexpr(tAcA.shape[1]):
+                        if tApA_m[m]:
+                            copy_A(
+                                tAmA[None, m, k_idx[k]], tAsA[(None, m, k), ab_producer_state.index]
+                            )
             # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1365,32 +1407,55 @@ class GemmSm90:
         # bound checking in the K dimension on the last k_tile
         if 0 < k_tile_cnt:
             k_tile = k_tile_cnt - 1
+            tma_warp_id = self.ab_load_warp_id + (
+                (k_tile % self.num_ab_load_warps) if const_expr(varlen_m) else 0
+            )
             ab_pipeline.producer_acquire(
                 ab_producer_state,
                 peek_ab_empty_status,
-                is_tma_warp=warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps),
+                is_tma_warp=warp_idx == tma_warp_id,
             )
-            if warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps):
+            if warp_idx == tma_warp_id:
                 copy_B(
                     tBgB[None, k_tile],
                     tBsB[None, ab_producer_state.index],
                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                 )
-            assert tAcA.shape[2] == 1  # there's only 1 load along the K dimension
-            tApA = cute.make_fragment(1, Boolean)
-            tApA[0] = tAcA[0, 0, 0][1] < limit_k
-            # (m, bK)
-            mA_cur = mA_k[None, (None, k_tile)]
-            for m in cutlass.range_constexpr(tAcA.shape[1]):
-                # ((elems_per_load, 1), thread_per_row)
-                mA_row = cute.tiled_divide(
-                    cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
-                )[None, None, 0]
-                if const_expr(is_even_m_smem) or t0AcA[0, m, 0][0] < limit_m:
-                    # There's only 1 load per row
-                    assert cute.size(tAcA.shape, mode=[2]) == 1
-                    ki = tAcA[0, 0, 0][1] // elems_per_load
-                    copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index], pred=tApA)
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            for k in cutlass.range_constexpr(cols_per_thread):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k
+            if const_expr(varlen_m):
+                # (m, bK)
+                mA_cur = mA_k[None, (None, k_tile)]
+                for m in cutlass.range_constexpr(tAcA.shape[1]):
+                    # ((elems_per_load, 1), thread_per_row)
+                    mA_row = cute.tiled_divide(
+                        cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+                    )[None, None, 0]
+                    if const_expr(is_even_m_smem) or tApA_m[k]:
+                        # There's only 1 load per row
+                        assert cute.size(tAcA.shape, mode=[2]) == 1
+                        ki = tAcA[0, 0, 0][1] // elems_per_load
+                        copy_A(
+                            mA_row[None, ki], tAsA[(None, m), ab_producer_state.index], pred=tApA_k
+                        )
+            else:
+                tApA_k = cute.prepend_ones(tApA_k, up_to_rank=2)  # (1, cols_per_thread)
+                gAIdx_cur = gAIdx[None, k_tile]
+                for k in cutlass.range(cols_per_thread):
+                    col_idx = tAcA[0, 0, k][1]
+                    if tApA_k[0, k]:
+                        k_idx[k] = gAIdx_cur[col_idx]
+                    else:
+                        k_idx[k] = -1
+                for k in cutlass.range_constexpr(tAcA.shape[2]):
+                    for m in cutlass.range_constexpr(tAcA.shape[1]):
+                        if tApA_m[m]:
+                            copy_A(
+                                tAmA[None, m, k_idx[k]],
+                                tAsA[(None, m, k), ab_producer_state.index],
+                                pred=tApA_k[None, k],
+                            )
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
         return ab_producer_state
@@ -2146,13 +2211,18 @@ class GemmSm90:
             num_bits_per_copy=copy_bits,
         )
         copy_elems = copy_bits // dtype.width
+        loads_per_cache_line = 128 * 8 // copy_bits  # 128 bytes per cache line
         shape_dim_1 = cute.size(self.tile_shape_mnk[2]) // copy_elems
+        if shape_dim_1 > loads_per_cache_line:
+            shape_dim_1 = math.gcd(shape_dim_1, loads_per_cache_line)
         # thread layout for copy
         thread_layout = cute.make_layout(
             (num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
         )
         if major_mode != LayoutEnum.ROW_MAJOR:
             shape_dim_0 = cute.size(self.tile_shape_mnk[0]) // copy_elems
+            if shape_dim_0 > loads_per_cache_line:
+                shape_dim_0 = math.gcd(shape_dim_0, loads_per_cache_line)
             thread_layout = cute.make_layout(
                 (shape_dim_0, num_threads // shape_dim_0), stride=(1, shape_dim_0)
             )
@@ -2328,6 +2398,7 @@ def gemm_sm90(
         GemmSm90.num_epi_tensormaps,
         pingpong,
         cu_seqlens_k=cu_seqlens_k,
+        gather_A=gather_A,
     )
 
     current_stream = cutlass_torch.current_stream()

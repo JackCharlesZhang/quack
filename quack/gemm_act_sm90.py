@@ -359,6 +359,7 @@ def gemm_act_sm90(
         tensor_infos,
         GemmActSm90.num_epi_tensormaps,
         pingpong,
+        gather_A=gather_A,
     )
 
     current_stream = cutlass_torch.current_stream()
