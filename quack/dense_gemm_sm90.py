@@ -1350,6 +1350,11 @@ class GemmSm90:
         # /////////////////////////////////////////////////////////////////////////
         copy_A = partial(cute.copy, thr_copy_A)
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
+            if const_expr(not varlen_m):  # Prefetch mAIdx early, even before smem is free
+                gAIdx_cur = gAIdx[None, k_tile]
+                for k in cutlass.range(cols_per_thread):
+                    col_idx = tAcA[0, 0, k][1]
+                    k_idx[k] = gAIdx_cur[col_idx]
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
             # A tiny bit faster to rotate the warp that does TMA
@@ -1387,10 +1392,6 @@ class GemmSm90:
                         ki = tAcA[0, 0, 0][1] // elems_per_load
                         copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index])
             else:
-                gAIdx_cur = gAIdx[None, k_tile]
-                for k in cutlass.range(cols_per_thread):
-                    col_idx = tAcA[0, 0, k][1]
-                    k_idx[k] = gAIdx_cur[col_idx]
                 for k in cutlass.range_constexpr(tAcA.shape[2]):
                     # copy_A(tAmA[None, None, k_idx[k]], tAsA[(None, None, k), ab_producer_state.index], pred=cute.prepend_ones(tApA_m, up_to_rank=2))
                     for m in cutlass.range_constexpr(tAcA.shape[1]):
@@ -1407,6 +1408,19 @@ class GemmSm90:
         # bound checking in the K dimension on the last k_tile
         if 0 < k_tile_cnt:
             k_tile = k_tile_cnt - 1
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            # if const_expr(not varlen_m):  # If varlen, limit_k is already adjusted
+            limit_k -= k_tile * self.tile_shape_mnk[2]
+            for k in cutlass.range_constexpr(cols_per_thread):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k
+            if const_expr(not varlen_m):
+                gAIdx_cur = gAIdx[None, k_tile]
+                for k in cutlass.range(cols_per_thread):
+                    col_idx = tAcA[0, 0, k][1]
+                    if tApA_k[k]:
+                        k_idx[k] = gAIdx_cur[col_idx]
+                    else:
+                        k_idx[k] = -1
             tma_warp_id = self.ab_load_warp_id + (
                 (k_tile % self.num_ab_load_warps) if const_expr(varlen_m) else 0
             )
@@ -1421,9 +1435,6 @@ class GemmSm90:
                     tBsB[None, ab_producer_state.index],
                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                 )
-            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
-            for k in cutlass.range_constexpr(cols_per_thread):
-                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k
             if const_expr(varlen_m):
                 # (m, bK)
                 mA_cur = mA_k[None, (None, k_tile)]
@@ -1441,13 +1452,6 @@ class GemmSm90:
                         )
             else:
                 tApA_k = cute.prepend_ones(tApA_k, up_to_rank=2)  # (1, cols_per_thread)
-                gAIdx_cur = gAIdx[None, k_tile]
-                for k in cutlass.range(cols_per_thread):
-                    col_idx = tAcA[0, 0, k][1]
-                    if tApA_k[0, k]:
-                        k_idx[k] = gAIdx_cur[col_idx]
-                    else:
-                        k_idx[k] = -1
                 for k in cutlass.range_constexpr(tAcA.shape[2]):
                     for m in cutlass.range_constexpr(tAcA.shape[1]):
                         if tApA_m[m]:

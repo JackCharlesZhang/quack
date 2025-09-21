@@ -64,7 +64,7 @@ def gemm_tuned(
     if gather_A:
         assert varlen, "gather_A requires either varlen_m or varlen_k"
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
-    if varlen:
+    if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
     if A.ndim == 2 and not varlen:
         A = A.unsqueeze(0)  # (1, M, K)
