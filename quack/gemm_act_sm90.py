@@ -43,7 +43,7 @@ class GemmActSm90(GemmSm90):
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
 
-        self.tile_shape_postact_mn = self.tile_shape_mnk[:2]
+        self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         self.epi_tile_postact = self.epi_tile
         postact_major_mode_size = (
             self.epi_tile_postact[1]
@@ -97,7 +97,7 @@ class GemmActSm90(GemmSm90):
     @staticmethod
     def epi_smem_bytes_per_stage(
         args: EpilogueArguments,
-        tile_shape_mnk: Tuple[int, int, int],
+        cta_tile_shape_mnk: Tuple[int, int, int],
         epi_tile: Tuple[int, int],
     ) -> int:
         postact_dtype = args.mPostAct.element_type
@@ -130,6 +130,7 @@ class GemmActSm90(GemmSm90):
         epi_smem_tensors: Tuple[cute.Tensor, ...],
         tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
         tiled_mma: cute.TiledMma,
@@ -168,7 +169,7 @@ class GemmActSm90(GemmSm90):
         bSG_sPostAct, bSG_gPostAct = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
             mPostAct_mnl,
-            self.tile_shape_postact_mn,
+            self.cta_tile_shape_postact_mn,
             self.epi_tile_postact,
             sPostAct,
             tile_coord_mnkl,
@@ -178,7 +179,7 @@ class GemmActSm90(GemmSm90):
 
         # We iterate over epi tiles in the N dimension first before the M dimension
         epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.tile_shape_mnk[:2]), self.epi_tile
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
         ).shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
         epi_tile_num = cute.size(epi_tile_shape)
@@ -237,8 +238,8 @@ class GemmActSm90(GemmSm90):
                     bSG_gPostAct[None, gmem_coord],
                     tma_desc_ptr=tma_desc_postact_ptr,
                 )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(self.epi_stage - 1, read=True)
+                epi_store_pipeline.producer_commit()
+                epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
 
         return epi_read_state, epi_producer_state
