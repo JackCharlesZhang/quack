@@ -272,7 +272,7 @@ class GemmSm90:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-    def _setup_attributes(self, epilogue_args: Optional[EpilogueArguments]):
+    def _setup_attributes(self, epilogue_args: EpilogueArguments):
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -884,14 +884,11 @@ class GemmSm90:
                             varlen_m=varlen_m,
                         )
                     tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
-                    tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 if const_expr(self.pingpong and not varlen_k):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
-                    # tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
-                    tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                 ab_pipeline.producer_tail(ab_producer_state)
                 if is_scheduler_warp:
@@ -2017,10 +2014,10 @@ class GemmSm90:
         b_dtype: Type[cutlass.Numeric],
         d_dtype: Optional[Type[cutlass.Numeric]],
         c_dtype: Optional[Type[cutlass.Numeric]],
-        epilogue_args: Optional[EpilogueArguments],
+        epilogue_args: EpilogueArguments,
         smem_capacity: int,
         occupancy: int,
-        overlap_sD_sA: bool,
+        overlap_sD_sA: bool = False,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 

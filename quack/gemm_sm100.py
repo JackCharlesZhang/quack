@@ -1034,7 +1034,6 @@ class GemmSm100(GemmSm90):
                         do_epi_load_barrier_arrive = Boolean(False)
                 # Advance to next tile
                 tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
-                tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
             # Wait A/B buffer empty
@@ -1128,7 +1127,6 @@ class GemmSm100(GemmSm90):
                     cute.slice_(sfa_smem_layout, (None, None, None, 0)),
                 )
                 tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
-
                 # Make SFB tmem tensor
                 sfb_tmem_ptr = cute.recast_ptr(
                     acc_tmem_ptr
