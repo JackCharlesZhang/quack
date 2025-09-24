@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Type, Union
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.runtime import from_dlpack
@@ -22,6 +22,59 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
     )
 
 
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem."""
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+@dsl_user_op
+def get_copy_atom(
+    dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
+) -> cute.CopyAtom:
+    num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
+    copy_op = cute.nvgpu.cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    return cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+
+
+@dsl_user_op
+def copy(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    *,
+    pred: Optional[cute.Tensor] = None,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
+    loc=None,
+    ip=None,
+    **kwargs,
+) -> None:
+    copy_atom = get_copy_atom(src.element_type, num_copy_elems, is_async)
+    cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+def tiled_copy_2d(
+    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = True
+) -> cute.TiledCopy:
+    num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
+    copy_elems = num_copy_bits // dtype.width
+    copy_op = cute.nvgpu.cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    gmem_threads_per_row = major_mode_size // copy_elems
+    assert num_threads % gmem_threads_per_row == 0
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
@@ -29,7 +82,7 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 @cute.jit
 def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
-    if cutlass.const_expr(isinstance(x, cute.Pointer)):
+    if const_expr(isinstance(x, cute.Pointer)):
         return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
     else:
         assert isinstance(x, Float32)
@@ -71,7 +124,7 @@ def store_shared_remote(
     remote_mbar_ptr_i32 = set_block_rank(
         mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
     ).ir_value()
-    if cutlass.const_expr(isinstance(val, float)):
+    if const_expr(isinstance(val, float)):
         val = Float32(val)
     assert isinstance(val, (Float32, Int32, cutlass.Int64)), "val must be Float32, Int32, or Int64"
     suffix = {Float32: "f32", Int32: "s32", cutlass.Int64: "s64"}[type(val)]
@@ -196,7 +249,7 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
     tXrX_fill.fill(fill_value)
     for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
         for rest_k in cutlass.range_constexpr(tXsX.shape[2]):
-            if cutlass.const_expr(tXpX is not None):
+            if const_expr(tXpX is not None):
                 if not tXpX[rest_v, 0, rest_k]:
                     cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
             else:
@@ -232,9 +285,9 @@ def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(
-        flat_stride
-    ), "Coordinate and stride must have the same length"
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
@@ -265,7 +318,7 @@ def coord_offset_i64(
 
 @cute.jit
 def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
-    if cutlass.const_expr(lane is None):
+    if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
         offset = 1 << i

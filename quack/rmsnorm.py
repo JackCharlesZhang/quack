@@ -207,8 +207,10 @@ class RMSNorm(ReductionBase):
             for mT in (mX, mRes, mO, mResO)
         ]
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
-        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y)) if const_expr(mW is not None) else None
-        gB = cute.local_tile(mB, tiler_mn, (0, cluster_y)) if const_expr(mB is not None) else None
+        gW, gB = [
+            cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None
+            for mT in (mW, mB)
+        ]
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
             if const_expr(mRstd is not None)
@@ -217,44 +219,9 @@ class RMSNorm(ReductionBase):
 
         # declare the atoms which will be used later for memory copy
         num_copy_elems_X = tv_layout.shape[1][0]
-        num_copy_bits_X = mX.element_type.width * num_copy_elems_X
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=num_copy_bits_X
+        copy_atom_load_X_async = utils.get_copy_atom(
+            mX.element_type, num_copy_elems_X, is_async=True
         )
-        copy_atom_load_X_async = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        copy_atom_load_W = None
-        if const_expr(mW is not None):
-            num_copy_bits_W = const_expr(min(128, num_copy_elems_X * mW.element_type.width))
-            copy_atom_load_W = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_copy_bits_W
-            )
-        copy_atom_load_B = None
-        if const_expr(mB is not None):
-            num_copy_bits_B = const_expr(min(128, num_copy_elems_X * mB.element_type.width))
-            copy_atom_load_B = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=num_copy_bits_B
-            )
-        if const_expr(mRes is not None):
-            num_copy_bits_Res = const_expr(min(128, num_copy_elems_X * mRes.element_type.width))
-            copy_atom_load_Res_async = cute.make_copy_atom(
-                cute.nvgpu.cpasync.CopyG2SOp(),
-                mRes.element_type,
-                num_bits_per_copy=num_copy_bits_Res,
-            )
-        num_copy_bits_O = const_expr(min(128, num_copy_elems_X * mO.element_type.width))
-        copy_atom_store_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=num_copy_bits_O
-        )
-        if const_expr(mResO is not None):
-            num_copy_bits_ResO = const_expr(min(128, num_copy_elems_X * mResO.element_type.width))
-            copy_atom_store_ResO = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mResO.element_type,
-                num_bits_per_copy=num_copy_bits_ResO,
-            )
-
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(
             tidx
         )
@@ -288,18 +255,21 @@ class RMSNorm(ReductionBase):
         tXpX = (
             utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
+        # Each copy will use the same number of elements as X and same predicate
+        copy = partial(utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
+
         row = tXcX[0][0]
         if row < shape[0]:
-            cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
+            copy(tXgX, tXsX, is_async=True)
             if const_expr(mRes is not None):
-                cute.copy(copy_atom_load_Res_async, tXgRes, tXsRes, pred=tXpX)
+                copy(tXgRes, tXsRes, is_async=True)
         cute.arch.cp_async_commit_group()
 
         if const_expr(not delay_w_load):
             if const_expr(mW is not None):
-                cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
+                copy(tXgW, tXrW)
             if const_expr(mB is not None):
-                cute.copy(copy_atom_load_B, tXgB, tXrB, pred=tXpX)
+                copy(tXgB, tXrB)
 
         cute.arch.cp_async_wait_group(0)
         cute.autovec_copy(tXsX, tXrX)
@@ -311,7 +281,7 @@ class RMSNorm(ReductionBase):
             tXrResO = cute.make_fragment_like(tXgResO)
             tXrResO.store(x.to(tXrResO.element_type))
             if row < shape[0]:
-                cute.copy(copy_atom_store_ResO, tXrResO, tXgResO, pred=tXpX)
+                copy(tXrResO, tXgResO)
 
         threads_per_row = tv_layout.shape[0][0]
         sum_sq_x = row_reduce(
@@ -334,14 +304,14 @@ class RMSNorm(ReductionBase):
                 tXrRstd[0] = rstd
         if const_expr(delay_w_load):
             if const_expr(mW is not None):
-                cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
+                copy(tXgW, tXrW)
             if const_expr(mB is not None):
-                cute.copy(copy_atom_load_B, tXgB, tXrB, pred=tXpX)
+                copy(tXgB, tXrB)
         if const_expr(reload_from == "smem" or reload_from == "gmem"):
             if const_expr(reload_from == "smem"):
                 cute.autovec_copy(tXsX, tXrX)
             else:
-                cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
+                copy(tXgX, tXrX)
             x = tXrX.load().to(cute.Float32)
             if const_expr(mRes is not None):
                 cute.autovec_copy(tXsRes, tXrRes)
@@ -354,7 +324,7 @@ class RMSNorm(ReductionBase):
             y += tXrB.load().to(cute.Float32)
         tXrO.store(y.to(tXrO.element_type))
         if row < shape[0]:
-            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
+            copy(tXrO, tXgO)
 
 
 @torch.library.custom_op(
@@ -673,50 +643,10 @@ class RMSNormBackward(ReductionBase):
             mbar_full_ptr, mbar_empty_ptr = None, None
 
         num_copy_elems_X = tv_layout.shape[1][0]
-        num_copy_bits_X = mX.element_type.width * num_copy_elems_X
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        copy_atom_load_X_async = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        num_copy_bits_dO = const_expr(min(128, num_copy_elems_X * mdO.element_type.width))
-        copy_atom_load_dO_async = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), mdO.element_type, num_bits_per_copy=num_copy_bits_dO
-        )
-        num_copy_bits_W = const_expr(min(128, num_copy_elems_X * mW.element_type.width))
-        copy_atom_load_W = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_copy_bits_W
-        )
-        if const_expr(mdResO is not None):
-            num_copy_bits_dResO = const_expr(min(128, num_copy_elems_X * mdResO.element_type.width))
-            copy_atom_load_dResO = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mdResO.element_type,
-                num_bits_per_copy=num_copy_bits_dResO,
-            )
-        num_copy_bits_dX = const_expr(min(128, num_copy_elems_X * mdX.element_type.width))
-        copy_atom_store_dX = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=num_copy_bits_dX
-        )
-        num_copy_bits_dW = const_expr(min(128, num_copy_elems_X * mdW.element_type.width))
-        copy_atom_store_dW = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mdW.element_type, num_bits_per_copy=num_copy_bits_dW
-        )
-        if const_expr(mdB is not None):
-            num_copy_bits_dB = const_expr(min(128, num_copy_elems_X * mdB.element_type.width))
-            copy_atom_store_dB = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mdB.element_type, num_bits_per_copy=num_copy_bits_dB
-            )
-        if const_expr(mdRes is not None):
-            num_copy_bits_dRes = const_expr(min(128, num_copy_elems_X * mdRes.element_type.width))
-            copy_atom_load_dRes = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mdRes.element_type,
-                num_bits_per_copy=num_copy_bits_dRes,
-            )
-
+        copy_atom_load_X = utils.get_copy_atom(mX.element_type, num_copy_elems_X, is_async=False)
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        # Each copy will use the same number of elements as X
+        copy = partial(utils.copy, num_copy_elems=num_copy_elems_X)
 
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         tXgW = thr_copy_X.partition_S(gW)
@@ -731,7 +661,7 @@ class RMSNormBackward(ReductionBase):
             if not is_even_N
             else None
         )
-        cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
+        copy(tXgW, tXrW, pred=tXpW)
         weight = tXrW.load().to(cute.Float32)
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -796,16 +726,13 @@ class RMSNormBackward(ReductionBase):
         if const_expr(mdRes is not None):
             tXrdRes = cute.make_fragment_like(tXgdRes[None, None, None, 0])
 
-        copy_X = partial(cute.copy, copy_atom_load_X_async, pred=tXpX)
-        copy_dO = partial(cute.copy, copy_atom_load_dO_async, pred=tXpX)
-
         # Prefetch the first batch
         row = tXcX[None, None, None, bidx_start][0][0]
         if row < M:
             tXgX_cur = utils.coord_offset_i64(bidx_start, tXgX, dim=3)[None, None, None, 0]
             tXgdO_cur = utils.coord_offset_i64(bidx_start, tXgdO, dim=3)[None, None, None, 0]
-            copy_X(tXgX_cur, tXsX[None, None, None, 0])
-            copy_dO(tXgdO_cur, tXsdO[None, None, None, 0])
+            copy(tXgX_cur, tXsX[None, None, None, 0], pred=tXpX, is_async=True)
+            copy(tXgdO_cur, tXsdO[None, None, None, 0], pred=tXpX, is_async=True)
         elif tiler_mn[0] > 1:
             # Fill with zero, otherwise smem will be uninitialized, and we could read this back
             # later into registers, causing wrong dW.
@@ -828,8 +755,8 @@ class RMSNormBackward(ReductionBase):
             if row + gdim * tiler_mn[0] < M:  # Prefetch the next batch
                 tXgX_cur = utils.coord_offset_i64(bidx + gdim, tXgX, dim=3)[None, None, None, 0]
                 tXgdO_cur = utils.coord_offset_i64(bidx + gdim, tXgdO, dim=3)[None, None, None, 0]
-                copy_X(tXgX_cur, tXsX[None, None, None, stage ^ 1])
-                copy_dO(tXgdO_cur, tXsdO[None, None, None, stage ^ 1])
+                copy(tXgX_cur, tXsX[None, None, None, stage ^ 1], pred=tXpX, is_async=True)
+                copy(tXgdO_cur, tXsdO[None, None, None, stage ^ 1], pred=tXpX, is_async=True)
             elif tiler_mn[0] > 1:
                 utils.fill_oob(
                     tXsX[None, None, None, stage ^ 1],
@@ -848,7 +775,7 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdResO is not None):
                 tXgdResO_cur = utils.coord_offset_i64(bidx, tXgdResO, dim=3)[None, None, None, 0]
                 if row < M or tiler_mn[0] == 1:
-                    cute.copy(copy_atom_load_dResO, tXgdResO_cur, tXrdResO, pred=tXpX)
+                    copy(tXgdResO_cur, tXrdResO, pred=tXpX)
                 elif tiler_mn[0] > 1:
                     tXrdResO.fill(0.0)
             cute.arch.cp_async_wait_group(1)
@@ -896,12 +823,12 @@ class RMSNormBackward(ReductionBase):
             tXrdX.store(dx.to(tXrdX.element_type))
             if row < M or tiler_mn[0] == 1:
                 tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
-                cute.copy(copy_atom_store_dX, tXrdX, tXgdX_cur, pred=tXpX)
+                copy(tXrdX, tXgdX_cur, pred=tXpX)
             if const_expr(mdRes is not None):
                 tXrdRes.store(dx.to(tXrdRes.element_type))
                 tXgdRes_cur = utils.coord_offset_i64(bidx, tXgdRes, dim=3)[None, None, None, 0]
                 if row < M or tiler_mn[0] == 1:
-                    cute.copy(copy_atom_load_dRes, tXrdRes, tXgdRes_cur, pred=tXpX)
+                    copy(tXrdRes, tXgdRes_cur, pred=tXpX)
             # Accumulate weight gradients in fp32
             tXrdW.store(tXrdW.load() + dout * x_hat)
             if const_expr(mdB is not None):
@@ -933,7 +860,7 @@ class RMSNormBackward(ReductionBase):
                     tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
                     cute.autovec_copy(tXsdW_other, tXrdW_other)
                     tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                cute.copy(copy_atom_store_dW, tXrdW, tXgdW, pred=tXpdW)
+                copy(tXrdW, tXgdW, pred=tXpdW)
             cute.arch.barrier()
             if const_expr(mdB is not None):
                 sdB = cute.make_tensor(
@@ -954,12 +881,12 @@ class RMSNormBackward(ReductionBase):
                         )
                         cute.autovec_copy(tXsdB_other, tXrdB_other)
                         tXrdB.store(tXrdB.load() + tXrdB_other.load())
-                    cute.copy(copy_atom_store_dB, tXrdB, tXgdB, pred=tXpdB)
+                    copy(tXrdB, tXgdB, pred=tXpdB)
         else:
             # dw is already in fp32, so we can directly copy to global memory
-            cute.copy(copy_atom_store_dW, tXrdW, tXgdW, pred=tXpdW)
+            copy(tXrdW, tXgdW, pred=tXpdW)
             if const_expr(mdB is not None):
-                cute.copy(copy_atom_store_dB, tXrdB, tXgdB, pred=tXpdB)
+                copy(tXrdB, tXgdB, pred=tXpdB)
 
 
 def _get_sm_count(N: int, device: torch.device) -> int:
