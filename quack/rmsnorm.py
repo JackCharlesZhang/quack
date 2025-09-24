@@ -492,13 +492,19 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
     """Reference implementation for RMSNorm backward pass."""
     x_f32 = x.float()
     x_hat = x_f32 * rstd.unsqueeze(1)
-    wdy = dout * w
+    if w is not None:
+        wdy = dout * w
+    else:
+        wdy = dout
     c1 = (x_hat * wdy).mean(dim=-1, keepdim=True)
     dx = (wdy - x_hat * c1) * rstd.unsqueeze(1)
 
     # dL/dW
-    dw = (dout * x_hat).sum(dim=0)
-    return dx.to(x.dtype), dw.to(w.dtype)
+    if w is not None:
+        dw = (dout * x_hat).sum(dim=0)
+        return dx.to(x.dtype), dw.to(w.dtype)
+    else:
+        return dx.to(x.dtype), None
 
 
 class RMSNormBackward(ReductionBase):
@@ -549,12 +555,12 @@ class RMSNormBackward(ReductionBase):
     def __call__(
         self,
         mX: cute.Tensor,
-        mW: cute.Tensor,
+        mW: Optional[cute.Tensor],
         mdO: cute.Tensor,
         mdResO: Optional[cute.Tensor],
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
-        mdW: cute.Tensor,
+        mdW: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         sm_count: Int32,
@@ -605,12 +611,12 @@ class RMSNormBackward(ReductionBase):
     def kernel(
         self,
         mX: cute.Tensor,
-        mW: cute.Tensor,
+        mW: Optional[cute.Tensor],
         mdO: cute.Tensor,
         mdResO: Optional[cute.Tensor],
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
-        mdW: cute.Tensor,
+        mdW: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         tv_layout: cute.Layout,
@@ -648,57 +654,18 @@ class RMSNormBackward(ReductionBase):
         # Each copy will use the same number of elements as X
         copy = partial(utils.copy, num_copy_elems=num_copy_elems_X)
 
-        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
-        tXgW = thr_copy_X.partition_S(gW)
-        tXrW = cute.make_fragment_like(tXgW)
-        # Need this, otherwise rW can have arbitrary values that changes the reduction
-        if not is_even_N:
-            tXrW.fill(0.0)
-
-        gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tXpW = (
-            utils.predicate_k(thr_copy_X.partition_S(gW_coord), limit=shape[1])
-            if not is_even_N
-            else None
-        )
-        copy(tXgW, tXrW, pred=tXpW)
-        weight = tXrW.load().to(cute.Float32)
-
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-
-        self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
-
-        dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tXpdW = (
-            utils.predicate_k(thr_copy_X.partition_S(dw_coord), limit=shape[1])
-            if not is_even_N
-            else None
-        )
-        if const_expr(mdB is not None):
-            db_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-            tXpdB = (
-                utils.predicate_k(thr_copy_X.partition_S(db_coord), limit=shape[1])
-                if not is_even_N
-                else None
-            )
-
-        gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
-        tXgdW = thr_copy_X.partition_S(gdW)
-        # Always compute partial weight gradients in fp32
-        tXrdW = cute.make_fragment_like(tXgdW, Float32)
-
-        gdB = (
-            cute.local_tile(mdB, (1, tiler_mn[1]), (bidx_start, cluster_y))
-            if const_expr(mdB is not None)
-            else None
-        )
-        tXgdB = thr_copy_X.partition_S(gdB) if const_expr(mdB is not None) else None
-        tXrdB = cute.make_fragment_like(tXgdB, Float32) if const_expr(mdB is not None) else None
-
         gX, gdO, gdResO, gdX, gdRes, cX = [
             cute.local_tile(mT, tiler_mn, (None, cluster_y)) if mT is not None else None
             for mT in (mX, mdO, mdResO, mdX, mdRes, idX)
         ]
+        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y)) if mW is not None else None
+        gdW, gdB = [
+            cute.local_tile(mT, (1, tiler_mn[1]), (bidx_start, cluster_y))
+            if const_expr(mT is not None)
+            else None
+            for mT in (mdW, mdB)
+        ]
+
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
         tXgdO = thr_copy_X.partition_S(gdO)
@@ -709,12 +676,6 @@ class RMSNormBackward(ReductionBase):
         if const_expr(mdRes is not None):
             tXgdRes = thr_copy_X.partition_D(gdRes)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
-        # This doesn't change across iterations
-        tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
-            if not is_even_N
-            else None
-        )
 
         tXrX, tXrdO, tXrdX = [
             cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)
@@ -725,6 +686,37 @@ class RMSNormBackward(ReductionBase):
         tXrdRes = None
         if const_expr(mdRes is not None):
             tXrdRes = cute.make_fragment_like(tXgdRes[None, None, None, 0])
+
+        # This doesn't change across iterations
+        tXpX = (
+            utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+            if not is_even_N
+            else None
+        )
+
+        tXgdW, tXrdW = None, None
+        tXgdB, tXrdB = None, None
+        if const_expr(mdW is not None):
+            tXgdW = thr_copy_X.partition_S(gdW)
+            # Always compute partial weight gradients in fp32
+            tXrdW = cute.make_fragment_like(tXgdW, Float32)
+        if const_expr(mdB is not None):
+            tXgdB = thr_copy_X.partition_S(gdB)
+            # Always compute partial bias gradients in fp32
+            tXrdB = cute.make_fragment_like(tXgdB, Float32)
+
+        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+
+        self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
+
+        tXrW = None
+        if const_expr(mW is not None):
+            tXgW = thr_copy_X.partition_S(gW)
+            tXrW = cute.make_fragment_like(tXgW)
+            # Need this, otherwise rW can have arbitrary values that changes the reduction
+            if not is_even_N:
+                tXrW.fill(0.0)
+            copy(tXgW, tXrW, pred=tXpX)
 
         # Prefetch the first batch
         row = tXcX[None, None, None, bidx_start][0][0]
@@ -744,7 +736,8 @@ class RMSNormBackward(ReductionBase):
             cute.arch.cluster_wait()
 
         threads_per_row = tv_layout.shape[0][0]
-        tXrdW.fill(0.0)
+        if const_expr(mdW is not None):
+            tXrdW.fill(0.0)
         if const_expr(mdB is not None):
             tXrdB.fill(0.0)
         stage = Int32(0)
@@ -786,7 +779,9 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdResO is not None):
                 dout += tXrdResO.load().to(cute.Float32)
             x_hat = x * rstd
-            wdy = dout * weight
+            wdy = dout
+            if const_expr(mW is not None):
+                wdy *= tXrW.load().to(Float32)
             if const_expr(self.cluster_n > 1):
                 cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
             mean_xhat_wdy = (
@@ -817,7 +812,9 @@ class RMSNormBackward(ReductionBase):
                 dout = tXrdO.load().to(cute.Float32)
                 if const_expr(mdResO is not None):
                     dout += tXrdResO.load().to(cute.Float32)
-                wdy = dout * weight
+                wdy = dout
+                if const_expr(mW is not None):
+                    wdy *= tXrW.load().to(Float32)
 
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdX.element_type))
@@ -829,8 +826,8 @@ class RMSNormBackward(ReductionBase):
                 tXgdRes_cur = utils.coord_offset_i64(bidx, tXgdRes, dim=3)[None, None, None, 0]
                 if row < M or tiler_mn[0] == 1:
                     copy(tXrdRes, tXgdRes_cur, pred=tXpX)
-            # Accumulate weight gradients in fp32
-            tXrdW.store(tXrdW.load() + dout * x_hat)
+            if const_expr(mdW is not None):
+                tXrdW.store(tXrdW.load() + dout * x_hat)
             if const_expr(mdB is not None):
                 tXrdB.store(tXrdB.load() + dout)
 
@@ -839,29 +836,29 @@ class RMSNormBackward(ReductionBase):
                 consumer_phase ^= 1
                 producer_phase ^= 1
 
-        if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
-            cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
-
         if const_expr(tiler_mn[0] > 1):
-            # reduction of dw_partial within the same threadblock
-            sdW = cute.make_tensor(
-                cute.recast_ptr(sX.iterator, dtype=cute.Float32),
-                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            )
-            tXsdW = thr_copy_X.partition_D(sdW)
-            cute.arch.barrier()
-            row = tXcX[None, None, None, 0][0][0]
-            if row > 0:
-                cute.autovec_copy(tXrdW, tXsdW)
-            cute.arch.barrier()
-            if row == 0:
-                for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
-                    tXrdW_other = cute.make_fragment_like(tXrdW)
-                    tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
-                    cute.autovec_copy(tXsdW_other, tXrdW_other)
-                    tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                copy(tXrdW, tXgdW, pred=tXpdW)
-            cute.arch.barrier()
+            if const_expr(mdW is not None):
+                # reduction of dw_partial within the same threadblock
+                sdW = cute.make_tensor(
+                    cute.recast_ptr(sX.iterator, dtype=cute.Float32),
+                    cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                )
+                tXsdW = thr_copy_X.partition_D(sdW)
+                cute.arch.barrier()
+                row = tXcX[None, None, None, 0][0][0]
+                if row > 0:
+                    cute.autovec_copy(tXrdW, tXsdW)
+                cute.arch.barrier()
+                if row == 0:
+                    for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
+                        tXrdW_other = cute.make_fragment_like(tXrdW)
+                        tXsdW_other = cute.make_tensor(
+                            tXsdW.iterator + i * sdW.stride[0], tXsdW.layout
+                        )
+                        cute.autovec_copy(tXsdW_other, tXrdW_other)
+                        tXrdW.store(tXrdW.load() + tXrdW_other.load())
+                    copy(tXrdW, tXgdW, pred=tXpX)
+                cute.arch.barrier()
             if const_expr(mdB is not None):
                 sdB = cute.make_tensor(
                     cute.recast_ptr(sX.iterator, dtype=cute.Float32),
@@ -881,12 +878,21 @@ class RMSNormBackward(ReductionBase):
                         )
                         cute.autovec_copy(tXsdB_other, tXrdB_other)
                         tXrdB.store(tXrdB.load() + tXrdB_other.load())
-                    copy(tXrdB, tXgdB, pred=tXpdB)
+                    copy(tXrdB, tXgdB, pred=tXpX)
         else:
             # dw is already in fp32, so we can directly copy to global memory
-            copy(tXrdW, tXgdW, pred=tXpdW)
+            if const_expr(mdW is not None):
+                copy(tXrdW, tXgdW, pred=tXpX)
             if const_expr(mdB is not None):
-                copy(tXrdB, tXgdB, pred=tXpdB)
+                copy(tXrdB, tXgdB, pred=tXpX)
+
+        if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
+            # Assume state contains that next useful buffer
+            # So we only need to advance to num_stages - 1 times to last used buffer
+            stage ^= 1
+            if stage == 0:
+                producer_phase ^= 1
+            cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
 
 
 def _get_sm_count(N: int, device: torch.device) -> int:
@@ -911,40 +917,43 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!) dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
-    weight: Tensor,
+    weight: Optional[Tensor],
     dout: Tensor,
     rstd: Tensor,
     dx: Tensor,
-    dw_partial: Tensor,
+    dw_partial: Optional[Tensor],
     db_partial: Optional[Tensor] = None,
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
+    sm_count: Optional[int] = None,
 ) -> None:
     """RMSNorm backward pass.
     Args:
         x: Input tensor of shape (M, N)
-        weight: Weight tensor of shape (N,)
+        weight: Optional weight tensor of shape (N,)
         dout: Upstream gradients tensor of shape (M, N)
         rstd: Reciprocal standard deviation tensor of shape (M,)
     Returns:
         Tuple of (dx, dw) where:
         - dx: Input gradients tensor of same shape as x
-        - dw: Weight gradients tensor of same shape as weight
+        - dw: Weight gradients tensor of same shape as weight (or None if weight is None)
     """
     assert x.dim() == 2, "Input must be 2D"
-    assert weight.dim() == 1, "Weight must be 1D"
-    assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
-    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
+    assert x.is_cuda, "Input tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
-    assert weight.dtype in [
-        torch.float32,
-        torch.bfloat16,
-        torch.float16,
-    ], "Weight must be float32, float16 or bfloat16"
+    if weight is not None:
+        assert weight.dim() == 1, "Weight must be 1D"
+        assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
+        assert weight.is_cuda, "Weight tensor must be on CUDA device"
+        assert weight.dtype in [
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        ], "Weight must be float32, float16 or bfloat16"
     if dresidual_out is not None:
         assert dresidual_out.shape == x.shape
         assert dresidual_out.is_cuda
@@ -964,7 +973,10 @@ def _rmsnorm_bwd(
 
     N = x.size(1)
     device = x.device
-    sm_count = dw_partial.shape[0]
+    if dw_partial is None and db_partial is None:
+        assert sm_count is not None
+    else:
+        sm_count = dw_partial.shape[0] if dw_partial is not None else db_partial.shape[0]
     convert_from_dlpack = lambda x: (
         from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     )
@@ -973,12 +985,19 @@ def _rmsnorm_bwd(
         for t in (x, dout, dresidual_out, dx, dresidual)
     ]
     # Handle weight div based on weight dtype
-    weight_dtype = torch2cute_dtype_map[weight.dtype]
-    weight_tensor = utils.convert_from_dlpack(
-        weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
-    )
+    if weight is not None:
+        weight_dtype = torch2cute_dtype_map[weight.dtype]
+        weight_tensor = utils.convert_from_dlpack(
+            weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
+        )
+    else:
+        weight_tensor = None
 
-    dw_partial_tensor = from_dlpack(dw_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
+    dw_partial_tensor = (
+        from_dlpack(dw_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
+        if dw_partial is not None
+        else None
+    )
     db_partial_tensor = (
         from_dlpack(db_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
         if db_partial is not None
@@ -991,7 +1010,7 @@ def _rmsnorm_bwd(
     compile_key = (
         N,
         x_tensor.element_type,
-        weight_tensor.element_type,
+        weight_tensor.element_type if weight is not None else None,
         db_partial.dtype if db_partial is not None else None,
         dresidual.dtype if dresidual is not None else None,
         dresidual_out.dtype if dresidual_out is not None else None,
@@ -1033,27 +1052,33 @@ _rmsnorm_bwd.compile_cache = {}
 
 def rmsnorm_bwd(
     x: Tensor,
-    weight: Tensor,
+    weight: Optional[Tensor],
     dout: Tensor,
     rstd: Tensor,
     dresidual_out: Optional[Tensor] = None,  # grad wrt residual_out
     has_bias: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     device = x.device
     N = x.size(1)
-    sm_count = _get_sm_count(N, device)
     dx = torch.empty_like(x)
-
     if dresidual_out is not None and dresidual_out.dtype != dx.dtype:
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
         dresidual = None
-    # Always store partial gradients in fp32 for numerical accuracy
-    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+    sm_count = _get_sm_count(N, device)
+    if weight is not None:
+        # Always store partial gradients in fp32 for numerical accuracy
+        dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+    else:
+        dw_partial = None
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
-    _rmsnorm_bwd(x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual)
+
+    _rmsnorm_bwd(
+        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+    )
+
     # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
     if dresidual_out is not None and dresidual_out.dtype == dx.dtype:
@@ -1104,7 +1129,6 @@ class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         x, weight, rstd = ctx.saved_tensors
-        assert weight is not None, "RMSNorm backward doesn't support weight=None yet"
         has_bias = ctx.has_bias
         if ctx.prenorm and ctx.residual_dtype is not None:
             dresidual_out = args[0]
@@ -1148,7 +1172,7 @@ def rmsnorm(
     return RMSNormFunction.apply(x, weight, bias, residual, out_dtype, residual_dtype, eps, prenorm)
 
 
-class QuackRMSNorm(torch.nn.Module):
+class QuackRMSNorm(torch.nn.RMSNorm):
     """RMSNorm module that behaves like torch.nn.RMSNorm.
 
     This class provides a drop-in replacement for torch.nn.RMSNorm that uses
@@ -1163,10 +1187,10 @@ class QuackRMSNorm(torch.nn.Module):
         eps (float): A small constant for numerical stability
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(dim))
-        self.eps = eps
+    def __init__(
+        self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True, device=None, dtype=None
+    ):
+        super().__init__(dim, eps, elementwise_affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
         """Apply RMSNorm to the input tensor.
@@ -1178,7 +1202,3 @@ class QuackRMSNorm(torch.nn.Module):
             Tensor: Normalized tensor
         """
         return rmsnorm(x, self.weight, eps=self.eps)
-
-    def reset_parameters(self):
-        """Reset the weight parameter to ones."""
-        torch.nn.init.ones_(self.weight)
