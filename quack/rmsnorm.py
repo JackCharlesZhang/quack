@@ -94,7 +94,7 @@ class RMSNorm(ReductionBase):
     def __call__(
         self,
         mX: cute.Tensor,
-        mW: cute.Tensor,
+        mW: Optional[cute.Tensor],
         mB: Optional[cute.Tensor],
         mRes: Optional[cute.Tensor],
         mO: cute.Tensor,
@@ -130,8 +130,11 @@ class RMSNorm(ReductionBase):
         )
         num_threads = cute.size(tv_layout, mode=[0])
         num_warps = num_threads // cute.arch.WARP_SIZE
-        mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
-        mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        if const_expr(mW is not None):
+            mW_expanded_layout = cute.prepend(
+                mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
+            )
+            mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
         if const_expr(mB is not None):
             mB_expanded_layout = cute.prepend(
                 mB.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
@@ -158,7 +161,7 @@ class RMSNorm(ReductionBase):
     def kernel(
         self,
         mX: cute.Tensor,
-        mW: cute.Tensor,
+        mW: Optional[cute.Tensor],
         mB: Optional[cute.Tensor],
         mRes: Optional[cute.Tensor],
         mO: cute.Tensor,
@@ -204,7 +207,7 @@ class RMSNorm(ReductionBase):
             for mT in (mX, mRes, mO, mResO)
         ]
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
-        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
+        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y)) if const_expr(mW is not None) else None
         gB = cute.local_tile(mB, tiler_mn, (0, cluster_y)) if const_expr(mB is not None) else None
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
@@ -221,22 +224,18 @@ class RMSNorm(ReductionBase):
         copy_atom_load_X_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=num_copy_bits_X
         )
-        num_copy_bits_W = const_expr(min(128, num_copy_elems_X * mW.element_type.width))
-        copy_atom_load_W = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_copy_bits_W
-        )
-        num_bits_per_copy_B = (
-            cutlass.const_expr(min(128, num_copy_elems_X * mB.element_type.width))
-            if const_expr(mB is not None)
-            else 0
-        )
-        copy_atom_load_B = (
-            cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=num_bits_per_copy_B
+        copy_atom_load_W = None
+        if const_expr(mW is not None):
+            num_copy_bits_W = const_expr(min(128, num_copy_elems_X * mW.element_type.width))
+            copy_atom_load_W = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_copy_bits_W
             )
-            if const_expr(mB is not None)
-            else None
-        )
+        copy_atom_load_B = None
+        if const_expr(mB is not None):
+            num_copy_bits_B = const_expr(min(128, num_copy_elems_X * mB.element_type.width))
+            copy_atom_load_B = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=num_copy_bits_B
+            )
         if const_expr(mRes is not None):
             num_copy_bits_Res = const_expr(min(128, num_copy_elems_X * mRes.element_type.width))
             copy_atom_load_Res_async = cute.make_copy_atom(
@@ -260,7 +259,7 @@ class RMSNorm(ReductionBase):
             tidx
         )
 
-        tXgW = thr_copy_X.partition_S(gW)
+        tXgW = thr_copy_X.partition_S(gW) if const_expr(mW is not None) else None
         tXgB = thr_copy_X.partition_S(gB) if const_expr(mB is not None) else None
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
@@ -274,8 +273,9 @@ class RMSNorm(ReductionBase):
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
-        tXrW = cute.make_fragment_like(tXgW)
-        tXrW.fill(0.0)
+        tXrW = cute.make_fragment_like(tXgW) if const_expr(mW is not None) else None
+        if const_expr(mW is not None):
+            tXrW.fill(0.0)
         tXrB = cute.make_fragment_like(tXgB) if const_expr(mB is not None) else None
         tXrX, tXrO = [cute.make_fragment_like(t) for t in (tXgX, tXgO)]
         if const_expr(mRes is not None):
@@ -296,7 +296,8 @@ class RMSNorm(ReductionBase):
         cute.arch.cp_async_commit_group()
 
         if const_expr(not delay_w_load):
-            cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
+            if const_expr(mW is not None):
+                cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
             if const_expr(mB is not None):
                 cute.copy(copy_atom_load_B, tXgB, tXrB, pred=tXpX)
 
@@ -332,7 +333,8 @@ class RMSNorm(ReductionBase):
             ):
                 tXrRstd[0] = rstd
         if const_expr(delay_w_load):
-            cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
+            if const_expr(mW is not None):
+                cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpX)
             if const_expr(mB is not None):
                 cute.copy(copy_atom_load_B, tXgB, tXrB, pred=tXpX)
         if const_expr(reload_from == "smem" or reload_from == "gmem"):
@@ -345,11 +347,11 @@ class RMSNorm(ReductionBase):
                 cute.autovec_copy(tXsRes, tXrRes)
                 x += tXrRes.load().to(cute.Float32)
         x_hat = x * rstd
-        w = tXrW.load().to(cute.Float32)
-        y = x_hat * w
+        y = x_hat
+        if const_expr(mW is not None):
+            y *= tXrW.load().to(cute.Float32)
         if const_expr(mB is not None):
-            b = tXrB.load().to(cute.Float32)
-            y = y + b
+            y += tXrB.load().to(cute.Float32)
         tXrO.store(y.to(tXrO.element_type))
         if row < shape[0]:
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
@@ -360,11 +362,11 @@ class RMSNorm(ReductionBase):
     mutates_args=("out", "rstd", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor? residual, Tensor(a6!)? residual_out, float eps=1e-6) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor? residual, Tensor(a6!)? residual_out, float eps=1e-6) -> ()",
 )
 def _rmsnorm_fwd(
     x: Tensor,
-    weight: Tensor,
+    weight: Optional[Tensor],
     out: Tensor,
     bias: Optional[Tensor] = None,
     rstd: Optional[Tensor] = None,
@@ -375,21 +377,23 @@ def _rmsnorm_fwd(
     """RMSNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
-        weight: Weight tensor of shape (N,)
+        weight: Optional weight tensor of shape (N,)
         eps: Small value for numerical stability
     Returns:
         Normalized output tensor of same shape as x
     """
     assert x.dim() == 2, "Input must be 2D"
-    assert weight.dim() == 1, "Weight must be 1D"
-    assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
-    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
+    assert x.is_cuda, "Input tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
-    assert weight.dtype in [
-        torch.float32,
-        torch.bfloat16,
-        torch.float16,
-    ], "Weight must be float32, float16 or bfloat16"
+    if weight is not None:
+        assert weight.dim() == 1, "Weight must be 1D"
+        assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
+        assert weight.is_cuda, "Weight tensor must be on CUDA device"
+        assert weight.dtype in [
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        ], "Weight must be float32, float16 or bfloat16"
     if residual is not None:
         assert residual.shape == x.shape
         assert residual.is_cuda
@@ -402,11 +406,6 @@ def _rmsnorm_fwd(
     _, N = x.shape
     device = x.device
     dtype = torch2cute_dtype_map[x.dtype]
-    # convert_from_dlpack = lambda x: (
-    #     from_dlpack(x.detach(), assumed_align=16).mark_compact_shape_dynamic(
-    #         mode=0, divisibility=128 // dtype.width
-    #     )
-    # )
     convert_from_dlpack = lambda x: (
         from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     )
@@ -414,10 +413,13 @@ def _rmsnorm_fwd(
         convert_from_dlpack(t) if t is not None else None for t in (x, residual, out, residual_out)
     ]
     # handle weight divisibility based on weight dtype
-    weight_dtype = torch2cute_dtype_map[weight.dtype]
-    weight_tensor = utils.convert_from_dlpack(
-        weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
-    )
+    if weight is not None:
+        weight_dtype = torch2cute_dtype_map[weight.dtype]
+        weight_tensor = utils.convert_from_dlpack(
+            weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
+        )
+    else:
+        weight_tensor = None
     if bias is not None:
         bias_dtype = torch2cute_dtype_map[bias.dtype]
         bias_tensor = utils.convert_from_dlpack(
@@ -435,7 +437,7 @@ def _rmsnorm_fwd(
         N,
         dtype,
         res_tensor.element_type if residual is not None else None,
-        weight_tensor.element_type,
+        weight_tensor.element_type if weight is not None else None,
         bias_tensor.element_type if bias is not None else None,
         res_out_tensor.element_type if residual_out is not None else None,
         rstd is not None,
@@ -472,7 +474,7 @@ _rmsnorm_fwd.compile_cache = {}
 
 def rmsnorm_fwd(
     x: Tensor,
-    weight: Tensor,
+    weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     residual: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -501,12 +503,13 @@ def rmsnorm_fwd(
     return out, residual_out, rstd
 
 
-def rmsnorm_ref(x, w, bias=None, residual=None, eps=1e-6):
+def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
     x_f32 = x.float()
     if residual is not None:
         residual_f32 = residual.float()
         x_f32 += residual_f32
-    out = x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps)) * w
+    x_norm = x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps))
+    out = x_norm * w if w is not None else x_norm
     if bias is not None:
         out = out + bias.float()
     if residual is None:
@@ -613,8 +616,11 @@ class RMSNormBackward(ReductionBase):
         )
         num_threads = cute.size(tv_layout, mode=[0])
         num_warps = num_threads // cute.arch.WARP_SIZE
-        mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
-        mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        if const_expr(mW is not None):
+            mW_expanded_layout = cute.prepend(
+                mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
+            )
+            mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
 
         num_blocks = sm_count
         self.kernel(mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tv_layout, tiler_mn).launch(
@@ -1171,6 +1177,7 @@ class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         x, weight, rstd = ctx.saved_tensors
+        assert weight is not None, "RMSNorm backward doesn't support weight=None yet"
         has_bias = ctx.has_bias
         if ctx.prenorm and ctx.residual_dtype is not None:
             dresidual_out = args[0]
@@ -1193,7 +1200,7 @@ class RMSNormFunction(torch.autograd.Function):
 
 def rmsnorm(
     x: Tensor,
-    weight: Tensor,
+    weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     residual: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -1205,7 +1212,7 @@ def rmsnorm(
 
     Args:
         x: Input tensor of shape (M, N)
-        weight: Weight tensor of shape (N,)
+        weight: Optional weight tensor of shape (N,)
         eps: Small value for numerical stability
 
     Returns:
