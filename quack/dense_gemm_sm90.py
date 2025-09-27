@@ -36,6 +36,7 @@ from quack.tensormap_manager import TensorMapManagerSm90
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.utils as utils
+import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
 
@@ -790,22 +791,16 @@ class GemmSm90:
                             tensormap_b_ptr, cute.AddressSpace.generic
                         )
                     #  TMA load A partition_S/D
-                    a_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
-                    )
-                    a_cta_crd = cluster_coord_mnk[1]
+                    copy_A = None
                     if const_expr(not self.gather_A):
-                        # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
-                        tAsA, tAgA_k = cpasync.tma_partition(
+                        copy_A, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_a,
-                            a_cta_crd,
-                            a_cta_layout,
-                            cute.group_modes(sA, 0, 2),
-                            cute.group_modes(gA_k, 0, 2),
-                        )
-                        copy_A = partial(
-                            cute.copy,
-                            tma_atom_a,
+                            cta_coord=cluster_coord_mnk[1],
+                            cta_layout=cute.make_layout(
+                                cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
+                            ),
+                            src_tensor=gA_k,
+                            dst_tensor=sA,
                             mcast_mask=a_mcast_mask,
                             tma_desc_ptr=tma_desc_a_ptr,
                         )
@@ -827,20 +822,16 @@ class GemmSm90:
                             tAsA = cute.group_modes(tAsA, 0, 3)
                         copy_A = partial(cute.copy, tiled_copy_A)
                     # TMA load B partition_S/D
-                    b_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
-                    )
-                    b_cta_crd = cluster_coord_mnk[0]
-                    # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
-                    tBsB, tBgB_k = cpasync.tma_partition(
+                    copy_B, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_b,
-                        b_cta_crd,
-                        b_cta_layout,
-                        cute.group_modes(sB, 0, 2),
-                        cute.group_modes(gB_k, 0, 2),
-                    )
-                    copy_B = partial(
-                        cute.copy, tma_atom_b, mcast_mask=b_mcast_mask, tma_desc_ptr=tma_desc_b_ptr
+                        cta_coord=cluster_coord_mnk[0],
+                        cta_layout=cute.make_layout(
+                            cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
+                        ),
+                        src_tensor=gB_k,
+                        dst_tensor=sB,
+                        mcast_mask=b_mcast_mask,
+                        tma_desc_ptr=tma_desc_b_ptr,
                     )
                     k_len = (
                         cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
@@ -850,15 +841,7 @@ class GemmSm90:
                     k_tile_cnt = cute.ceil_div(k_len, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
                         ab_producer_state = self.load_AB(
-                            ab_pipeline,
-                            ab_producer_state,
-                            copy_A,
-                            tAgA_k,
-                            tAsA,
-                            copy_B,
-                            tBgB_k,
-                            tBsB,
-                            k_tile_cnt,
+                            ab_pipeline, ab_producer_state, copy_A, copy_B, k_tile_cnt
                         )
                     else:
                         limit_m = (
@@ -874,8 +857,6 @@ class GemmSm90:
                             tAsA,
                             gAIdx,
                             copy_B,
-                            tBgB_k,
-                            tBsB,
                             k_tile_cnt,
                             limit_A=(
                                 limit_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
@@ -1058,8 +1039,9 @@ class GemmSm90:
                         for tensormap_epi_ptr in tensormap_epi_ptrs
                     ]
 
+                copy_D = None
                 if const_expr(has_D):
-                    bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
+                    copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         mD_mnl,
                         self.cta_tile_shape_mnk[:2],
@@ -1067,12 +1049,11 @@ class GemmSm90:
                         sD,
                         tile_coord_mnkl,
                         cu_seqlens_m,
+                        tma_desc_ptr=tma_desc_d_ptr,
                     )
-                    copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_d_ptr)
-                else:
-                    bSG_sD, bSG_gD, copy_D = None, None, None
+                copy_C = None
                 if const_expr(has_C):
-                    bGS_sC, bGS_gC = self.epilog_gmem_copy_and_partition(
+                    copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         mC_mnl,
                         self.cta_tile_shape_mnk[:2],
@@ -1081,15 +1062,15 @@ class GemmSm90:
                         tile_coord_mnkl,
                         cu_seqlens_m,
                     )
-                    copy_C = partial(cute.copy, tma_atom_c)
-                    epi_load_g2s = partial(self.epi_load_g2s, epi_pipeline, copy_C, bGS_gC, bGS_sC)
-                else:
-                    epi_load_g2s = None
+                    copy_C = copy_utils.producer_copy_fn(copy_C_fn, epi_pipeline)
 
                 d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
-                tiled_copy_r2s, tRS_rAcc, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-                    tiled_mma, self.d_layout, d_dtype_for_layout, acc, sD, tidx
+                tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
+                    tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
+                # (R2S, R2S_M, R2S_N)
+                tRS_rAcc = tiled_copy_r2s.retile(acc)
+                load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
                         tiled_mma, self.c_layout, self.c_dtype, sC, tRS_rD.layout, tidx
@@ -1113,7 +1094,7 @@ class GemmSm90:
                     epi_read_state,
                     epi_producer_state,
                     tiled_mma,
-                    tRS_rAcc,
+                    load_acc_subtile,
                     tRS_rD,
                     tRS_rC,
                     tiled_copy_r2s,
@@ -1122,9 +1103,7 @@ class GemmSm90:
                     tSR_rC,
                     tSR_sC,
                     copy_D,
-                    bSG_sD,
-                    bSG_gD,
-                    epi_load_g2s,
+                    copy_C,
                     tile_coord_mnkl,
                     cu_seqlens_m,
                     epilogue_barrier,
@@ -1176,13 +1155,20 @@ class GemmSm90:
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_producer_state: cutlass.pipeline.PipelineState,
         copy_A: Callable,
-        tAgA: cute.Tensor,
-        tAsA: cute.Tensor,
         copy_B: Callable,
-        tBgB: cute.Tensor,
-        tBsB: cute.Tensor,
         k_tile_cnt: Int32,
+        # These are for Sm100 blockscaled gemm
+        copy_SFA: Optional[Callable] = None,
+        tAgSFA: Optional[cute.Tensor] = None,
+        tAsSFA: Optional[cute.Tensor] = None,
+        copy_SFB: Optional[Callable] = None,
+        tBgSFB: Optional[cute.Tensor] = None,
+        tBsSFB: Optional[cute.Tensor] = None,
     ) -> cutlass.pipeline.PipelineState:
+        blockscaled = const_expr(copy_SFA is not None)
+        if const_expr(blockscaled):
+            assert all(x is not None for x in (copy_SFA, tAgSFA, tAsSFA))
+            assert all(x is not None for x in (copy_SFB, tBgSFB, tBsSFB))
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
@@ -1195,8 +1181,12 @@ class GemmSm90:
             # Also sets the transaction barrier for the A/B buffers
             ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
-            copy_A(tAgA[None, k_tile], tAsA[None, ab_producer_state.index], tma_bar_ptr=tma_bar_ptr)
-            copy_B(tBgB[None, k_tile], tBsB[None, ab_producer_state.index], tma_bar_ptr=tma_bar_ptr)
+            smem_idx = ab_producer_state.index
+            copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            if const_expr(blockscaled):
+                copy_SFA(tAgSFA[None, k_tile], tAsSFA[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
+                copy_SFB(tBgSFB[None, k_tile], tBsSFB[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
             # Mainloop pipeline's producer commit is a NOP
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1215,8 +1205,6 @@ class GemmSm90:
         tAsA: cute.Tensor,
         gAIdx: cute.Tensor,  # (tile_M,) if varlen_m, (tile_K, RestK) if varlen_k
         copy_B: Callable,
-        tBgB: cute.Tensor,
-        tBsB: cute.Tensor,
         k_tile_cnt: Int32,
         limit_A: Tuple[Int32, Int32],
         varlen_m: bool,
@@ -1290,13 +1278,11 @@ class GemmSm90:
                 peek_ab_empty_status,
                 is_tma_warp=warp_idx == tma_warp_id,
             )
+            smem_idx = ab_producer_state.index
             # A bit faster to load B first while we calculate the predicate for A
             if warp_idx == tma_warp_id:
-                copy_B(
-                    tBgB[None, k_tile],
-                    tBsB[None, ab_producer_state.index],
-                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                )
+                tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             # (m, bK)
             if const_expr(varlen_m):
                 mA_cur = mA_k[None, (None, k_tile)]
@@ -1312,15 +1298,13 @@ class GemmSm90:
                         # There's only 1 load per row
                         assert cute.size(tAcA.shape, mode=[2]) == 1
                         ki = tAcA[0, 0, 0][1] // elems_per_load
-                        copy_A(mA_row[None, ki], tAsA[(None, m), ab_producer_state.index])
+                        copy_A(mA_row[None, ki], tAsA[(None, m), smem_idx])
             else:
                 for k in cutlass.range_constexpr(tAcA.shape[2]):
-                    # copy_A(tAmA[None, None, k_idx[k]], tAsA[(None, None, k), ab_producer_state.index], pred=cute.prepend_ones(tApA_m, up_to_rank=2))
+                    # copy_A(tAmA[None, None, k_idx[k]], tAsA[(None, None, k), smem_idx], pred=cute.prepend_ones(tApA_m, up_to_rank=2))
                     for m in cutlass.range_constexpr(tAcA.shape[1]):
                         if tApA_m[m]:
-                            copy_A(
-                                tAmA[None, m, k_idx[k]], tAsA[(None, m, k), ab_producer_state.index]
-                            )
+                            copy_A(tAmA[None, m, k_idx[k]], tAsA[(None, m, k), smem_idx])
             # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1350,12 +1334,10 @@ class GemmSm90:
                 peek_ab_empty_status,
                 is_tma_warp=warp_idx == tma_warp_id,
             )
+            smem_idx = ab_producer_state.index
             if warp_idx == tma_warp_id:
-                copy_B(
-                    tBgB[None, k_tile],
-                    tBsB[None, ab_producer_state.index],
-                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                )
+                tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             if const_expr(varlen_m):
                 # (m, bK)
                 mA_cur = mA_k[None, (None, k_tile)]
@@ -1368,9 +1350,7 @@ class GemmSm90:
                         # There's only 1 load per row
                         assert cute.size(tAcA.shape, mode=[2]) == 1
                         ki = tAcA[0, 0, 0][1] // elems_per_load
-                        copy_A(
-                            mA_row[None, ki], tAsA[(None, m), ab_producer_state.index], pred=tApA_k
-                        )
+                        copy_A(mA_row[None, ki], tAsA[(None, m), smem_idx], pred=tApA_k)
             else:
                 tApA_k = cute.prepend_ones(tApA_k, up_to_rank=2)  # (1, cols_per_thread)
                 for k in cutlass.range_constexpr(tAcA.shape[2]):
@@ -1378,7 +1358,7 @@ class GemmSm90:
                         if tApA_m[m]:
                             copy_A(
                                 tAmA[None, m, k_idx[k]],
-                                tAsA[(None, m, k), ab_producer_state.index],
+                                tAsA[(None, m, k), smem_idx],
                                 pred=tApA_k[None, k],
                             )
             ab_pipeline.producer_commit(ab_producer_state)
@@ -1481,9 +1461,9 @@ class GemmSm90:
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
-        epi_producer_state: cutlass.pipeline.PipelineState,
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
         tiled_mma: cute.TiledMma,
-        tRS_rAcc: cute.Tensor,
+        load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
         tiled_copy_r2s: cute.core.ThrCopy,
@@ -1492,9 +1472,7 @@ class GemmSm90:
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
         copy_D: Optional[Callable],
-        bSG_sD: cute.Tensor,
-        bSG_gD: cute.Tensor,
-        epi_load_g2s: Optional[Callable],
+        copy_C: Optional[Callable],
         tile_coord_mnkl: cute.Coord,
         cu_seqlens_m: Optional[cute.Tensor],
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
@@ -1512,14 +1490,18 @@ class GemmSm90:
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
-        if const_expr(epi_load_g2s is not None):
+        if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                epi_producer_state = epi_load_g2s(epi_producer_state, epi_idx, is_tma_warp)
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # Copy from acc to D registers
-            for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
-                tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
+            load_acc_subtile(tRS_rD, epi_idx)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -1531,10 +1513,13 @@ class GemmSm90:
                 with cute.arch.elect_one():
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
-            if const_expr(epi_load_g2s is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                epi_producer_state = epi_load_g2s(
-                    epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
-                )
+            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
             tRS_rEpi = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy from D registers to shared memory
@@ -1548,12 +1533,12 @@ class GemmSm90:
                 cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
             )
             epilogue_barrier.arrive_and_wait()
-            # Get the global memory coordinate for the current epi tile
+            # The global memory coordinate for the current epi tile
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from shared memory to global memory
             if is_tma_warp:
                 if const_expr(has_D):
-                    copy_D(bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
+                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
                 epi_store_pipeline.producer_commit()
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
@@ -1561,31 +1546,9 @@ class GemmSm90:
         return epi_read_state, epi_producer_state
 
     @cute.jit
-    def epi_load_g2s(
-        self,
-        epi_pipeline: cutlass.pipeline.PipelineAsync,
-        copy_C: Callable,
-        bGS_gC: cute.Tensor,
-        bGS_sC: cute.Tensor,
-        epi_producer_state: cutlass.pipeline.PipelineState,
-        epi_idx: Int32,
-        should_load: Boolean,
-    ) -> cutlass.pipeline.PipelineState:
-        # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_layout = cute.make_layout(bGS_gC.shape[1], stride=(bGS_gC.shape[1][1], 1))
-        if should_load:
-            epi_pipeline.producer_acquire(epi_producer_state)
-            # Get the global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            copy_C(
-                bGS_gC[None, gmem_coord],
-                bGS_sC[None, epi_producer_state.index],
-                tma_bar_ptr=epi_pipeline.producer_get_barrier(epi_producer_state),
-            )
-            # Epi pipeline's producer commit is a NOP
-            epi_pipeline.producer_commit(epi_producer_state)
-        epi_producer_state.advance()
-        return epi_producer_state
+    def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
+        for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
+            tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
 
     def epi_visit_acc_subtile(
         self,
@@ -1852,7 +1815,6 @@ class GemmSm90:
         tiled_mma: cute.TiledMma,
         d_layout: Optional[LayoutEnum],
         dtype: Type[cutlass.Numeric],
-        acc: cute.Tensor,
         sD: cute.Tensor,
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
@@ -1868,12 +1830,10 @@ class GemmSm90:
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         tRS_sD = thr_copy_r2s.partition_D(sD) if sD is not None else None
-        # (R2S, R2S_M, R2S_N)
-        tRS_rAcc = tiled_copy_r2s.retile(acc)
         sD_shape = sD.shape[:2] if sD is not None else self.epi_tile
         tRS_rD_shape = thr_copy_r2s.partition_S(cute.make_identity_tensor(sD_shape)).shape
         tRS_rD = cute.make_fragment(tRS_rD_shape, self.acc_dtype)
-        return tiled_copy_r2s, tRS_rAcc, tRS_rD, tRS_sD
+        return tiled_copy_r2s, tRS_rD, tRS_sD
 
     def epilog_smem_load_and_partition(
         self,
@@ -1902,6 +1862,7 @@ class GemmSm90:
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
         cu_seqlens_m: Optional[cute.Tensor] = None,
+        tma_desc_ptr: Optional[cute.Pointer] = None,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         batch_idx = tile_coord_mnkl[3]
         if const_expr(cu_seqlens_m is not None):
@@ -1911,14 +1872,20 @@ class GemmSm90:
         # (bM, bN)
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
-        bSG_sD, bSG_gD = cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sD, 0, 2),
-            tDgD_for_tma_partition,
+        is_s2g = isinstance(
+            atom.op, (cpasync.CopyBulkTensorTileS2GOp, cpasync.CopyReduceBulkTensorTileS2GOp)
         )
-        return bSG_sD, bSG_gD
+        src_tensor, dst_tensor = (
+            (sD, tDgD_for_tma_partition) if is_s2g else (tDgD_for_tma_partition, sD)
+        )
+        return copy_utils.tma_get_copy_fn(
+            atom,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=src_tensor,
+            dst_tensor=dst_tensor,
+            tma_desc_ptr=tma_desc_ptr,
+        )
 
     def make_ab_pipeline(
         self,

@@ -134,7 +134,7 @@ class GemmActSm90(GemmSm90):
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
         tiled_mma: cute.TiledMma,
-        tRS_rAcc: cute.Tensor,
+        load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
         tiled_copy_r2s: cute.core.ThrCopy,
@@ -143,9 +143,7 @@ class GemmActSm90(GemmSm90):
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
         copy_D: Optional[Callable],
-        bSG_sD: cute.Tensor,
-        bSG_gD: cute.Tensor,
-        epi_load_g2s: Optional[Callable],
+        copy_C: Optional[Callable],
         tile_coord_mnkl: cute.Coord,
         cu_seqlens_m: Optional[cute.Tensor],
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
@@ -166,7 +164,8 @@ class GemmActSm90(GemmSm90):
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         thr_copy_postact_r2s = tiled_copy_postact_r2s.get_slice(tidx)
         tRS_sPostAct = thr_copy_postact_r2s.partition_D(sPostAct)
-        bSG_sPostAct, bSG_gPostAct = self.epilog_gmem_copy_and_partition(
+        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
+        copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
             mPostAct_mnl,
             self.cta_tile_shape_postact_mn,
@@ -174,8 +173,8 @@ class GemmActSm90(GemmSm90):
             sPostAct,
             tile_coord_mnkl,
             cu_seqlens_m,
+            tma_desc_ptr=tma_desc_postact_ptr,
         )
-        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
 
         # We iterate over epi tiles in the N dimension first before the M dimension
         epi_tile_shape = cute.zipped_divide(
@@ -185,14 +184,18 @@ class GemmActSm90(GemmSm90):
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
-        if const_expr(epi_load_g2s is not None):
+        if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                epi_producer_state = epi_load_g2s(epi_producer_state, epi_idx, is_tma_warp)
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # Copy from acc to D registers
-            for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
-                tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
+            load_acc_subtile(tRS_rD, epi_idx)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -204,10 +207,13 @@ class GemmActSm90(GemmSm90):
                 with cute.arch.elect_one():
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
-            if const_expr(epi_load_g2s is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                epi_producer_state = epi_load_g2s(
-                    epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
-                )
+            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy from D registers to shared memory
@@ -231,13 +237,8 @@ class GemmActSm90(GemmSm90):
             # Copy from shared memory to global memory
             if is_tma_warp:
                 if const_expr(has_D):
-                    copy_D(bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
-                cute.copy(
-                    tma_atom_postact,
-                    bSG_sPostAct[None, epi_buffer],
-                    bSG_gPostAct[None, gmem_coord],
-                    tma_desc_ptr=tma_desc_postact_ptr,
-                )
+                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
                 epi_store_pipeline.producer_commit()
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
