@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 import quack.utils as utils
+import quack.copy_utils as copy_utils
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -219,7 +220,7 @@ class RMSNorm(ReductionBase):
 
         # declare the atoms which will be used later for memory copy
         num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X_async = utils.get_copy_atom(
+        copy_atom_load_X_async = copy_utils.get_copy_atom(
             mX.element_type, num_copy_elems_X, is_async=True
         )
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(
@@ -256,7 +257,7 @@ class RMSNorm(ReductionBase):
             utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
         # Each copy will use the same number of elements as X and same predicate
-        copy = partial(utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
 
         row = tXcX[0][0]
         if row < shape[0]:
@@ -649,10 +650,12 @@ class RMSNormBackward(ReductionBase):
             mbar_full_ptr, mbar_empty_ptr = None, None
 
         num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X = utils.get_copy_atom(mX.element_type, num_copy_elems_X, is_async=False)
+        copy_atom_load_X = copy_utils.get_copy_atom(
+            mX.element_type, num_copy_elems_X, is_async=False
+        )
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
         # Each copy will use the same number of elements as X
-        copy = partial(utils.copy, num_copy_elems=num_copy_elems_X)
+        copy = partial(copy_utils.copy, num_copy_elems=num_copy_elems_X)
 
         gX, gdO, gdResO, gdX, gdRes, cX = [
             cute.local_tile(mT, tiler_mn, (None, cluster_y)) if mT is not None else None
