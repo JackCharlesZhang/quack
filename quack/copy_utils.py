@@ -1,12 +1,12 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Type, Callable
+from typing import Optional, Type, Tuple, Callable
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import const_expr
+from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
@@ -94,3 +94,155 @@ def producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
         )
 
     return copy_fn
+
+
+@cute.jit
+def gather_m_get_copy_fn(
+    thr_copy_A: cute.core.ThrCopy,
+    mA: cute.Tensor,  # (whatever, K)
+    sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
+    gAIdx: cute.Tensor,  # (tile_M)
+    limit_m: Int32,
+    limit_k: Int32,
+) -> Callable:
+    tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
+    tAsA = thr_copy_A.partition_D(sA)
+    # k-major
+    assert tAsA.shape[2] == 1
+    tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+
+    is_even_m_smem = tile_shape_mk[0] % thr_copy_A.tiler_mn[0].shape == 0
+    if const_expr(not is_even_m_smem):
+        limit_m = min(limit_m, tile_shape_mk[0])
+    elems_per_load = cute.size(tAsA.shape[0][0])
+    cA = cute.make_identity_tensor(tile_shape_mk)
+    tAcA = thr_copy_A.partition_S(cA)
+    t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
+    # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
+    # since we know that tAcA[m][0] = t0AcA[m][0] + tAcA[0][0].
+    # This is so that when we do the comparison, t0AcA is known at compile time.
+    limit_m = limit_m - tAcA[0][0]
+    limit_k = limit_k - tAcA[0][1]
+    # Read and cache indices for A
+    rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+    cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
+    tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+    for m in cutlass.range(rows_per_thread, unroll_full=True):
+        tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
+    m_idx = cute.make_fragment(rows_per_thread, Int32)
+    for m in cutlass.range(rows_per_thread, unroll_full=True):
+        row_idx = tAcA[0, m, 0][0]
+        if tApA_m[m]:
+            m_idx[m] = gAIdx[row_idx]
+        else:
+            m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
+
+    mA_k = cute.logical_divide(mA, (None, tile_shape_mk[1]))
+
+    def copy_fn(src_idx, dst_idx, pred: bool = False):
+        tApA_k = None
+        if const_expr(pred):
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            for k in cutlass.range(cols_per_thread, unroll_full=True):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
+        mA_cur = mA_k[None, (None, src_idx)]
+        for m in cutlass.range_constexpr(tAcA.shape[1]):
+            # cute.tiled_divide(mA_cur[m_idx[m], None], (elems_per_load,)) would give shape
+            # ((elems_per_load), thread_per_row)
+            # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
+            # So we append 1s to the last dimension and then do tiled_divide, then slice.
+            mA_row = cute.tiled_divide(
+                cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
+            )[None, None, 0]
+            if const_expr(is_even_m_smem) or tApA_m[m]:
+                # There's only 1 load per row
+                assert cute.size(tAcA.shape, mode=[2]) == 1
+                ki = tAcA[0, 0, 0][1] // elems_per_load
+                cute.copy(thr_copy_A, mA_row[None, ki], tAsA[(None, m), dst_idx], pred=tApA_k)
+
+    return copy_fn
+
+
+@cute.jit
+def gather_k_get_copy_fn(
+    thr_copy_A: cute.core.ThrCopy,
+    mA: cute.Tensor,  # (tile_M, whatever)
+    sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
+    gAIdx: cute.Tensor,  # (tile_K, RestK)
+    limit_m: Int32,
+    limit_k: Int32,
+) -> Callable:
+    tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
+    # (atom_v, CPY_M, 1, STAGE)
+    tAsA = thr_copy_A.partition_D(sA)
+    # m-major
+    tAsA = cute.group_modes(tAsA, 0, 3)
+
+    is_even_m_smem = tile_shape_mk[0] % thr_copy_A.tiler_mn[0].shape == 0
+    if const_expr(not is_even_m_smem):
+        limit_m = min(limit_m, tile_shape_mk[0])
+    elems_per_load = cute.size(tAsA.shape[0][0])
+    cA = cute.make_identity_tensor(tile_shape_mk)
+    tAcA = thr_copy_A.partition_S(cA)
+    t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
+    # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
+    # since we know that tAcA[m][0] = t0AcA[m][0] + tAcA[0][0].
+    # This is so that when we do the comparison, t0AcA is known at compile time.
+    limit_m = limit_m - tAcA[0][0]
+    limit_k = limit_k - tAcA[0][1]
+    # Read and cache indices for A
+    rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+    cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
+    tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+    for m in cutlass.range(rows_per_thread, unroll_full=True):
+        tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
+    threads_per_col = const_expr(thr_copy_A.tiler_mn[0].shape // elems_per_load)
+    # This is very convoluted but idk a better way
+    # for tile_M=128, flat_divide gives (8, 16, K),
+    # then logical_divide gives ((8, 1), (8, 2), K).
+    tidx = thr_copy_A.thr_idx
+    tAmA = cute.logical_divide(
+        cute.flat_divide(mA, (elems_per_load,)), (elems_per_load, threads_per_col)
+    )[None, (tidx % threads_per_col, None), None]  # ((8, 1), 2, K)
+
+    def prefetch_fn(src_idx, pred: bool = False) -> Tuple[cute.Tensor, cute.Tensor]:
+        # Prefetch mAIdx early, even before smem is free
+        tApA_k = None
+        if const_expr(pred):
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            for k in cutlass.range(cols_per_thread, unroll_full=True):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
+        gAIdx_cur = gAIdx[None, src_idx]
+        k_idx = cute.make_fragment(cols_per_thread, Int32)
+        for k in cutlass.range(cols_per_thread):
+            col_idx = tAcA[0, 0, k][1]
+            if const_expr(not pred):
+                k_idx[k] = gAIdx_cur[col_idx]
+            else:
+                if tApA_k[k]:
+                    k_idx[k] = gAIdx_cur[col_idx]
+                else:
+                    k_idx[k] = -1
+        return k_idx, tApA_k
+
+    def copy_fn(
+        src_idx, dst_idx, k_idx_tApA_k: Tuple[cute.Tensor, cute.Tensor], pred: bool = False
+    ):
+        k_idx, tApA_k = k_idx_tApA_k
+        tApA_k_pred = None
+        if const_expr(pred):
+            tApA_k_pred = cute.prepend_ones(tApA_k, up_to_rank=2)  # (1, cols_per_thread)
+        for k in cutlass.range_constexpr(tAcA.shape[2]):
+            # copy_A(tAmA[None, None, k_idx[k]], tAsA[(None, None, k), smem_idx], pred=cute.prepend_ones(tApA_m, up_to_rank=2))
+            for m in cutlass.range_constexpr(tAcA.shape[1]):
+                if tApA_m[m]:
+                    cute.copy(
+                        thr_copy_A,
+                        tAmA[None, m, k_idx[k]],
+                        tAsA[(None, m, k), dst_idx],
+                        pred=None if const_expr(tApA_k_pred is None) else tApA_k_pred[None, k],
+                    )
+
+    return copy_fn, prefetch_fn
