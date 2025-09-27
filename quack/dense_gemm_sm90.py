@@ -691,12 +691,12 @@ class GemmSm90:
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
                 cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+                block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
                 a_mcast_mask = cute.make_layout_image_mask(
-                    cluster_layout_mnk, cluster_coord_mnk, mode=1
+                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=1
                 )
                 b_mcast_mask = cute.make_layout_image_mask(
-                    cluster_layout_mnk, cluster_coord_mnk, mode=0
+                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=0
                 )
                 a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
                 b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
@@ -795,7 +795,7 @@ class GemmSm90:
                     if const_expr(not self.gather_A):
                         copy_A, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_a,
-                            cta_coord=cluster_coord_mnk[1],
+                            cta_coord=block_in_cluster_coord_mnk[1],
                             cta_layout=cute.make_layout(
                                 cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
                             ),
@@ -835,7 +835,7 @@ class GemmSm90:
                     # TMA load B partition_S/D
                     copy_B, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_b,
-                        cta_coord=cluster_coord_mnk[0],
+                        cta_coord=block_in_cluster_coord_mnk[0],
                         cta_layout=cute.make_layout(
                             cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
                         ),
@@ -1044,6 +1044,7 @@ class GemmSm90:
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         mD_mnl,
+                        None,  # thr_mma
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
@@ -1056,6 +1057,7 @@ class GemmSm90:
                     copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         mC_mnl,
+                        None,  # thr_mma
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sC,
@@ -1094,6 +1096,7 @@ class GemmSm90:
                     epi_read_state,
                     epi_producer_state,
                     tiled_mma,
+                    self.epi_tile,
                     load_acc_subtile,
                     tRS_rD,
                     tRS_rC,
@@ -1159,16 +1162,11 @@ class GemmSm90:
         k_tile_cnt: Int32,
         # These are for Sm100 blockscaled gemm
         copy_SFA: Optional[Callable] = None,
-        tAgSFA: Optional[cute.Tensor] = None,
-        tAsSFA: Optional[cute.Tensor] = None,
         copy_SFB: Optional[Callable] = None,
-        tBgSFB: Optional[cute.Tensor] = None,
-        tBsSFB: Optional[cute.Tensor] = None,
     ) -> cutlass.pipeline.PipelineState:
         blockscaled = const_expr(copy_SFA is not None)
         if const_expr(blockscaled):
-            assert all(x is not None for x in (copy_SFA, tAgSFA, tAsSFA))
-            assert all(x is not None for x in (copy_SFB, tBgSFB, tBsSFB))
+            assert copy_SFB is not None
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
@@ -1185,8 +1183,8 @@ class GemmSm90:
             copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             if const_expr(blockscaled):
-                copy_SFA(tAgSFA[None, k_tile], tAsSFA[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
-                copy_SFB(tBgSFB[None, k_tile], tBsSFB[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
+                copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_SFB(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             # Mainloop pipeline's producer commit is a NOP
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1362,6 +1360,7 @@ class GemmSm90:
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: Optional[cutlass.pipeline.PipelineState],
         tiled_mma: cute.TiledMma,
+        epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
@@ -1381,11 +1380,11 @@ class GemmSm90:
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
-        # We iterate over epi tiles in the N dimension first before the M dimension
         epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        # We iterate over epi tiles in the N dimension first before the M dimension
+        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
@@ -1423,10 +1422,7 @@ class GemmSm90:
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy from D registers to shared memory
             if const_expr(has_D):
-                # Type conversion
-                tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
-                tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
-                cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[None, None, None, epi_buffer])
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
             # Fence and barrier to make sure shared memory store is visible to TMA store
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
@@ -1756,6 +1752,7 @@ class GemmSm90:
         self,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
         mD_mnl: cute.Tensor,
+        thr_mma: Optional[cute.core.ThrMma],
         tile_shape_mn: cute.Tile,
         epi_tile: cute.Tile,
         sD: cute.Tensor,
@@ -1770,6 +1767,9 @@ class GemmSm90:
             mD_mn = mD_mnl[None, None, batch_idx]
         # (bM, bN)
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])
+        if const_expr(thr_mma is not None):
+            # partition_C gives ((MMA_TILE_M, MMA_TILE_N), MMA_M, MMA_N)
+            gD = thr_mma.partition_C(gD)[(None, None), 0, 0]
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         is_s2g = isinstance(
             atom.op, (cpasync.CopyBulkTensorTileS2GOp, cpasync.CopyReduceBulkTensorTileS2GOp)

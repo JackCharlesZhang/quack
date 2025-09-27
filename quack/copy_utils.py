@@ -13,6 +13,25 @@ import cutlass.pipeline
 
 
 @dsl_user_op
+def cvt_copy(
+    atom: cute.CopyAtom,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    *,
+    pred: Optional[cute.Tensor] = None,
+    loc=None,
+    ip=None,
+    **kwargs,
+) -> None:
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    if const_expr(src.element_type != dst.element_type):
+        src_cvt = cute.make_fragment_like(src, dst.element_type)
+        src_cvt.store(src.load().to(dst.element_type))
+        src = src_cvt
+    cute.copy(atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+@dsl_user_op
 def get_copy_atom(
     dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
 ) -> cute.CopyAtom:
@@ -60,6 +79,7 @@ def tma_get_copy_fn(
     cta_layout: cute.Layout,
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
+    filter_zeros: bool = False,
     **kwargs,
 ) -> Callable:
     src_is_smem = const_expr(
@@ -75,7 +95,9 @@ def tma_get_copy_fn(
         cute.group_modes(smem_tensor, 0, cute.rank(smem_tensor) - 1),
         cute.group_modes(gmem_tensor, 0, cute.rank(gmem_tensor) - 1),
     )
-
+    if const_expr(filter_zeros):
+        s = cute.filter_zeros(s)
+        g = cute.filter_zeros(g)
     src, dst = (s, g) if src_is_smem else (g, s)
 
     def copy_tma(src_idx, dst_idx, **new_kwargs):

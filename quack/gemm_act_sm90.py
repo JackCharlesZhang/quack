@@ -15,6 +15,7 @@ from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.dense_gemm_sm90 import GemmSm90
 from quack.cute_dsl_utils import get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
+import quack.copy_utils as copy_utils
 import quack.activation
 
 
@@ -134,6 +135,7 @@ class GemmActSm90(GemmSm90):
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
         tiled_mma: cute.TiledMma,
+        epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
@@ -168,6 +170,7 @@ class GemmActSm90(GemmSm90):
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
             mPostAct_mnl,
+            None,  # thr_mma
             self.cta_tile_shape_postact_mn,
             self.epi_tile_postact,
             sPostAct,
@@ -178,7 +181,7 @@ class GemmActSm90(GemmSm90):
 
         # We iterate over epi tiles in the N dimension first before the M dimension
         epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
         epi_tile_num = cute.size(epi_tile_shape)
@@ -218,10 +221,7 @@ class GemmActSm90(GemmSm90):
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy from D registers to shared memory
             if const_expr(has_D):
-                # Type conversion
-                tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
-                tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
-                cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[None, None, None, epi_buffer])
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
             cute.copy(
                 tiled_copy_postact_r2s,
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
