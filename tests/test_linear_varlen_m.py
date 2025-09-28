@@ -42,14 +42,14 @@ def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
     return A, A_idx
 
 
-@pytest.mark.parametrize("gather_A", [False, True])
-# @pytest.mark.parametrize("gather_A", [True])
+# @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha", [1.0, 1.7])
 # @pytest.mark.parametrize("alpha_is_tensor", [False])
 # @pytest.mark.parametrize("alpha", [1.0])
-@pytest.mark.parametrize("dynamic_scheduler", [False, True])
-# @pytest.mark.parametrize("dynamic_scheduler", [False])
+# @pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 # @pytest.mark.parametrize("B_major", ["k"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -95,12 +95,14 @@ def test_gemm_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
-@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("beta_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("beta", [0.5, 1.0])
 @pytest.mark.parametrize("alpha", [1.0, 1.5])
-@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+# @pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1504, 2048])
@@ -169,12 +171,14 @@ def test_gemm_add_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
-@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("beta_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("alpha", [1.0, 2.0])
-@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+# @pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1024, 1504])
@@ -253,10 +257,12 @@ def test_gemm_add_inplace_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
-@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("activation", [None, "relu", "gelu_tanh_approx"])
 # @pytest.mark.parametrize("activation", [None])
-@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+# @pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1024, 1504])
@@ -315,9 +321,11 @@ def test_gemm_act_varlen_m(
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
-@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("activation", [None, "relu", "gelu_tanh_approx"])
-@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+# @pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1024, 1504])

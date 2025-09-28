@@ -736,10 +736,9 @@ class GemmSm90:
                             mA_mk = cute.local_tile(
                                 mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
                             )
-                    mB_nk = varlen_manager.offset_batch_B(mB_nkl, batch_idx)
                     # (bN, bK, RestK)
                     gB_k = cute.local_tile(
-                        mB_nk,
+                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
                     )

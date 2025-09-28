@@ -898,43 +898,44 @@ class GemmSm100(GemmSm90):
                     tile_coord_mnkl[1],
                     tile_coord_mnkl[3],
                 )
-                # TODO: varlen_m
-                len_k = varlen_manager.len_k(batch_idx)
                 # (bM, bK, RestK)
-                gA_mkl = cute.local_tile(
-                    mA_mkl,
-                    cute.slice_(self.mma_tiler, (None, 0, None)),
-                    (mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]),
+                gA_mk = cute.local_tile(
+                    varlen_manager.offset_batch_A(mA_mkl, batch_idx),
+                    cute.select(self.mma_tiler, [0, 2]),
+                    (mma_tile_coord_mnl[0], None),
                 )
                 # (bN, bK, RestK)
-                gB_nkl = cute.local_tile(
-                    mB_nkl,
-                    cute.slice_(self.mma_tiler, (0, None, None)),
-                    (mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]),
+                gB_nk = cute.local_tile(
+                    varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                    cute.select(self.mma_tiler, [1, 2]),
+                    (mma_tile_coord_mnl[1], None),
                 )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
                     gSFA_mkl = cute.local_tile(
-                        mSFA_mkl,
-                        cute.slice_(self.mma_tiler, (None, 0, None)),
-                        (mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]),
+                        varlen_manager.offset_batch_A(mSFA_mkl, batch_idx),
+                        cute.select(self.mma_tiler, [0, 2]),
+                        (mma_tile_coord_mnl[0], None),
                     )
                     # (bN, bK)
                     gSFB_nkl = cute.local_tile(
-                        mSFB_nkl,
-                        cute.slice_(self.mma_tiler, (0, None, None)),
-                        (mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]),
+                        varlen_manager.offset_batch_B(mSFB_nkl, batch_idx),
+                        cute.select(self.mma_tiler, [1, 2]),
+                        (mma_tile_coord_mnl[1], None),
                     )
                 # Partition global tensor for TiledMMA_A/B/D
                 # (MMA, MMA_M, MMA_K, RestK)
-                tCgA = thr_mma.partition_A(gA_mkl)
+                tCgA = thr_mma.partition_A(gA_mk)
                 # (MMA, MMA_N, MMA_K, RestK)
-                tCgB = thr_mma.partition_B(gB_nkl)
+                tCgB = thr_mma.partition_B(gB_nk)
                 if const_expr(self.blockscaled):
                     # (MMA, MMA_M, MMA_K)
                     tCgSFA = thr_mma.partition_A(gSFA_mkl)
                     # (MMA, MMA_N, MMA_K)
                     tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
+
+                varlen_manager.fence_tensormap_update_AB(is_tma_warp)
+                len_k = varlen_manager.len_k(batch_idx)
                 # Partition global/shared tensor for TMA load A/B
                 # TMA load A partition_S/D
                 a_cta_layout = cute.make_layout(
@@ -1029,7 +1030,6 @@ class GemmSm100(GemmSm90):
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
                     tile_coord_mnkl = work_tile.tile_idx
-                    # TODO: varlen_m
                     batch_idx = tile_coord_mnkl[3]
                     copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
@@ -1118,7 +1118,6 @@ class GemmSm100(GemmSm90):
                 tiled_copy_s2t_sfa, tCsSFA_compact_s2t, tCtSFA_compact_s2t = None, None, None
                 tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = None, None, None
 
-            k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.mma_tiler[2])
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -1131,6 +1130,9 @@ class GemmSm100(GemmSm90):
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
+                batch_idx = tile_coord_mnkl[3]
+                k_len = varlen_manager.len_k(batch_idx)
+                k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
@@ -1172,6 +1174,14 @@ class GemmSm100(GemmSm90):
                 )
             # Bar sync for retrieve tensor memory ptr from shared memory
             tmem_alloc_barrier.arrive_and_wait()
+
+            is_tma_warp = Boolean(warp_idx == self.epilog_warp_id[0])
+            varlen_manager.init_tensormap_epi(
+                tma_atom_d, self.epi_get_tma_atoms(epilogue_params), is_tma_warp
+            )
+            tma_desc_d_ptr = varlen_manager.get_tma_desc_d_ptr()
+            tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
+
             # Retrieving tensor memory ptr and make accumulator tensor
             acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
@@ -1183,13 +1193,6 @@ class GemmSm100(GemmSm90):
                 barrier_id=int(NamedBarrierGemm.Epilogue),
                 num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
             )
-
-            is_tma_warp = Boolean(warp_idx == self.epilog_warp_id[0])
-            varlen_manager.init_tensormap_epi(
-                tma_atom_d, self.epi_get_tma_atoms(epilogue_params), is_tma_warp
-            )
-            tma_desc_d_ptr = varlen_manager.get_tma_desc_d_ptr()
-            tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
 
             # Partition for epilogue
             epi_tidx = tidx
