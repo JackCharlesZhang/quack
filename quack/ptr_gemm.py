@@ -424,6 +424,13 @@ class PtrGemmSm90:
                 cute.printf("BROKEN")
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             return cute.make_tensor(ptr, layout)
+
+        mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
+        mB = create_tensor_from_ptr(b_ptr, (self._m, self._k, self._l), self.b_major)
+        mD = create_tensor_from_ptr(d_ptr, (self._m, self._m, self._l), "n")
+        mC = create_tensor_from_ptr(c_ptr, (self._m, self._m, self._l), self.c_major) if c_ptr is not None else None
+
+
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
