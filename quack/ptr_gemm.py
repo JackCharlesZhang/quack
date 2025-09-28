@@ -151,6 +151,7 @@ class PtrGemmSm90:
         tile_shape_mn: Tuple[int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         m: int,
+        n: int,
         k: int,
         l: int,
         a_major: str,
@@ -177,6 +178,7 @@ class PtrGemmSm90:
 
         self.acc_dtype = acc_dtype
         self._m = m
+        self._n = n
         self._k = k
         self._l = l
         self.a_major = a_major
@@ -2640,6 +2642,7 @@ def ptr_gemm_sm90(
             tile_shape_mn,
             cluster_shape_mnk,
             m=M,
+            n=N,
             k=K,
             l=L,
             a_major=tensor_infos["A"].major,
