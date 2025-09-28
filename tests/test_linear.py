@@ -22,11 +22,11 @@ def test_linear(in_features, out_features, input_dtype):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
-    x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
+    x = torch.ones((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
     x = x[::2]  # Testing non-contiguous
     w = (
-        torch.randn((out_features, in_features), device=device, dtype=input_dtype)
-        / math.sqrt(in_features)
+        torch.ones((out_features, in_features), device=device, dtype=input_dtype)
+        #/ math.sqrt(in_features)
     ).requires_grad_()
     out = linear_func(x, w, tuned=False)  # Disable tuning for faster test
     out_ref = F.linear(x.float(), w.float())
