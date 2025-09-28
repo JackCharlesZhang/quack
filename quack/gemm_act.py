@@ -1,25 +1,28 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025, Wentao Guo, Tri Dao.
 from typing import Tuple, Optional, Callable
+from functools import partial
 from dataclasses import dataclass
 
 from torch import Tensor
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import warpgroup
-import cutlass.utils.hopper_helpers as sm90_utils
+import cutlass.utils.hopper_helpers as sm90_utils_og
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.dense_gemm_sm90 import GemmSm90
-from quack.cute_dsl_utils import get_max_active_clusters
+from quack.gemm_sm100 import GemmSm100
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
+import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
 import quack.activation
 
 
-class GemmActSm90(GemmSm90):
+class GemmActMixin:
     num_epi_tensormaps: int = 1
 
     @dataclass
@@ -34,6 +37,7 @@ class GemmActSm90(GemmSm90):
         tma_atom_postact: cute.CopyAtom
         mPostAct_mnl: cute.Tensor
         epi_postact_smem_layout_staged: cute.ComposedLayout
+        epi_tile_postact: cute.Tile
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32] = None
         beta: Optional[Float32] = None
@@ -45,33 +49,22 @@ class GemmActSm90(GemmSm90):
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
 
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        self.epi_tile_postact = self.epi_tile
-        postact_major_mode_size = (
-            self.epi_tile_postact[1]
-            if self.postact_layout.is_n_major_c()
-            else self.epi_tile_postact[0]
-        )
-        postact_smem_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                self.postact_layout, self.postact_dtype, postact_major_mode_size
-            ),
-            self.postact_dtype,
-        )
-        epi_postact_smem_layout_staged = cute.tile_to_shape(
-            postact_smem_layout_atom,
-            cute.append(self.epi_tile_postact, self.epi_stage),
-            order=(0, 1, 2),
+        epi_tile_postact = self.epi_tile
+        utils_cls = sm100_utils if self.arch == 100 else sm90_utils
+        epi_postact_smem_layout_staged = utils_cls.make_smem_layout_epi(
+            self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
         )
         tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
             args.mPostAct,
             epi_postact_smem_layout_staged,
-            self.epi_tile_postact,
+            epi_tile_postact,
             op_type="store",
         )
-        return GemmActSm90.EpilogueParams(
+        return self.__class__.EpilogueParams(
             tma_atom_postact,
             tma_tensor_postact,
             epi_postact_smem_layout_staged,
+            epi_tile_postact,
             args.act_fn,
             args.alpha,
             args.beta,
@@ -99,10 +92,10 @@ class GemmActSm90(GemmSm90):
     def epi_smem_bytes_per_stage(
         args: EpilogueArguments,
         cta_tile_shape_mnk: Tuple[int, int, int],
-        epi_tile: Tuple[int, int],
+        epi_tile: cute.Tile,
     ) -> int:
         postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = cute.size(epi_tile) * (postact_dtype.width // 8)
+        postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
         return postact_bytes_per_stage
 
     def epi_get_smem_struct(self, params: EpilogueParams):
@@ -134,14 +127,15 @@ class GemmActSm90(GemmSm90):
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
-        tiled_mma: cute.TiledMma,
+        thr_mma: Optional[cute.core.ThrMma],  # Only for Sm100
         epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
-        tiled_copy_r2s: cute.core.ThrCopy,
+        tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
+        tiled_copy_r2s: cute.TiledCopy,
         tRS_sD: cute.Tensor,
-        tiled_copy_s2r: Optional[cute.core.ThrCopy],
+        tiled_copy_s2r: Optional[cute.TiledCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
         copy_D: Optional[Callable],
@@ -159,20 +153,24 @@ class GemmActSm90(GemmSm90):
         tma_atom_postact = params.tma_atom_postact
         mPostAct_mnl = params.mPostAct_mnl
         (sPostAct,) = epi_smem_tensors
-        tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
-        copy_atom_postact_r2s = sm90_utils.sm90_get_smem_store_op(
-            self.postact_layout, elem_ty_d=self.postact_dtype, elem_ty_acc=self.acc_dtype
+        get_smem_store_op = (
+            partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
+            if self.arch == 100
+            else sm90_utils_og.sm90_get_smem_store_op
         )
-        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
-        thr_copy_postact_r2s = tiled_copy_postact_r2s.get_slice(tidx)
-        tRS_sPostAct = thr_copy_postact_r2s.partition_D(sPostAct)
+        copy_atom_postact_r2s = get_smem_store_op(
+            self.postact_layout, self.postact_dtype, self.acc_dtype
+        )
+        # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
+        # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
+        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
+        tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
         (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
             mPostAct_mnl,
-            None,  # thr_mma
             self.cta_tile_shape_postact_mn,
-            self.epi_tile_postact,
+            params.epi_tile_postact,
             sPostAct,
             tile_coord_mnkl,
             cu_seqlens_m,
@@ -276,6 +274,14 @@ class GemmActSm90(GemmSm90):
         return tRS_rPostAct_out
 
 
+class GemmActSm90(GemmActMixin, GemmSm90):
+    pass
+
+
+class GemmActSm100(GemmActMixin, GemmSm100):
+    pass
+
+
 act_fn_map = {
     None: None,
     "relu": quack.activation.relu,
@@ -284,7 +290,7 @@ act_fn_map = {
 }
 
 
-def gemm_act_sm90(
+def gemm_act(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
     D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
@@ -327,10 +333,17 @@ def gemm_act_sm90(
     }
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
+    device_capacity = get_device_capacity(A.device)
+    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
+    GemmCls = GemmActSm100 if device_capacity[0] > 9 else GemmActSm90
+    # TODO: implement dynamic persistent
+    if device_capacity[0] > 9:
+        tile_count_semaphore = None
+
     acc_dtype = cutlass.Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmActSm90.is_valid_dtypes(
+    if not GemmCls.is_valid_dtypes(
         tensor_infos["A"].dtype,
         tensor_infos["B"].dtype,
         acc_dtype,
@@ -343,7 +356,7 @@ def gemm_act_sm90(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = act_fn_map[activation]
-    epi_args = GemmActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -356,7 +369,7 @@ def gemm_act_sm90(
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
-        GemmActSm90.num_epi_tensormaps,
+        GemmCls.num_epi_tensormaps,
         pingpong,
     )
 
@@ -369,23 +382,24 @@ def gemm_act_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        device_capacity,
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
-    cache = gemm_act_sm90.compile_cache
+    cache = gemm_act.compile_cache
     if compile_key not in cache:
-        gemm = GemmActSm90(
+        if device_capacity[0] == 9:
+            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            pingpong=pingpong,
-            is_persistent=persistent,
             gather_A=gather_A,
         )
         cache[compile_key] = cute.compile(
-            gemm,
+            gemm_obj,
             tensor_infos["A"].cute_tensor,
             tensor_infos["B"].cute_tensor,
             tensor_infos["D"].cute_tensor,
@@ -407,4 +421,4 @@ def gemm_act_sm90(
     )
 
 
-gemm_act_sm90.compile_cache = {}
+gemm_act.compile_cache = {}

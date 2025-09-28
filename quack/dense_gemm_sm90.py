@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from functools import partial
 import math
 
-from torch import Tensor
 
 import cuda.bindings.driver as cuda
 
@@ -18,8 +17,6 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
 
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
@@ -37,8 +34,7 @@ from quack.tensormap_manager import TensorMapManagerSm90
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.utils as utils
 import quack.copy_utils as copy_utils
-from quack.cute_dsl_utils import get_max_active_clusters
-from quack.gemm_wrapper_utils import GemmWrapperBase
+import quack.sm90_utils as quack_sm90_utils
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -336,7 +332,7 @@ class GemmSm90:
             self.d_dtype,
             self.c_dtype,
             epilogue_args,
-            self.smem_capacity,
+            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
             # epi_smem will reuse smem ab if not persistent.
             overlap_sD_sA=not self.is_persistent,
@@ -536,7 +532,6 @@ class GemmSm90:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
-            smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1044,7 +1039,6 @@ class GemmSm90:
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         mD_mnl,
-                        None,  # thr_mma
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
@@ -1057,7 +1051,6 @@ class GemmSm90:
                     copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         mC_mnl,
-                        None,  # thr_mma
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sC,
@@ -1095,11 +1088,12 @@ class GemmSm90:
                     epi_store_pipeline,
                     epi_read_state,
                     epi_producer_state,
-                    tiled_mma,
+                    None,  # thr_mma, for Sm100 only
                     self.epi_tile,
                     load_acc_subtile,
                     tRS_rD,
                     tRS_rC,
+                    None,  # tiled_copy_t2r, for Sm100 only
                     tiled_copy_r2s,
                     tRS_sD,
                     tiled_copy_s2r,
@@ -1359,11 +1353,12 @@ class GemmSm90:
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: Optional[cutlass.pipeline.PipelineState],
-        tiled_mma: cute.TiledMma,
+        thr_mma: Optional[cute.core.ThrMma],  # Only for Sm100
         epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
+        tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
         tiled_copy_r2s: cute.core.ThrCopy,
         tRS_sD: cute.Tensor,
         tiled_copy_s2r: Optional[cute.core.ThrCopy],
@@ -1644,7 +1639,7 @@ class GemmSm90:
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
-        return GemmSm90.EpilogueParams(alpha=args.alpha, beta=args.beta)
+        return self.__class__.EpilogueParams(alpha=args.alpha, beta=args.beta)
 
     def epi_get_tma_atoms(
         self, params: EpilogueParams, *, loc=None, ip=None
@@ -1668,7 +1663,7 @@ class GemmSm90:
     def epi_smem_bytes_per_stage(
         args: Optional[EpilogueArguments],
         cta_tile_shape_mnk: Tuple[int, int, int],
-        epi_tile: Tuple[int, int],
+        epi_tile: cute.Tile,
     ) -> int:
         return 0
 
@@ -1710,7 +1705,7 @@ class GemmSm90:
         tiled_mma: cute.TiledMma,
         d_layout: Optional[LayoutEnum],
         dtype: Type[cutlass.Numeric],
-        sD: cute.Tensor,
+        sD: Optional[cute.Tensor],
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         if d_layout is None:
@@ -1752,7 +1747,6 @@ class GemmSm90:
         self,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
         mD_mnl: cute.Tensor,
-        thr_mma: Optional[cute.core.ThrMma],
         tile_shape_mn: cute.Tile,
         epi_tile: cute.Tile,
         sD: cute.Tensor,
@@ -1767,9 +1761,6 @@ class GemmSm90:
             mD_mn = mD_mnl[None, None, batch_idx]
         # (bM, bN)
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])
-        if const_expr(thr_mma is not None):
-            # partition_C gives ((MMA_TILE_M, MMA_TILE_N), MMA_M, MMA_N)
-            gD = thr_mma.partition_C(gD)[(None, None), 0, 0]
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         is_s2g = isinstance(
             atom.op, (cpasync.CopyBulkTensorTileS2GOp, cpasync.CopyReduceBulkTensorTileS2GOp)
@@ -2048,36 +2039,18 @@ class GemmSm90:
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 
+        epi_smem_layout_staged = None
         if d_dtype is not None:
-            d_smem_shape = epi_tile
-            d_major_mode_size = epi_tile[1] if d_layout.is_n_major_c() else epi_tile[0]
-            d_smem_layout_atom = warpgroup.make_smem_layout_atom(
-                sm90_utils.get_smem_layout_atom(d_layout, d_dtype, d_major_mode_size),
-                d_dtype,
+            epi_smem_layout_staged = quack_sm90_utils.make_smem_layout_epi(
+                d_dtype, d_layout, epi_tile, epi_stage
             )
-            epi_smem_layout_staged = cute.tile_to_shape(
-                d_smem_layout_atom,
-                cute.append(d_smem_shape, epi_stage),
-                order=(1, 0, 2) if d_layout.is_m_major_c() else (0, 1, 2),
-            )
-        else:
-            epi_smem_layout_staged = None
 
+        epi_c_smem_layout_staged = None
         if c_dtype is not None:
             assert c_layout is not None
-            c_smem_shape = epi_tile
-            c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
-            c_smem_layout_atom = warpgroup.make_smem_layout_atom(
-                sm90_utils.get_smem_layout_atom(c_layout, c_dtype, c_major_mode_size),
-                c_dtype,
+            epi_c_smem_layout_staged = quack_sm90_utils.make_smem_layout_epi(
+                c_dtype, c_layout, epi_tile, epi_c_stage
             )
-            epi_c_smem_layout_staged = cute.tile_to_shape(
-                c_smem_layout_atom,
-                cute.append(c_smem_shape, epi_c_stage),
-                order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
-            )
-        else:
-            epi_c_smem_layout_staged = None
 
         return (
             a_smem_layout_staged,
@@ -2252,155 +2225,3 @@ class GemmSm90:
         if (a_dtype.width == 8 and a_major != "k") or (b_dtype.width == 8 and b_major != "k"):
             is_valid = False
         return is_valid
-
-
-def gemm_sm90(
-    # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
-    A: Tensor,
-    B: Tensor,  # (l, n, k) or (n, total_k) if varlen_k
-    D: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
-    C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    tile_count_semaphore: Optional[Tensor],  # (1,)
-    tile_M: int,
-    tile_N: int,
-    cluster_M: int,
-    cluster_N: int,
-    pingpong: bool = False,
-    persistent: bool = True,
-    alpha: float | Tensor = 1.0,
-    beta: float | Tensor = 1.0,
-    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
-    cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
-    A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
-    batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
-    add_to_output: bool = False,
-) -> None:
-    varlen = cu_seqlens_m is not None or cu_seqlens_k is not None
-    assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
-        "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
-    )
-    gather_A = A_idx is not None
-    if gather_A:
-        assert varlen, "gather_A requires varlen (cu_seqlens_m or cu_seqlens_k must be specified)"
-        assert cluster_N == 1, "gather_A requires cluster_N=1"
-    if varlen:
-        assert persistent, "varlen requires persistent=True"
-    if add_to_output:
-        assert cu_seqlens_m is None, "Add to output not supported with varlen_m"
-    if cu_seqlens_m is not None:
-        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
-        assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
-    if cu_seqlens_k is not None:
-        assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
-        assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
-
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx
-    )
-    GemmWrapperBase.permute_tensors(
-        tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
-    )
-    GemmWrapperBase.extract_dtypes(tensor_infos)
-    major_configs = {
-        "A": ("m", "k", "l"),
-        "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"),
-        "C": ("m", "n", "l"),
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
-
-    acc_dtype = cutlass.Float32
-    tile_shape_mn = (tile_M, tile_N)
-    cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmSm90.is_valid_dtypes(
-        tensor_infos["A"].dtype,
-        tensor_infos["B"].dtype,
-        acc_dtype,
-        tensor_infos["D"].dtype,
-        tensor_infos["A"].major,
-        tensor_infos["B"].major,
-    ):
-        raise TypeError("Skipping due to unsupported combination of types and majors")
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-
-    def scalar_arg(scalar: float | Tensor):
-        if isinstance(scalar, float):
-            return Float32(scalar) if scalar != 1.0 else None
-        else:
-            assert isinstance(scalar, Tensor)
-            return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-
-    epi_args = GemmSm90.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta), add_to_output)
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters,
-        tile_count_semaphore,
-        batch_idx_permute,
-    )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen)
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        cu_seqlens_k,
-        A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmSm90.num_epi_tensormaps,
-        pingpong,
-    )
-
-    current_stream = cutlass_torch.current_stream()
-    compile_key = GemmWrapperBase.get_compile_key(
-        tensor_infos,
-        None,
-        tile_shape_mn,
-        cluster_shape_mnk,
-        pingpong,
-        persistent,
-        tile_count_semaphore is not None,
-        2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
-        2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
-        add_to_output,
-        cu_seqlens_m is not None,
-        cu_seqlens_k is not None,
-        gather_A,
-        batch_idx_permute is not None,
-        key_tensor_names=("A", "B", "D", "C"),
-    )
-    cache = gemm_sm90.compile_cache
-    if compile_key not in cache:
-        gemm = GemmSm90(
-            acc_dtype,
-            tensor_infos["A"].dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong=pingpong,
-            is_persistent=persistent,
-            gather_A=gather_A,
-        )
-        cache[compile_key] = cute.compile(
-            gemm,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
-
-
-gemm_sm90.compile_cache = {}

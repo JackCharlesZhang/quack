@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 from typing import Optional
+from functools import partial
 
 from torch import Tensor
 
@@ -8,17 +9,19 @@ import cutlass.cute as cute
 from cutlass import const_expr
 import cutlass.torch as cutlass_torch
 
-from quack.gemm_act_sm90 import GemmActSm90
-from quack.cute_dsl_utils import get_max_active_clusters
+from quack.dense_gemm_sm90 import GemmSm90
+from quack.gemm_sm100 import GemmSm100
+from quack.gemm_act import GemmActMixin
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
 import quack.activation
 
 
-class GemmDActSm90(GemmActSm90):
+class GemmDActMixin(GemmActMixin):
     # Different from GemmActSm90, here act_bwd_fn must take in 2 arguments (x, dout)
     # and return 2 arguments (dx, out)
-    EpilogueArguments = GemmActSm90.EpilogueArguments
-    EpilogueParams = GemmActSm90.EpilogueParams
+    EpilogueArguments = GemmActMixin.EpilogueArguments
+    EpilogueParams = GemmActMixin.EpilogueParams
 
     @cute.jit
     def epi_visit_acc_subtile(
@@ -43,6 +46,14 @@ class GemmDActSm90(GemmActSm90):
         return tRS_rPostAct_out
 
 
+class GemmDActSm90(GemmDActMixin, GemmSm90):
+    pass
+
+
+class GemmDActSm100(GemmDActMixin, GemmSm100):
+    pass
+
+
 dact_fn_map = {
     None: None,
     "relu": quack.activation.drelu,
@@ -51,7 +62,7 @@ dact_fn_map = {
 }
 
 
-def gemm_dact_sm90(
+def gemm_dact(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
     Out: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
@@ -100,10 +111,17 @@ def gemm_dact_sm90(
     }
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
+    device_capacity = get_device_capacity(A.device)
+    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
+    GemmCls = GemmDActSm100 if device_capacity[0] > 9 else GemmDActSm90
+    # TODO: implement dynamic persistent
+    if device_capacity[0] > 9:
+        tile_count_semaphore = None
+
     acc_dtype = cutlass.Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmDActSm90.is_valid_dtypes(
+    if not GemmCls.is_valid_dtypes(
         tensor_infos["A"].dtype,
         tensor_infos["B"].dtype,
         acc_dtype,
@@ -116,7 +134,7 @@ def gemm_dact_sm90(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = dact_fn_map[activation]
-    epi_args = GemmDActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -129,7 +147,7 @@ def gemm_dact_sm90(
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
-        GemmDActSm90.num_epi_tensormaps,
+        GemmCls.num_epi_tensormaps,
         pingpong,
     )
 
@@ -142,19 +160,20 @@ def gemm_dact_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        device_capacity,
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
-    cache = gemm_dact_sm90.compile_cache
+    cache = gemm_dact.compile_cache
     if compile_key not in cache:
-        gemm = GemmDActSm90(
+        if device_capacity[0] == 9:
+            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        gemm = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            pingpong=pingpong,
-            is_persistent=persistent,
             gather_A=gather_A,
         )
         cache[compile_key] = cute.compile(
@@ -180,4 +199,4 @@ def gemm_dact_sm90(
     )
 
 
-gemm_dact_sm90.compile_cache = {}
+gemm_dact.compile_cache = {}

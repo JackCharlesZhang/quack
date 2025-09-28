@@ -149,6 +149,7 @@ class GemmSm100(GemmSm90):
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],  # ignored for now
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
@@ -201,7 +202,6 @@ class GemmSm100(GemmSm90):
         self.threads_per_cta = 32 * len(
             (self.mma_warp_id, self.tma_warp_id, self.tma_epi_warp_id, *self.epilog_warp_id)
         )
-        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
         """Set up configurations that are dependent on GEMM inputs
@@ -310,8 +310,8 @@ class GemmSm100(GemmSm90):
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
-            self.d_layout,
-            self.d_dtype,
+            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
+            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
             layout_c=self.c_layout,
             elem_ty_c=self.c_dtype,
         )
@@ -336,7 +336,7 @@ class GemmSm100(GemmSm90):
             self.d_layout,
             self.c_layout,
             epilogue_args,
-            self.smem_capacity,
+            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
         )
         self.sched_stage = 1  # For compatibility with GemmSm90
@@ -348,15 +348,16 @@ class GemmSm100(GemmSm90):
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
         )
-        self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.d_dtype, self.d_layout, self.epi_tile, self.epi_stage
-        )
+        self.epi_smem_layout_staged = None
+        if const_expr(self.d_dtype is not None):
+            self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+                self.d_dtype, self.d_layout, self.epi_tile, self.epi_stage
+            )
+        self.epi_c_smem_layout_staged = None
         if const_expr(self.c_dtype is not None):
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
                 self.c_dtype, self.c_layout, self.epi_tile, self.epi_c_stage
             )
-        else:
-            self.epi_c_smem_layout_staged = None
         if const_expr(self.blockscaled):
             self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
                 self.tiled_mma,
@@ -659,7 +660,6 @@ class GemmSm100(GemmSm90):
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
-            smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1048,20 +1048,13 @@ class GemmSm100(GemmSm90):
                     # Get tile coord from tile scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     # TODO: varlen_m
-                    mma_tile_coord_mnkl = (
-                        tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
-                        tile_coord_mnkl[1],
-                        None,
-                        tile_coord_mnkl[3],
-                    )
                     copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         mC_mnl,
-                        thr_mma,
-                        self.mma_tiler[:2],
+                        self.cta_tile_shape_mnk[:2],
                         epi_tile,
                         sC,
-                        mma_tile_coord_mnkl,
+                        tile_coord_mnkl,
                         cu_seqlens_m,
                     )
                     copy_C = copy_utils.producer_copy_fn(copy_C_fn, epi_pipeline)
@@ -1283,12 +1276,6 @@ class GemmSm100(GemmSm90):
                             is_manager_warp=is_tma_warp,
                         )
 
-                mma_tile_coord_mnkl = (
-                    tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_coord_mnkl[1],
-                    None,
-                    tile_coord_mnkl[3],
-                )
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, acc_consumer_state.index]
@@ -1315,18 +1302,18 @@ class GemmSm100(GemmSm90):
                         for tensormap_epi_ptr in tensormap_epi_ptrs
                     ]
 
-                # copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_d_ptr)
-                copy_D, _, _ = self.epilog_gmem_copy_and_partition(
-                    tma_atom_d,
-                    mD_mnl,
-                    thr_mma,
-                    self.mma_tiler[:2],
-                    epi_tile,
-                    sD,
-                    mma_tile_coord_mnkl,
-                    cu_seqlens_m,
-                    tma_desc_ptr=tma_desc_d_ptr,
-                )
+                copy_D = None
+                if const_expr(has_D):
+                    copy_D, _, _ = self.epilog_gmem_copy_and_partition(
+                        tma_atom_d,
+                        mD_mnl,
+                        self.cta_tile_shape_mnk[:2],
+                        epi_tile,
+                        sD,
+                        tile_coord_mnkl,
+                        cu_seqlens_m,
+                        tma_desc_ptr=tma_desc_d_ptr,
+                    )
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 load_acc_subtile = partial(
@@ -1341,11 +1328,12 @@ class GemmSm100(GemmSm90):
                     epi_store_pipeline,
                     epi_read_state,
                     None,  # epi_producer_state
-                    tiled_mma,
+                    thr_mma,
                     epi_tile,
                     load_acc_subtile,
                     tRS_rD,
                     tRS_rC,
+                    tiled_copy_t2r,
                     tiled_copy_r2s,
                     tRS_sD,
                     tiled_copy_s2r,
@@ -1357,7 +1345,7 @@ class GemmSm100(GemmSm90):
                     cu_seqlens_m,
                     epilogue_barrier,
                     tile_scheduler,
-                    tidx,
+                    epi_tidx,
                     is_tma_warp,
                 )
 
@@ -1472,6 +1460,7 @@ class GemmSm100(GemmSm90):
         # Load accumulator from tensor memory buffer to register
         cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_idx], tTR_rAcc)
         tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
+        # TODO: if varlen_k and k_tile == 0, set tRS_rD to zero
         tRS_rD.store(tRS_rAcc.load())
 
     def mainloop_s2t_copy_and_partition(
@@ -1537,8 +1526,8 @@ class GemmSm100(GemmSm90):
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
-            self.d_layout,
-            self.d_dtype,
+            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
+            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
             self.acc_dtype,
             epi_tile,
             use_2cta_instrs,
@@ -1588,12 +1577,15 @@ class GemmSm100(GemmSm90):
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.d_layout, self.d_dtype, self.acc_dtype, tiled_copy_t2r
+            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
+            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
+            self.acc_dtype,
+            tiled_copy_t2r,
         )
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-        tRS_sD = thr_copy_r2s.partition_D(sD)
+        tRS_sD = thr_copy_r2s.partition_D(sD) if sD is not None else None
         # (R2S, R2S_M, R2S_N)
         tRS_rD = tiled_copy_r2s.retile(tTR_rD)
         return tiled_copy_r2s, tRS_rD, tRS_sD
@@ -1691,7 +1683,7 @@ class GemmSm100(GemmSm90):
         sf_vec_size: Optional[int],
         d_dtype: Optional[Type[cutlass.Numeric]],
         c_dtype: Optional[Type[cutlass.Numeric]],
-        d_layout: LayoutEnum,
+        d_layout: Optional[LayoutEnum],
         c_layout: Optional[LayoutEnum],
         epilogue_args: EpilogueArguments,
         smem_capacity: int,
@@ -1711,7 +1703,7 @@ class GemmSm100(GemmSm90):
         :type epi_tile: cute.Tile
         :param d_dtype: Data type of operand C (output).
         :type d_dtype: type[cutlass.Numeric]
-        :param d_layout: Layout enum of operand C.
+        :param d_layout: Layout enum of operand D.
         :type d_layout: LayoutEnum
         :param smem_capacity: Total available shared memory capacity in bytes.
         :type smem_capacity: int
@@ -1746,7 +1738,11 @@ class GemmSm100(GemmSm90):
             b_dtype,
             1,  # a tmp 1 stage is provided
         )
-        d_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
+        d_smem_layout_staged_one = (
+            sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
+            if d_dtype is not None
+            else None
+        )
         c_smem_layout_staged_one = (
             sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
             if c_dtype is not None
@@ -1824,9 +1820,12 @@ class GemmSm100(GemmSm90):
 
     @staticmethod
     def is_valid_dtypes(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
-        d_dtype: Type[cutlass.Numeric],
+        d_dtype: Optional[Type[cutlass.Numeric]],
+        a_major: str,
+        b_major: str,
     ) -> bool:
         """
         Check if the dtypes are valid
@@ -1842,6 +1841,9 @@ class GemmSm100(GemmSm90):
         :rtype: bool
         """
         is_valid = True
+        if b_dtype != a_dtype:
+            is_valid = False
+        ab_dtype = a_dtype
         if ab_dtype not in {
             cutlass.Float16,
             cutlass.BFloat16,
@@ -1860,7 +1862,7 @@ class GemmSm100(GemmSm90):
             and ab_dtype not in {cutlass.Uint8, cutlass.Int8}
         ):
             is_valid = False
-        if (
+        if d_dtype is not None and (
             acc_dtype == Float32
             and d_dtype
             not in {
@@ -1890,6 +1892,8 @@ class GemmSm100(GemmSm90):
                 cutlass.Uint8,
             }
         ):
+            is_valid = False
+        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
         return is_valid
 
@@ -1945,34 +1949,6 @@ class GemmSm100(GemmSm90):
         }:
             is_valid = False
 
-        return is_valid
-
-    @staticmethod
-    def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-    ) -> bool:
-        """
-        Check if the dtypes and sf_vec_size are valid combinations
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param d_dtype: The data type of the output tensor
-        :type d_dtype: Type[cutlass.Numeric]
-        :param a_major: The major dimension of the A tensor
-        :type a_major: str
-        :param b_major: The major dimension of the B tensor
-        :type b_major: str
-        :param d_major: The major dimension of the C tensor
-        :type d_major: str
-
-        :return: True if the layouts are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
         return is_valid
 
     @staticmethod
@@ -2120,7 +2096,7 @@ class GemmSm100(GemmSm90):
         """
         can_implement = True
         # Skip unsupported types
-        if not GemmSm100.is_valid_dtypes(ab_dtype, acc_dtype, d_dtype):
+        if not GemmSm100.is_valid_dtypes(ab_dtype, ab_dtype, acc_dtype, d_dtype, a_major, b_major):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
         if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
@@ -2295,7 +2271,7 @@ def run(
 
     # Configure gemm kernel
     cluster_shape_mnk = (*cluster_shape_mn, 1)
-    gemm = GemmSm100(acc_dtype, mma_tiler_mn, cluster_shape_mnk)
+    gemm = GemmSm100(acc_dtype, ab_dtype, mma_tiler_mn, cluster_shape_mnk)
 
     # Compute max active clusters on current device
     hardware_info = cutlass.utils.HardwareInfo()

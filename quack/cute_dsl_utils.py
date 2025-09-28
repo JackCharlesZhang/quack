@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+from typing import Tuple
 from functools import partial, lru_cache
 from dataclasses import dataclass, fields
 
@@ -35,6 +36,11 @@ torch2cute_dtype_map = {
 @lru_cache
 def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+
+
+@lru_cache
+def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+    return torch.cuda.get_device_capability(device)
 
 
 @dataclass
