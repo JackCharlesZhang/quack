@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass import const_expr
 import cutlass.torch as cutlass_torch
 
-from quack.dense_gemm_sm90 import GemmSm90
+from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_act import GemmActMixin
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters

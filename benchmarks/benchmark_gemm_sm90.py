@@ -14,7 +14,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.gemm_sm90 import GemmSm90, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 """

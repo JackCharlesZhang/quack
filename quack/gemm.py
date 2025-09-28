@@ -10,7 +10,7 @@ from cutlass.cute.runtime import make_ptr
 
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.dense_gemm_sm90 import GemmSm90
+from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 
 
