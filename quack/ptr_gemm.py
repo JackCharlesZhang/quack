@@ -156,6 +156,7 @@ class PtrGemmSm90:
         l: int,
         a_major: str,
         b_major: str,
+        d_major: str,
         c_major: Optional[str],
         pingpong: bool = False,
         is_persistent: bool = True,
@@ -183,6 +184,7 @@ class PtrGemmSm90:
         self._l = l
         self.a_major = a_major
         self.b_major = b_major
+        self.d_major = d_major
         self.c_major = c_major
         self.pingpong = pingpong
         self.is_persistent = is_persistent
@@ -436,7 +438,7 @@ class PtrGemmSm90:
 
         mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
-        mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
+        mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
         mC = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
 
 
@@ -2583,6 +2585,7 @@ def ptr_gemm_sm90(
         tensor_infos["D"].dtype, 
         tensor_infos["A"].major,
         tensor_infos["B"].major,
+        tensor_infos["D"].major,
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
@@ -2656,6 +2659,7 @@ def ptr_gemm_sm90(
             l=L,
             a_major=tensor_infos["A"].major,
             b_major=tensor_infos["B"].major,
+            d_major=tensor_infos["D"].major,
             c_major=tensor_infos["C"].major,
             pingpong=pingpong,
             is_persistent=persistent,
