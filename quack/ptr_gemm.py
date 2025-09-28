@@ -2585,7 +2585,6 @@ def ptr_gemm_sm90(
         tensor_infos["D"].dtype, 
         tensor_infos["A"].major,
         tensor_infos["B"].major,
-        tensor_infos["D"].major,
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
