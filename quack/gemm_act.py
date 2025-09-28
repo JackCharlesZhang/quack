@@ -13,6 +13,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from quack.varlen_utils import VarlenManager
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
@@ -78,13 +79,13 @@ class GemmActMixin:
     def epi_get_tensormap_update_shapes_orders(
         self,
         params: EpilogueParams,
-        cu_seqlens_m: cute.Tensor,
+        cu_seqlens_m: Optional[cute.Tensor],
         batch_idx: Int32,
         *,
         loc=None,
         ip=None,
     ) -> tuple[list[Int32], list[int]]:
-        shapes = [cu_seqlens_m[batch_idx + 1]]
+        shapes = [cu_seqlens_m[batch_idx + 1] if cu_seqlens_m is not None else None]
         orders = [0 if const_expr(self.postact_layout.is_m_major_c()) else 1]
         return shapes, orders
 
@@ -127,7 +128,6 @@ class GemmActMixin:
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
-        thr_mma: Optional[cute.core.ThrMma],  # Only for Sm100
         epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
@@ -141,7 +141,7 @@ class GemmActMixin:
         copy_D: Optional[Callable],
         copy_C: Optional[Callable],
         tile_coord_mnkl: cute.Coord,
-        cu_seqlens_m: Optional[cute.Tensor],
+        varlen_manager: VarlenManager,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tile_scheduler,
         tidx: Int32,
@@ -166,14 +166,14 @@ class GemmActMixin:
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
         (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
+        batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
-            mPostAct_mnl,
+            varlen_manager.offset_batch_epi(mPostAct_mnl, batch_idx),
             self.cta_tile_shape_postact_mn,
             params.epi_tile_postact,
             sPostAct,
             tile_coord_mnkl,
-            cu_seqlens_m,
             tma_desc_ptr=tma_desc_postact_ptr,
         )
 
