@@ -11,6 +11,7 @@ from torch import Tensor
 
 import cuda.bindings.driver as cuda
 
+from quack.jack_utils import make_ptr as make_jack_ptr
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -147,6 +148,12 @@ class GemmSm90:
         a_dtype: Type[cutlass.Numeric],
         tile_shape_mn: Tuple[int, int],
         cluster_shape_mnk: Tuple[int, int, int],
+        m: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        c_major: Optional[str],
         pingpong: bool = False,
         is_persistent: bool = True,
         fp8_fast_accum: bool = False,
@@ -167,6 +174,12 @@ class GemmSm90:
         """
 
         self.acc_dtype = acc_dtype
+        self._m = m
+        self._k = k
+        self._l = l
+        self.a_major = a_major
+        self.b_major = b_major
+        self.c_major = c_major
         self.pingpong = pingpong
         self.is_persistent = is_persistent
         if self.pingpong:
@@ -366,10 +379,14 @@ class GemmSm90:
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
+        # mA: cute.Tensor,
+        # mB: cute.Tensor,
+        # mD: Optional[cute.Tensor],
+        # mC: Optional[cute.Tensor],
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        d_ptr: cute.Pointer,
+        c_ptr: Optional[cute.Pointer],
         epilogue_args: ArgumentsBase,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
@@ -391,6 +408,25 @@ class GemmSm90:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
+
+        # Create tensors from pointers
+        def create_tensor_from_ptr(ptr, shape, major_order):
+            if cutlass.const_expr(major_order == "m"):
+                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
+            elif cutlass.const_expr(major_order == "k"):
+                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
+            elif cutlass.const_expr(major_order == "n"):
+                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
+            else:
+                # This should never happen if major_order is passed correctly
+                cute.printf("BROKEN")
+                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
+            return cute.make_tensor(ptr, layout)
+
+        mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
+        mB = create_tensor_from_ptr(b_ptr, (self._m, self._k, self._l), self.b_major)
+        mD = create_tensor_from_ptr(d_ptr, (self._m, self._m, self._l), "n")
+        mC = create_tensor_from_ptr(c_ptr, (self._m, self._m, self._l), self.c_major) if c_ptr is not None else None
 
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
@@ -541,7 +577,7 @@ class GemmSm90:
         )
         return
 
-    #  GPU device kernel
+   #  GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -2388,6 +2424,7 @@ class GemmSm90:
         return is_valid
 
 
+
 def gemm_sm90(
     # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
     A: Tensor,
@@ -2428,9 +2465,90 @@ def gemm_sm90(
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx
+    # Inline validation and tensor preparation logic
+    assert not (cu_seqlens_m is not None and cu_seqlens_k is not None), (
+        "Only one of cu_seqlens_m and cu_seqlens_k can be specified"
     )
+    assert B.dtype == A.dtype, "A and B must have the same dtype"
+
+    # Validate A_idx if provided (for gather_A case)
+    gather_A = A_idx is not None
+    if gather_A:
+        assert cu_seqlens_m is not None or cu_seqlens_k is not None, (
+            "gather_A requires either varlen_m or varlen_k"
+        )
+        assert A_idx.dtype == torch.int32, f"A_idx must be int32, got {A_idx.dtype}"
+        assert A_idx.dim() == 1, f"A_idx must be 1D, got {A_idx.dim()}D"
+
+    # Determine mode and extract dimensions
+    if cu_seqlens_m is not None:
+        # varlen_m: A is (total_m, k) or (whatever, k) if gather_A, B is (l, n, k), D/C are (total_m, n)
+        assert A.dim() == 2, f"A must be 2D when using varlen_m, got {A.dim()}D"
+        assert B.dim() == 3, f"B must be 3D with varlen_m, got {B.dim()}D"
+
+        if gather_A:
+            # When gather_A, A can have any number of rows, we use A_idx.shape[0] as total_M
+            total_M = A_idx.shape[0]
+            _, K = A.shape
+        else:
+            total_M, K = A.shape
+
+        L, N, K_B = B.shape
+        assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
+        assert cu_seqlens_m.shape == (L + 1,), (
+            f"cu_seqlens_m must have shape ({L + 1},), got {cu_seqlens_m.shape}"
+        )
+        M = total_M
+        dc_shape = (total_M, N)
+        dc_ndim = 2
+    elif cu_seqlens_k is not None:
+        # varlen_k: A is (m, total_k) or (m, whatever) if gather_A, B is (n, total_k), D/C are (l, m, n)
+        assert A.dim() == 2, f"A must be 2D when using varlen_k, got {A.dim()}D"
+        assert B.dim() == 2, f"B must be 2D with varlen_k, got {B.dim()}D"
+
+        if gather_A:
+            # When gather_A with varlen_k, A can have any number of columns, we use A_idx.shape[0] as total_K
+            M, _ = A.shape
+            total_K = A_idx.shape[0]
+        else:
+            M, total_K = A.shape
+
+        N, K_B = B.shape
+        assert total_K == K_B, f"K dimension mismatch: expected {total_K}, B has {K_B}"
+        L = cu_seqlens_k.shape[0] - 1
+        assert cu_seqlens_k.shape == (L + 1,), (
+            f"cu_seqlens_k must have shape ({L + 1},), got {cu_seqlens_k.shape}"
+        )
+        K = total_K
+        dc_shape = (L, M, N)
+        dc_ndim = 3
+    else:
+        # Normal case - all tensors must be 3D
+        GemmWrapperBase.validate_tensor(A, "A", 3)
+        GemmWrapperBase.validate_tensor(B, "B", 3)
+        L, M, K = A.shape
+        _, N, K_B = B.shape
+        assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
+        GemmWrapperBase.validate_shape(B, (L, N, K), "B")
+        dc_shape = (L, M, N)
+        dc_ndim = 3
+
+    # Validate D and C shapes uniformly
+    for tensor, name in [(D, "D"), (C, "C")]:
+        if tensor is not None:
+            assert tensor.dim() == dc_ndim, (
+                f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
+            )
+            assert tensor.shape == dc_shape, (
+                f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
+            )
+
+    tensor_infos = {
+        "A": GemmTensorInfo(A),
+        "B": GemmTensorInfo(B),
+        "D": GemmTensorInfo(D),
+        "C": GemmTensorInfo(C),
+    }
     GemmWrapperBase.permute_tensors(
         tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
     )
@@ -2450,14 +2568,19 @@ def gemm_sm90(
         tensor_infos["A"].dtype,
         tensor_infos["B"].dtype,
         acc_dtype,
-        tensor_infos["D"].dtype,
+        tensor_infos["D"].dtype, 
         tensor_infos["A"].major,
         tensor_infos["B"].major,
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    #GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+
+    for tensor in tensor_infos.values():
+        torch_tensor = tensor.tensor
+        if torch_tensor is not None:
+            tensor.cute_tensor = make_jack_ptr(cutlass_dtype, torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
 
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
@@ -2485,7 +2608,10 @@ def gemm_sm90(
         pingpong,
     )
 
-    current_stream = cutlass_torch.current_stream()
+    # Cache current stream to avoid repeated calls
+    if not hasattr(cutlass_torch, '_cached_current_stream'):
+        cutlass_torch._cached_current_stream = cutlass_torch.current_stream()
+    current_stream = cutlass_torch._cached_current_stream
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
         None,
@@ -2510,6 +2636,12 @@ def gemm_sm90(
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
+            m=M,
+            k=K,
+            l=L,
+            a_major=tensor_infos["A"].major,
+            b_major=tensor_infos["B"].major,
+            c_major=tensor_infos["C"].major,
             pingpong=pingpong,
             is_persistent=persistent,
             gather_A=gather_A,
