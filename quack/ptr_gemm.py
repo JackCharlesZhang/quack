@@ -427,6 +427,8 @@ class PtrGemmSm90:
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             return cute.make_tensor(ptr, layout)
 
+        print(self._m, self._n, self._k, self._l)
+
         mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
