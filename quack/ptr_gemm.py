@@ -2623,7 +2623,7 @@ def ptr_gemm_sm90(
         batch_idx_permute is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
-    cache = gemm_sm90.compile_cache
+    cache = ptr_gemm_sm90.compile_cache
     if compile_key not in cache:
         gemm = PtrGemmSm90(
             acc_dtype,
@@ -2663,4 +2663,4 @@ def ptr_gemm_sm90(
     )
 
 
-gemm_sm90.compile_cache = {}
+ptr_gemm_sm90.compile_cache = {}
