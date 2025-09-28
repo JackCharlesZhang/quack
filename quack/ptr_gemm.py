@@ -23,6 +23,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 
 from quack.gemm_wrapper_utils import GemmTensorInfo
+from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
 from quack.tile_scheduler import (
@@ -2575,7 +2576,7 @@ def ptr_gemm_sm90(
     for tensor in tensor_infos.values():
         torch_tensor = tensor.tensor
         if torch_tensor is not None:
-            tensor.cute_tensor = make_jack_ptr(cutlass_dtype, torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            tensor.cute_tensor = make_jack_ptr(torch2cute_dtype_map[torch_tensor.dtype], torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
 
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
