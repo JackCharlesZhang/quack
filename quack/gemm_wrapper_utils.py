@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union
 from dataclasses import dataclass
 
 import torch
@@ -13,13 +13,15 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.varlen_utils import VarlenArguments
 from quack.dense_gemm_sm90 import TileSchedulerOptions
 
+from cutlass.cute.typing import Pointer
+
 
 @dataclass
 class GemmTensorInfo:
     tensor: Optional[Tensor]
     dtype: Optional[Any] = None
     major: Optional[str] = None
-    cute_tensor: Optional[cute.Tensor] = None
+    cute_tensor: Optional[Union[cute.Tensor, Pointer]] = None
 
 
 class GemmWrapperBase:

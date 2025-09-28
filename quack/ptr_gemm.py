@@ -415,7 +415,6 @@ class PtrGemmSm90:
         :type stream: cuda.CUstream
         """
 
-        # Create tensors from pointers
         def create_tensor_from_ptr(ptr, shape, major_order):
             if cutlass.const_expr(major_order == "m"):
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
@@ -428,6 +427,7 @@ class PtrGemmSm90:
                 cute.printf("BROKEN")
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             return cute.make_tensor(ptr, layout)
+        
 
         print(self._m, self._n, self._k, self._l)
 
@@ -436,6 +436,7 @@ class PtrGemmSm90:
         # mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
         # mC = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
 
+        print("Type of a ptr ", type(a_ptr))
         mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
