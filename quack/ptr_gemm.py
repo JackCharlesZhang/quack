@@ -429,6 +429,11 @@ class PtrGemmSm90:
 
         print(self._m, self._n, self._k, self._l)
 
+        # mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
+        # mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
+        # mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
+        # mC = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
+
         mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
@@ -2614,6 +2619,8 @@ def ptr_gemm_sm90(
         PtrGemmSm90.num_epi_tensormaps,
         pingpong,
     )
+
+    print("D MAJOR", tensor_infos["D"].major)
 
     # Cache current stream to avoid repeated calls
     if not hasattr(cutlass_torch, '_cached_current_stream'):
