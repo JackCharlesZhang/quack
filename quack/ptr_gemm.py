@@ -22,6 +22,7 @@ from cutlass.utils import LayoutEnum
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 
+from quack.gemm_wrapper_utils import GemmTensorInfo
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
 from quack.tile_scheduler import (
