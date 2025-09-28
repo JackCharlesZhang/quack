@@ -12,6 +12,7 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.dense_gemm_sm90 import gemm_sm90
 from quack.gemm_act_sm90 import gemm_act_sm90
 from quack.gemm_dact_sm90 import gemm_dact_sm90
+from quack.ptr_gemm import ptr_gemm_sm90
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -102,7 +103,7 @@ def gemm_tuned(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    gemm_sm90(
+    ptr_gemm_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         out if not config.swap_ab else out.mT,
