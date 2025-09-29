@@ -426,13 +426,23 @@ def run(
     epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
     varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor, mAIdx)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    
+    from cutlass.cute.runtime import make_ptr
+    from quack.cute_dsl_utils import torch2cute_dtype_map
+
+    a_ptr = make_ptr(torch2cute_dtype_map[a_torch.dtype], a_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(torch2cute_dtype_map[b_torch.dtype], b_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    d_ptr = make_ptr(torch2cute_dtype_map[d_torch.dtype], d_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(torch2cute_dtype_map[c_torch.dtype], c_torch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16) if c_torch is not None else None
+    
+    
     # compile gemm kernel
     compiled_gemm = cute.compile(
         gemm,
-        mA,
-        mB,
-        mD,
-        mC,
+        a_ptr,
+        b_ptr,
+        d_ptr,
+        c_ptr,
         epi_args,
         scheduler_args,
         varlen_args,
@@ -441,7 +451,7 @@ def run(
 
     if not skip_ref_check and not add_to_output and not (gather_A and varlen_k):
         # execution
-        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream)
+        compiled_gemm(a_ptr, b_ptr, d_ptr, c_ptr, epi_args, scheduler_args, varlen_args, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 
@@ -551,7 +561,7 @@ def run(
     time.sleep(0.5)
 
     def fn():
-        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream)
+        compiled_gemm(a_ptr, b_ptr, d_ptr, c_ptr, epi_args, scheduler_args, varlen_args, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 
