@@ -15,6 +15,12 @@ import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass.cute.nvgpu.warp import (
+    LdMatrix8x8x16bOp,
+    LdMatrix16x16x8bOp,
+    StMatrix8x8x16bOp,
+    StMatrix16x8x8bOp,
+)
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.runtime import from_dlpack, make_ptr
@@ -1202,20 +1208,15 @@ class GemmSm100(GemmSm90):
 
             # tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
             tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
-            tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_copy_and_partition(
-                tiled_copy_t2r, tTR_rD, epi_tidx, sD
+            tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
+                tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
             if const_expr(mC_mnl is not None):
-                tTR_rC = cute.make_fragment_like(tTR_rD, self.c_dtype)
-                tiled_copy_s2r, tSR_rC, tSR_sC = self.epilog_smem_copy_and_partition(
-                    tiled_copy_t2r, tTR_rC, epi_tidx, sC
+                tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
+                    tiled_copy_t2r, self.c_layout, self.c_dtype, sC, tRS_rD.layout, epi_tidx
                 )
-                # TODO: for m major, D is being stored w STSM so we'd need LDSM here
-                # tRS_rC = tSR_rC  # TODO: retile?
-                tRS_rC = cute.make_fragment(tRS_rD.layout, self.c_dtype)
-                tSR_rC = tiled_copy_s2r.get_slice(epi_tidx).retile(tRS_rC)
 
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
@@ -1500,12 +1501,14 @@ class GemmSm100(GemmSm90):
         tTR_rAcc = cute.make_fragment(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
-    def epilog_smem_copy_and_partition(
+    def epilog_smem_store_and_partition(
         self,
         tiled_copy_t2r: cute.TiledCopy,
+        d_layout: Optional[LayoutEnum],
+        dtype: Optional[Type[cutlass.Numeric]],
         tTR_rD: cute.Tensor,
-        tidx: Int32,
         sD: cute.Tensor,
+        tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
@@ -1527,8 +1530,8 @@ class GemmSm100(GemmSm90):
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
-            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
+            d_layout if d_layout is not None else LayoutEnum.ROW_MAJOR,
+            dtype if dtype is not None else cutlass.BFloat16,
             self.acc_dtype,
             tiled_copy_t2r,
         )
@@ -1540,69 +1543,38 @@ class GemmSm100(GemmSm90):
         tRS_rD = tiled_copy_r2s.retile(tTR_rD)
         return tiled_copy_r2s, tRS_rD, tRS_sD
 
-    # def epilog_smem_load_copy_and_partition(
-    #     self,
-    #     tiled_copy_t2r: cute.TiledCopy,
-    #     tTR_rC: cute.Tensor,
-    #     tidx: Int32,
-    #     sC: cute.Tensor,
-    # ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-    #     copy_atom_s2r = cute.make_copy_atom(
-    #         warp.LdMatrix8x8x16bOp(self.c_layout.is_m_major_c(), num_matrices=4),
-    #         self.c_dtype,  # TODO: this probably only works for f16 for now?
-    #     )
-    #     # copy_atom_s2r = utils.sm90_get_smem_load_op(self.c_layout, self.c_dtype)
-    #     tiled_copy_s2r = cute.make_tiled_copy_D(copy_atom_s2r, tiled_copy_t2r)
-    #     # (R2S, R2S_M, R2S_N, PIPE_D)
-    #     thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
-    #     # (R2S, R2S_M, R2S_N)
-    #     tSR_sC = thr_copy_s2r.partition_S(sC)
-    #     return tiled_copy_s2r, tSR_sC
-
-    # def epilog_gmem_copy_and_partition(
-    #     self,
-    #     atom: Union[cute.CopyAtom, cute.TiledCopy],
-    #     gD_mnl: cute.Tensor,
-    #     epi_tile: cute.Tile,
-    #     sD: cute.Tensor,
-    # ) -> Tuple[cute.Tensor, cute.Tensor]:
-    #     """Make tiledCopy for global memory store, then use it to:
-    #     - partition register array (source) and global memory (destination) for none TMA store version;
-    #     - partition shared memory (source) and global memory (destination) for TMA store version.
-
-    #     :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-    #     :type atom: cute.CopyAtom or cute.TiledCopy
-    #     :param gD_mnl: The global tensor C
-    #     :type gD_mnl: cute.Tensor
-    #     :param epi_tile: The epilogue tiler
-    #     :type epi_tile: cute.Tile
-    #     :param sD: The shared memory tensor to be copied and partitioned
-    #     :type sD: cute.Tensor
-
-    #     :return: A tuple containing either:
-    #         - For TMA store: (tma_atom_d, bSG_sD, bSG_gD) where:
-    #             - tma_atom_d: The TMA copy atom
-    #             - bSG_sD: The partitioned shared memory tensor C
-    #             - bSG_gD: The partitioned global tensor C
-    #         - For non-TMA store: (simt_atom, tTR_rD, tTR_gD) where:
-    #             - simt_atom: The SIMT copy atom
-    #             - tTR_rD: The register tensor C
-    #             - tTR_gD: The partitioned global tensor C
-    #     :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
-    #     """
-    #     # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
-    #     gD_epi = cute.flat_divide(gD_mnl[((None, None), 0, 0)], epi_tile)
-    #     sD_for_tma_partition = cute.group_modes(sD, 0, 2)
-    #     gD_for_tma_partition = cute.group_modes(gD_epi, 0, 2)
-    #     # ((ATOM_V, REST_V), EPI_M, EPI_N)
-    #     bSG_sD, bSG_gD = cpasync.tma_partition(
-    #         atom,
-    #         0,
-    #         cute.make_layout(1),
-    #         sD_for_tma_partition,
-    #         gD_for_tma_partition,
-    #     )
-    #     return bSG_sD, bSG_gD
+    def epilog_smem_load_and_partition(
+        self,
+        tiled_copy_t2r: cute.TiledCopy,
+        c_layout: LayoutEnum,
+        dtype: Type[cutlass.Numeric],
+        # tTR_rC: cute.Tensor,
+        sC: cute.Tensor,
+        tRS_rD_layout: cutlass.Layout,
+        tidx: Int32,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        copy_atom_r2s = sm100_utils.get_smem_store_op(
+            c_layout, dtype, self.acc_dtype, tiled_copy_t2r
+        )
+        store_op = copy_atom_r2s.op
+        # m8n8 16-bit path
+        if isinstance(store_op, StMatrix8x8x16bOp):
+            op = LdMatrix8x8x16bOp(num_matrices=store_op.num_matrices, transpose=store_op.transpose)
+        # m16n8 8-bit store -> m16n16 8-bit load
+        elif isinstance(store_op, StMatrix16x8x8bOp) and store_op.num_matrices in [2, 4]:
+            # transpose=True is enforced by the class
+            op = LdMatrix16x16x8bOp(num_matrices=store_op.num_matrices // 2)
+        else:
+            op = cute.nvgpu.CopyUniversalOp()
+        copy_atom_s2r = cute.make_copy_atom(op, dtype)
+        tiled_copy_s2r = cute.make_tiled_copy_D(copy_atom_s2r, tiled_copy_t2r)
+        thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
+        # (R2S, R2S_M, R2S_N, PIPE_D)
+        tSR_sC = thr_copy_s2r.partition_S(sC)
+        tRS_rC = cute.make_fragment(tRS_rD_layout, dtype)
+        # (R2S, R2S_M, R2S_N)
+        tSR_rC = tiled_copy_s2r.retile(tRS_rC)
+        return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
 
     def make_acc_pipeline(
         self, cluster_layout_vmnk: cute.Layout, acc_pipeline_mbar_ptr: cute.Pointer
