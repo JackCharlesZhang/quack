@@ -384,10 +384,10 @@ class PtrGemmSm90:
     @cute.jit
     def __call__(
         self,
-        mA_ptr: Pointer,
-        mB_ptr: Pointer,
-        mD_ptr: Optional[Pointer],
-        mC_ptr: Optional[Pointer],
+        mA_ptr: cute.Pointer,
+        mB_ptr: cute.Pointer,
+        mD_ptr: Optional[cute.Pointer],
+        mC_ptr: Optional[cute.Pointer],
         epilogue_args: ArgumentsBase,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
