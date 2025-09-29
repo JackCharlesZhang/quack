@@ -26,7 +26,7 @@ def test_linear(in_features, out_features, input_dtype):
     x = x[::2]  # Testing non-contiguous
     w = (
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
-        #/ math.sqrt(in_features)
+        / math.sqrt(in_features)
     ).requires_grad_()
     out = linear_func(x, w, tuned=False)  # Disable tuning for faster test
     out_ref = F.linear(x.float(), w.float())
