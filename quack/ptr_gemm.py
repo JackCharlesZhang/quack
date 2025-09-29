@@ -437,6 +437,9 @@ class PtrGemmSm90:
         # mC = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
 
         print("Type of a ptr ", type(a_ptr))
+        print(self.a_major)
+        print(self.b_major)
+        print(self.d_major)
         mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
