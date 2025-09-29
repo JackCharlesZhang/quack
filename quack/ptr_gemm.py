@@ -6,7 +6,7 @@ from typing import Tuple, Type, Callable, Optional, Union, Literal
 from dataclasses import dataclass
 from functools import partial
 import math
-
+import functools
 from torch import Tensor
 
 import cuda.bindings.driver as cuda
@@ -2419,7 +2419,7 @@ class PtrGemmSm90:
         return is_valid
 
 
-
+@functools.cache
 def ptr_gemm_sm90(
     # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
     A: Tensor,
