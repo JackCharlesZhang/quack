@@ -384,10 +384,10 @@ class PtrGemmSm90:
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
+        mA_ptr: Pointer,
+        mB_ptr: Pointer,
+        mD_ptr: Optional[Pointer],
+        mC_ptr: Optional[Pointer],
         epilogue_args: ArgumentsBase,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
@@ -409,6 +409,14 @@ class PtrGemmSm90:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
+
+
+        mA = cute.make_tensor(mA_ptr, layout=(0 if tensor_infos["B"].major == "m" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
+        mB = cute.make_tensor(mB_ptr, layout=(0 if tensor_infos["B"].major == "n" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
+        mD = cute.make_tensor(mD_ptr, layout=(0 if tensor_infos["D"].major == "m" else 1, 0 if tensor_infos["D"].major == "n" else 1, 2))
+        mC = cute.make_tensor(mC_ptr, layout=(0 if tensor_infos["C"].major == "m" else 1, 0 if tensor_infos["C"].major == "n" else 1, 2)) if tensor_infos["C"] is not None else None
+
+
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
@@ -2564,11 +2572,6 @@ def ptr_gemm_sm90(
             tensor.pointer = make_ptr(torch2cute_dtype_map[torch_tensor.dtype], torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
     
-    tensor_infos["A"].cute_tensor = cute.make_tensor(tensor_infos["A"].pointer, layout=(0 if tensor_infos["B"].major == "m" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
-    tensor_infos["B"].cute_tensor = cute.make_tensor(tensor_infos["B"].pointer, layout=(0 if tensor_infos["B"].major == "n" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
-    tensor_infos["D"].cute_tensor = cute.make_tensor(tensor_infos["D"].pointer, layout=(0 if tensor_infos["D"].major == "m" else 1, 0 if tensor_infos["D"].major == "n" else 1, 2))
-    tensor_infos["C"].cute_tensor = cute.make_tensor(tensor_infos["C"].pointer, layout=(0 if tensor_infos["C"].major == "m" else 1, 0 if tensor_infos["C"].major == "n" else 1, 2)) if tensor_infos["C"] is not None else None
-
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
             return Float32(scalar) if scalar != 1.0 else None
@@ -2639,20 +2642,20 @@ def ptr_gemm_sm90(
         )
         cache[compile_key] = cute.compile(
             gemm,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,  
+            tensor_infos["A"].pointer,
+            tensor_infos["B"].pointer,
+            tensor_infos["D"].pointer,
+            tensor_infos["C"].pointer,  
             epi_args,
             scheduler_args,
             varlen_args,
             current_stream,
         )
     cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
+        tensor_infos["A"].pointer,
+        tensor_infos["B"].pointer,
+        tensor_infos["D"].pointer,
+        tensor_infos["C"].pointer,
         epi_args,
         scheduler_args,
         varlen_args,
