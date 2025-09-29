@@ -27,6 +27,7 @@ def gemm(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
@@ -104,6 +105,7 @@ def gemm(
         max_active_clusters,
         tile_count_semaphore,
         batch_idx_permute,
+        max_swizzle_size,
     )
 
     # Create varlen arguments if needed (assumes persistent=True when varlen)

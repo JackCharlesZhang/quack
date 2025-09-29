@@ -214,6 +214,7 @@ class GemmWrapperBase:
         max_active_clusters: int,
         tile_count_semaphore: Optional[Tensor] = None,
         batch_idx_permute: Optional[Tensor] = None,
+        max_swizzle_size: int = 8,
     ) -> TileSchedulerOptions:
         return TileSchedulerOptions(
             Int32(max_active_clusters),
@@ -227,6 +228,7 @@ class GemmWrapperBase:
             )
             if batch_idx_permute is not None
             else None,
+            max_swizzle_size=Int32(max_swizzle_size),
         )
 
     @staticmethod

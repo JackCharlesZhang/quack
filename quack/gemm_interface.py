@@ -9,6 +9,7 @@ from torch import Tensor
 from quack.gemm_config import GemmConfig, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
+from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
@@ -34,6 +35,16 @@ gated_to_pytorch_fn_map = {
 }
 
 
+default_device_capacity = get_device_capacity(torch.device("cuda"))
+
+
+def default_config(device):
+    if get_device_capacity(device)[0] != 10:
+        return GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+    else:
+        return GemmConfig(tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False)
+
+
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
     gather_A = kwargs.get("A_idx", None) is not None
@@ -51,7 +62,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
     key=["dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -72,7 +83,7 @@ def gemm_tuned(
     config: Optional[GemmConfig] = None,
 ) -> None:
     if config is None:
-        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+        config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
@@ -113,6 +124,7 @@ def gemm_tuned(
         config.cluster_m,
         config.cluster_n,
         config.pingpong,
+        max_swizzle_size=config.max_swizzle_size,
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
@@ -124,7 +136,7 @@ def gemm_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -143,7 +155,7 @@ def gemm_act_tuned(
     config: Optional[GemmConfig] = None,
 ) -> None:
     if config is None:
-        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+        config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
@@ -185,7 +197,7 @@ def gemm_act_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -203,7 +215,7 @@ def gemm_dact_tuned(
     config: Optional[GemmConfig] = None,
 ) -> None:
     if config is None:
-        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+        config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
