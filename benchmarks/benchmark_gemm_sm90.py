@@ -387,11 +387,23 @@ def run(
     else:
         tensormaps_tensor = None
 
+    M = a_torch.size(0)
+    N = b_torch.size(0)
+    K = a_torch.size(1)
+    L = a_torch.size(2)
     gemm = PtrGemmSm90(
         acc_dtype,
         a_dtype,
         tile_shape_mn,
         cluster_shape_mnk,
+        m=M,
+        n=N,
+        k=K,
+        l=L,
+        a_major=a_major,
+        b_major=b_major,
+        d_major=d_major,
+        c_major=c_major if c_dtype is not None else None,
         pingpong=pingpong,
         is_persistent=persistent,
         fp8_fast_accum=fp8_fast_accum,
