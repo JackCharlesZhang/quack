@@ -11,7 +11,6 @@ from torch import Tensor
 
 import cuda.bindings.driver as cuda
 
-from quack.jack_utils import make_ptr as make_jack_ptr
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -389,10 +388,6 @@ class PtrGemmSm90:
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
-        d_ptr: cute.Pointer,
-        c_ptr: Optional[cute.Pointer],
         epilogue_args: ArgumentsBase,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
@@ -414,79 +409,6 @@ class PtrGemmSm90:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
-
-        def create_tensor_from_ptr(ptr, shape, major_order):
-            if cutlass.const_expr(major_order == "m"):
-                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
-            elif cutlass.const_expr(major_order == "k"):
-                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
-            elif cutlass.const_expr(major_order == "n"):
-                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
-            else:
-                # This should never happen if major_order is passed correctly
-                cute.printf("BROKEN")
-                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
-            return cute.make_tensor(ptr, layout)
-        
-
-        print(self._m, self._n, self._k, self._l)
-
-        # mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
-        # mB = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
-        # mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), "n")
-        # mC = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
-
-        print("Type of a ptr ", type(a_ptr))
-        print(self.a_major)
-        print(self.b_major)
-        print(self.d_major)
-        mA_ptr = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
-        mB_ptr = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
-        mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
-        # mC_ptr = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
-
-        # print("mA.shape()", mA.shape)
-        # print("mA_ptr.shape()", mA_ptr.shape)
-
-        # print("mB.shape()", mB.shape)
-        # print("mB_ptr.shape()", mB_ptr.shape)
-
-        # print("mD.shape()", mD.shape)
-        # print("mD_ptr.shape()", mD_ptr.shape)
-
-        # cute.print_tensor(mA)
-
-
-
-        # for r in range(self._m):
-        #     for c in range(self._k):
-        #         for b in range(self._l):
-        #             print("HERE")
-        #             if mA[r, c, b] != mA_ptr[r, c, b]:
-        #                 print(f"mA[{r}, {c}, {b}] != mA_ptr[{r}, {c}, {b}]")
-        #                 print(mA[r, c, b])
-        #                 print(mA_ptr[r, c, b])
-        #                 print("MISMATCH")
-
-        # # Debug logic for mB
-        # for r in range(self._k):
-        #     for c in range(self._n):
-        #         for b in range(self._l):
-        #             if mB[r, c, b] != mB_ptr[r, c, b]:
-        #                 print(f"mB[{r}, {c}, {b}] != mB_ptr[{r}, {c}, {b}]")
-        #                 print(mB[r, c, b])
-        #                 print(mB_ptr[r, c, b])
-
-        # # Debug logic for mD
-        # for r in range(self._m):
-        #     for c in range(self._n):
-        #         for b in range(self._l):
-        #             if mD[r, c, b] != mD_ptr[r, c, b]:
-        #                 print(f"mD[{r}, {c}, {b}] != mD_ptr[{r}, {c}, {b}]")
-        #                 print(mD[r, c, b])
-        #                 print(mD_ptr[r, c, b])
-
-
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
@@ -2634,12 +2556,18 @@ def ptr_gemm_sm90(
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    #GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
 
     for tensor in tensor_infos.values():
         torch_tensor = tensor.tensor
         if torch_tensor is not None:
-            tensor.pointer = make_jack_ptr(torch2cute_dtype_map[torch_tensor.dtype], torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            tensor.pointer = make_ptr(torch2cute_dtype_map[torch_tensor.dtype], torch_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+
+    
+    tensor_infos["A"].cute_tensor = cute.make_tensor(tensor_infos["A"].pointer, layout=(0 if tensor_infos["B"].major == "m" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
+    tensor_infos["B"].cute_tensor = cute.make_tensor(tensor_infos["B"].pointer, layout=(0 if tensor_infos["B"].major == "n" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
+    tensor_infos["D"].cute_tensor = cute.make_tensor(tensor_infos["D"].pointer, layout=(0 if tensor_infos["D"].major == "m" else 1, 0 if tensor_infos["D"].major == "n" else 1, 2))
+    tensor_infos["C"].cute_tensor = cute.make_tensor(tensor_infos["C"].pointer, layout=(0 if tensor_infos["C"].major == "m" else 1, 0 if tensor_infos["C"].major == "n" else 1, 2)) if tensor_infos["C"] is not None else None
 
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
@@ -2715,10 +2643,6 @@ def ptr_gemm_sm90(
             tensor_infos["B"].cute_tensor,
             tensor_infos["D"].cute_tensor,
             tensor_infos["C"].cute_tensor,  
-            tensor_infos["A"].pointer,
-            tensor_infos["B"].pointer,
-            tensor_infos["D"].pointer,
-            tensor_infos["C"].pointer,
             epi_args,
             scheduler_args,
             varlen_args,
@@ -2729,10 +2653,6 @@ def ptr_gemm_sm90(
         tensor_infos["B"].cute_tensor,
         tensor_infos["D"].cute_tensor,
         tensor_infos["C"].cute_tensor,
-        tensor_infos["A"].pointer,
-        tensor_infos["B"].pointer,
-        tensor_infos["D"].pointer,
-        tensor_infos["C"].pointer,
         epi_args,
         scheduler_args,
         varlen_args,
