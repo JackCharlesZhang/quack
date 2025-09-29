@@ -4,6 +4,7 @@ import os
 import pathlib
 from functools import partial, lru_cache
 from dataclasses import dataclass, fields
+import ctypes
 
 import torch
 
@@ -116,3 +117,57 @@ def cute_compile_patched(*args, **kwargs):
             sass = extract(cubin_path, None)
             pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
     return output
+
+
+def make_ptr(
+    dtype: Type[Numeric],
+    value: Union[int, ctypes._Pointer],
+    mem_space: AddressSpace = AddressSpace.generic,
+    assumed_align=None,
+) -> Pointer:
+    """
+    From Flash Infer
+    
+    Create a pointer from a memory address
+
+    :param dtype: Data type of the pointer elements
+    :type dtype: Type[Numeric]
+    :param value: Memory address as integer or ctypes pointer
+    :type value: Union[int, ctypes._Pointer]
+    :param mem_space: Memory address space, defaults to AddressSpace.generic
+    :type mem_space: AddressSpace, optional
+    :param assumed_align: Alignment in bytes, defaults to None
+    :type assumed_align: int, optional
+    :return: A pointer object
+    :rtype: Pointer
+
+    .. code-block:: python
+
+        import numpy as np
+        import ctypes
+
+        from cutlass import Float32
+        from cutlass.cute.runtime import make_ptr
+
+        # Create a numpy array
+        a = np.random.randn(16, 32).astype(np.float32)
+
+        # Get pointer address as integer
+        ptr_address = a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        # Create pointer from address
+        y = make_ptr(cutlass.Float32, ptr_address)
+    """
+    # check if value is int or ctypes.POINTER
+    if isinstance(value, int):
+        address_value = value
+    elif isinstance(value, ctypes._Pointer):
+        # get address value
+        address_value = ctypes.cast(value, ctypes.c_void_p).value
+        assert address_value is not None, "Pointer address is None"
+    else:
+        raise TypeError(
+            f"Expect int or ctypes.POINTER for value but got {type(value)=}"
+        )
+
+    return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)

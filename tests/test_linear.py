@@ -22,6 +22,8 @@ def test_linear(in_features, out_features, input_dtype):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
+
+
     x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
     #x = x[::2]  # Testing non-contiguous
     w = (
@@ -32,15 +34,23 @@ def test_linear(in_features, out_features, input_dtype):
     out_ref = F.linear(x.float(), w.float())
     out_pt = F.linear(x, w)
 
- 
-    print(out[:20])
-    print(out_ref[:20])
-    print(out.size(), out_ref.size())
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
+    dout = torch.randn_like(out)
+    dx, dw = torch.autograd.grad(out, (x, w), dout)
+    dx_ref, dw_ref = torch.autograd.grad(out_ref, (x, w), dout)
+    dx_pt, dw_pt = torch.autograd.grad(out_pt, (x, w), dout)
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-6
+    assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
 
-    print("max diff", (out - out_ref).abs().max())
-    print("sum of out:", out.sum())
-    print("sum of out_ref:", out_ref.sum())
-    print("sum diff:", (out.sum() - out_ref.sum()).abs())
+    x = torch.ones((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
+    #x = x[::2]  # Testing non-contiguous
+    w = (
+        torch.ones((out_features, in_features), device=device, dtype=input_dtype)
+        / math.sqrt(in_features)
+    ).requires_grad_()
+    out = linear_func(x, w, tuned=False)  # Disable tuning for faster test
+    out_ref = F.linear(x.float(), w.float())
+    out_pt = F.linear(x, w)
 
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
     dout = torch.randn_like(out)

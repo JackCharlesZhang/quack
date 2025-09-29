@@ -19,7 +19,8 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
+# from cutlass.cute.runtime import make_ptr
+from quack.cute_dsl_utils import make_ptr
 
 from quack.gemm_wrapper_utils import GemmTensorInfo
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -2625,6 +2626,7 @@ def ptr_gemm_sm90(
         gather_A,
         batch_idx_permute is not None,
         key_tensor_names=("A", "B", "D", "C"),
+        M, N, K, L,
     )
 
     print("compile_key", compile_key)

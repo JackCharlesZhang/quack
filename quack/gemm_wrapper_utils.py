@@ -7,8 +7,9 @@ from torch import Tensor
 
 import cutlass.cute as cute
 from cutlass import Int32
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass.cute.runtime import from_dlpack #, make_ptr
 
+from quack.cute_dsl_utils import make_ptr
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.varlen_utils import VarlenArguments
 from quack.tile_scheduler import TileSchedulerOptions
@@ -313,7 +314,6 @@ class GemmWrapperBase:
         for name in key_tensor_names:
             if name in tensors:
                 key_parts.append(tensors[name].major)
-                key_parts.append(tensors[name].pointer)
         key_parts.extend([pingpong, persistent, has_semaphore])
         key_parts.extend(args)
         return tuple(key_parts)
