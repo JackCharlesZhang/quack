@@ -76,6 +76,7 @@ def gemm_dact(
     cluster_N: int,
     pingpong: bool = True,
     persistent: bool = True,
+    max_swizzle_size: int = 8,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
@@ -136,7 +137,7 @@ def gemm_dact(
     act_fn = dact_fn_map[activation]
     epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore
+        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
 
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)
@@ -161,6 +162,7 @@ def gemm_dact(
         persistent,
         tile_count_semaphore is not None,
         device_capacity,
+        max_swizzle_size,
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),

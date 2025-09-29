@@ -61,7 +61,7 @@ class GemmActMixin:
             epi_tile_postact,
             op_type="store",
         )
-        return self.__class__.EpilogueParams(
+        return self.EpilogueParams(
             tma_atom_postact,
             tma_tensor_postact,
             epi_postact_smem_layout_staged,
@@ -264,8 +264,14 @@ class GemmActMixin:
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
-            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
+            if const_expr(self.arch < 100):
+                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                    tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
+            else:
+                for i in cutlass.range(cute.size(tRS_rPostAct), step=2, unroll_full=True):
+                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+                        (tRS_rD[2 * i], tRS_rD[2 * i + 1])
+                    )
         else:
             tRS_rPostAct = tRS_rD
         # Type conversion
@@ -304,6 +310,7 @@ def gemm_act(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    max_swizzle_size: int = 8,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
@@ -358,7 +365,7 @@ def gemm_act(
     act_fn = act_fn_map[activation]
     epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore
+        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
 
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)
@@ -383,6 +390,7 @@ def gemm_act(
         persistent,
         tile_count_semaphore is not None,
         device_capacity,
+        max_swizzle_size,
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),

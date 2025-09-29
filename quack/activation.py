@@ -5,9 +5,14 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+
+import quack.utils as utils
+
+
+F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
 
 
 @dsl_user_op
@@ -26,14 +31,22 @@ def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def sigmoid(x: Float32, *, loc=None, ip=None) -> Float32:
-    # return 0.5 + 0.5 * cute.math.tanh(0.5 * x, fastmath=True)
-    return 0.5 + 0.5 * tanh(0.5 * x)
+def sigmoid(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        # return 0.5 + 0.5 * cute.math.tanh(0.5 * x, fastmath=True)
+        return 0.5 + 0.5 * tanh(0.5 * x)
+    else:
+        x_half = utils.mul_packed_f32x2((0.5, 0.5), x)
+        tanh_x_half = (tanh(x_half[0]), tanh(x_half[1]))
+        return utils.fma_packed_f32x2(tanh_x_half, (0.5, 0.5), (0.5, 0.5))
 
 
 @dsl_user_op
-def relu(x: Float32, *, loc=None, ip=None) -> Float32:
-    return cute.arch.fmax(x, Float32(0.0))
+def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        return cute.arch.fmax(x, Float32(0.0))
+    else:
+        return cute.arch.fmax(x[0], Float32(0.0)), cute.arch.fmax(x[1], Float32(0.0))
 
 
 @cute.jit
@@ -44,8 +57,12 @@ def drelu(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
 
 
 @dsl_user_op
-def relu_sq(x: Float32, *, loc=None, ip=None) -> Float32:
-    return cute.arch.fmax(x, Float32(0.0)) * x
+def relu_sq(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        return cute.arch.fmax(x, Float32(0.0)) * x
+    else:
+        relu_x = (cute.arch.fmax(x[0], Float32(0.0)), cute.arch.fmax(x[1], Float32(0.0)))
+        return utils.mul_packed_f32x2(relu_x, x)
 
 
 @cute.jit
@@ -66,19 +83,29 @@ def drelu_sq(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[Float32, 
 
 
 @dsl_user_op
-def gelu_tanh_approx(x: Float32, *, loc=None, ip=None) -> Float32:
+def gelu_tanh_approx(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     """
     gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
             = 0.5 * x * (1 + tanh(x * (0.797885 + 0.0356774 * x * x)))
     """
     sqrt_2_over_pi = math.sqrt(2 / math.pi)  # ~0.797885
     sqrt_2_over_pi_coeff = 0.044715 * sqrt_2_over_pi  # ~0.0356774
-    return 0.5 * (
-        x
-        # Currently cute.math.tanh(x, fastmath=True) generates very slow code
-        # * (1 + cute.math.tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x)), fastmath=True))
-        * (1.0 + tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x))))
-    )
+    if const_expr(not isinstance(x, tuple)):
+        return 0.5 * (
+            x
+            # Currently cute.math.tanh(x, fastmath=True) generates very slow code
+            # * (1 + cute.math.tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x)), fastmath=True))
+            * (1.0 + tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x))))
+        )
+    else:
+        x_sq = utils.mul_packed_f32x2(x, x)
+        x_sq_scaled = utils.fma_packed_f32x2(
+            x_sq, (sqrt_2_over_pi_coeff, sqrt_2_over_pi_coeff), (sqrt_2_over_pi, sqrt_2_over_pi)
+        )
+        z = utils.mul_packed_f32x2(x, x_sq_scaled)
+        tanh_z = (tanh(z[0]), tanh(z[1]))
+        x_tanh_z = utils.fma_packed_f32x2(tanh_z, x, x)
+        return utils.mul_packed_f32x2((0.5, 0.5), x_tanh_z)
 
 
 @dsl_user_op
@@ -117,19 +144,27 @@ def dgelu_tanh_approx(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[
 
 
 @dsl_user_op
-def silu(x: Float32, *, loc=None, ip=None) -> Float32:
+def silu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     """
     silu(x) = x * sigmoid(x) = x * (1 + tanh(x / 2)) / 2 = (0.5 * x) * tanh(0.5 * x) + (0.5 * x)
     This compiles down to 3 SASS instructions: FMUL to get 0.5 * x, MUFU.TANH, and FFMA.
     """
-    x_half = 0.5 * x
-    # return x_half * cute.math.tanh(x_half, fastmath=True) + x_half
-    return x_half * tanh(x_half) + x_half
+    if const_expr(not isinstance(x, tuple)):
+        x_half = 0.5 * x
+        # return x_half * cute.math.tanh(x_half, fastmath=True) + x_half
+        return x_half * tanh(x_half) + x_half
+    else:
+        x_half = utils.mul_packed_f32x2((0.5, 0.5), x)
+        tanh_x_half = (tanh(x_half[0]), tanh(x_half[1]))
+        return utils.fma_packed_f32x2(x_half, tanh_x_half, x_half)
 
 
 @dsl_user_op
-def swiglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
-    return silu(x) * y
+def swiglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        return silu(x) * y
+    else:
+        return utils.mul_packed_f32x2(silu(x), y)
 
 
 @dsl_user_op
@@ -166,17 +201,26 @@ def dswiglu(
 
 
 @dsl_user_op
-def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.702, *, loc=None, ip=None) -> Float32:
+def swiglu_oai(
+    x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
+) -> F32_or_F32x2:
     """The swiglu variant used in gpt-oss, which has a scaling factor on x and bias of 1 to y.
     https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
     x * sigmoid(alpha * x) * (y + 1)
     Compile down to FMUL, FMUL, TANH, FFMA, FFMA
     """
     # Compute sigmoid(alpha * x) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
-    x_half = 0.5 * x
-    # silu_x = x_half * cute.math.tanh(alpha * x_half, fastmath=True) + x_half
-    silu_x = x_half * tanh(alpha * x_half) + x_half
-    return silu_x * y + silu_x
+    if const_expr(not isinstance(x, tuple)):
+        x_half = 0.5 * x
+        # silu_x = x_half * cute.math.tanh(alpha * x_half, fastmath=True) + x_half
+        silu_x = x_half * tanh(alpha * x_half) + x_half
+        return silu_x * y + silu_x
+    else:
+        x_half = utils.mul_packed_f32x2((0.5, 0.5), x)
+        alpha_x_half = utils.mul_packed_f32x2((alpha, alpha), x_half)
+        tanh_alpha_x_half = (tanh(alpha_x_half[0]), tanh(alpha_x_half[1]))
+        silu_x = utils.fma_packed_f32x2(x_half, tanh_alpha_x_half, x_half)
+        return utils.fma_packed_f32x2(silu_x, y, silu_x)
 
 
 @dsl_user_op
@@ -208,13 +252,17 @@ def dswiglu_oai(
 
 
 @dsl_user_op
-def glu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+def glu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     """GLU: Gated Linear Unit
     glu(x, y) = sigmoid(x) * y
     Using tanh to compute sigmoid: sigmoid(x) = 0.5 * (1 + tanh(x/2))
     """
-    sigmoid_x = sigmoid(x)  # FMUL, MUFU.TANH, then FFMA
-    return sigmoid_x * y  # FMUL
+    if const_expr(not isinstance(x, tuple)):
+        sigmoid_x = sigmoid(x)  # FMUL, MUFU.TANH, then FFMA
+        return sigmoid_x * y  # FMUL
+    else:
+        sigmoid_x = sigmoid(x)
+        return utils.mul_packed_f32x2(sigmoid_x, y)
 
 
 @dsl_user_op
@@ -244,11 +292,15 @@ def dglu(
 
 
 @dsl_user_op
-def reglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+def reglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     """ReGLU: ReLU Gated Linear Unit
     reglu(x, y) = relu(x) * y = max(x, 0) * y
     """
-    return cute.arch.fmax(x, Float32(0.0)) * y
+    if const_expr(not isinstance(x, tuple)):
+        return cute.arch.fmax(x, Float32(0.0)) * y
+    else:
+        relu_x = relu(x)
+        return utils.mul_packed_f32x2(relu_x, y)
 
 
 @cute.jit
@@ -273,12 +325,15 @@ def dreglu(
 
 
 @dsl_user_op
-def geglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+def geglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     """GeGLU: GELU Gated Linear Unit
     geglu(x, y) = gelu(x) * y
     Uses the tanh approximation of GELU
     """
-    return gelu_tanh_approx(x) * y
+    if const_expr(not isinstance(x, tuple)):
+        return gelu_tanh_approx(x) * y
+    else:
+        return utils.mul_packed_f32x2(gelu_tanh_approx(x), y)
 
 
 @dsl_user_op

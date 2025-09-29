@@ -813,7 +813,7 @@ class GemmSm100(GemmSm90):
         varlen_manager = VarlenManager.create(
             varlen_params,
             has_D,
-            self.__class__.num_epi_tensormaps,
+            self.num_epi_tensormaps,
             # Only used if not varlen_m
             len_m_static=Int32(
                 mA_mkl.shape[0] if varlen_params.mAIdx is None else varlen_params.mAIdx.shape[0]

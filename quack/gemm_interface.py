@@ -124,6 +124,7 @@ def gemm_tuned(
         config.cluster_m,
         config.cluster_n,
         config.pingpong,
+        persistent=True,
         max_swizzle_size=config.max_swizzle_size,
         alpha=alpha,
         beta=beta,
@@ -191,6 +192,7 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
@@ -251,6 +253,7 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )

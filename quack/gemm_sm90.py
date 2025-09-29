@@ -649,7 +649,7 @@ class GemmSm90:
         varlen_manager = VarlenManager.create(
             varlen_params,
             has_D,
-            self.__class__.num_epi_tensormaps,
+            self.num_epi_tensormaps,
             # Only used if not varlen_m
             len_m_static=Int32(
                 mA_mkl.shape[0] if varlen_params.mAIdx is None else varlen_params.mAIdx.shape[0]
@@ -1435,7 +1435,7 @@ class GemmSm90:
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
-        return self.__class__.EpilogueParams(alpha=args.alpha, beta=args.beta)
+        return self.EpilogueParams(alpha=args.alpha, beta=args.beta)
 
     def epi_get_tma_atoms(
         self, params: EpilogueParams, *, loc=None, ip=None
