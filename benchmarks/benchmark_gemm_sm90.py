@@ -14,7 +14,8 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+#from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.ptr_gemm import PtrGemmSm90
 from quack.varlen_utils import VarlenArguments
 
 """
@@ -229,7 +230,7 @@ def run(
     cluster_shape_mnk = (*cluster_shape_mn, 1)
 
     # Skip unsupported types
-    if not GemmSm90.is_valid_dtypes(
+    if not PtrGemmSm90.is_valid_dtypes(
         a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major
     ):
         raise TypeError(
@@ -386,7 +387,7 @@ def run(
     else:
         tensormaps_tensor = None
 
-    gemm = GemmSm90(
+    gemm = PtrGemmSm90(
         acc_dtype,
         a_dtype,
         tile_shape_mn,
