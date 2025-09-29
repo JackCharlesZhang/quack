@@ -264,12 +264,12 @@ def run(
             shape,
             gen_dtype,
             permute_order=permute_order,
-            # init_type=cutlass.torch.TensorInitType.RANDOM,
-            # init_config=cutlass.torch.RandomInitConfig(
-            #     min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
-            # ),
-            init_type=cutlass.torch.TensorInitType.GAUSSIAN,
-            init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
+            init_type=cutlass.torch.TensorInitType.RANDOM,
+            init_config=cutlass.torch.RandomInitConfig(
+                min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
+            ),
+            # init_type=cutlass.torch.TensorInitType.GAUSSIAN,
+            # init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
         ).to(torch_dtype)
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
