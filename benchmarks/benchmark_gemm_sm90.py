@@ -524,6 +524,7 @@ def run(
         out = d_torch.cpu().squeeze()
         out_ref = ref_d.squeeze()
         # breakpoint()
+        print("max diff", (out - out_ref).abs().max())
         torch.testing.assert_close(d_torch.cpu(), ref_d, atol=tolerance, rtol=1e-03)
 
     # return
