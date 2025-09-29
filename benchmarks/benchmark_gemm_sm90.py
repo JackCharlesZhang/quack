@@ -15,6 +15,7 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
 #from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.tile_scheduler import TileSchedulerOptions
 from quack.ptr_gemm import PtrGemmSm90
 from quack.varlen_utils import VarlenArguments
 
