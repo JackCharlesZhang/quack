@@ -440,21 +440,21 @@ class PtrGemmSm90:
         print(self.a_major)
         print(self.b_major)
         print(self.d_major)
-        mA_ptr = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
+        mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB_ptr = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD_ptr = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
         mC_ptr = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
 
-        print("mA.shape()", mA.shape)
-        print("mA_ptr.shape()", mA_ptr.shape)
+        # print("mA.shape()", mA.shape)
+        # print("mA_ptr.shape()", mA_ptr.shape)
 
-        print("mB.shape()", mB.shape)
-        print("mB_ptr.shape()", mB_ptr.shape)
+        # print("mB.shape()", mB.shape)
+        # print("mB_ptr.shape()", mB_ptr.shape)
 
-        print("mD.shape()", mD.shape)
-        print("mD_ptr.shape()", mD_ptr.shape)
+        # print("mD.shape()", mD.shape)
+        # print("mD_ptr.shape()", mD_ptr.shape)
 
-        cute.print_tensor(mA)
+        # cute.print_tensor(mA)
 
 
 
