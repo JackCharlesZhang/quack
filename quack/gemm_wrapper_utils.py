@@ -313,6 +313,7 @@ class GemmWrapperBase:
         for name in key_tensor_names:
             if name in tensors:
                 key_parts.append(tensors[name].major)
+                key_parts.append(tensors[name].pointer)
         key_parts.extend([pingpong, persistent, has_semaphore])
         key_parts.extend(args)
         return tuple(key_parts)
