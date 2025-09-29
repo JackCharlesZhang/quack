@@ -2626,6 +2626,8 @@ def ptr_gemm_sm90(
         batch_idx_permute is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
+
+    print("compile_key", compile_key)
     cache = ptr_gemm_sm90.compile_cache
     if compile_key not in cache:
         print("HI")
