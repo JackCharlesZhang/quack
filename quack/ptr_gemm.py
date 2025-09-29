@@ -411,10 +411,10 @@ class PtrGemmSm90:
         """
 
 
-        mA = cute.make_tensor(mA_ptr, layout=(0 if tensor_infos["B"].major == "m" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
-        mB = cute.make_tensor(mB_ptr, layout=(0 if tensor_infos["B"].major == "n" else 1, 0 if tensor_infos["B"].major == "k" else 1, 2))
-        mD = cute.make_tensor(mD_ptr, layout=(0 if tensor_infos["D"].major == "m" else 1, 0 if tensor_infos["D"].major == "n" else 1, 2))
-        mC = cute.make_tensor(mC_ptr, layout=(0 if tensor_infos["C"].major == "m" else 1, 0 if tensor_infos["C"].major == "n" else 1, 2)) if tensor_infos["C"] is not None else None
+        mA = cute.make_tensor(mA_ptr, layout=(0 if self.a_major == "m" else 1, 0 if self.a_major == "k" else 1, 2))
+        mB = cute.make_tensor(mB_ptr, layout=(0 if self.b_major == "n" else 1, 0 if self.b_major == "k" else 1, 2))
+        mD = cute.make_tensor(mD_ptr, layout=(0 if self.d_major == "m" else 1, 0 if self.d_major == "n" else 1, 2))
+        mC = cute.make_tensor(mC_ptr, layout=(0 if self.c_major == "m" else 1, 0 if self.c_major == "n" else 1, 2)) if self.c_major is not None else None
 
 
         # setup static attributes before smem/grid/tma computation
