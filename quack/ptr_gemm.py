@@ -2625,8 +2625,8 @@ def ptr_gemm_sm90(
         cu_seqlens_k is not None,
         gather_A,
         batch_idx_permute is not None,
-        key_tensor_names=("A", "B", "D", "C"),
         M, N, K, L,
+        key_tensor_names=("A", "B", "D", "C"),
     )
 
     print("compile_key", compile_key)
