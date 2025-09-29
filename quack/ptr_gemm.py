@@ -419,7 +419,7 @@ class PtrGemmSm90:
             if cutlass.const_expr(major_order == "m"):
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             elif cutlass.const_expr(major_order == "k"):
-                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
+                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             elif cutlass.const_expr(major_order == "n"):
                 layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
             else:
