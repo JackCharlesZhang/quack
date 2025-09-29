@@ -11,7 +11,7 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.varlen_utils import VarlenArguments
-from quack.dense_gemm_sm90 import TileSchedulerOptions
+from quack.tile_scheduler import TileSchedulerOptions
 
 from cutlass.cute.typing import Pointer
 
