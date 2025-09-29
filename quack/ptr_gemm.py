@@ -459,10 +459,12 @@ class PtrGemmSm90:
         for r in range(self._m):
             for c in range(self._k):
                 for b in range(self._l):
+                    print("HERE")
                     if mA[r, c, b] != mA_ptr[r, c, b]:
                         print(f"mA[{r}, {c}, {b}] != mA_ptr[{r}, {c}, {b}]")
                         print(mA[r, c, b])
                         print(mA_ptr[r, c, b])
+                        print("MISMATCH")
 
         # # Debug logic for mB
         # for r in range(self._k):
