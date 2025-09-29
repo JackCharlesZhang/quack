@@ -2604,8 +2604,6 @@ def ptr_gemm_sm90(
         pingpong,
     )
 
-    print("D MAJOR", tensor_infos["D"].major)
-
     # Cache current stream to avoid repeated calls
     if not hasattr(cutlass_torch, '_cached_current_stream'):
         cutlass_torch._cached_current_stream = cutlass_torch.current_stream()
@@ -2629,10 +2627,8 @@ def ptr_gemm_sm90(
         key_tensor_names=("A", "B", "D", "C"),
     )
 
-    print("compile_key", compile_key)
     cache = ptr_gemm_sm90.compile_cache
     if compile_key not in cache:
-        print("HI")
         gemm = PtrGemmSm90(
             acc_dtype,
             tensor_infos["A"].dtype,
