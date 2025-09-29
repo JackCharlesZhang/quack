@@ -21,7 +21,8 @@ class GemmTensorInfo:
     tensor: Optional[Tensor]
     dtype: Optional[Any] = None
     major: Optional[str] = None
-    cute_tensor: Optional[Union[cute.Tensor, Pointer]] = None
+    cute_tensor: Optional[cute.Tensor] = None
+    pointer: Optional[Pointer] = None
 
 
 class GemmWrapperBase:
