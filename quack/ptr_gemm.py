@@ -419,7 +419,7 @@ class PtrGemmSm90:
             if cutlass.const_expr(major_order == "m"):
                 layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
             elif cutlass.const_expr(major_order == "k"):
-                layout = cute.make_ordered_layout(shape, order=(0, 1, 2))
+                layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
             elif cutlass.const_expr(major_order == "n"):
                 layout = cute.make_ordered_layout(shape, order=(1, 0, 2))
             else:
@@ -440,7 +440,7 @@ class PtrGemmSm90:
         print(self.a_major)
         print(self.b_major)
         print(self.d_major)
-        mA = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
+        mA_ptr = create_tensor_from_ptr(a_ptr, (self._m, self._k, self._l), self.a_major)
         mB_ptr = create_tensor_from_ptr(b_ptr, (self._n, self._k, self._l), self.b_major)
         mD = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
         # mC_ptr = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
