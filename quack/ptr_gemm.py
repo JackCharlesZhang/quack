@@ -445,14 +445,14 @@ class PtrGemmSm90:
         mD_ptr = create_tensor_from_ptr(d_ptr, (self._m, self._n, self._l), self.d_major)
         mC_ptr = create_tensor_from_ptr(c_ptr, (self._m, self._n, self._l), self.c_major) if c_ptr is not None else None
 
-        print("mA.shape()", mA.shape())
-        print("mA_ptr.shape()", mA_ptr.shape())
+        print("mA.shape()", mA.shape)
+        print("mA_ptr.shape()", mA_ptr.shape)
 
-        print("mB.shape()", mB.shape())
-        print("mB_ptr.shape()", mB_ptr.shape())
+        print("mB.shape()", mB.shape)
+        print("mB_ptr.shape()", mB_ptr.shape)
 
-        print("mD.shape()", mD.shape())
-        print("mD_ptr.shape()", mD_ptr.shape())
+        print("mD.shape()", mD.shape)
+        print("mD_ptr.shape()", mD_ptr.shape)
 
 
 
