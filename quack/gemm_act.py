@@ -268,7 +268,7 @@ class GemmActMixin:
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                     tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
             else:
-                for i in cutlass.range(cute.size(tRS_rPostAct), step=2, unroll_full=True):
+                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
                     tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1])
                     )

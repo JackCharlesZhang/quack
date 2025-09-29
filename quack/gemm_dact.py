@@ -36,8 +36,18 @@ class GemmDActMixin(GemmActMixin):
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
-            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rD[i], tRS_rPostAct[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
+            if const_expr(self.arch < 100):
+                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                    tRS_rD[i], tRS_rPostAct[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
+            else:
+                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
+                    (
+                        (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                        (tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1]),
+                    ) = params.act_fn(
+                        (tRS_rC_acc[2 * i], tRS_rC_acc[2 * i + 1]),
+                        (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                    )
         else:
             tRS_rPostAct = tRS_rC_acc
         # Type conversion
