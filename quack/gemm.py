@@ -130,6 +130,10 @@ def gemm(
         persistent,
         tile_count_semaphore is not None,
         device_capacity,
+        # Technically we don't need to recompile for different max_swizzle_size, but currently
+        # not recompiling will skew the autotuning results due to power throttling.
+        # Effectively we're recompiling as a way to pause between benchmarks during autotuning.
+        max_swizzle_size,
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         add_to_output,

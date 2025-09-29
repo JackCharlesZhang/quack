@@ -82,7 +82,7 @@ def get_all_configs(
         swap_ab_vals = [False, True]
         if epilogue in ["lse", "gated"]:
             swap_ab_vals = [False]
-        max_swizzle_size_vals = [2, 4, 8, 16]
+        max_swizzle_size_vals = [4, 8, 16]
         GemmConfigCls = partial(GemmConfig, pingpong=False)  # There's no pingpong on Sm100
         return [
             GemmConfigCls(
