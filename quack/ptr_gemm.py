@@ -2628,6 +2628,7 @@ def ptr_gemm_sm90(
     )
     cache = ptr_gemm_sm90.compile_cache
     if compile_key not in cache:
+        print("HI")
         gemm = PtrGemmSm90(
             acc_dtype,
             tensor_infos["A"].dtype,
