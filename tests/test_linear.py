@@ -35,7 +35,8 @@ def test_linear(in_features, out_features, input_dtype):
     print(out_ref[:20])
     print(out.size(), out_ref.size())
 
-    
+    print("max diff", (out - out_ref).abs().max())
+
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
     dout = torch.randn_like(out)
     dx, dw = torch.autograd.grad(out, (x, w), dout)
