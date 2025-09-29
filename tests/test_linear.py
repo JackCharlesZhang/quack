@@ -23,7 +23,7 @@ def test_linear(in_features, out_features, input_dtype):
     torch.random.manual_seed(0)
     m = 1920
     x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
-    #x = x[::2]  # Testing non-contiguous
+    x = x[::2]  # Testing non-contiguous
     w = (
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
