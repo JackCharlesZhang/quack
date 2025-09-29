@@ -18,6 +18,7 @@ import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+from typing import Union
 
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
