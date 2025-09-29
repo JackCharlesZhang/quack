@@ -454,17 +454,19 @@ class PtrGemmSm90:
         print("mD.shape()", mD.shape)
         print("mD_ptr.shape()", mD_ptr.shape)
 
+        cute.print_tensor(mA)
 
 
-        for r in range(self._m):
-            for c in range(self._k):
-                for b in range(self._l):
-                    print("HERE")
-                    if mA[r, c, b] != mA_ptr[r, c, b]:
-                        print(f"mA[{r}, {c}, {b}] != mA_ptr[{r}, {c}, {b}]")
-                        print(mA[r, c, b])
-                        print(mA_ptr[r, c, b])
-                        print("MISMATCH")
+
+        # for r in range(self._m):
+        #     for c in range(self._k):
+        #         for b in range(self._l):
+        #             print("HERE")
+        #             if mA[r, c, b] != mA_ptr[r, c, b]:
+        #                 print(f"mA[{r}, {c}, {b}] != mA_ptr[{r}, {c}, {b}]")
+        #                 print(mA[r, c, b])
+        #                 print(mA_ptr[r, c, b])
+        #                 print("MISMATCH")
 
         # # Debug logic for mB
         # for r in range(self._k):
@@ -475,14 +477,14 @@ class PtrGemmSm90:
         #                 print(mB[r, c, b])
         #                 print(mB_ptr[r, c, b])
 
-        # Debug logic for mD
-        for r in range(self._m):
-            for c in range(self._n):
-                for b in range(self._l):
-                    if mD[r, c, b] != mD_ptr[r, c, b]:
-                        print(f"mD[{r}, {c}, {b}] != mD_ptr[{r}, {c}, {b}]")
-                        print(mD[r, c, b])
-                        print(mD_ptr[r, c, b])
+        # # Debug logic for mD
+        # for r in range(self._m):
+        #     for c in range(self._n):
+        #         for b in range(self._l):
+        #             if mD[r, c, b] != mD_ptr[r, c, b]:
+        #                 print(f"mD[{r}, {c}, {b}] != mD_ptr[{r}, {c}, {b}]")
+        #                 print(mD[r, c, b])
+        #                 print(mD_ptr[r, c, b])
 
 
         # setup static attributes before smem/grid/tma computation
