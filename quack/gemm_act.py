@@ -11,7 +11,6 @@ import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.varlen_utils import VarlenManager
@@ -96,7 +95,6 @@ class GemmActMixin:
         cta_tile_shape_mnk: Tuple[int, int, int],
         epi_tile: cute.Tile,
     ) -> int:
-        print(args)
         postact_dtype = args.mPostAct.element_type
         postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
         return postact_bytes_per_stage
@@ -295,7 +293,6 @@ act_fn_map = {
     "relu": quack.activation.relu,
     "relu_sq": quack.activation.relu_sq,
     "gelu_tanh_approx": quack.activation.gelu_tanh_approx,
-    "identity": quack.activation.identity,
 }
 
 
@@ -314,8 +311,6 @@ def gemm_act(
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
-    alpha: float | Tensor = 1.0,
-    beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
@@ -367,16 +362,8 @@ def gemm_act(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-
-    def scalar_arg(scalar: float | Tensor):
-        if isinstance(scalar, float):
-            return Float32(scalar) if scalar != 1.0 else None
-        else:
-            assert isinstance(scalar, Tensor)
-            return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-
     act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn, scalar_arg(alpha), scalar_arg(beta))
+    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
