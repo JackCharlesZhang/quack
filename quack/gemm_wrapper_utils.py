@@ -225,7 +225,7 @@ class GemmWrapperBase:
             leading_dim=leading_dim
         )
         transposed_tensor =cute.make_tensor(
-            untransposed_tensor.iterator, cute.make_layout(shape=cute.select(untransposed_tensor.shape, mode=[1, 0, 2]), stride=cute.select(untransposed_tensor.stride, mode=[1, 0, 2]))
+            untransposed_tensor.iterator, cute.make_layout(untransposed_tensor.shape, stride=cute.select(untransposed_tensor.stride, mode=[1, 0, 2]))
         )
         return transposed_tensor
 
