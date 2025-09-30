@@ -96,6 +96,7 @@ class GemmActMixin:
         cta_tile_shape_mnk: Tuple[int, int, int],
         epi_tile: cute.Tile,
     ) -> int:
+        print(args)
         postact_dtype = args.mPostAct.element_type
         postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
         return postact_bytes_per_stage
