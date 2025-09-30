@@ -134,6 +134,7 @@ class TileScheduler:
         loc=None,
         ip=None,
     ):
+        print("NORMAL TILE SCHEDULER")
         self._current_work_linear_idx = current_work_linear_idx
         self.num_tiles_executed = num_tiles_executed
         self._tile_count = tile_count
