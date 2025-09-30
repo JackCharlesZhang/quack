@@ -932,8 +932,8 @@ def gemm_symmetric_out(
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
     gemm_symmetric_sm90(
-        A
-        B
+        A,
+        B,
         D if D is not None else None,
         C if C is not None else None,
         PostAct,
