@@ -16,13 +16,13 @@ class TestSymmetricGemm:
         """Default shape for most tests (L, M, K)."""
         return (2, 1024, 512)
 
-    def torch_reference(self, a, b=None, C=None, c=None, alpha=1.0, beta=1.0):
+    def torch_reference(self, a, b=None, C=None, alpha=1.0, beta=1.0):
         """Reference implementation using PyTorch operations.
 
         Args:
             a: Input tensor A of shape (L, M, K)
             b: Input tensor B of shape (L, M, K) - if None, uses A (symmetric case)
-            c: Optional bias tensor C of shape (L, M, M)
+            C: Optional additive tensor C of shape (L, M, M)
             alpha: Scaling factor for A @ B^T
             beta: Scaling factor for C
 
@@ -36,9 +36,8 @@ class TestSymmetricGemm:
         # a: (L, M, K), b: (L, M, K) -> result: (L, M, M)
         result = alpha * torch.einsum("lmk,lnk->lmn", a, b)
 
-        bias = C if C is not None else c
-        if bias is not None:
-            result = result + beta * bias
+        if C is not None:
+            result = result + beta * C
 
         return result
 
