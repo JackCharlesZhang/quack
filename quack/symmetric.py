@@ -1,3 +1,16 @@
+from typing import Optional
+from functools import partial
+from torch import Tensor
+from quack.gemm_act import GemmActMixin, GemmActSm90, act_fn_map, gemm_act
+from quack.gemm_sm90 import GemmSm90
+from quack.tile_scheduler import TriangularTileScheduler
+from quack.gemm_wrapper_utils import GemmWrapperBase
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+import cutlass
+import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
+from cutlass import Float32
+
 class GemmSymmetric(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
         return TriangularTileScheduler
@@ -47,8 +60,8 @@ def gemm_symmetric(
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmActSm100 if device_capacity[0] > 9 else GemmActSm90
+    assert device_capacity[0] in [9], "Only SM90 is supported"
+    GemmCls = GemmActSm90
     # TODO: implement dynamic persistent
     if device_capacity[0] > 9:
         tile_count_semaphore = None
