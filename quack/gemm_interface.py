@@ -905,7 +905,7 @@ def gemm_dgated_ref(
 def gemm_symmetric_out(
     A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
-    preact_out: Optional[Tensor],  # (M, N) or (L, M, N)
+    preact_out: Tensor,  # (M, N) or (L, M, N)
     postact_out: Tensor,  # (M, N) or (L, M, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     dynamic_scheduler: bool = False,
@@ -920,7 +920,7 @@ def gemm_symmetric_out(
         B = B.unsqueeze(0)  # (1, M, K)
     if C is not None and C.ndim == 2:   
         C = C.unsqueeze(0)  # (1, M, M)
-    if preact_out is not None and preact_out.ndim == 2:
+    if preact_out.ndim == 2:
         D = preact_out.unsqueeze(0)
     else:
         D = preact_out
@@ -975,7 +975,7 @@ def gemm_symmetric(
     if lower_triangle is None:
         lower_triangle = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if upper_triangle is None:
-        upper_triangle = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
+        upper_triangle = lower_triangle.transpose(-1, -2)
     
     alpha_val = alpha if isinstance(alpha, float) else 1.0
     beta_val = beta if isinstance(beta, float) else 1.0
