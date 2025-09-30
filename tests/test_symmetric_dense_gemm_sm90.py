@@ -252,32 +252,32 @@ def run_tests():
         test_class.test_basic_symmetric_gemm(torch.float16)
         print("✓ Basic test passed")
 
-        # # Test with bias
-        # print("Testing with bias...")
-        # test_class.test_symmetric_gemm_with_bias(torch.float16)
-        # print("✓ Bias test passed")
+        # Test with bias
+        print("Testing with bias...")
+        test_class.test_symmetric_gemm_with_bias(torch.float16)
+        print("✓ Bias test passed")
 
-        # # Test scaling
-        # print("Testing alpha/beta scaling...")
-        # test_class.test_alpha_beta_scaling(torch.float16)
-        # print("✓ Scaling test passed")
+        # Test scaling
+        print("Testing alpha/beta scaling...")
+        test_class.test_alpha_beta_scaling(torch.float16)
+        print("✓ Scaling test passed")
 
-        # # Test symmetry
-        # print("Testing symmetry property...")
-        # test_class.test_symmetry_property(torch.float16)
-        # print("✓ Symmetry test passed")
+        # Test symmetry
+        print("Testing symmetry property...")
+        test_class.test_symmetry_property(torch.float16)
+        print("✓ Symmetry test passed")
 
-        # # Test different sizes
-        # print("Testing different sizes...")
-        # test_class.test_different_sizes()
-        # print("✓ Different sizes test passed")
+        # Test different sizes
+        print("Testing different sizes...")
+        test_class.test_different_sizes()
+        print("✓ Different sizes test passed")
 
-        # # Test different stride patterns
-        # print("Testing different stride patterns...")
-        # test_class.test_different_stride_patterns(torch.float16)
-        # print("✓ Different stride patterns test passed")
+        # Test different stride patterns
+        print("Testing different stride patterns...")
+        test_class.test_different_stride_patterns(torch.float16)
+        print("✓ Different stride patterns test passed")
 
-        # print("\n🎉 All tests passed!")
+        print("\n🎉 All tests passed!")
 
     except Exception as e:
         print(f"\n❌ Test failed with error: {e}")
