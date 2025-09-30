@@ -13,7 +13,7 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
-from quack.symmetric_gemm_sm90 import gemm_symmetric as gemm_symmetric_sm90
+from quack.symmetric_gemm import gemm_symmetric as gemm_symmetric
 
 
 # Dictionary mapping activation names to PyTorch functions

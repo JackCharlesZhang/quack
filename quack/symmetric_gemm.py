@@ -12,9 +12,15 @@ import cutlass.torch as cutlass_torch
 from cutlass import Float32
 from cutlass.cute.runtime import make_ptr
 
-class GemmSymmetric(GemmActMixin, GemmSm90):
+class GemmSymmetricMixin(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
         return TriangularTileScheduler
+
+class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
+    pass
+
+class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
+    pass
 
 def gemm_symmetric(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
@@ -63,8 +69,8 @@ def gemm_symmetric(
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9], "Only SM90 is supported"
-    GemmCls = GemmSymmetric
+    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
+    GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
     # TODO: implement dynamic persistent
     if device_capacity[0] > 9:
         tile_count_semaphore = None
