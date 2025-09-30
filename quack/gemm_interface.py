@@ -900,14 +900,14 @@ def gemm_dgated_ref(
     "quack::gemm_symmetric_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, idx=None, bool dynamic_scheduler=False, bool tuned=True, float alpha=1.0, float beta=1.0) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
 )
 def gemm_symmetric_out(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
+    A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
-    preact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    preact_out: Optional[Tensor],  # (M, N) or (L, M, N)
+    postact_out: Tensor,  # (M, N) or (L, M, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     dynamic_scheduler: bool = False,
     alpha: float = 1.0,
     beta: float = 1.0,
