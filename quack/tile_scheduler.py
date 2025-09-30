@@ -134,7 +134,6 @@ class TileScheduler:
         loc=None,
         ip=None,
     ):
-        print("NORMAL TILE SCHEDULER")
         self._current_work_linear_idx = current_work_linear_idx
         self.num_tiles_executed = num_tiles_executed
         self._tile_count = tile_count
@@ -378,7 +377,6 @@ def triangular_idx_to_coord(idx: Int32) -> Tuple[Int32, Int32]:
     Convert a triangular index to 2D coordinates.
     This is used to convert the linear index to 2D coordinates for triangular matrices.
     """
-    print("TRIANGLE")
     row = utils.ceil((cute.math.sqrt(2 * idx + 2.25, fastmath=True) - 0.5)) - 1
     col = idx - (row * (row + 1)) // 2
     return row, col
