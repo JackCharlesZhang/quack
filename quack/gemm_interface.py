@@ -908,15 +908,13 @@ def gemm_dgated_ref(
     return dx.to(out_dtype), postact.to(postact_dtype)
 
 def gemm_symmetric(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    lower_triangle: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    upper_triangle: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    A: Tensor,  # (M, K) or (L, M, K) 
+    B: Tensor,  # (K, M) or (L, K, M)
+    C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
+    lower_triangle: Optional[Tensor] = None,  # (M, M) or (L, M, M)
+    upper_triangle: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     alpha: float | Tensor = 1.0,
@@ -936,7 +934,7 @@ def gemm_symmetric(
         upper_triangle = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
     gemm_act_out(
         A, B, lower_triangle, upper_triangle, C, "identity", 
-        cu_seqlens_m, A_idx, dynamic_scheduler, tuned,
+        cu_seqlens_m=None, A_idx=None, dynamic_scheduler, tuned,
         kernel_fn=gemm_symmetric_sm90, alpha=alpha, beta=beta
     )
     return lower_triangle
