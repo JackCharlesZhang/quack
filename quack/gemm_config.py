@@ -76,7 +76,8 @@ def get_all_configs(
         tile_n_64_vals = [128, 192, 256]
         tile_mn_cluster_vals = (
             [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
-            + [(128, tile_n, (2, 1)) for tile_n in tile_n_64_vals]
+            # + [(128, tile_n, (2, 1)) for tile_n in tile_n_64_vals]
+            + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
             + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
         )
         swap_ab_vals = [False, True]
