@@ -932,11 +932,11 @@ def gemm_symmetric_out(
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
     gemm_symmetric_sm90(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        (D if not config.swap_ab else D.mT) if D is not None else None,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
-        PostAct if not config.swap_ab else PostAct.mT,
+        A
+        B
+        D if D is not None else None,
+        C if C is not None else None,
+        PostAct,
         tile_count_semaphore,
         "identity",
         tile_M=128,
@@ -945,7 +945,7 @@ def gemm_symmetric_out(
         cluster_N=1,
         pingpong=False,
         persistent=True,
-        max_swizzle_size=config.max_swizzle_size,
+        max_swizzle_size=8,
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=None,
