@@ -2,9 +2,9 @@ import torch
 from quack.gemm_interface import gemm_symmetric
 
 # Create input tensors
-A = torch.randn(size=(2, 8192, 4096))
-B = torch.randn(size=(2, 4096, 8192))
-C = torch.ones(size=(2, 8192, 8192))
+A = torch.randn(size=(2, 8192, 4096)).to(torch.bfloat16)
+B = torch.randn(size=(2, 4096, 8192)).to(torch.bfloat16)
+C = torch.ones(size=(2, 8192, 8192)).to(torch.bfloat16)
 
 # Move tensors to GPU for meaningful profiling
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
