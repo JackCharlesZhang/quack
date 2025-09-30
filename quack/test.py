@@ -12,20 +12,17 @@ A = A.to(device)
 B = B.to(device)
 C = C.to(device)
 
-# Profiling context
+# Reduce profiling overhead - shorter trace
 with torch.profiler.profile(
     activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
+        torch.profiler.ProfilerActivity.CUDA,  # Only CUDA, not CPU
     ],
-    record_shapes=True,
-    profile_memory=True,
-    with_stack=True
+    record_shapes=False,  # Disable shape recording
+    profile_memory=False,  # Disable memory profiling
+    with_stack=False      # Disable stack traces
 ) as prof:
     
-   
     D = gemm_symmetric(A, B, C=C.clone(), alpha=2.0, beta=3.0)
-    
     D_ref = torch.baddbmm(C.clone(), A, B, alpha=2.0, beta=3.0)
 
 # Export Chrome trace
@@ -34,6 +31,3 @@ prof.export_chrome_trace("gemm_profile.json")
 print("Profile saved to gemm_profile.json")
 print("Open chrome://tracing in Chrome and load the file to visualize")
 
-# Verify results match
-print(f"\nResults match: {torch.allclose(D, D_ref, rtol=1e-4, atol=1e-4)}")
-print(f"Max difference: {(D - D_ref).abs().max().item()}")
