@@ -85,9 +85,6 @@ def gemm_symmetric(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors({k: v for k, v in tensor_infos.items()}, major_configs)
 
-    # tensor_infos["PostAct"].cute_tensor = GemmWrapperBase.create_transposed_cute_tensor(tensor_infos["PostAct"].tensor, tensor_infos["PostAct"].major, major_configs["PostAct"])
-    
-    
     def scalar_arg(scalar: float | Tensor):
         if isinstance(scalar, float):
             return Float32(scalar) if scalar != 1.0 else None
