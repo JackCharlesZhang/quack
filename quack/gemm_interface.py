@@ -934,7 +934,7 @@ def gemm_symmetric(
         upper_triangle = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
     gemm_act_out(
         A, B, lower_triangle, upper_triangle, C, "identity", 
-        cu_seqlens_m=None, A_idx=None, dynamic_scheduler, tuned,
+        cu_seqlens_m=None, A_idx=None, dynamic_scheduler=dynamic_scheduler, tuned=tuned,
         kernel_fn=gemm_symmetric_sm90, alpha=alpha, beta=beta
     )
     return lower_triangle
