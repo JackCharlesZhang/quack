@@ -208,6 +208,26 @@ class GemmWrapperBase:
                 info.cute_tensor = GemmWrapperBase.create_cute_tensor(
                     info.tensor, info.major, major_configs[name]
                 )
+    
+    @staticmethod
+    def create_transposed_cute_tensor(
+        tensor: Optional[Tensor],
+        major: Optional[str],
+        dims: Tuple[str, str, str],
+        assumed_align: int = 16,
+    ) -> Optional[cute.Tensor]:
+        if tensor is None:
+            return None
+        # Tensor is already permuted to (dims[0], dims[1], dims[2]) or (dim[0], dim[1])
+        # If major is dims[1], leading_dim is 1; if major is dims[0], leading_dim is 0
+        leading_dim = 1 if major == dims[1] else 0
+        untransposed_tensor = from_dlpack(tensor.detach(), assumed_align=assumed_align).mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+        transposed_tensor =cute.make_tensor(
+            untransposed_tensor.iterator, cute.make_layout(shape=cute.select(untransposed_tensor.shape, mode=[1, 0, 2]), stride=cute.select(untransposed_tensor.stride, mode=[1, 0, 2]))
+        )
+        return transposed_tensor
 
     @staticmethod
     def create_scheduler_args(

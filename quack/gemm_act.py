@@ -293,6 +293,7 @@ act_fn_map = {
     "relu": quack.activation.relu,
     "relu_sq": quack.activation.relu_sq,
     "gelu_tanh_approx": quack.activation.gelu_tanh_approx,
+    "identity": quack.activation.identity,
 }
 
 

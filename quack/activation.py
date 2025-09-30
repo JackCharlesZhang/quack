@@ -14,6 +14,9 @@ import quack.utils as utils
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
 
+@dsl_user_op
+def identity(x: Float32, *, loc=None, ip=None) -> Float32:
+    return x
 
 @dsl_user_op
 def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:

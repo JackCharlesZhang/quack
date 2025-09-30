@@ -1,8 +1,8 @@
 import torch
 import pytest
 
-from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
-
+# from quack.symmetric_dense_gemm_sm90 import symmetric_dense_gemm
+from quack.gemm_interface import symmetric_dense_gemm
 
 class TestSymmetricGemm:
     """Unit tests for symmetric dense GEMM wrapper."""
@@ -117,10 +117,10 @@ class TestSymmetricGemm:
         c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
 
         # Compute with our wrapper
-        result_quack = symmetric_dense_gemm(a, a, c=c)
+        result_quack = symmetric_dense_gemm(a, a, C=c)
 
         # Compute reference
-        result_torch = self.torch_reference(a, a, c=c)
+        result_torch = self.torch_reference(a, a, C=c)
 
         # Check shapes match
         assert result_quack.shape == result_torch.shape == (L, M, M)
@@ -145,10 +145,10 @@ class TestSymmetricGemm:
         c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
 
         # Compute with our wrapper
-        result_quack = symmetric_dense_gemm(a, a, c=c, alpha=alpha, beta=beta)
+        result_quack = symmetric_dense_gemm(a, a, C=c, alpha=alpha, beta=beta)
 
         # Compute reference
-        result_torch = self.torch_reference(a, a, c=c, alpha=alpha, beta=beta)
+        result_torch = self.torch_reference(a, a, C=c, alpha=alpha, beta=beta)
 
         # Check values match
         if dtype == torch.float32:
@@ -168,7 +168,7 @@ class TestSymmetricGemm:
         a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
 
         # Compute symmetric GEMM
-        result = symmetric_dense_gemm(a, a)
+        result = symmetric_dense_gemm(a, a, C=None)
 
         # Check symmetry for each batch
         for l in range(L):
@@ -194,7 +194,7 @@ class TestSymmetricGemm:
         for L, M, K in test_sizes:
             a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
 
-            result = symmetric_dense_gemm(a, a)
+            result = symmetric_dense_gemm(a, a, C=None)
             expected = self.torch_reference(a, a)
 
             assert result.shape == (L, M, M)
