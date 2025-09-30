@@ -156,6 +156,8 @@ def gemm_act_tuned(
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     kernel_fn=None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -196,6 +198,8 @@ def gemm_act_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
+        alpha=alpha,
+        beta=beta,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
@@ -667,6 +671,8 @@ def gemm_act(
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -685,7 +691,7 @@ def gemm_act(
     if postact_out is None:
         postact_out = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
     gemm_act_out(
-        A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned
+        A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned, alpha=alpha, beta=beta
     )
     return preact_out, postact_out
 
@@ -707,11 +713,13 @@ def gemm_act_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
-    kernel_fn=None
+    kernel_fn=None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, kernel_fn=kernel_fn)
+    fn(A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, kernel_fn=kernel_fn, alpha=alpha, beta=beta)
 
 
 def gemm_act_ref(
@@ -907,9 +915,12 @@ def gemm_symmetric(
     upper_triangle: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -925,8 +936,8 @@ def gemm_symmetric(
         upper_triangle = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
     gemm_act_out(
         A, B, lower_triangle, upper_triangle, C, "identity", 
-        None, A_idx, dynamic_scheduler, tuned,
-        kernel_fn=gemm_symmetric_sm90
+        cu_seqlens_m, A_idx, dynamic_scheduler, tuned,
+        kernel_fn=gemm_symmetric_sm90, alpha=alpha, beta=beta
     )
     return lower_triangle
 
