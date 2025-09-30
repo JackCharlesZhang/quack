@@ -64,7 +64,7 @@ def gemm_symmetric(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9], "Only SM90 is supported"
-    GemmCls = GemmActSm90
+    GemmCls = GemmSymmetric
     # TODO: implement dynamic persistent
     if device_capacity[0] > 9:
         tile_count_semaphore = None
