@@ -93,8 +93,8 @@ class TestSymmetricGemm:
 
         print(f"a.shape = {a.shape}, a.stride = {a.stride()}")
 
-        # Test symmetric case (B = A)
-        result_quack = symmetric_dense_gemm(a, a, C=None)
+        # Test symmetric case (B = A.transpose(-2, -1) for symmetric GEMM)
+        result_quack = symmetric_dense_gemm(a, a.transpose(-2, -1), C=None)
         result_torch = self.torch_reference(a, a)
 
         assert result_quack.shape == result_torch.shape == (L, M, M)
@@ -117,7 +117,7 @@ class TestSymmetricGemm:
         c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
 
         # Compute with our wrapper
-        result_quack = symmetric_dense_gemm(a, a, C=c, alpha=1.0, beta=1.0)
+        result_quack = symmetric_dense_gemm(a, a.transpose(-2, -1), C=c, alpha=1.0, beta=1.0)
 
         # Compute reference
         result_torch = self.torch_reference(a, a, C=c)
@@ -145,7 +145,7 @@ class TestSymmetricGemm:
         c = self.create_symmetric_tensor(L, M, dtype, device, seed=123)
 
         # Compute with our wrapper
-        result_quack = symmetric_dense_gemm(a, a, C=c, alpha=alpha, beta=beta)
+        result_quack = symmetric_dense_gemm(a, a.transpose(-2, -1), C=c, alpha=alpha, beta=beta)
 
         # Compute reference
         result_torch = self.torch_reference(a, a, C=c, alpha=alpha, beta=beta)
@@ -168,7 +168,7 @@ class TestSymmetricGemm:
         a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
 
         # Compute symmetric GEMM
-        result = symmetric_dense_gemm(a, a, C=None, alpha=1.0, beta=1.0)
+        result = symmetric_dense_gemm(a, a.transpose(-2, -1), C=None, alpha=1.0, beta=1.0)
 
         # Check symmetry for each batch
         for l in range(L):
@@ -194,7 +194,7 @@ class TestSymmetricGemm:
         for L, M, K in test_sizes:
             a = self.create_test_tensor(L, M, K, dtype, device, "m_major", seed=42)
 
-            result = symmetric_dense_gemm(a, a, C=None, alpha=1.0, beta=1.0)
+            result = symmetric_dense_gemm(a, a.transpose(-2, -1), C=None, alpha=1.0, beta=1.0)
             expected = self.torch_reference(a, a)
 
             assert result.shape == (L, M, M)
@@ -222,8 +222,8 @@ class TestSymmetricGemm:
         assert torch.equal(a_m_major, a_k_major), "Input tensors should have identical values"
         assert a_m_major.stride() != a_k_major.stride(), "Stride patterns should be different"
 
-        result_m_major = symmetric_dense_gemm(a_m_major, a_m_major, C=None, alpha=1.0, beta=1.0)
-        result_k_major = symmetric_dense_gemm(a_k_major, a_k_major, C=None, alpha=1.0, beta=1.0)
+        result_m_major = symmetric_dense_gemm(a_m_major, a_m_major.transpose(-2, -1), C=None, alpha=1.0, beta=1.0)
+        result_k_major = symmetric_dense_gemm(a_k_major, a_k_major.transpose(-2, -1), C=None, alpha=1.0, beta=1.0)
 
         assert result_m_major.shape == result_k_major.shape == (L, M, M)
 
