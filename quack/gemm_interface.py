@@ -938,7 +938,7 @@ def gemm_symmetric_out(
         C if C is not None else None,
         PostAct,
         tile_count_semaphore,
-        "identity",
+        activation=None,
         tile_M=128,
         tile_N=256,
         cluster_M=2,
