@@ -155,7 +155,6 @@ def gemm_act_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
-    kernel_fn=None,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
@@ -182,8 +181,7 @@ def gemm_act_tuned(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    kernel = kernel_fn if kernel_fn is not None else gemm_act_sm90_sm100
-    kernel(
+    gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         (D if not config.swap_ab else D.mT) if D is not None else None,
@@ -713,13 +711,10 @@ def gemm_act_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
-    kernel_fn=None,
-    alpha: float | Tensor = 1.0,
-    beta: float | Tensor = 1.0,
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, kernel_fn=kernel_fn, alpha=alpha, beta=beta)
+    fn(A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
 
 
 def gemm_act_ref(
@@ -907,6 +902,62 @@ def gemm_dgated_ref(
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
 
+@torch.library.custom_op(
+    "quack::gemm_symmetric_out",
+    mutates_args=("preact_out", "postact_out"),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, idx=None, bool dynamic_scheduler=False, bool tuned=True, float alpha=1.0, float beta=1.0) -> ()",
+)
+def gemm_symmetric_out(
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
+    B: Tensor,  # (K, N) or (L, K, N)
+    preact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    dynamic_scheduler: bool = False,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    """GEMM with guaranteed symmetric output."""
+    if A.ndim == 2:
+        A = A.unsqueeze(0)  # (1, M, K)
+    B = B.mT  # (M, K) or (L, M, K)
+    if B.ndim == 2:
+        B = B.unsqueeze(0)  # (1, M, K)
+    if C is not None and C.ndim == 2:   
+        C = C.unsqueeze(0)  # (1, M, M)
+    if preact_out is not None and preact_out.ndim == 2:
+        D = preact_out.unsqueeze(0)
+    else:
+        D = preact_out
+    if postact_out.ndim == 2:
+        PostAct = postact_out.unsqueeze(0)
+    else:
+        PostAct = postact_out
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_symmetric_sm90(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        (D if not config.swap_ab else D.mT) if D is not None else None,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
+        PostAct if not config.swap_ab else PostAct.mT,
+        tile_count_semaphore,
+        "identity",
+        tile_M=128,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
+        pingpong=False,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+        alpha=alpha,
+        beta=beta,
+        cu_seqlens_m=None,
+        A_idx=None,
+    )
+   
 def gemm_symmetric(
     A: Tensor,  # (M, K) or (L, M, K) 
     B: Tensor,  # (K, M) or (L, K, M)
@@ -916,7 +967,6 @@ def gemm_symmetric(
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
-    tuned: bool = True,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
@@ -932,10 +982,14 @@ def gemm_symmetric(
         lower_triangle = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if upper_triangle is None:
         upper_triangle = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
-    gemm_act_out(
-        A, B, lower_triangle, upper_triangle, C, "identity", 
-        cu_seqlens_m=None, A_idx=None, dynamic_scheduler=dynamic_scheduler, tuned=tuned,
-        kernel_fn=gemm_symmetric_sm90, alpha=alpha, beta=beta
+    
+    alpha_val = alpha if isinstance(alpha, float) else 1.0
+    beta_val = beta if isinstance(beta, float) else 1.0
+    
+    gemm_symmetric_out(
+        A, B, lower_triangle, upper_triangle, C, 
+        dynamic_scheduler=dynamic_scheduler,
+        alpha=alpha_val, beta=beta_val
     )
     return lower_triangle
 
