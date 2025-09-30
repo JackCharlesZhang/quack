@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass import Float32
+from cutlass.cute.runtime import make_ptr
 
 class GemmSymmetric(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
@@ -30,6 +31,8 @@ def gemm_symmetric(
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
@@ -83,8 +86,15 @@ def gemm_symmetric(
     GemmWrapperBase.create_cute_tensors({k: v for k, v in tensor_infos.items() if k != "PostAct"}, major_configs)
     tensor_infos["PostAct"].cute_tensor = GemmWrapperBase.create_transposed_cute_tensor(tensor_infos["PostAct"].cute_tensor, tensor_infos["PostAct"].major, major_configs["PostAct"])
 
+    def scalar_arg(scalar: float | Tensor):
+        if isinstance(scalar, float):
+            return Float32(scalar) if scalar != 1.0 else None
+        else:
+            assert isinstance(scalar, Tensor)
+            return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+
     act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn, scalar_arg(alpha), scalar_arg(beta))
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
@@ -112,6 +122,8 @@ def gemm_symmetric(
         tile_count_semaphore is not None,
         device_capacity,
         max_swizzle_size,
+        2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
+        2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
