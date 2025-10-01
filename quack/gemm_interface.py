@@ -13,6 +13,7 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
+from quack.symmetric_gemm import gemm_symmetric as gemm_symmetric_sm90_sm100
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -895,6 +896,83 @@ def gemm_dgated_ref(
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
 
+@torch.library.custom_op(
+    "quack::gemm_symmetric_out",
+    mutates_args=("out",),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
+)
+def gemm_symmetric_out(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, M) or (L, K, M)
+    out: Tensor,  # (M, M) or (L, M, M)
+    C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
+    dynamic_scheduler: bool = False,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    """GEMM with guaranteed symmetric output."""
+    if A.ndim == 2:
+        A = A.unsqueeze(0)  # (1, M, K)
+    B = B.mT  # (M, K) or (L, M, K)
+    if B.ndim == 2:
+        B = B.unsqueeze(0)  # (1, M, K)
+    if C is not None and C.ndim == 2:   
+        C = C.unsqueeze(0)  # (1, M, M)
+    if out.ndim == 2:
+        out = out.unsqueeze(0)
+    else:
+        out = out
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_symmetric_sm90_sm100(
+        A,
+        B,
+        out if out is not None else None,
+        C if C is not None else None,
+        tile_count_semaphore,
+        activation=None,
+        tile_M=128,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
+        pingpong=False,
+        persistent=True,
+        max_swizzle_size=8,
+        alpha=alpha,
+        beta=beta,
+    )
+   
+def gemm_symmetric(
+    A: Tensor,  # (M, K) or (L, M, K) 
+    B: Tensor,  # (K, M) or (L, K, M)
+    C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
+    out: Optional[Tensor] = None,  # (M, M) or (L, M, M)
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """GEMM with symmetric output."""
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    # Determine output shape based on gather_A
+    if A.ndim == 2:
+        out_shape = (A.shape[0], B.shape[-1])
+    else:
+        out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
+    if out is None:
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    
+    alpha_val = alpha if isinstance(alpha, float) else 1.0
+    beta_val = beta if isinstance(beta, float) else 1.0
+    
+    gemm_symmetric_out(
+        A, B, out, C, 
+        dynamic_scheduler=dynamic_scheduler,
+        alpha=alpha_val, beta=beta_val
+    )
+    return out
 
 # TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?
 # try:
