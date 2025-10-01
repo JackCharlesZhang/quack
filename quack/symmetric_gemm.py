@@ -24,11 +24,10 @@ class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
 
 def gemm_symmetric(
-    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
-    B: Tensor,  # (l, n, k)
-    D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    PostAct: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
+    A: Tensor,  # (l, m, k)
+    B: Tensor,  # (l, m, k)
+    D: Optional[Tensor],  # (l, m, m)
+    C: Optional[Tensor],  # (l, m, m) 
     tile_count_semaphore: Optional[Tensor],  # (1,)
     activation: Optional[str],
     tile_M: int,
@@ -44,8 +43,9 @@ def gemm_symmetric(
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}
+        A, B, D, C, additional_tensors={"PostAct": D.transpose(-1, -2)}
     )
+    assert M == N, "M and N must be the same; symmetric gemm only supports square matrices"
     GemmWrapperBase.permute_tensors(tensor_infos)
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
