@@ -129,7 +129,7 @@ def gemm_symmetric(
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            gather_A=gather_A,
+            gather_A=False,
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
