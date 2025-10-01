@@ -13,7 +13,7 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
-from quack.symmetric_gemm import gemm_symmetric as gemm_symmetric
+from quack.symmetric_gemm import gemm_symmetric as gemm_symmetric_sm90_sm100
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -931,7 +931,7 @@ def gemm_symmetric_out(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    gemm_symmetric_sm90(
+    gemm_symmetric_sm90_sm100(
         A,
         B,
         D if D is not None else None,
