@@ -903,6 +903,7 @@ def gemm_dgated_ref(
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
 
+
 @torch.library.custom_op(
     "quack::gemm_symmetric_out",
     mutates_args=("out",),
@@ -924,7 +925,7 @@ def gemm_symmetric_out(
     B = B.mT  # (M, K) or (L, M, K)
     if B.ndim == 2:
         B = B.unsqueeze(0)  # (1, M, K)
-    if C is not None and C.ndim == 2:   
+    if C is not None and C.ndim == 2:
         C = C.unsqueeze(0)  # (1, M, M)
     if out.ndim == 2:
         out = out.unsqueeze(0)
@@ -939,7 +940,6 @@ def gemm_symmetric_out(
         out if out is not None else None,
         C if C is not None else None,
         tile_count_semaphore,
-        activation=None,
         tile_M=128,
         tile_N=256,
         cluster_M=2,
@@ -950,9 +950,10 @@ def gemm_symmetric_out(
         alpha=alpha,
         beta=beta,
     )
-   
+
+
 def gemm_symmetric(
-    A: Tensor,  # (M, K) or (L, M, K) 
+    A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, M) or (L, K, M)
     C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out: Optional[Tensor] = None,  # (M, M) or (L, M, M)
@@ -970,16 +971,15 @@ def gemm_symmetric(
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-    
+
     alpha_val = alpha if isinstance(alpha, float) else 1.0
     beta_val = beta if isinstance(beta, float) else 1.0
-    
+
     gemm_symmetric_out(
-        A, B, out, C, 
-        dynamic_scheduler=dynamic_scheduler,
-        alpha=alpha_val, beta=beta_val
+        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha_val, beta=beta_val
     )
     return out
+
 
 # TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?
 # try:

@@ -1,7 +1,7 @@
 from typing import Optional
 from functools import partial
 from torch import Tensor
-from quack.gemm_act import GemmActMixin, GemmActSm90, act_fn_map, gemm_act
+from quack.gemm_act import GemmActMixin, act_fn_map, gemm_act
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.tile_scheduler import TriangularTileScheduler
@@ -13,23 +13,26 @@ import cutlass.torch as cutlass_torch
 from cutlass import Float32
 from cutlass.cute.runtime import make_ptr
 
+
 class GemmSymmetricMixin(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
         return TriangularTileScheduler
 
+
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
     pass
 
+
 class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
+
 
 def gemm_symmetric(
     A: Tensor,  # (l, m, k)
     B: Tensor,  # (l, m, k)
     D: Optional[Tensor],  # (l, m, m)
-    C: Optional[Tensor],  # (l, m, m) 
+    C: Optional[Tensor],  # (l, m, m)
     tile_count_semaphore: Optional[Tensor],  # (1,)
-    activation: Optional[str],
     tile_M: int,
     tile_N: int,
     cluster_M: int,
@@ -40,8 +43,6 @@ def gemm_symmetric(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
-    assert activation in act_fn_map, f"Unsupported activation {activation}"
-
     # Tranpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
 
@@ -90,8 +91,11 @@ def gemm_symmetric(
             assert isinstance(scalar, Tensor)
             return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
 
+    activation = None  # Equivalent to identity
     act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn, scalar_arg(alpha), scalar_arg(beta))
+    epi_args = GemmCls.EpilogueArguments(
+        tensor_infos["PostAct"].cute_tensor, act_fn, scalar_arg(alpha), scalar_arg(beta)
+    )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
