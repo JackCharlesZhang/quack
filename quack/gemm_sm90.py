@@ -217,7 +217,9 @@ class GemmSm90:
             atom_layout_m, atom_layout_n = 1, 1
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
-        self.num_mcast_ctas_a = self.cluster_shape_mnk[1] if not self.gather_A else 1
+        self.num_mcast_ctas_a = self.cluster_shape_mnk[1]
+        if self.gather_A:
+            assert self.num_mcast_ctas_a == 1
         self.num_mcast_ctas_b = self.cluster_shape_mnk[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
@@ -232,10 +234,9 @@ class GemmSm90:
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
         self.num_ab_load_warps = 1 if not self.gather_A else 4
-        self.num_ab_load_threads = cute.arch.WARP_SIZE * self.num_ab_load_warps
-        self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
         self.ab_load_warp_id = self.mma_warp_groups * 4
-        self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
+        # self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
+        # self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
 
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
             math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
@@ -715,7 +716,7 @@ class GemmSm90:
                     if const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
                         # (bM, bK, RestK)
-                        gA_k = cute.local_tile(
+                        gA_mk = cute.local_tile(
                             mA_mk,
                             cute.select(self.cta_tile_shape_mnk, [0, 2]),
                             (tile_coord_mnkl[0], None),
@@ -737,7 +738,7 @@ class GemmSm90:
                                 mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
                             )
                     # (bN, bK, RestK)
-                    gB_k = cute.local_tile(
+                    gB_nk = cute.local_tile(
                         varlen_manager.offset_batch_B(mB_nkl, batch_idx),
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
@@ -756,18 +757,17 @@ class GemmSm90:
                             cta_layout=cute.make_layout(
                                 cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
                             ),
-                            src_tensor=gA_k,
+                            src_tensor=gA_mk,
                             dst_tensor=sA,
                             mcast_mask=a_mcast_mask,
                             tma_desc_ptr=tma_desc_a_ptr,
                         )
                     else:
                         tiled_copy_A = self._make_gmem_tiled_copy_A(
-                            mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
+                            mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
                         )
                         tidx = (
-                            cute.arch.thread_idx()[0]
-                            - self.mma_warp_groups * self.num_threads_per_warp_group
+                            cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
                         )
                         thr_copy_A = tiled_copy_A.get_slice(tidx)
                         copy_A, prefetch_A = None, None
@@ -796,7 +796,7 @@ class GemmSm90:
                         cta_layout=cute.make_layout(
                             cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
                         ),
-                        src_tensor=gB_k,
+                        src_tensor=gB_nk,
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
                         tma_desc_ptr=tma_desc_b_ptr,
@@ -1065,7 +1065,7 @@ class GemmSm90:
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_producer_state: cutlass.pipeline.PipelineState,
-        copy_A: Callable,
+        copy_A: Optional[Callable],
         copy_B: Callable,
         k_tile_cnt: Int32,
         # These are for Sm100 blockscaled gemm
@@ -1088,7 +1088,8 @@ class GemmSm90:
             ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             smem_idx = ab_producer_state.index
-            copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            if const_expr(copy_A is not None):
+                copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             if const_expr(blockscaled):
                 copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
@@ -1142,7 +1143,9 @@ class GemmSm90:
             # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
-            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+            peek_ab_empty_status = Boolean(True)
+            if k_tile + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
         # bound checking in the K dimension on the last k_tile
         if 0 < k_tile_cnt:
             k_tile = k_tile_cnt - 1
@@ -1574,21 +1577,15 @@ class GemmSm90:
         ab_pipeline_mbar_ptr: cute.Pointer,
     ):
         # Threads/warps participating in this pipeline
-        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_threads
+        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = mcast_size
-        if const_expr(self.arch != 100):
-            consumer_arrive_cnt *= tiled_mma.size // cute.arch.WARP_SIZE
+        consumer_arrive_cnt = mcast_size * tiled_mma.size // cute.arch.WARP_SIZE
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        if const_expr(self.arch != 100):
-            pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
-        else:
-            # TODO: we need a pipeline class for TMACpAsyncUMMA
-            pipeline_cls = pipeline.PipelineTmaUmma if not self.gather_A else PipelineTmaCpAsync
+        pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
         return pipeline_cls.create(
             barrier_storage=ab_pipeline_mbar_ptr,
             num_stages=self.ab_stage,

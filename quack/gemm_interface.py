@@ -53,12 +53,19 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
-        # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
-        configs = [
-            conf
-            for conf in configs
-            if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_n != 208
-        ]
+        if get_device_capacity(kwargs["A"].device)[0] == 9:
+            # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
+            configs = [
+                conf
+                for conf in configs
+                if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_n != 208
+            ]
+        else:  # gather_A doesn't support 2CTA instruction
+            configs = [
+                conf
+                for conf in configs
+                if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_m != 256
+            ]
     return configs
 
 

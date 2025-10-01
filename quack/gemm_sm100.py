@@ -25,11 +25,13 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
+from quack.pipeline import PipelineTmaCpAsyncUmma
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 import quack.copy_utils as copy_utils
+import quack.sm100_utils as quack_sm100_utils
 
 # return PipelineStateWAdvance instead of PipelineState
 
@@ -198,15 +200,17 @@ class GemmSm100(GemmSm90):
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
+        self.num_ab_load_warps = 1 if not self.gather_A else 6
         self.occupancy = 1
         # Set specialized warp ids
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
-        self.tma_warp_id = 5
-        self.tma_epi_warp_id = 6
+        self.ab_load_warp_id = 5
+        self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.num_epi_warps = len(self.epilog_warp_id)
-        self.threads_per_cta = 32 * len(
-            (self.mma_warp_id, self.tma_warp_id, self.tma_epi_warp_id, *self.epilog_warp_id)
+        self.threads_per_cta = cute.arch.WARP_SIZE * (
+            self.num_ab_load_warps
+            + len((self.mma_warp_id, self.epi_load_warp_id, *self.epilog_warp_id))
         )
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
@@ -305,6 +309,8 @@ class GemmSm100(GemmSm90):
 
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
+        if self.gather_A:
+            assert self.num_mcast_ctas_a == 1
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
@@ -351,6 +357,11 @@ class GemmSm100(GemmSm90):
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
         )
+        self.a_smem_load_layout_staged = self.a_smem_layout_staged
+        if const_expr(self.gather_A):
+            self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
+                self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+            )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
         )
@@ -652,6 +663,7 @@ class GemmSm100(GemmSm90):
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
+            self.a_smem_load_layout_staged,
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
@@ -692,6 +704,7 @@ class GemmSm100(GemmSm90):
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: Optional[cute.Layout],
         a_smem_layout: cute.ComposedLayout,
+        a_smem_load_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         sfa_smem_layout: Optional[cute.Layout],
         sfb_smem_layout: Optional[cute.Layout],
@@ -718,7 +731,7 @@ class GemmSm100(GemmSm90):
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.tma_warp_id:
+        if warp_idx == self.ab_load_warp_id:
             for tma_atom in (
                 tma_atom_a,
                 tma_atom_b,
@@ -754,7 +767,7 @@ class GemmSm100(GemmSm90):
 
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
-            if warp_idx == self.tma_warp_id:
+            if warp_idx == self.ab_load_warp_id:
                 num_tmem_dealloc_threads = 32
                 cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads)
 
@@ -788,7 +801,8 @@ class GemmSm100(GemmSm90):
 
         # Setup smem tensor A/B/D
         # (MMA, MMA_M, MMA_K, STAGE)
-        sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        sA_mma = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        sA = storage.sA.get_tensor(a_smem_load_layout.outer, swizzle=a_smem_load_layout.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sSFA, sSFB = None, None
@@ -842,10 +856,13 @@ class GemmSm100(GemmSm90):
             )
 
         #
-        # Specialized TMA load warp
+        # Specialized AB load warps
         #
-        if warp_idx == self.tma_warp_id:
-            is_tma_warp = True
+        if (
+            warp_idx >= self.ab_load_warp_id
+            and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
+        ):
+            is_tma_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
             # initialize tensormap for A & B
             varlen_manager.init_tensormap_AB(tma_atom_a, tma_atom_b, is_tma_warp)
             tma_desc_a_ptr = varlen_manager.get_tma_desc_a_ptr()
@@ -904,12 +921,30 @@ class GemmSm100(GemmSm90):
                     tile_coord_mnkl[1],
                     tile_coord_mnkl[3],
                 )
-                # (bM, bK, RestK)
-                gA_mk = cute.local_tile(
-                    varlen_manager.offset_batch_A(mA_mkl, batch_idx),
-                    cute.select(self.mma_tiler, [0, 2]),
-                    (mma_tile_coord_mnl[0], None),
-                )
+                if const_expr(not self.gather_A):
+                    mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
+                    # (bM, bK, RestK)
+                    gA_mk = cute.local_tile(
+                        mA_mk,
+                        cute.select(self.mma_tiler, [0, 2]),
+                        (mma_tile_coord_mnl[0], None),
+                    )
+                else:
+                    mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
+                    if const_expr(varlen_m):
+                        gAIdx = cute.local_tile(
+                            mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],)
+                        )
+                        # (M, K)
+                        mA_mk = mA_mkl
+                    else:
+                        assert varlen_k
+                        # (tile_K, RestK)
+                        gAIdx = cute.flat_divide(mAIdx_mk, (self.cta_tile_shape_mnk[2],))
+                        # (tile_M, K)
+                        mA_mk = cute.local_tile(
+                            mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
+                        )
                 # (bN, bK, RestK)
                 gB_nk = cute.local_tile(
                     varlen_manager.offset_batch_B(mB_nkl, batch_idx),
@@ -929,9 +964,52 @@ class GemmSm100(GemmSm90):
                         cute.select(self.mma_tiler, [1, 2]),
                         (mma_tile_coord_mnl[1], None),
                     )
+
                 # Partition global tensor for TiledMMA_A/B/D
-                # (MMA, MMA_M, MMA_K, RestK)
-                tCgA = thr_mma.partition_A(gA_mk)
+                # Then partition global/shared tensor for TMA load A/B
+                varlen_manager.fence_tensormap_update_AB(is_tma_warp)
+                len_k = varlen_manager.len_k(batch_idx)
+                # TMA load A partition_S/D
+                a_cta_layout = cute.make_layout(
+                    cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+                )
+                if const_expr(not self.gather_A):
+                    # (MMA, MMA_M, MMA_K, RestK)
+                    tCgA = thr_mma.partition_A(gA_mk)
+                    copy_A, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_a,
+                        cta_coord=block_in_cluster_coord_vmnk[2],
+                        cta_layout=a_cta_layout,
+                        src_tensor=tCgA,
+                        dst_tensor=sA,
+                        mcast_mask=a_mcast_mask,
+                        tma_desc_ptr=tma_desc_a_ptr,
+                    )
+                else:
+                    tiled_copy_A = self._make_gmem_tiled_copy_A(
+                        mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
+                    )
+                    tidx = cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
+                    thr_copy_A = tiled_copy_A.get_slice(tidx)
+                    copy_A, prefetch_A = None, None
+                    if const_expr(varlen_m):
+                        copy_A = copy_utils.gather_m_get_copy_fn(
+                            thr_copy_A,
+                            mA_mk,
+                            sA,
+                            gAIdx,
+                            limit_m=varlen_manager.len_m(batch_idx),
+                            limit_k=len_k,
+                        )
+                    else:
+                        copy_A, prefetch_A = copy_utils.gather_k_get_copy_fn(
+                            thr_copy_A,
+                            mA_mk,
+                            sA,
+                            gAIdx,
+                            limit_m=varlen_manager.len_m(batch_idx),
+                            limit_k=len_k,
+                        )
                 # (MMA, MMA_N, MMA_K, RestK)
                 tCgB = thr_mma.partition_B(gB_nk)
                 if const_expr(self.blockscaled):
@@ -939,23 +1017,6 @@ class GemmSm100(GemmSm90):
                     tCgSFA = thr_mma.partition_A(gSFA_mkl)
                     # (MMA, MMA_N, MMA_K)
                     tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
-
-                varlen_manager.fence_tensormap_update_AB(is_tma_warp)
-                len_k = varlen_manager.len_k(batch_idx)
-                # Partition global/shared tensor for TMA load A/B
-                # TMA load A partition_S/D
-                a_cta_layout = cute.make_layout(
-                    cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-                )
-                copy_A, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_a,
-                    cta_coord=block_in_cluster_coord_vmnk[2],
-                    cta_layout=a_cta_layout,
-                    src_tensor=tCgA,
-                    dst_tensor=sA,
-                    mcast_mask=a_mcast_mask,
-                    tma_desc_ptr=tma_desc_a_ptr,
-                )
                 # TMA load B partition_S/D
                 copy_B, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_b,
@@ -996,15 +1057,26 @@ class GemmSm100(GemmSm90):
                         # tma_desc_ptr=tma_desc_sfa_ptr,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                ab_producer_state = self.load_AB(
-                    ab_pipeline,
-                    ab_producer_state,
-                    copy_A,
-                    copy_B,
-                    k_tile_cnt,
-                    copy_SFA,
-                    copy_SFB,
-                )
+                if const_expr(not self.gather_A):
+                    ab_producer_state = self.load_AB(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        copy_B,
+                        k_tile_cnt,
+                        copy_SFA,
+                        copy_SFB,
+                    )
+                else:
+                    ab_producer_state = self.load_AB_gather_A(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        prefetch_A,
+                        copy_B,
+                        k_tile_cnt,
+                        varlen_m=varlen_m,
+                    )
                 if const_expr(epi_load_barrier is not None):
                     # In the first work tile, the epi load warp will wait for the signal
                     # from the mainloop load warp to start loading C, to avoid interfering
@@ -1025,7 +1097,7 @@ class GemmSm100(GemmSm90):
         # Specialized TMA epi load warp
         #
         if const_expr(mC_mnl is not None):
-            if warp_idx == self.tma_epi_warp_id:
+            if warp_idx == self.epi_load_warp_id:
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
@@ -1073,7 +1145,7 @@ class GemmSm100(GemmSm90):
             )
             # Partition shared/tensor memory tensor for TiledMMA_A/B/D
             # (MMA, MMA_M, MMA_K, STAGE)
-            tCrA = tiled_mma.make_fragment_A(sA)
+            tCrA = tiled_mma.make_fragment_A(sA_mma)
             # (MMA, MMA_N, MMA_K, STAGE)
             tCrB = tiled_mma.make_fragment_B(sB)
             # (MMA, MMA_M, MMA_N, STAGE)
@@ -1575,6 +1647,31 @@ class GemmSm100(GemmSm90):
         # (R2S, R2S_M, R2S_N)
         tSR_rC = tiled_copy_s2r.retile(tRS_rC)
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
+
+    def make_ab_pipeline(
+        self,
+        tiled_mma: cute.TiledMma,
+        cluster_layout_vmnk: cute.Layout,
+        ab_pipeline_mbar_ptr: cute.Pointer,
+    ):
+        # Threads/warps participating in this pipeline
+        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
+        # Each warp will contribute to the arrive count with the number of mcast size
+        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        consumer_arrive_cnt = mcast_size
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        pipeline_cls = pipeline.PipelineTmaUmma if not self.gather_A else PipelineTmaCpAsyncUmma
+        return pipeline_cls.create(
+            barrier_storage=ab_pipeline_mbar_ptr,
+            num_stages=self.ab_stage,
+            producer_group=ab_pipeline_producer_group,
+            consumer_group=ab_pipeline_consumer_group,
+            tx_count=self.num_tma_load_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+        )
 
     def make_acc_pipeline(
         self, cluster_layout_vmnk: cute.Layout, acc_pipeline_mbar_ptr: cute.Pointer

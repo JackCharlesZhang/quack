@@ -42,8 +42,8 @@ def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
     return A, A_idx
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha", [1.0, 1.7])
 # @pytest.mark.parametrize("alpha_is_tensor", [False])
@@ -65,13 +65,12 @@ def test_gemm_varlen_m(
     """Test GEMM with variable length M dimension using cu_seqlens_m."""
     device = "cuda"
     torch.random.manual_seed(0)
-    seq_lens = torch.randint(100, 500, (num_groups,), device="cpu")
+    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
     # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    cu_seqlens_m = cu_seqlens_m.to(device)
     A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     if B_major == "k":
@@ -95,8 +94,8 @@ def test_gemm_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("beta_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("beta", [0.5, 1.0])
@@ -124,13 +123,12 @@ def test_gemm_add_varlen_m(
     """Test GEMM with addition and variable length M dimension using cu_seqlens_m."""
     device = "cuda"
     torch.random.manual_seed(0)
-    seq_lens = torch.randint(100, 500, (num_groups,), device="cpu")
+    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
     # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    cu_seqlens_m = cu_seqlens_m.to(device)
     A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     C = torch.randn((total_m, n), device=device, dtype=input_dtype)
@@ -171,8 +169,8 @@ def test_gemm_add_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("beta_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
@@ -200,13 +198,12 @@ def test_gemm_add_inplace_varlen_m(
     """Test in-place GEMM with addition and variable length M dimension: out = alpha * A @ B + beta * out."""
     device = "cuda"
     torch.random.manual_seed(42)
-    seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
+    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
     # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    cu_seqlens_m = cu_seqlens_m.to(device)
     A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     out = torch.randn((total_m, n), device=device, dtype=input_dtype)
@@ -257,8 +254,8 @@ def test_gemm_add_inplace_varlen_m(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("activation", [None, "relu", "gelu_tanh_approx"])
 # @pytest.mark.parametrize("activation", [None])
 # @pytest.mark.parametrize("dynamic_scheduler", [False, True])
@@ -281,12 +278,12 @@ def test_gemm_act_varlen_m(
     """Test GEMM with activation and variable length M dimension."""
     device = "cuda"
     torch.random.manual_seed(42)
-    seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
+    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
+    # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    cu_seqlens_m = cu_seqlens_m.to(device)
     A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     C = torch.randn((total_m, n), device=device, dtype=input_dtype) * 0.1
@@ -321,8 +318,8 @@ def test_gemm_act_varlen_m(
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 @pytest.mark.parametrize("activation", [None, "relu", "gelu_tanh_approx"])
 # @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False])
@@ -344,12 +341,12 @@ def test_gemm_dact_varlen_m(
     """Test GEMM with activation gradient and variable length M dimension."""
     device = "cuda"
     torch.random.manual_seed(42)
-    seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
+    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
+    # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    cu_seqlens_m = cu_seqlens_m.to(device)
     A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     PreAct = torch.randn((total_m, n), device=device, dtype=input_dtype) * 0.1
