@@ -42,8 +42,11 @@ def gemm_symmetric(
 ) -> None:
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
+    # Tranpose D so the "activation" is a write to the mirrored tile
+    PostAct = D.mT
+
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": D.transpose(-1, -2)}
+        A, B, D, C, additional_tensors={"PostAct": PostAct}
     )
     assert M == N, "M and N must be the same; symmetric gemm only supports square matrices"
     GemmWrapperBase.permute_tensors(tensor_infos)
@@ -92,18 +95,7 @@ def gemm_symmetric(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        None,
-        None,
-        None,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
-    )
+    varlen_args = None
 
     current_stream = cutlass_torch.current_stream()
     compile_key = GemmWrapperBase.get_compile_key(

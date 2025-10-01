@@ -904,9 +904,9 @@ def gemm_dgated_ref(
 )
 def gemm_symmetric_out(
     A: Tensor,  # (M, K) or (L, M, K)
-    B: Tensor,  # (K, N) or (L, K, N)
-    out: Tensor,  # (M, N) or (L, M, N)
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    B: Tensor,  # (K, M) or (L, K, M)
+    out: Tensor,  # (M, M) or (L, M, M)
+    C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     dynamic_scheduler: bool = False,
     alpha: float = 1.0,
     beta: float = 1.0,
@@ -950,14 +950,12 @@ def gemm_symmetric(
     C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     # Determine output shape based on gather_A
     if A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
