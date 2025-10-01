@@ -948,8 +948,6 @@ def gemm_symmetric_out(
         max_swizzle_size=8,
         alpha=alpha,
         beta=beta,
-        cu_seqlens_m=None,
-        A_idx=None,
     )
    
 def gemm_symmetric(

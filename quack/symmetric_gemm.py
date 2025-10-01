@@ -39,25 +39,13 @@ def gemm_symmetric(
     max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
-    A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
-    if cu_seqlens_m is not None:
-        assert persistent, "varlen_m requires persistent=True"
-        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
-        if D is not None:
-            assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
-        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
-    if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
-        assert cluster_N == 1, "gather_A requires cluster_N=1"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+        A, B, D, C, additional_tensors={"PostAct": PostAct}
     )
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
+    GemmWrapperBase.permute_tensors(tensor_infos)
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
@@ -106,9 +94,9 @@ def gemm_symmetric(
 
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        None,  # cu_seqlens_k
-        A_idx,
+        None,
+        None,
+        None,
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
@@ -129,8 +117,6 @@ def gemm_symmetric(
         max_swizzle_size,
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
-        cu_seqlens_m is not None,
-        A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_act.compile_cache
