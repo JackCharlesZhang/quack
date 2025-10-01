@@ -900,7 +900,7 @@ def gemm_dgated_ref(
     "quack::gemm_symmetric_out",
     mutates_args=("out",),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
 )
 def gemm_symmetric_out(
     A: Tensor,  # (M, K) or (L, M, K)
