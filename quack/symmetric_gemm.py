@@ -3,6 +3,7 @@ from functools import partial
 from torch import Tensor
 from quack.gemm_act import GemmActMixin, GemmActSm90, act_fn_map, gemm_act
 from quack.gemm_sm90 import GemmSm90
+from quack.gemm_sm100 import GemmSm100
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
