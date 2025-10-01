@@ -177,7 +177,8 @@ class Softmax(ReductionBase):
                 hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
                 return_exp_x=True,
             )
-        y = exp_x * (1.0 / denom)
+        # y = exp_x * (1.0 / denom)
+        y = exp_x * cute.arch.rcp_approx(denom)
         tXrO.store(y.to(tXrO.element_type))
         tOpO = (
             utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])

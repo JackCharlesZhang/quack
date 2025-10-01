@@ -237,7 +237,8 @@ class CrossEntropy(ReductionBase):
             # Compute probabilities: exp(x) / sum(exp(x))
             # If ignored, gradient should be zero
             denom_inv = (
-                1.0 / denom
+                # 1.0 / denom
+                cute.arch.rcp_approx(denom)
                 if not (denom == 0.0 or denom != denom or should_ignore)
                 else Float32.zero
             )
