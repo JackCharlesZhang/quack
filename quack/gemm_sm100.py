@@ -1360,8 +1360,14 @@ class GemmSm100(GemmSm90):
                 copy_C = None  # We're using a separate warp to load C
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                k_len = varlen_manager.len_k(batch_idx)
                 load_acc_subtile = partial(
-                    self.epi_load_acc_subtile, tiled_copy_t2r, tiled_copy_r2s, tTR_tAcc, tTR_rAcc
+                    self.epi_load_acc_subtile,
+                    tiled_copy_t2r,
+                    tiled_copy_r2s,
+                    tTR_tAcc,
+                    tTR_rAcc,
+                    clear_acc=varlen_k and k_len == 0,
                 )
 
                 epi_read_state, _ = self.epilogue(
@@ -1547,6 +1553,7 @@ class GemmSm100(GemmSm90):
         # "operand #0 does not dominate this use"
         return ab_consumer_state, acc_producer_state, tiled_mma
 
+    @cute.jit
     def epi_load_acc_subtile(
         self,
         tiled_copy_t2r: cute.TiledCopy,
@@ -1555,12 +1562,15 @@ class GemmSm100(GemmSm90):
         tTR_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
         epi_idx: int,
+        clear_acc: Boolean = False,
     ):
-        # Load accumulator from tensor memory buffer to register
-        cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_idx], tTR_rAcc)
-        tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
-        # TODO: if varlen_k and k_tile == 0, set tRS_rD to zero
-        tRS_rD.store(tRS_rAcc.load())
+        if not clear_acc:
+            # Load accumulator from tensor memory buffer to register
+            cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_idx], tTR_rAcc)
+            tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
+            tRS_rD.store(tRS_rAcc.load())
+        else:
+            tRS_rD.fill(0.0)
 
     def mainloop_s2t_copy_and_partition(
         self,

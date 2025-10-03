@@ -43,8 +43,8 @@ def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
 
 
 @pytest.mark.parametrize("permute_batch", [False, True])
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 # @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
@@ -110,8 +110,50 @@ def test_gemm_varlen_k(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1024])
+@pytest.mark.parametrize("m", [2048])
+def test_gemm_varlen_k_with_zero_lengths(
+    m,
+    n,
+    input_dtype,
+    gather_A,
+):
+    device = "cuda"
+    torch.random.manual_seed(42)
+    seq_lens = torch.tensor([150, 64, 0, 200, 0], device="cpu", dtype=torch.int32)
+    num_groups = seq_lens.shape[0]
+    total_k = seq_lens.sum().item()
+    cu_seqlens_k = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    cu_seqlens_k = cu_seqlens_k.to(device)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
+    avg_k = total_k / num_groups
+    B = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(avg_k)
+    out = gemm(
+        A,
+        B,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        dynamic_scheduler=False,
+        tuned=False,
+    )
+    assert out.shape == (num_groups, m, n)
+    out_ref = gemm_ref(
+        A.float(),
+        B.float(),
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+    )
+    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx)
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
+
+
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 # @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("C_major", ["m", "n"])
@@ -186,8 +228,8 @@ def test_gemm_add_varlen_k(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
-# @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("gather_A", [False])
+@pytest.mark.parametrize("gather_A", [False, True])
+# @pytest.mark.parametrize("gather_A", [False])
 # @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
