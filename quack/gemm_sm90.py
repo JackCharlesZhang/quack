@@ -653,7 +653,9 @@ class GemmSm90:
             self.num_epi_tensormaps,
             # Only used if not varlen_m
             len_m_static=Int32(
-                mA_mkl.shape[0] if varlen_params.mAIdx is None else varlen_params.mAIdx.shape[0]
+                mA_mkl.shape[0]
+                if varlen_k or varlen_params.mAIdx is None
+                else varlen_params.mAIdx.shape[0]
             ),
             len_k_static=Int32(mA_mkl.shape[1]),
             pingpong=self.pingpong,

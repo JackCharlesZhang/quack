@@ -890,9 +890,14 @@ def gemm_dgated_ref(
     # Split PreAct into gate and up projections
     gate = PreAct[..., ::2]  # (M, N)
     up = PreAct[..., 1::2]  # (M, N)
-    postact = gated_to_pytorch_fn_map[activation](gate, up)
     # Use autograd to compute gradients w.r.t. gate and up
+    gate_requires_grad, up_requires_grad = gate.requires_grad, up.requires_grad
+    gate.requires_grad_(True)
+    up.requires_grad_(True)
+    postact = gated_to_pytorch_fn_map[activation](gate, up)
     dgate, dup = torch.autograd.grad(postact, [gate, up], dout, create_graph=False)
+    gate.requires_grad_(gate_requires_grad)
+    up.requires_grad_(up_requires_grad)
     # Interleave gradients back
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
