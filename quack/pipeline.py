@@ -4,8 +4,9 @@ from typing import Optional
 from dataclasses import dataclass
 
 import cutlass.cute as cute
+from cutlass import const_expr
 from cutlass.cutlass_dsl import Boolean, Int32, if_generate, and_
-from cutlass.pipeline import CooperativeGroup, PipelineOp, pipeline_init_wait
+from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp, pipeline_init_wait
 from cutlass.pipeline import PipelineAsync, PipelineTmaAsync, PipelineState, PipelineUserType
 from cutlass.pipeline import PipelineTmaUmma
 
@@ -145,11 +146,52 @@ class PipelineTmaCpAsync(PipelineTmaAsync):
             lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
         )
 
-    def producer_commit(self, state: PipelineState):
+    def producer_cpasync_commit(self, state: PipelineState):
         """
         We need the mbarrier to track the completion of cp.async
         """
         cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state))
+
+
+class MbarrierArrayWDropCount(MbarrierArray):
+    def __init__(
+        self,
+        barrier_storage: cute.Pointer,
+        num_stages: int,
+        agent: tuple[PipelineOp, CooperativeGroup],
+        tx_count: int = 0,
+        drop_count: Optional[Int32] = None,
+    ) -> None:
+        self.barrier_storage = barrier_storage
+        self.tx_count = tx_count
+        self.num_stages = num_stages
+        self.op_type, self.cg = agent
+        self.arrive_count = self.cg.size
+        self.drop_count = drop_count
+
+        if self.num_stages <= 0:
+            raise ValueError("Error: Mbarrier stage count must be greater than 0.")
+        if self.arrive_count <= 0:
+            raise ValueError("Error: Mbarrier arrive count must be greater than 0.")
+        if self.op_type is PipelineOp.TmaLoad and self.tx_count < 0:
+            raise ValueError("Error: Mbarrier tx count must not be less than 0 for TMA ops.")
+
+        if const_expr(drop_count is not None):
+            self.arrive_count = self.arrive_count - drop_count
+
+        # Store mbarrier base pointer
+        self.mbarrier_base = self.barrier_storage
+
+        # Mbarrier initialization in constructor
+        self.mbarrier_init()
+
+    def __extract_mlir_values__(self):
+        return [self.barrier_storage, self.drop_count]
+
+    def __new_from_mlir_values__(self, values):
+        return MbarrierArrayWDropCount(
+            values[0], self.num_stages, (self.op_type, self.cg), self.tx_count, values[1]
+        )
 
 
 @dataclass(frozen=True)
@@ -168,6 +210,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         tx_count: int,
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
+        producer_drop_count: Optional[Int32] = None,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
@@ -195,8 +238,12 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer, tx_count
+        sync_object_full = MbarrierArrayWDropCount(
+            barrier_storage.align(min_align=8),
+            num_stages,
+            producer,
+            tx_count,
+            drop_count=producer_drop_count,
         )
         sync_object_empty = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
@@ -216,8 +263,6 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1
             else cute.nvgpu.tcgen05.CtaGroup.TWO
         )
-        # Currently this pipeline doesn't work 2 CTA instruction
-        assert cta_group == cute.nvgpu.tcgen05.CtaGroup.ONE
 
         consumer_mask = producer_mask
 
@@ -254,7 +299,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
         )
 
-    def producer_commit(self, state: PipelineState):
+    def producer_cpasync_commit(self, state: PipelineState):
         """
         We need the mbarrier to track the completion of cp.async
         """

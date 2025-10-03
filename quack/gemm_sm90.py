@@ -747,6 +747,7 @@ class GemmSm90:
                     #  Partition shared tensor for TMA load A/B
                     # //////////////////////////////////////////////////////////////////////////
                     varlen_manager.fence_tensormap_update_AB(is_tma_warp)
+                    len_m = varlen_manager.len_m(batch_idx)
                     len_k = varlen_manager.len_k(batch_idx)
                     #  TMA load A partition_S/D
                     copy_A = None
@@ -777,7 +778,7 @@ class GemmSm90:
                                 mA_mk,
                                 sA,
                                 gAIdx,
-                                limit_m=varlen_manager.len_m(batch_idx),
+                                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
                                 limit_k=len_k,
                             )
                         else:
@@ -786,7 +787,7 @@ class GemmSm90:
                                 mA_mk,
                                 sA,
                                 gAIdx,
-                                limit_m=varlen_manager.len_m(batch_idx),
+                                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
                                 limit_k=len_k,
                             )
                     # TMA load B partition_S/D
@@ -1141,7 +1142,7 @@ class GemmSm90:
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out)
             # This tells mbarrier to track the completion of cp.async
-            ab_pipeline.producer_commit(ab_producer_state)
+            ab_pipeline.producer_cpasync_commit(ab_producer_state)
             ab_producer_state.advance()
             peek_ab_empty_status = Boolean(True)
             if k_tile + 1 < k_tile_cnt:
@@ -1161,7 +1162,7 @@ class GemmSm90:
                 tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, pred=True)
-            ab_pipeline.producer_commit(ab_producer_state)
+            ab_pipeline.producer_cpasync_commit(ab_producer_state)
             ab_producer_state.advance()
         return ab_producer_state
 

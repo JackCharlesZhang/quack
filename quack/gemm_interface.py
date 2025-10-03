@@ -13,7 +13,7 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
-from quack.symmetric_gemm import gemm_symmetric as gemm_symmetric_sm90_sm100
+from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -59,12 +59,6 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
                 conf
                 for conf in configs
                 if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_n != 208
-            ]
-        else:  # gather_A doesn't support 2CTA instruction
-            configs = [
-                conf
-                for conf in configs
-                if conf.kwargs["config"].cluster_n == 1 and conf.kwargs["config"].tile_m != 256
             ]
     return configs
 

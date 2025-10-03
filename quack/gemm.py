@@ -76,8 +76,6 @@ def gemm(
     if device_capacity[0] > 9:
         # TODO: implement dynamic persistent
         tile_count_semaphore = None
-        if gather_A and tile_M == 256:  # gather_A doesn't support 2CTA instructions
-            tile_M = 128
 
     acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
