@@ -207,10 +207,18 @@ class GemmSm100(GemmSm90):
         self.mma_warp_id = 4
         self.ab_load_warp_id = 5
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
+        self.scheduler_warp_id = self.epi_load_warp_id + 1
         self.num_epi_warps = len(self.epilog_warp_id)
         self.threads_per_cta = cute.arch.WARP_SIZE * (
             self.num_ab_load_warps
-            + len((self.mma_warp_id, self.epi_load_warp_id, *self.epilog_warp_id))
+            + len(
+                (
+                    self.mma_warp_id,
+                    self.epi_load_warp_id,
+                    self.scheduler_warp_id,
+                    *self.epilog_warp_id,
+                )
+            )
         )
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
@@ -351,7 +359,7 @@ class GemmSm100(GemmSm90):
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
         )
-        self.sched_stage = 1  # For compatibility with GemmSm90
+        self.sched_stage = 1
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -791,12 +799,11 @@ class GemmSm100(GemmSm90):
         sched_pipeline = None
         tile_count = None
         if const_expr(tile_sched_params.tile_count_semaphore is not None):
-            # TODO: Untested, not sure if this is right for Sm100
             # Dynamic persistent scheduler
             sched_pipeline = self.make_sched_pipeline(
                 self.cluster_shape_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                varlen_k=varlen_k,
+                has_C=has_C,
             )
             tile_count = storage.tile_count.get_tensor((self.sched_stage,))
 
@@ -892,10 +899,7 @@ class GemmSm100(GemmSm90):
                     )
 
             # Persistent tile scheduling loop
-            is_scheduler_warp = True
-            if const_expr(cute.size(cluster_layout_vmnk) > 1):
-                is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
-            tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
+            tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
@@ -1035,13 +1039,10 @@ class GemmSm100(GemmSm90):
                         epi_load_barrier.arrive()
                         do_epi_load_barrier_arrive = Boolean(False)
                 # Advance to next tile
-                tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
             # Wait A/B buffer empty
             ab_pipeline.producer_tail(ab_producer_state)
-            if is_scheduler_warp:
-                tile_scheduler.producer_tail()
 
         if const_expr(self.gather_A):
             if (
@@ -1110,6 +1111,26 @@ class GemmSm100(GemmSm90):
                     # Advance to next tile
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
+
+        #
+        # Specialized scheduler warp
+        #
+        if const_expr(tile_sched_params.tile_count_semaphore is not None):
+            if warp_idx == self.scheduler_warp_id:
+                is_scheduler_warp = True
+                if const_expr(cute.size(cluster_layout_vmnk) > 1):
+                    is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
+                # Persistent tile scheduling loop
+                tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
+                work_tile = tile_scheduler.initial_work_tile_info()
+                while work_tile.is_valid_tile:
+                    # Advance to next tile
+                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
+                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    work_tile = tile_scheduler.get_current_work()
+                    # End of persistent scheduler loop
+                if is_scheduler_warp:
+                    tile_scheduler.producer_tail()
 
         #
         # Specialized TMA epi load warp
@@ -1799,6 +1820,30 @@ class GemmSm100(GemmSm90):
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+        )
+
+    def make_sched_pipeline(
+        self,
+        cluster_layout_mnk: cute.Layout,
+        sched_pipeline_mbar_ptr: cute.Pointer,
+        has_C: bool = False,
+    ):
+        # Threads/warps participating in this pipeline
+        sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        cluster_size = cute.size(cluster_layout_mnk)
+        # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE - (0 if has_C else 1)
+        consumer_arrive_cnt = warps_per_cta * cluster_size - 1
+        sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        return pipeline.PipelineAsync.create(
+            barrier_storage=sched_pipeline_mbar_ptr,
+            num_stages=self.sched_stage,
+            producer_group=sched_pipeline_producer_group,
+            consumer_group=sched_pipeline_consumer_group,
+            # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
+            consumer_mask=None if const_expr(cluster_size == 1) else 0,
         )
 
     @classmethod

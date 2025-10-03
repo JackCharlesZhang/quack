@@ -343,9 +343,6 @@ def gemm_act(
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     GemmCls = GemmActSm100 if device_capacity[0] > 9 else GemmActSm90
-    # TODO: implement dynamic persistent
-    if device_capacity[0] > 9:
-        tile_count_semaphore = None
 
     acc_dtype = cutlass.Float32
     tile_shape_mn = (tile_M, tile_N)

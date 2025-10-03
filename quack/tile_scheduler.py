@@ -320,16 +320,16 @@ class TileScheduler:
                             )
                         # cute.printf("Producer bidx = {}, tidx = {}, after full arrive", bidx, tidx)
                 else:
-                    # if tidx % 64 == 0: cute.printf("bidx = {},tidx = {}, before full wait, idx = {}", bidx, tidx, current_work_linear_idx)
+                    # if tidx % 32 == 0: cute.printf("bidx = {},tidx = {}, before full wait, idx = {}", bidx, tidx, current_work_linear_idx)
                     self._scheduler_pipeline.consumer_wait(self._pipeline_state)
-                    # if tidx % 64 == 0: cute.printf("bidx = {}, tidx = {}, after full wait, idx = {}", bidx, tidx, current_work_linear_idx)
+                    # if tidx % 32 == 0: cute.printf("bidx = {}, tidx = {}, after full wait, idx = {}", bidx, tidx, current_work_linear_idx)
                     current_work_linear_idx = self._tile_count[self._pipeline_state.index]
-                    # if tidx % 64 == 0: cute.printf("bidx = {}, tidx = {}, after smem read, idx = {}", bidx, tidx, current_work_linear_idx)
+                    # if tidx % 32 == 0: cute.printf("bidx = {}, tidx = {}, after smem read, idx = {}", bidx, tidx, current_work_linear_idx)
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
-                        # if tidx % 64 == 0: cute.printf("bidx = {}, tidx = {}, before empty arrive", bidx, tidx)
+                        # if tidx % 32 == 0: cute.printf("bidx = {}, tidx = {}, before empty arrive", bidx, tidx)
                         self._scheduler_pipeline.consumer_release(self._pipeline_state)
-                        # if tidx % 64 == 0: cute.printf("bidx = {}, tidx = {}, after empty arrive", bidx, tidx)
+                        # if tidx % 32 == 0: cute.printf("bidx = {}, tidx = {}, after empty arrive", bidx, tidx)
                 self._current_work_linear_idx = current_work_linear_idx
                 self._pipeline_state.advance()
         self.num_tiles_executed += Int32(advance_count)
