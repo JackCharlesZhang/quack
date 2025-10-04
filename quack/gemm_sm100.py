@@ -207,7 +207,7 @@ class GemmSm100(GemmSm90):
         self.mma_warp_id = 4
         self.ab_load_warp_id = 5
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
-        self.scheduler_warp_id = self.epi_load_warp_id + 1
+        # self.scheduler_warp_id = self.epi_load_warp_id + 1
         self.num_epi_warps = len(self.epilog_warp_id)
         self.threads_per_cta = cute.arch.WARP_SIZE * (
             self.num_ab_load_warps
@@ -215,7 +215,7 @@ class GemmSm100(GemmSm90):
                 (
                     self.mma_warp_id,
                     self.epi_load_warp_id,
-                    self.scheduler_warp_id,
+                    # self.scheduler_warp_id,
                     *self.epilog_warp_id,
                 )
             )
@@ -899,7 +899,11 @@ class GemmSm100(GemmSm90):
                     )
 
             # Persistent tile scheduling loop
-            tile_scheduler = TileSchedulerCls()
+            is_scheduler_warp = True
+            if const_expr(cute.size(cluster_layout_vmnk) > 1):
+                is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
+            # tile_scheduler = TileSchedulerCls()
+            tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
             work_tile = tile_scheduler.initial_work_tile_info()
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
@@ -1039,10 +1043,14 @@ class GemmSm100(GemmSm90):
                         epi_load_barrier.arrive()
                         do_epi_load_barrier_arrive = Boolean(False)
                 # Advance to next tile
-                tile_scheduler.advance_to_next_work()
+                tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
+                tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                # tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
             # Wait A/B buffer empty
             ab_pipeline.producer_tail(ab_producer_state)
+            if is_scheduler_warp:
+                tile_scheduler.producer_tail()
 
         if const_expr(self.gather_A):
             if (
@@ -1112,25 +1120,25 @@ class GemmSm100(GemmSm90):
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
 
-        #
-        # Specialized scheduler warp
-        #
-        if const_expr(tile_sched_params.tile_count_semaphore is not None):
-            if warp_idx == self.scheduler_warp_id:
-                is_scheduler_warp = True
-                if const_expr(cute.size(cluster_layout_vmnk) > 1):
-                    is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
-                # Persistent tile scheduling loop
-                tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
-                work_tile = tile_scheduler.initial_work_tile_info()
-                while work_tile.is_valid_tile:
-                    # Advance to next tile
-                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
-                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
-                    work_tile = tile_scheduler.get_current_work()
-                    # End of persistent scheduler loop
-                if is_scheduler_warp:
-                    tile_scheduler.producer_tail()
+        # #
+        # # Specialized scheduler warp
+        # #
+        # if const_expr(tile_sched_params.tile_count_semaphore is not None):
+        #     if warp_idx == self.scheduler_warp_id:
+        #         is_scheduler_warp = True
+        #         if const_expr(cute.size(cluster_layout_vmnk) > 1):
+        #             is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
+        #         # Persistent tile scheduling loop
+        #         tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
+        #         work_tile = tile_scheduler.initial_work_tile_info()
+        #         while work_tile.is_valid_tile:
+        #             # Advance to next tile
+        #             tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
+        #             tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+        #             work_tile = tile_scheduler.get_current_work()
+        #             # End of persistent scheduler loop
+        #         if is_scheduler_warp:
+        #             tile_scheduler.producer_tail()
 
         #
         # Specialized TMA epi load warp
