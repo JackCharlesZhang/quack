@@ -56,6 +56,17 @@ def copy(
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
+def tiled_copy_1d(
+    dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
+) -> cute.TiledCopy:
+    num_copy_bits = num_copy_elems * dtype.width
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    thr_layout = cute.make_layout(num_threads)
+    val_layout = cute.make_layout(num_copy_elems)
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
 def tiled_copy_2d(
     dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = True
 ) -> cute.TiledCopy:
@@ -191,10 +202,16 @@ def gather_k_get_copy_fn(
     thr_copy_A: cute.core.ThrCopy,
     mA: cute.Tensor,  # (tile_M, whatever)
     sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
-    gAIdx: cute.Tensor,  # (tile_K, RestK)
+    gsAIdx: cute.Tensor,  # (tile_K, RestK), either gmem or smem
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
+    gAIdx, sAIdx = None, None
+    if const_expr(gsAIdx.memspace == cute.AddressSpace.gmem):
+        gAIdx = gsAIdx
+    else:
+        assert gsAIdx.memspace == cute.AddressSpace.smem
+        sAIdx = gsAIdx
     tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
     # (atom_v, CPY_M, 1, STAGE)
     tAsA = thr_copy_A.partition_D(sA)
@@ -228,7 +245,7 @@ def gather_k_get_copy_fn(
         cute.flat_divide(mA, (elems_per_load,)), (elems_per_load, threads_per_col)
     )[None, (tidx % threads_per_col, None), None]  # ((8, 1), 2, K)
 
-    def prefetch_fn(src_idx, pred: bool = False) -> Tuple[cute.Tensor, cute.Tensor]:
+    def prefetch_from_gmem_fn(src_idx, pred: bool = False) -> Tuple[cute.Tensor, cute.Tensor]:
         # Prefetch mAIdx early, even before smem is free
         tApA_k = None
         if const_expr(pred):
@@ -249,6 +266,26 @@ def gather_k_get_copy_fn(
                     k_idx[k] = -1
         return k_idx, tApA_k
 
+    def prefetch_from_smem_fn(
+        a_prefetch_pipeline, src_idx, dst_idx, a_prefetch_consumer_state, pred: bool = False
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        tApA_k = None
+        if const_expr(pred):
+            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            for k in cutlass.range(cols_per_thread, unroll_full=True):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
+        a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
+        sAIdx_cur = sAIdx[None, dst_idx]
+        k_idx = cute.make_fragment(cols_per_thread, Int32)
+        for k in cutlass.range(cols_per_thread):
+            col_idx = tAcA[0, 0, k][1]
+            k_idx[k] = sAIdx_cur[col_idx]
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        return k_idx, tApA_k
+
     def copy_fn(
         src_idx, dst_idx, k_idx_tApA_k: Tuple[cute.Tensor, cute.Tensor], pred: bool = False
     ):
@@ -267,4 +304,6 @@ def gather_k_get_copy_fn(
                         pred=None if const_expr(tApA_k_pred is None) else tApA_k_pred[None, k],
                     )
 
-    return copy_fn, prefetch_fn
+    return copy_fn, prefetch_from_gmem_fn if const_expr(
+        gAIdx is not None
+    ) else prefetch_from_smem_fn
