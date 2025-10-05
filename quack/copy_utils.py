@@ -134,7 +134,7 @@ def gather_m_get_copy_fn(
     thr_copy_A: cute.core.ThrCopy,
     mA: cute.Tensor,  # (whatever, K)
     sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
-    gAIdx: cute.Tensor,  # (tile_M)
+    gsAIdx: cute.Tensor,  # (tile_M), either gmem or smem
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
@@ -166,7 +166,7 @@ def gather_m_get_copy_fn(
     for m in cutlass.range(rows_per_thread, unroll_full=True):
         row_idx = tAcA[0, m, 0][0]
         if tApA_m[m]:
-            m_idx[m] = gAIdx[row_idx]
+            m_idx[m] = gsAIdx[row_idx]
         else:
             m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
 
