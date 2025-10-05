@@ -81,7 +81,7 @@ def set_block_rank(
 
 @dsl_user_op
 def store_shared_remote(
-    val: float | Float32 | cutlass.Int64,
+    val: float | Float32 | Int32 | cutlass.Int64,
     smem_ptr: cute.Pointer,
     mbar_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: cute.typing.Int,

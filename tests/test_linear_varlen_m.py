@@ -49,23 +49,23 @@ def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
 # @pytest.mark.parametrize("alpha_is_tensor", [False])
 # @pytest.mark.parametrize("alpha", [1.0])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
-# @pytest.mark.parametrize("dynamic_scheduler", [False])
+# @pytest.mark.parametrize("dynamic_scheduler", [True])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 # @pytest.mark.parametrize("B_major", ["k"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("n", [1504, 2048])
-@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("n", [1504, 2048, 4096])
+@pytest.mark.parametrize("k", [736, 1024, 8192])
 # @pytest.mark.parametrize("n", [2048])
 # @pytest.mark.parametrize("k", [736])
 @pytest.mark.parametrize("num_groups", [3, 5])
-# @pytest.mark.parametrize("num_groups", [3])
+# @pytest.mark.parametrize("num_groups", [4])
 def test_gemm_varlen_m(
     num_groups, k, n, input_dtype, B_major, dynamic_scheduler, alpha, alpha_is_tensor, gather_A
 ):
     """Test GEMM with variable length M dimension using cu_seqlens_m."""
     device = "cuda"
     torch.random.manual_seed(0)
-    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
+    seq_lens = torch.randint(8192 - 1024, 8192 + 1024, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
     # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
@@ -104,8 +104,8 @@ def test_gemm_varlen_m(
 # @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("n", [1504, 2048])
-@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("n", [1504, 2048, 4096])
+@pytest.mark.parametrize("k", [736, 1024, 8192])
 @pytest.mark.parametrize("num_groups", [3, 5])
 def test_gemm_add_varlen_m(
     num_groups,
@@ -123,7 +123,7 @@ def test_gemm_add_varlen_m(
     """Test GEMM with addition and variable length M dimension using cu_seqlens_m."""
     device = "cuda"
     torch.random.manual_seed(0)
-    seq_lens = torch.randint(100, 500, (num_groups,), device=device)
+    seq_lens = torch.randint(8192 - 1024, 8192 + 1024, (num_groups,), device=device)
     total_m = seq_lens.sum().item()
     # Create cumulative sequence lengths (num_groups + 1)
     cu_seqlens_m = torch.cat(
