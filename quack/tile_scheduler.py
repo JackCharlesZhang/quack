@@ -326,6 +326,12 @@ class TileScheduler:
                     # if tidx % 32 == 0: cute.printf("bidx = {}, bidz = {}, tidx = {}, after full wait, idx = {}", bidx, bidz, tidx, current_work_linear_idx)
                     current_work_linear_idx = self._tile_count[self._pipeline_state.index]
                     # if tidx % 32 == 0: cute.printf("bidx = {}, bidz = {}, tidx = {}, after smem read, idx = {}", bidx, bidz, tidx, current_work_linear_idx)
+                    # Need this fence since the STAS from the producer is using the async proxy.
+                    # Without this, we get race condition / deadlock.
+                    if const_expr(cute.size(params.cluster_shape_mn) > 1):
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                        )
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
                         # if tidx % 32 == 0: cute.printf("bidx = {}, bidz = {}, tidx = {}, before empty arrive", bidx, bidz, tidx)
