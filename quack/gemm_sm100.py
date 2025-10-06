@@ -1264,7 +1264,7 @@ class GemmSm100(GemmSm90):
                         sC,
                         tile_coord_mnkl,
                     )
-                    copy_C = copy_utils.producer_copy_fn(copy_C_fn, epi_pipeline)
+                    copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
                     if do_epi_load_barrier_wait:
                         epi_load_barrier.arrive_and_wait()
                         do_epi_load_barrier_wait = Boolean(False)

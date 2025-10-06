@@ -10,28 +10,31 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.cutlass_dsl import if_generate
 import cutlass.torch as cutlass_torch
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.varlen_utils import VarlenManager
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
+import quack.utils as utils
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
 import quack.activation
 
 
-class GemmActMixin:
+class GemmActMixin(GemmDefaultEpiMixin):
     num_epi_tensormaps: int = 1
 
     @dataclass
     class EpilogueArguments(ArgumentsBase):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
-        alpha: Optional[Float32] = None
-        beta: Optional[Float32] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -40,8 +43,8 @@ class GemmActMixin:
         epi_postact_smem_layout_staged: cute.ComposedLayout
         epi_tile_postact: cute.Tile
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
-        alpha: Optional[Float32] = None
-        beta: Optional[Float32] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
@@ -187,14 +190,35 @@ class GemmActMixin:
 
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
+        def tma_store_fn(src_idx, dst_idx):
+            # Fence and barrier to make sure shared memory store is visible to TMA store
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            epilogue_barrier.arrive_and_wait()
+            # Copy from shared memory to global memory
+            if is_tma_warp:
+                if const_expr(has_D):
+                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
+                copy_postact(src_idx=src_idx, dst_idx=dst_idx)
+            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
+            epilogue_barrier.arrive_and_wait()
+
+        delay_tma_store = False
+
+        src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            # The global memory coordinate for the current epi tile
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
             if const_expr(has_C):
@@ -209,14 +233,18 @@ class GemmActMixin:
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
             if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rPostAct = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
+            tRS_rPostAct = self.epi_visit_subtile(params, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            if const_expr(delay_tma_store):
+                if const_expr(epi_idx > 0):
+                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
@@ -225,41 +253,35 @@ class GemmActMixin:
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            epilogue_barrier.arrive_and_wait()
-            # Get the global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
-                copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
-                epi_store_pipeline.producer_commit()
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
+            if const_expr(not delay_tma_store):
+                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord)
+
+        if const_expr(delay_tma_store):
+            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
 
         return epi_read_state, epi_producer_state
 
     @cute.jit
-    def epi_visit_acc_subtile(
+    def epi_visit_subtile(
         self,
         params: EpilogueParams,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        rD = tRS_rD.load()
         # Apply alpha scaling to accumulator if alpha is provided (not None)
-        if const_expr(params.alpha is not None):
-            tRS_rD.store(tRS_rD.load() * params.alpha)
+        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
+            alpha = utils.load_scalar_or_pointer(params.alpha)
+            rD *= alpha
         # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
-            if const_expr(params.beta is None):
+            if const_expr(not hasattr(params, "beta") or params.beta is None):
                 # beta is None, default behavior: add C (beta=1.0)
-                tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+                rD += tRS_rC.load().to(tRS_rD.element_type)
             else:
-                tRS_rD.store(tRS_rD.load() + params.beta * tRS_rC.load().to(tRS_rD.element_type))
+                beta = utils.load_scalar_or_pointer(params.beta)
+                rD += beta * tRS_rC.load().to(tRS_rD.element_type)
+        tRS_rD.store(rD)
         # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):

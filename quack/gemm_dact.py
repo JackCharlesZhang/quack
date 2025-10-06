@@ -24,7 +24,7 @@ class GemmDActMixin(GemmActMixin):
     EpilogueParams = GemmActMixin.EpilogueParams
 
     @cute.jit
-    def epi_visit_acc_subtile(
+    def epi_visit_subtile(
         self,
         params: EpilogueParams,
         tRS_rD: cute.Tensor,

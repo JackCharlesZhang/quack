@@ -4,8 +4,8 @@ from typing import Optional
 from dataclasses import dataclass
 
 import cutlass.cute as cute
-from cutlass import const_expr
-from cutlass.cutlass_dsl import Boolean, Int32, if_generate, and_
+from cutlass import Boolean, Int32, const_expr
+from cutlass.cutlass_dsl import if_generate, and_
 from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp, pipeline_init_wait
 from cutlass.pipeline import PipelineAsync, PipelineTmaAsync, PipelineState, PipelineUserType
 from cutlass.pipeline import PipelineTmaUmma

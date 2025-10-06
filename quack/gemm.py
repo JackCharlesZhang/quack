@@ -10,8 +10,7 @@ from cutlass.cute.runtime import make_ptr
 
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
 
 
 def gemm(
@@ -72,7 +71,7 @@ def gemm(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmSm100 if device_capacity[0] > 9 else GemmSm90
+    GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
 
     acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
@@ -97,7 +96,9 @@ def gemm(
             assert isinstance(scalar, Tensor)
             return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
 
-    epi_args = GemmCls.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta), add_to_output)
+    epi_args = GemmCls.EpilogueArguments(
+        scalar_arg(alpha), scalar_arg(beta), add_to_output=add_to_output
+    )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore,

@@ -117,7 +117,7 @@ def tma_get_copy_fn(
     return copy_tma, s, g
 
 
-def producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
+def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
     def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
         copy(
             src_idx=src_idx,

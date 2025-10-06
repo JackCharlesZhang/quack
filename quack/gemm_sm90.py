@@ -3,7 +3,6 @@
 
 import enum
 from typing import Tuple, Type, Callable, Optional, Union, Literal
-from dataclasses import dataclass
 from functools import partial
 import math
 
@@ -15,7 +14,8 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass import Int32, Boolean, const_expr
+from cutlass.cutlass_dsl import if_generate
 from cutlass.utils import LayoutEnum
 
 
@@ -125,16 +125,8 @@ class GemmSm90:
     arch = 90
     num_epi_tensormaps: int = 0
 
-    @dataclass
-    class EpilogueArguments(ArgumentsBase):
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        add_to_output: bool = False
-
-    @dataclass
-    class EpilogueParams(ParamsBase):
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
+    EpilogueArguments = ArgumentsBase
+    EpilogueParams = ParamsBase
 
     def __init__(
         self,
@@ -976,7 +968,7 @@ class GemmSm90:
                         sC,
                         tile_coord_mnkl,
                     )
-                    copy_C = copy_utils.producer_copy_fn(copy_C_fn, epi_pipeline)
+                    copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
 
                 d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
@@ -1270,7 +1262,7 @@ class GemmSm90:
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
         tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
-        tiled_copy_r2s: cute.core.ThrCopy,
+        tiled_copy_r2s: cute.TiledCopy,
         tRS_sD: cute.Tensor,
         tiled_copy_s2r: Optional[cute.core.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
@@ -1296,14 +1288,36 @@ class GemmSm90:
 
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
+        def tma_store_fn(src_idx, dst_idx):
+            # Fence and barrier to make sure shared memory store is visible to TMA store
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            epilogue_barrier.arrive_and_wait()
+            # Copy from shared memory to global memory
+            if is_tma_warp:
+                if const_expr(has_D):
+                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
+            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
+            epilogue_barrier.arrive_and_wait()
+
+        # We could delay the TMA store by 1 epi tile to better overlap the non-TMA ops
+        # with the TMA store. However, currently this doesn't seem to improve perf.
+        delay_tma_store = False
+
+        src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            # The global memory coordinate for the current epi tile
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
             if const_expr(has_C):
@@ -1318,58 +1332,28 @@ class GemmSm90:
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
             if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rEpi = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
+            tRS_rEpi = self.epi_visit_subtile(params, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            if const_expr(delay_tma_store):
+                if const_expr(epi_idx > 0):
+                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            epilogue_barrier.arrive_and_wait()
-            # The global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
-                epi_store_pipeline.producer_commit()
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
+            if const_expr(not delay_tma_store):
+                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord)
+
+        if const_expr(delay_tma_store):
+            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
 
         return epi_read_state, epi_producer_state
-
-    @cute.jit
-    def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
-        for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
-            tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
-
-    def epi_visit_acc_subtile(
-        self,
-        params: EpilogueParams,
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        # Apply alpha scaling to accumulator if alpha is provided (not None)
-        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            alpha = utils.load_scalar_or_pointer(params.alpha)
-            tRS_rD.store(tRS_rD.load() * alpha)
-        # Apply C with beta scaling
-        if const_expr(tRS_rC is not None):
-            if const_expr(not hasattr(params, "beta") or params.beta is None):
-                # beta is None, default behavior: add C (beta=1.0)
-                tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
-            else:
-                beta = utils.load_scalar_or_pointer(params.beta)
-                tRS_rD.store(tRS_rD.load() + beta * tRS_rC.load().to(tRS_rD.element_type))
-        return None
 
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
@@ -1428,6 +1412,19 @@ class GemmSm90:
             )
         return tile_sched_args
 
+    @cute.jit
+    def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
+        for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
+            tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
+
+    def epi_visit_subtile(
+        self,
+        params: EpilogueParams,
+        tRS_rD: cute.Tensor,
+        tRS_rC: Optional[cute.Tensor] = None,
+    ) -> Optional[cute.Tensor]:
+        return None
+
     def epi_visit_acc(
         self,
         params: EpilogueParams,
@@ -1441,7 +1438,7 @@ class GemmSm90:
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
-        return self.EpilogueParams(alpha=args.alpha, beta=args.beta)
+        return self.EpilogueParams()
 
     def epi_get_tma_atoms(
         self, params: EpilogueParams, *, loc=None, ip=None
