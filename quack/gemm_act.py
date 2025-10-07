@@ -111,9 +111,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
 
     @staticmethod
     def epi_smem_bytes_per_stage(
-        args: EpilogueArguments,
-        cta_tile_shape_mnk: Tuple[int, int, int],
-        epi_tile: cute.Tile,
+        args: EpilogueArguments, cta_tile_shape_mnk: Tuple[int, int, int], epi_tile: cute.Tile
     ) -> int:
         postact_dtype = args.mPostAct.element_type
         postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)

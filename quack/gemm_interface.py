@@ -531,6 +531,7 @@ def gemm_add_ref(
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
@@ -542,7 +543,7 @@ def gemm_add_ref(
     """Reference implementation for GEMM with addition and pre-allocated output."""
     if cu_seqlens_m is None and cu_seqlens_k is None:
         if isinstance(alpha, float) and isinstance(beta, float):
-            return torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
+            out = torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
         else:
             out_dtype = (
                 out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
@@ -550,7 +551,9 @@ def gemm_add_ref(
             result = (alpha * (A @ B) + beta * C).to(out_dtype)
             if out is not None:
                 out.copy_(result)
-            return result
+        if bias is not None:
+            bias = bias if A.ndim == 2 else bias.unsqueeze(1)
+            out += bias
     elif cu_seqlens_m is not None:
         # Handle varlen_m case
         if out is None:
@@ -567,6 +570,8 @@ def gemm_add_ref(
             C_slice = C[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
             out_slice = out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
             result = alpha * torch.mm(A_slice, B[i]) + beta * C_slice
+            if bias is not None:
+                result += bias[i]
             out_slice.copy_(result)
     else:  # cu_seqlens_k is not None
         # Handle varlen_k case
@@ -583,6 +588,8 @@ def gemm_add_ref(
             B_slice = B[cu_seqlens_k[i] : cu_seqlens_k[i + 1], :]
             result = alpha * torch.mm(A_slice, B_slice) + beta * C[i]
             out[i].copy_(result)
+        if bias is not None:
+            out += bias
     return out
 
 
@@ -767,9 +774,7 @@ def gemm_act_ref(
     if C is None:
         out = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     else:
-        out = gemm_add_ref(A, B, C, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
-        if bias is not None:  # TODO: we should add bias to gemm_add_ref
-            out += bias
+        out = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     postact = act_to_pytorch_fn_map[activation](out).to(postact_dtype)
     return out.to(out_dtype) if store_preact else None, postact
 
@@ -864,6 +869,7 @@ def gemm_gated_ref(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal["glu", "swiglu", "swiglu_oai", "reglu", "geglu"] = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -890,9 +896,9 @@ def gemm_gated_ref(
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
-        preact = gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        preact = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     else:
-        preact = gemm_add_ref(A, B, C, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        preact = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     # Split preact into gate and up projections
     gate = preact[..., ::2]  # (M, N//2)
     up = preact[..., 1::2]  # (M, N//2)

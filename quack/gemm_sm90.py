@@ -1451,6 +1451,7 @@ class GemmSm90:
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
+        epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
