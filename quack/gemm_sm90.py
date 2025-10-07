@@ -1286,6 +1286,17 @@ class GemmSm90:
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
+        epi_tensors = self.epi_begin(
+            params,
+            epi_smem_tensors,
+            epi_tile,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            epilogue_barrier,
+            tidx,
+        )
+
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                 gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
@@ -1320,6 +1331,7 @@ class GemmSm90:
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -1338,7 +1350,7 @@ class GemmSm90:
                     copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rEpi = self.epi_visit_subtile(params, tRS_rD, tRS_rC)
+            tRS_rEpi = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(delay_tma_store):
                 if const_expr(epi_idx > 0):
@@ -1416,6 +1428,25 @@ class GemmSm90:
     def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
         for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
             tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
+
+    @cute.jit
+    def epi_begin(
+        self,
+        params: EpilogueParams,
+        epi_smem_tensors: Tuple[cute.Tensor, ...],
+        epi_tile: cute.Tile,
+        tiled_copy_r2s: cute.TiledCopy,
+        tile_coord_mnkl: cute.Coord,
+        varlen_manager: VarlenManager,
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tidx: Int32,
+    ) -> Tuple[cute.Tensor, ...]:
+        return ()
+
+    def epi_begin_loop(
+        self, params: EpilogueParams, epi_tensors: Tuple[cute.Tensor, ...], epi_coord: cute.Coord
+    ) -> Tuple[cute.Tensor, ...]:
+        return ()
 
     def epi_visit_subtile(
         self,

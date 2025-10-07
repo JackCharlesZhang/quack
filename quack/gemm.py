@@ -6,7 +6,7 @@ from torch import Tensor
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass import Float32
-from cutlass.cute.runtime import make_ptr
+from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
@@ -27,6 +27,8 @@ def gemm(
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
+    rowvec_bias: Optional[Tensor] = None,  # (l, n)
+    colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
@@ -97,7 +99,19 @@ def gemm(
             return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
 
     epi_args = GemmCls.EpilogueArguments(
-        scalar_arg(alpha), scalar_arg(beta), add_to_output=add_to_output
+        scalar_arg(alpha),
+        scalar_arg(beta),
+        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=1
+        )
+        if rowvec_bias is not None
+        else None,
+        mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=1 if cu_seqlens_m is None else 0
+        )
+        if colvec_bias is not None
+        else None,
+        add_to_output=add_to_output,
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
@@ -132,6 +146,8 @@ def gemm(
         # not recompiling will skew the autotuning results due to power throttling.
         # Effectively we're recompiling as a way to pause between benchmarks during autotuning.
         max_swizzle_size,
+        rowvec_bias.dtype if rowvec_bias is not None else None,
+        colvec_bias.dtype if colvec_bias is not None else None,
         2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
         2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         add_to_output,

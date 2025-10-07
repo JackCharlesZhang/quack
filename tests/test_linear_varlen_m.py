@@ -44,6 +44,7 @@ def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
 
 @pytest.mark.parametrize("gather_A", [False, True])
 # @pytest.mark.parametrize("gather_A", [True])
+@pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("alpha_is_tensor", [False, True])
 @pytest.mark.parametrize("alpha", [1.0, 1.7])
 # @pytest.mark.parametrize("alpha_is_tensor", [False])
@@ -60,7 +61,16 @@ def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
 @pytest.mark.parametrize("num_groups", [3, 5])
 # @pytest.mark.parametrize("num_groups", [4])
 def test_gemm_varlen_m(
-    num_groups, k, n, input_dtype, B_major, dynamic_scheduler, alpha, alpha_is_tensor, gather_A
+    num_groups,
+    k,
+    n,
+    input_dtype,
+    B_major,
+    dynamic_scheduler,
+    alpha,
+    alpha_is_tensor,
+    has_bias,
+    gather_A,
 ):
     """Test GEMM with variable length M dimension using cu_seqlens_m."""
     device = "cuda"
@@ -77,17 +87,21 @@ def test_gemm_varlen_m(
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     if alpha_is_tensor:
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
+    bias = torch.randn(num_groups, n, device=device) if has_bias else None
     out = gemm(
         A,
         B,
+        bias=bias,
         alpha=alpha,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    out_ref = gemm_ref(A.float(), B.float(), alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
-    out_pt = gemm_ref(A, B, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+    out_ref = gemm_ref(
+        A.float(), B.float(), bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    out_pt = gemm_ref(A, B, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     assert out.shape == (total_m, n), (
         f"Output shape mismatch: {out.shape} vs expected ({total_m}, {n})"
     )

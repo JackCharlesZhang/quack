@@ -14,55 +14,75 @@ from quack.gemm_interface import (
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("out_features", [1504, 2048])
 @pytest.mark.parametrize("in_features", [736, 4096])
 # @pytest.mark.parametrize("out_features", [2048])
 # @pytest.mark.parametrize("in_features", [4096])
-def test_linear(in_features, out_features, input_dtype):
+def test_linear(in_features, out_features, has_bias, input_dtype):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
-    x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
-    x = x[::2]  # Testing non-contiguous
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype)
+    x = x[::2].requires_grad_(True)  # Testing non-contiguous
     w = (
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
     ).requires_grad_()
-    out = linear_func(x, w, tuned=False)  # Disable tuning for faster test
-    out_ref = F.linear(x.float(), w.float())
-    out_pt = F.linear(x, w)
+    bias = torch.randn(out_features, device=device, requires_grad=True) if has_bias else None
+    x_ref, w_ref, bias_ref = [
+        t.detach().clone().float().requires_grad_(True) if t is not None else None
+        for t in (x, w, bias)
+    ]
+    x_pt, w_pt, bias_pt = [
+        t.detach().clone().to(x.dtype).requires_grad_(True) if t is not None else None
+        for t in (x, w, bias)
+    ]
+    out = linear_func(x, w, bias, tuned=False)  # Disable tuning for faster test
+    out_ref = F.linear(x_ref, w_ref, bias_ref)
+    out_pt = F.linear(x_pt, w_pt, bias_pt)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
     dout = torch.randn_like(out)
-    dx, dw = torch.autograd.grad(out, (x, w), dout)
-    dx_ref, dw_ref = torch.autograd.grad(out_ref, (x, w), dout)
-    dx_pt, dw_pt = torch.autograd.grad(out_pt, (x, w), dout)
-    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-6
-    assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
+    out.backward(dout)
+    out_ref.backward(dout.float())
+    out_pt.backward(dout)
+    assert (x.grad - x_ref.grad).abs().max() < 2 * (x_pt.grad - x_ref.grad).abs().max() + 1e-6
+    assert (w.grad - w_ref.grad).abs().max() < 2 * (w_pt.grad - w_ref.grad).abs().max() + 1e-6
+    if bias is not None:
+        assert (bias.grad - bias_ref.grad).abs().max() < 2 * (
+            bias_pt.grad - bias_ref.grad
+        ).abs().max() + 1e-6
 
 
 @pytest.mark.parametrize("store_preact", [False, True])
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("out_features", [1504, 2048])
 @pytest.mark.parametrize("in_features", [736, 4096])
 # @pytest.mark.parametrize("out_features", [2048])
 # @pytest.mark.parametrize("in_features", [4096])
-def test_linear_act(in_features, out_features, input_dtype, activation, store_preact):
+def test_linear_act(in_features, out_features, has_bias, input_dtype, activation, store_preact):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
-    x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
-    x = x[::2]  # Testing non-contiguous
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype)
+    x = x[::2].requires_grad_(True)  # Testing non-contiguous
     w = (
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
     ).requires_grad_()
+    bias = torch.randn(out_features, device=device, requires_grad=True) if has_bias else None
     # Disable tuning for faster test
-    preact, postact = linear_act_func(x, w, activation, store_preact=store_preact, tuned=False)
-    preact_ref, postact_ref = gemm_act_ref(
-        x.float(), w.float().T, activation=activation, store_preact=store_preact
+    preact, postact = linear_act_func(
+        x, w, activation, bias=bias, store_preact=store_preact, tuned=False
     )
-    preact_pt, postact_pt = gemm_act_ref(x, w.T, activation=activation, store_preact=store_preact)
+    preact_ref, postact_ref = gemm_act_ref(
+        x.float(), w.float().T, activation=activation, bias=bias, store_preact=store_preact
+    )
+    preact_pt, postact_pt = gemm_act_ref(
+        x, w.T, activation=activation, bias=bias, store_preact=store_preact
+    )
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
     if store_preact:
         assert preact is not None and preact_ref is not None

@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
-from typing import Optional
+from typing import Optional, Tuple
 from functools import partial
 
 from torch import Tensor
@@ -11,6 +11,7 @@ import cutlass.torch as cutlass_torch
 
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_act import GemmActMixin
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
@@ -27,10 +28,13 @@ class GemmDActMixin(GemmActMixin):
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
+        epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         assert tRS_rC is not None
+        # We don't add C to the accumulator
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
         tRS_rC_acc = cute.make_fragment_like(tRS_rC, self.acc_dtype)
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
         # If we don't have .shape here, the compiler generates local stores and loads

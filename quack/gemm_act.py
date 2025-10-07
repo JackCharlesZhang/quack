@@ -12,6 +12,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import if_generate
 import cutlass.torch as cutlass_torch
+from cutlass.cute.runtime import from_dlpack
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.varlen_utils import VarlenManager
@@ -20,7 +21,6 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
-import quack.utils as utils
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
 import quack.activation
@@ -35,6 +35,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -45,6 +47,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
@@ -64,14 +68,27 @@ class GemmActMixin(GemmDefaultEpiMixin):
             epi_tile_postact,
             op_type="store",
         )
+        # Assume all strides are divisible by 32 bits except the last stride
+        new_stride = lambda t: tuple(
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
+            for s in t.stride
+        )
+        mRowVecBroadcast, mColVecBroadcast = [
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
+            if t is not None
+            else None
+            for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
+        ]
         return self.EpilogueParams(
             tma_atom_postact,
             tma_tensor_postact,
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             args.act_fn,
-            args.alpha,
-            args.beta,
+            alpha=args.alpha,
+            beta=args.beta,
+            mRowVecBroadcast=mRowVecBroadcast,
+            mColVecBroadcast=mColVecBroadcast,
         )
 
     def epi_get_tma_atoms(
@@ -100,11 +117,25 @@ class GemmActMixin(GemmDefaultEpiMixin):
     ) -> int:
         postact_dtype = args.mPostAct.element_type
         postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
-        return postact_bytes_per_stage
+        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
+            args, cta_tile_shape_mnk, epi_tile
+        )
+        return postact_bytes_per_stage + rowvec_colvec_bytes
 
     def epi_get_smem_struct(self, params: EpilogueParams):
+        row_vec_smem_size = 0 if params.mRowVecBroadcast is None else self.cta_tile_shape_mnk[1]
+        col_vec_smem_size = 0 if params.mColVecBroadcast is None else self.cta_tile_shape_mnk[0]
+        row_vec_dtype = (
+            params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
+        )
+        col_vec_dtype = (
+            params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
+        )
+
         @cute.struct
         class EpiSharedStorage:
+            sRowVec: cute.struct.Align[cute.struct.MemRange[row_vec_dtype, row_vec_smem_size], 16]
+            sColVec: cute.struct.Align[cute.struct.MemRange[col_vec_dtype, col_vec_smem_size], 16]
             sPostAct: cute.struct.Align[
                 cute.struct.MemRange[
                     self.postact_dtype, cute.cosize(params.epi_postact_smem_layout_staged)
@@ -115,11 +146,12 @@ class GemmActMixin(GemmDefaultEpiMixin):
         return EpiSharedStorage
 
     def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
+        sRowVec, sColVec = super().epi_get_smem_tensors(params, storage)
         sPostAct = storage.epi.sPostAct.get_tensor(
             params.epi_postact_smem_layout_staged.outer,
             swizzle=params.epi_postact_smem_layout_staged.inner,
         )
-        return (sPostAct,)
+        return (sRowVec, sColVec, sPostAct)
 
     @cute.jit
     def epilogue(
@@ -155,7 +187,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
 
         tma_atom_postact = params.tma_atom_postact
         mPostAct_mnl = params.mPostAct_mnl
-        (sPostAct,) = epi_smem_tensors
+        sRowVec, sColVec, sPostAct = epi_smem_tensors
         get_smem_store_op = (
             partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
             if self.arch == 100
@@ -187,6 +219,17 @@ class GemmActMixin(GemmDefaultEpiMixin):
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+
+        epi_tensors = self.epi_begin(
+            params,
+            epi_smem_tensors,
+            epi_tile,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            epilogue_barrier,
+            tidx,
+        )
 
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
@@ -221,6 +264,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -239,7 +283,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rPostAct = self.epi_visit_subtile(params, tRS_rD, tRS_rC)
+            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(delay_tma_store):
                 if const_expr(epi_idx > 0):
@@ -265,23 +309,11 @@ class GemmActMixin(GemmDefaultEpiMixin):
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
+        epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        rD = tRS_rD.load()
-        # Apply alpha scaling to accumulator if alpha is provided (not None)
-        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            alpha = utils.load_scalar_or_pointer(params.alpha)
-            rD *= alpha
-        # Apply C with beta scaling
-        if const_expr(tRS_rC is not None):
-            if const_expr(not hasattr(params, "beta") or params.beta is None):
-                # beta is None, default behavior: add C (beta=1.0)
-                rD += tRS_rC.load().to(tRS_rD.element_type)
-            else:
-                beta = utils.load_scalar_or_pointer(params.beta)
-                rD += beta * tRS_rC.load().to(tRS_rD.element_type)
-        tRS_rD.store(rD)
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
@@ -333,6 +365,8 @@ def gemm_act(
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
+    rowvec_bias: Optional[Tensor] = None,  # (l, n)
+    colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
@@ -382,7 +416,20 @@ def gemm_act(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    epi_args = GemmCls.EpilogueArguments(
+        tensor_infos["PostAct"].cute_tensor,
+        act_fn,
+        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=1
+        )
+        if rowvec_bias is not None
+        else None,
+        mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=1 if cu_seqlens_m is None else 0
+        )
+        if colvec_bias is not None
+        else None,
+    )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
@@ -410,6 +457,8 @@ def gemm_act(
         tile_count_semaphore is not None,
         device_capacity,
         max_swizzle_size,
+        rowvec_bias.dtype if rowvec_bias is not None else None,
+        colvec_bias.dtype if colvec_bias is not None else None,
         cu_seqlens_m is not None,
         A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),

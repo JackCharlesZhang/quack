@@ -61,10 +61,11 @@ class LinearFunc(torch.autograd.Function):
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
     @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight, fuse_grad_accum=False):
+    def forward(cls, ctx, x, weight, bias=None, fuse_grad_accum=False):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
+        bias: (out_features,) or None
         out: (..., out_features)
         """
         ctx.weight_dtype = weight.dtype
@@ -74,8 +75,9 @@ class LinearFunc(torch.autograd.Function):
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
         # out = F.linear(x, weight)
-        out = cls.matmul_fwd_fn(x, weight.T)
+        out = cls.matmul_fwd_fn(x, weight.T, bias=bias)
         linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
+        ctx.bias_dtype = bias.dtype if bias is not None else None
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
@@ -87,13 +89,18 @@ class LinearFunc(torch.autograd.Function):
         x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
         batch_shape = dout.shape[:-1]
         dout = dout.reshape(-1, dout.shape[-1])
+        dbias = (
+            dout.sum(0, dtype=ctx.bias_dtype)
+            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]
+            else None
+        )
         dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
         dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
         dweight = linear_bwd_compute_weight_grad(
             ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace
         )
         # return extra Nones for other classes that inherit from LinearFunc
-        return dx, dweight, *([None] * 10)
+        return dx, dweight, dbias, *([None] * 10)
 
 
 class LinearUntunedFunc(LinearFunc):
@@ -104,9 +111,9 @@ class LinearUntunedFunc(LinearFunc):
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
 
 
-def linear_func(x, weight, fuse_grad_accum=False, tuned=True):
+def linear_func(x, weight, bias=None, fuse_grad_accum=False, tuned=True):
     fn_cls = LinearFunc if tuned else LinearUntunedFunc
-    return fn_cls.apply(x, weight, fuse_grad_accum)
+    return fn_cls.apply(x, weight, bias, fuse_grad_accum)
 
 
 class LinearActFunc(LinearFunc):
@@ -115,10 +122,13 @@ class LinearActFunc(LinearFunc):
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
     @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight, activation, store_preact=True, fuse_grad_accum=False):
+    def forward(
+        cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False
+    ):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
+        bias: (out_features,) or None
         out: (..., out_features)
         Return both out and post-activation, but only out is differentiable.
         """
@@ -129,11 +139,12 @@ class LinearActFunc(LinearFunc):
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
         out, postact = cls.matmul_fwd_fn(
-            x, weight.T, activation=activation, store_preact=store_preact
+            x, weight.T, bias=bias, activation=activation, store_preact=store_preact
         )
         linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
         if out is not None:
             out = out.reshape(*batch_shape, out.shape[-1])
+        ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.mark_non_differentiable(postact)
         ctx.set_materialize_grads(False)  # We don't want to materialize grads for postact
         return out, postact.reshape(*batch_shape, postact.shape[-1])
@@ -147,9 +158,11 @@ class LinearActUntunedFunc(LinearActFunc):
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
 
 
-def linear_act_func(x, weight, activation, store_preact=True, fuse_grad_accum=False, tuned=True):
+def linear_act_func(
+    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
+):
     fn_cls = LinearActFunc if tuned else LinearActUntunedFunc
-    return fn_cls.apply(x, weight, activation, store_preact, fuse_grad_accum)
+    return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
 
 
 class DActLinearFunc(LinearFunc):
@@ -229,12 +242,7 @@ class Linear(nn.Linear):
         self.fuse_grad_accum = fuse_grad_accum
 
     def forward(self, input: Tensor) -> Tensor:
-        if (
-            self.bias is None
-            and input.is_cuda
-            and self.in_features % 8 == 0
-            and self.out_features % 8 == 0
-        ):
-            return linear_func(input, self.weight, fuse_grad_accum=self.fuse_grad_accum)
+        if input.is_cuda and self.in_features % 8 == 0 and self.out_features % 8 == 0:
+            return linear_func(input, self.weight, self.bias, fuse_grad_accum=self.fuse_grad_accum)
         else:
             return F.linear(input, self.weight, self.bias)

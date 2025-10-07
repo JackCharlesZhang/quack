@@ -74,6 +74,7 @@ def gemm_tuned(
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,  # (1,)
     beta: float | Tensor = 1.0,  # (1,)
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
@@ -104,6 +105,8 @@ def gemm_tuned(
         C = C.unsqueeze(0)  # (1, M, N)
     if out.ndim == 2 and not varlen_m:
         out = out.unsqueeze(0)
+    if bias is not None and bias.ndim == 1:
+        bias = bias.unsqueeze(0)  # (L, N)
     batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
     if varlen_m:
         # If gather_A (A_idx provided), use its length; otherwise use A.shape[0]
@@ -128,6 +131,8 @@ def gemm_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
+        rowvec_bias=bias if not config.swap_ab else None,
+        colvec_bias=bias if config.swap_ab else None,
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
@@ -151,6 +156,7 @@ def gemm_act_tuned(
     preact_out: Optional[Tensor],
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -177,6 +183,8 @@ def gemm_act_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
+    if bias is not None and bias.ndim == 1:
+        bias = bias.unsqueeze(0)  # (L, N)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
@@ -195,6 +203,8 @@ def gemm_act_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
+        rowvec_bias=bias if not config.swap_ab else None,
+        colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
@@ -266,6 +276,7 @@ def gemm(
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
@@ -298,6 +309,7 @@ def gemm(
         A,
         B,
         out,
+        bias=bias,
         alpha=alpha,
         alpha_tensor=alpha_tensor,
         cu_seqlens_m=cu_seqlens_m,
@@ -316,13 +328,14 @@ def gemm(
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
     # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? bias, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
@@ -340,6 +353,7 @@ def gemm_out(
         B,
         out,
         C=None,
+        bias=bias,
         alpha=alpha,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
@@ -354,6 +368,7 @@ def gemm_ref(
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
@@ -366,6 +381,11 @@ def gemm_ref(
     if cu_seqlens_m is None and cu_seqlens_k is None:
         fn = torch.bmm if A.ndim == 3 else torch.mm
         out = fn(A, B, out_dtype=out_dtype, out=out)
+        if not isinstance(alpha, float) or alpha != 1.0:
+            out *= alpha
+        if bias is not None:
+            bias = bias if A.ndim == 2 else bias.unsqueeze(1)
+            out += bias
     elif cu_seqlens_m is not None:
         # Handle varlen_m case
         if out is None:
@@ -379,6 +399,10 @@ def gemm_ref(
                 else A[cu_seqlens_m[i] : cu_seqlens_m[i + 1]]
             )
             torch.mm(A_slice, B[i], out=out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]])
+            if not isinstance(alpha, float) or alpha != 1.0:
+                out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]] *= alpha
+            if bias is not None:
+                out[cu_seqlens_m[i] : cu_seqlens_m[i + 1]] += bias[i]
     else:  # cu_seqlens_k is not None
         L = cu_seqlens_k.shape[0] - 1
         if out is None:
@@ -390,8 +414,10 @@ def gemm_ref(
                 else A[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]]
             )
             torch.mm(A_slice, B[cu_seqlens_k[i] : cu_seqlens_k[i + 1], :], out=out[i])
-    if not isinstance(alpha, float) or alpha != 1.0:
-        out = out * alpha
+        if not isinstance(alpha, float) or alpha != 1.0:
+            out *= alpha
+        if bias is not None:
+            out += bias
     return out
 
 
@@ -656,6 +682,7 @@ def gemm_act(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
@@ -684,7 +711,17 @@ def gemm_act(
     if postact_out is None:
         postact_out = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
     gemm_act_out(
-        A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias,
+        activation,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+        tuned,
     )
     return preact_out, postact_out
 
@@ -693,7 +730,7 @@ def gemm_act(
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -701,6 +738,7 @@ def gemm_act_out(
     preact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -709,13 +747,14 @@ def gemm_act_out(
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
 
 
 def gemm_act_ref(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -726,9 +765,11 @@ def gemm_act_ref(
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
-        out = gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        out = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     else:
         out = gemm_add_ref(A, B, C, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        if bias is not None:  # TODO: we should add bias to gemm_add_ref
+            out += bias
     postact = act_to_pytorch_fn_map[activation](out).to(postact_dtype)
     return out.to(out_dtype) if store_preact else None, postact
 
