@@ -112,7 +112,7 @@ class GemmDefaultEpiMixin:
                 mColVec = params.mColVecBroadcast[batch_idx, None]
             else:
                 mColVec = cute.domain_offset(
-                    params.mColVecBroadcast, varlen_manager.params.cu_seqlens_m[batch_idx]
+                    (varlen_manager.params.cu_seqlens_m[batch_idx],), params.mColVecBroadcast
                 )
             gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
             tCVgCV = thr_copy_CV.partition_S(gColVec)
