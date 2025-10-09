@@ -348,6 +348,31 @@ def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
 
 
+def convert_layout_zero_stride(
+    input: cute.Tensor | cute.Layout, ref_layout: cute.Layout
+) -> cute.Layout:
+    layout = input.layout if const_expr(isinstance(input, cute.Tensor)) else input
+    # Group the modes with non-zero stride in the ref_layout together,
+    # and the modes with zero stride together
+    layout_flat = cute.flatten(layout)
+    ref_layout_flat = cute.flatten(ref_layout)
+    nonzero_modes = [i for i in range(cute.rank(layout_flat)) if ref_layout_flat[i].stride != 0]
+    zero_modes = [i for i in range(cute.rank(layout_flat)) if ref_layout_flat[i].stride == 0]
+    new_shape = (
+        tuple(layout_flat[i].shape for i in nonzero_modes),
+        tuple(layout_flat[i].shape for i in zero_modes),
+    )
+    new_stride = (
+        tuple(layout_flat[i].stride for i in nonzero_modes),
+        tuple(layout_flat[i].stride for i in zero_modes),
+    )
+    out_layout = cute.make_layout(new_shape, stride=new_stride)
+    if const_expr(isinstance(input, cute.Tensor)):
+        return cute.make_tensor(input.iterator, out_layout)
+    else:
+        return out_layout
+
+
 @dsl_user_op
 def sm90_get_smem_load_op(
     layout_c: cutlass.utils.LayoutEnum,

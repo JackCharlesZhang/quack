@@ -1365,6 +1365,16 @@ class GemmSm90:
         if const_expr(delay_tma_store):
             tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
 
+        self.epi_end(
+            params,
+            epi_tensors,
+            epi_tile,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            tidx,
+        )
+
         return epi_read_state, epi_producer_state
 
     def get_scheduler_class(self, varlen_m: bool = False):
@@ -1464,6 +1474,19 @@ class GemmSm90:
         tiled_mma: cute.TiledMma,
         tile_coord_mnkl: cute.Coord,
         tidx: Int32,
+    ) -> None:
+        pass
+
+    @cute.jit
+    def epi_end(
+        self,
+        params: EpilogueParams,
+        epi_tensors: Tuple[cute.Tensor, ...],
+        epi_tile: cute.Tile,
+        tiled_copy_r2s,
+        tile_coord_mnkl: cute.Coord,
+        varlen_manager,
+        tidx,
     ) -> None:
         pass
 

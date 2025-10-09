@@ -254,7 +254,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
             epilogue_barrier.arrive_and_wait()
 
-        delay_tma_store = False
+        delay_tma_store = True
 
         src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
@@ -300,6 +300,16 @@ class GemmActMixin(GemmDefaultEpiMixin):
 
         if const_expr(delay_tma_store):
             tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+
+        self.epi_end(
+            params,
+            epi_tensors,
+            epi_tile,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            tidx,
+        )
 
         return epi_read_state, epi_producer_state
 
