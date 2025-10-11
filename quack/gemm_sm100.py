@@ -1426,7 +1426,6 @@ class GemmSm100(GemmSm90):
                 epi_tidx, tCtAcc_base, epi_tile, use_2cta_instrs
             )
 
-            # tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
             tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                 tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx

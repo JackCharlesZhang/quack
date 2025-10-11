@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
 from typing import Optional, Tuple
+from functools import partial
 from dataclasses import dataclass
 
 
@@ -10,6 +11,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
 from quack.varlen_utils import VarlenManager
@@ -60,6 +62,7 @@ class GemmDefaultEpiMixin:
         params: EpilogueParams,
         epi_smem_tensors: Tuple[cute.Tensor, ...],
         epi_tile: cute.Tile,
+        tiled_copy_t2r: Optional[cute.TiledCopy],
         tiled_copy_r2s: cute.TiledCopy,
         tile_coord_mnkl: cute.Coord,
         varlen_manager: VarlenManager,
@@ -76,6 +79,14 @@ class GemmDefaultEpiMixin:
         batch_idx = tile_coord_mnkl[3]
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
         # Don't need sync as we assume the previous epilogue has finished
+
+        partition_for_epilogue_fn = partial(
+            partition_for_epilogue,
+            epi_tile=epi_tile,
+            tiled_copy=tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s,
+            tidx=tidx,
+            reference_src=tiled_copy_t2r is None,
+        )
 
         tDsRowVec = None
         if const_expr(params.mRowVecBroadcast is not None):
@@ -94,12 +105,14 @@ class GemmDefaultEpiMixin:
             for m in cutlass.range(cute.size(tRVsRV.shape[1]), unroll_full=True):
                 tRVpRV[0, m] = tRVcRV[0, m] < limit_n
             cute.copy(thr_copy_RV, tRVgRV, tRVsRV, pred=tRVpRV)
-            sRowVecMma = cute.make_tensor(
-                sRowVec.iterator, cute.make_layout((tile_M, tile_N), stride=(0, 1))
-            )
-            sRowVec_for_epi_partition = cute.flat_divide(sRowVecMma, epi_tile)
             # (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
-            tDsRowVec = tiled_copy_r2s.get_slice(tidx).partition_S(sRowVec_for_epi_partition)
+            tDsRowVec = partition_for_epilogue_fn(
+                cute.make_tensor(
+                    sRowVec.iterator, cute.make_layout((tile_M, tile_N), stride=(0, 1))
+                )
+            )
+            if const_expr(tiled_copy_t2r is not None):
+                tDsRowVec = tiled_copy_r2s.retile(tDsRowVec)
 
         tDsColVec = None
         if const_expr(params.mColVecBroadcast is not None):
@@ -123,12 +136,13 @@ class GemmDefaultEpiMixin:
             for m in cutlass.range(cute.size(tCVsCV.shape[1]), unroll_full=True):
                 tCVpCV[0, m] = tCVcCV[0, m] < limit_m
             cute.copy(thr_copy_CV, tCVgCV, tCVsCV, pred=tCVpCV)
-            sColVecMma = cute.make_tensor(
-                sColVec.iterator, cute.make_layout((tile_M, tile_N), stride=(1, 0))
+            tDsColVec = partition_for_epilogue_fn(
+                cute.make_tensor(
+                    sColVec.iterator, cute.make_layout((tile_M, tile_N), stride=(1, 0))
+                )
             )
-            sColVec_for_epi_partition = cute.flat_divide(sColVecMma, epi_tile)
-            # (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
-            tDsColVec = tiled_copy_r2s.get_slice(tidx).partition_S(sColVec_for_epi_partition)
+            if const_expr(tiled_copy_t2r is not None):
+                tDsColVec = tiled_copy_r2s.retile(tDsColVec)
 
         if const_expr(params.mRowVecBroadcast is not None or params.mColVecBroadcast is not None):
             cute.arch.cp_async_commit_group()
@@ -183,11 +197,13 @@ class GemmDefaultEpiMixin:
             else:
                 beta = utils.load_scalar_or_pointer(params.beta)
                 rD += beta * tRS_rC.load().to(tRS_rD.element_type)
-        if const_expr(tDrRowVec is not None):
-            rD += tDrRowVec.load()
-        if const_expr(tDrColVec is not None):
-            rD += tDrColVec.load()
         tRS_rD.store(rD)
+        if const_expr(tDrRowVec is not None):
+            for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
+                tRS_rD[i] += tDrRowVec[i]
+        if const_expr(tDrColVec is not None):
+            for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
+                tRS_rD[i] += tDrColVec[i]
         return None
 
     @staticmethod
