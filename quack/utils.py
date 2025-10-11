@@ -358,12 +358,13 @@ def convert_layout_zero_stride(
     ref_layout_flat = cute.flatten(ref_layout)
     nonzero_modes = [i for i in range(cute.rank(layout_flat)) if ref_layout_flat[i].stride != 0]
     zero_modes = [i for i in range(cute.rank(layout_flat)) if ref_layout_flat[i].stride == 0]
+    # There's an edge case when all modes are zero stride
     new_shape = (
-        tuple(layout_flat[i].shape for i in nonzero_modes),
+        tuple(layout_flat[i].shape for i in nonzero_modes) if len(nonzero_modes) > 0 else (1,),
         tuple(layout_flat[i].shape for i in zero_modes),
     )
     new_stride = (
-        tuple(layout_flat[i].stride for i in nonzero_modes),
+        tuple(layout_flat[i].stride for i in nonzero_modes) if len(nonzero_modes) > 0 else (0,),
         tuple(layout_flat[i].stride for i in zero_modes),
     )
     out_layout = cute.make_layout(new_shape, stride=new_stride)
