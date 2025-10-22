@@ -1896,6 +1896,7 @@ class RMSNormFunction(torch.autograd.Function):
             else (torch.float32 if residual_in_fp32 else None)
         )
         ctx.residual_dtype = residual_dtype
+        ctx.has_bias = bias is not None
         if out is not None:
             out = out.reshape(-1, out.shape[-1])
         if residual_out is not None:
