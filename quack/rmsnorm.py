@@ -1065,7 +1065,7 @@ def rmsnorm_bwd(
     device = x.device
     N = x.size(1)
     dx = torch.empty_like(x)
-    if has_residual is not None and dresidual_out.dtype != dx.dtype:
+    if has_residual and x.dtype != dx.dtype:
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
         dresidual = None
@@ -1085,7 +1085,7 @@ def rmsnorm_bwd(
     dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
-    if has_residual and dresidual_out.dtype == dx.dtype:
+    if has_residual and x.dtype == dx.dtype:
         dresidual = dx
     return dx, dw, db, dresidual
 
