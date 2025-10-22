@@ -21,12 +21,37 @@ from quack.reduction_base import ReductionBase
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
 import math
+from typing import Optional, List
+
 import torch
+import torch.nn.functional as F
+from torch import Tensor
+
 import triton
 import triton.language as tl
-from torch import Tensor
-from typing import Optional
+
+from flash_attn.utils.torch import custom_fwd, custom_bwd
 from flash_attn.utils.library import triton_op
+
+def maybe_contiguous_lastdim(x):
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None else None
+
+
+def triton_autotune_configs():
+    # Return configs with a valid warp count for the current device
+    configs = []
+    # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
+    max_threads_per_block = 1024
+    # Default to warp size 32 if not defined by device
+    warp_size = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32)
+    # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
+    return [triton.Config({}, num_warps=warp_count) for warp_count in [1, 2, 4, 8, 16, 32]
+            if warp_count * warp_size <= max_threads_per_block]
+    # return [triton.Config({}, num_warps=8)]
 
 
 @triton.autotune(
@@ -200,8 +225,6 @@ def _layer_norm_bwd_kernel(
         if HAS_B1:
             tl.store(DB1 + row_block_id * N + cols, db1, mask=mask)
 
-def maybe_contiguous_lastdim(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 def _layer_norm_bwd(
     dy: Tensor,
