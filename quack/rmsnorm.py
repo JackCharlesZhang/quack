@@ -1851,8 +1851,6 @@ class RMSNormFunction(torch.autograd.Function):
     #     else:
     #         return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
 
-x, weight, bias, residual, out_dtype, residual_dtype, eps, prenorm
-
     @staticmethod
     def forward(
         ctx,
