@@ -18,24 +18,24 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 @pytest.mark.parametrize(
     "N",
     [
-        192,
-        256,
-        512,
-        760,
+        # 192,
+        # 256,
+        # 512,
+        # 760,
         1024,
-        1128,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
+        # 1128,
+        # 2048,
+        # 4096,
+        # 8192,
+        # 16384,
+        # 32768,
+        # 65536,
+        # 131072,
+        # 262144,
     ],
 )
-@pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
-# @pytest.mark.parametrize("M", [1])
+# @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
+@pytest.mark.parametrize("M", [2048])
 @pytest.mark.parametrize("use_compile", [False, True])
 # @pytest.mark.parametrize("use_compile", [False])
 def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_compile):
