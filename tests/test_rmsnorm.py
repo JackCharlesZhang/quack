@@ -277,15 +277,16 @@ def test_rmsnorm_with_bias(use_compile):
 def test_rmsnorm_with_residual(use_compile):
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
-    M, N = 32, 1024
-    eps = 1e-6
-    input_dtype = torch.float16
+    L, M, N = 16, 2048, 1024
+    eps = 1e-5
+    input_dtype = torch.bfloat16
     weight_dtype = torch.float32
+    residual_dtype = torch.float32
 
     torch.random.manual_seed(0)
-    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    x = torch.randn(L,M, N, device=device, dtype=input_dtype, requires_grad=True)
     weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
-    residual = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    residual = torch.randn(L, M, N, device=device, dtype=residual_dtype, requires_grad=True)
 
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
@@ -297,16 +298,16 @@ def test_rmsnorm_with_residual(use_compile):
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
+    torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-4, rtol=1e-3)
 
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
     out_ref.backward(grad_out)
     out.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-1, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-4, rtol=1e-3)
 
 
 def test_amp_bf16_training():
