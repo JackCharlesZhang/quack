@@ -302,7 +302,7 @@ def test_rmsnorm_with_residual(use_compile):
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
     # out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
-    out_ref, residual_out_ref = layer_norm_fn(x_ref, weight_ref, residual=residual_ref, eps=eps, prenorm=True, residual_in_fp32=True, is_rms_norm=True)
+    out_ref, residual_out_ref = layer_norm_fn(x_ref, weight_ref, bias=None, residual=residual_ref, eps=eps, dropout_p=0.0, prenorm=True, residual_in_fp32=True, is_rms_norm=True)
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
