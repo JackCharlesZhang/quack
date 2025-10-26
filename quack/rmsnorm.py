@@ -1129,7 +1129,6 @@ class RMSNormFunction(torch.autograd.Function):
         ctx.x_shape_og = x_shape_og
         ctx.residual_dtype = residual.dtype if residual is not None else None
         ctx.prenorm = prenorm
-        ctx.has_residual = residual is not None
         if residual_out is None or not prenorm:
             return out.reshape(x_shape_og)
         else:
@@ -1139,7 +1138,6 @@ class RMSNormFunction(torch.autograd.Function):
     def backward(ctx, dout, *args):
         x, weight, rstd = ctx.saved_tensors
         has_bias = ctx.has_bias
-        has_residual = ctx.has_residual
         if ctx.prenorm and ctx.residual_dtype is not None:
             dresidual_out = args[0]
             dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
@@ -1148,7 +1146,7 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual)
+        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual=ctx.residual_dtype is not None)
         dx = dx.view(x_shape_og)
         if dresidual is not None:
             dresidual = dresidual.reshape(x_shape_og)
