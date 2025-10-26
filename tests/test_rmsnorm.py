@@ -51,10 +51,10 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     else:
         atol = 1e-4
     torch.random.manual_seed(0)
-    x = torch.randn(M, N, device=device, dtype=input_dtype) * 100
+    x = torch.randn(M, N, device=device, dtype=input_dtype) * 100000
     x.requires_grad = True
     if weight_dtype is not None:
-        weight = torch.randn(N, device=device, dtype=weight_dtype) * 100
+        weight = torch.randn(N, device=device, dtype=weight_dtype) * 100000
         weight.requires_grad = True
     else:
         weight = None
