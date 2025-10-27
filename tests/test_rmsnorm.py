@@ -19,7 +19,7 @@ except ImportError:
 @pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
