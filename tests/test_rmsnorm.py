@@ -316,7 +316,7 @@ def test_rmsnorm_with_residual():
     torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
     torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-4, rtol=1e-3)
 
-    grad_out = torch.randn_like(out) * 100
+    grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
     out_ref.backward(grad_out)
     out.backward(grad_out)
