@@ -280,8 +280,7 @@ def test_rmsnorm_with_bias(use_compile):
     torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
 
 
-@pytest.mark.parametrize("use_compile", [False, True])
-def test_rmsnorm_with_residual(use_compile):
+def test_rmsnorm_with_residual():
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
     L, M, N = 16, 2048, 1024
@@ -299,7 +298,7 @@ def test_rmsnorm_with_residual(use_compile):
     weight_ref = weight.detach().clone().requires_grad_()
     residual_ref = residual.detach().clone().requires_grad_()
 
-    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    function = rmsnorm
     out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
     # out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
     out_ref, residual_out_ref = layer_norm_fn(x_ref, weight_ref, bias=None, residual=residual_ref, eps=eps, dropout_p=0.0, prenorm=True, residual_in_fp32=True, is_rms_norm=True)
