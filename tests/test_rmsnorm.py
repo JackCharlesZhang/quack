@@ -286,7 +286,7 @@ def test_rmsnorm_with_residual():
     L, M, N = 16, 2048, 1024
     eps = 1e-5
     input_dtype = torch.bfloat16
-    weight_dtype = torch.bfloat16
+    weight_dtype = torch.float32
     residual_dtype = torch.float32
 
     torch.random.manual_seed(torch.randint(0, 2**32, (1,)).item())
@@ -313,7 +313,7 @@ def test_rmsnorm_with_residual():
     out_ref.backward(grad_out)
     out.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-1, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-1, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-4, rtol=1e-3)
 
 
