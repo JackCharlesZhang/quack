@@ -300,7 +300,7 @@ def test_rmsnorm_with_residual():
     residual_ref = residual.detach().clone().requires_grad_()
 
     function = rmsnorm
-    out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
+    out, residual_out = function(x, weight, residual=residual, eps=eps, residual_dtype=torch.float32, prenorm=True)
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
     #out_ref, residual_out_ref = layer_norm_fn(x_ref, weight_ref, bias=None, residual=residual_ref, eps=eps, dropout_p=0.0, prenorm=True, residual_in_fp32=True, is_rms_norm=True)
 
