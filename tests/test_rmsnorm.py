@@ -281,6 +281,7 @@ def test_rmsnorm_with_bias(use_compile):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.repeat(10000)
 def test_rmsnorm_with_residual(use_compile):
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
@@ -290,7 +291,7 @@ def test_rmsnorm_with_residual(use_compile):
     weight_dtype = torch.bfloat16
     residual_dtype = torch.float32
 
-    torch.random.manual_seed(0)
+    torch.random.manual_seed(torch.randint(0, 2**32, (1,)).item())
     x = torch.randn(L,M, N, device=device, dtype=input_dtype, requires_grad=True)
     weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     residual = torch.randn(L, M, N, device=device, dtype=residual_dtype, requires_grad=True)
