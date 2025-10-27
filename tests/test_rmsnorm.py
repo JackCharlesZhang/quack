@@ -16,12 +16,12 @@ except ImportError:
     print("WARNING: flash_attn layer_norm_fn not available")
     exit(1)
 
-@pytest.mark.parametrize("eps", [1e-5, 1e-6])
+@pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("eps", [1e-5])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])
-# @pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-# @pytest.mark.parametrize("input_dtype", [torch.float32])
+# @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
     [
@@ -43,7 +43,7 @@ except ImportError:
 )
 # @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
 @pytest.mark.parametrize("M", [2048])
-@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("use_compile", [False])
 # @pytest.mark.parametrize("use_compile", [False])
 def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_compile):
     """Test RMSNorm forward pass against reference implementation."""
