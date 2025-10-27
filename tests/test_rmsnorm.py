@@ -16,36 +16,43 @@ except ImportError:
     print("WARNING: flash_attn layer_norm_fn not available")
     exit(1)
 
-@pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("eps", [1e-5])
-# @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("weight_dtype", [torch.float32])
-# @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize(
-    "N",
-    [
-        # 192,
-        # 256,
-        # 512,
-        # 760,
-        1024,
-        # 1128,
-        # 2048,
-        # 4096,
-        # 8192,
-        # 16384,
-        # 32768,
-        # 65536,
-        # 131072,
-        # 262144,
-    ],
-)
-# @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
-@pytest.mark.parametrize("M", [2048])
-@pytest.mark.parametrize("use_compile", [False])
+# # @pytest.mark.parametrize("eps", [1e-5])
+# # @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])
+# @pytest.mark.parametrize("weight_dtype", [torch.float32])
+# # @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+# @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+# @pytest.mark.parametrize(
+#     "N",
+#     [
+#         # 192,
+#         # 256,
+#         # 512,
+#         # 760,
+#         1024,
+#         # 1128,
+#         # 2048,
+#         # 4096,
+#         # 8192,
+#         # 16384,
+#         # 32768,
+#         # 65536,
+#         # 131072,
+#         # 262144,
+#     ],
+# )
+# # @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
+# @pytest.mark.parametrize("M", [2048])
 # @pytest.mark.parametrize("use_compile", [False])
-def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_compile):
+# @pytest.mark.parametrize("use_compile", [False])
+#def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_compile):
+def test_rmsnorm_forward_backward():
+    M = 2048
+    N = 1024
+    input_dtype = torch.bfloat16
+    weight_dtype = torch.float32
+    eps = 1e-5
+    use_compile = False
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
