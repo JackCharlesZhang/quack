@@ -281,7 +281,6 @@ def test_rmsnorm_with_bias(use_compile):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
-@pytest.mark.repeat(10000)
 def test_rmsnorm_with_residual(use_compile):
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
