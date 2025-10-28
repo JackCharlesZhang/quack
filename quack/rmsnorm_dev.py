@@ -1984,8 +1984,8 @@ class RMSNormFunction(torch.autograd.Function):
     # TRITON
     @staticmethod
     def backward(ctx, dy, *args):
-        # x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
-        x, weight, rstd, bias = ctx.saved_tensors
+        x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
+        #x, weight, rstd, bias = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
         # if weight1 is not None:
         #     dy1, args = args[0], args[1:]
