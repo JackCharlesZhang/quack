@@ -2016,7 +2016,7 @@ class RMSNormFunction(torch.autograd.Function):
             None, # rowscale
             ctx.has_residual,
             False, # has_x1
-            True, # zero_centered_weight
+            False, # zero_centered_weight
             True, # is_rms_norm
             x.dtype,
             recompute_output=False,
