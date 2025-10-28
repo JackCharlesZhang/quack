@@ -1844,7 +1844,7 @@ class RMSNormFunction(torch.autograd.Function):
             eps=eps,
             store_rstd=need_grad,
         )
-        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd)
+        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd, bias) # add bias
         ctx.has_bias = bias is not None
         ctx.eps = eps
         ctx.x_shape_og = x_shape_og
