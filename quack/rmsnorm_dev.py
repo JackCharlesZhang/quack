@@ -1816,150 +1816,150 @@ def rmsnorm_bwd(
 
 
 class RMSNormFunction(torch.autograd.Function):
-    # @staticmethod
-    # def forward(
-    #     ctx,
-    #     x,
-    #     weight,
-    #     bias=None,
-    #     residual=None,
-    #     out_dtype=None,
-    #     residual_dtype=None,
-    #     eps=1e-6,
-    #     prenorm=False,
-    # ):
-        # x_shape_og = x.shape
-        # # Flatten input
-        # x = x.reshape(-1, x.shape[-1])
-        # if residual is not None:
-        #     residual = residual.reshape(-1, residual.shape[-1])
-        # need_grad = any(ctx.needs_input_grad[:3])
-        # out, residual_out, rstd = rmsnorm_fwd(
-        #     x,
-        #     weight,
-        #     bias=bias,
-        #     residual=residual,
-        #     out_dtype=out_dtype,
-        #     residual_dtype=residual_dtype,
-        #     eps=eps,
-        #     store_rstd=need_grad,
-        # )
-        # ctx.save_for_backward(x if residual is None else residual_out, weight, rstd, bias) # add bias
-        # ctx.has_bias = bias is not None
-        # ctx.eps = eps
-        # ctx.x_shape_og = x_shape_og
-        # ctx.residual_dtype = residual.dtype if residual is not None else None
-        # ctx.prenorm = prenorm
-        # ctx.has_residual = residual is not None
-        # if residual_out is None or not prenorm:
-        #     return out.reshape(x_shape_og)
-        # else:
-        #     return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
-
     @staticmethod
     def forward(
         ctx,
         x,
         weight,
-        bias,
+        bias=None,
         residual=None,
-        out_dtype=None, 
+        out_dtype=None,
         residual_dtype=None,
         eps=1e-6,
         prenorm=False,
-        x1=None,
-        weight1=None,
-        bias1=None,
-        dropout_p=0.0,
-        rowscale=None,
-        residual_in_fp32=False,
-        zero_centered_weight=False,
-        is_rms_norm=True,
-        return_dropout_mask=False,
-        out=None,
-        residual_out=None
     ):
         x_shape_og = x.shape
-        # reshape input data into 2D tensor
-        x = maybe_contiguous_lastdim(x.reshape(-1, x.shape[-1]))
+        # Flatten input
+        x = x.reshape(-1, x.shape[-1])
         if residual is not None:
-            assert residual.shape == x_shape_og
-            residual = maybe_contiguous_lastdim(residual.reshape(-1, residual.shape[-1]))
-        if x1 is not None:
-            assert x1.shape == x_shape_og
-            assert rowscale is None, "rowscale is not supported with parallel LayerNorm"
-            x1 = maybe_contiguous_lastdim(x1.reshape(-1, x1.shape[-1]))
-        weight = weight.contiguous()
-        bias = maybe_contiguous(bias)
-        weight1 = maybe_contiguous(weight1)
-        bias1 = maybe_contiguous(bias1)
-        if rowscale is not None:
-            rowscale = rowscale.reshape(-1).contiguous()
-        residual_dtype = (
-            residual.dtype
-            if residual is not None
-            else (torch.float32 if residual_in_fp32 else None)
-        )
-        ctx.residual_dtype = residual_dtype
-        ctx.has_bias = bias is not None
-        if out is not None:
-            out = out.reshape(-1, out.shape[-1])
-        if residual_out is not None:
-            residual_out = residual_out.reshape(-1, residual_out.shape[-1])
-        y, y1, mean, rstd, residual_out, seeds, dropout_mask, dropout_mask1 = _layer_norm_fwd(
+            residual = residual.reshape(-1, residual.shape[-1])
+        need_grad = any(ctx.needs_input_grad[:3])
+        out, residual_out, rstd = rmsnorm_fwd(
             x,
             weight,
-            bias,
-            eps,
-            residual,
-            x1,
-            weight1,
-            bias1,
-            dropout_p=dropout_p,
-            rowscale=rowscale,
+            bias=bias,
+            residual=residual,
             out_dtype=out_dtype,
             residual_dtype=residual_dtype,
-            zero_centered_weight=zero_centered_weight,
-            is_rms_norm=is_rms_norm,
-            return_dropout_mask=return_dropout_mask,
-            out=out,
-            residual_out=residual_out,
+            eps=eps,
+            store_rstd=need_grad,
         )
-        ctx.save_for_backward(
-            residual_out, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd
-        )
-        ctx.x_shape_og = x_shape_og
+        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd, bias) # add bias
+        ctx.has_bias = bias is not None
         ctx.eps = eps
-        ctx.dropout_p = dropout_p
-        ctx.is_rms_norm = is_rms_norm
-        ctx.has_residual = residual is not None
-        ctx.has_x1 = x1 is not None
+        ctx.x_shape_og = x_shape_og
+        ctx.residual_dtype = residual.dtype if residual is not None else None
         ctx.prenorm = prenorm
-        ctx.x_dtype = x.dtype
-        ctx.zero_centered_weight = zero_centered_weight
-        y = y.reshape(x_shape_og)
-        y1 = y1.reshape(x_shape_og) if y1 is not None else None
-        residual_out = residual_out.reshape(x_shape_og) if residual_out is not None else None
-        dropout_mask = dropout_mask.reshape(x_shape_og) if dropout_mask is not None else None
-        dropout_mask1 = dropout_mask1.reshape(x_shape_og) if dropout_mask1 is not None else None
-        if not return_dropout_mask:
-            if weight1 is None:
-                return y if not prenorm else (y, residual_out)
-            else:
-                return (y, y1) if not prenorm else (y, y1, residual_out)
+        ctx.has_residual = residual is not None
+        if residual_out is None or not prenorm:
+            return out.reshape(x_shape_og)
         else:
-            if weight1 is None:
-                return (
-                    (y, dropout_mask, dropout_mask1)
-                    if not prenorm
-                    else (y, residual_out, dropout_mask, dropout_mask1)
-                )
-            else:
-                return (
-                    (y, y1, dropout_mask, dropout_mask1)
-                    if not prenorm
-                    else (y, y1, residual_out, dropout_mask, dropout_mask1)
-                )
+            return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
+
+    # @staticmethod
+    # def forward(
+    #     ctx,
+    #     x,
+    #     weight,
+    #     bias,
+    #     residual=None,
+    #     out_dtype=None, 
+    #     residual_dtype=None,
+    #     eps=1e-6,
+    #     prenorm=False,
+    #     x1=None,
+    #     weight1=None,
+    #     bias1=None,
+    #     dropout_p=0.0,
+    #     rowscale=None,
+    #     residual_in_fp32=False,
+    #     zero_centered_weight=False,
+    #     is_rms_norm=True,
+    #     return_dropout_mask=False,
+    #     out=None,
+    #     residual_out=None
+    # ):
+    #     x_shape_og = x.shape
+    #     # reshape input data into 2D tensor
+    #     x = maybe_contiguous_lastdim(x.reshape(-1, x.shape[-1]))
+    #     if residual is not None:
+    #         assert residual.shape == x_shape_og
+    #         residual = maybe_contiguous_lastdim(residual.reshape(-1, residual.shape[-1]))
+    #     if x1 is not None:
+    #         assert x1.shape == x_shape_og
+    #         assert rowscale is None, "rowscale is not supported with parallel LayerNorm"
+    #         x1 = maybe_contiguous_lastdim(x1.reshape(-1, x1.shape[-1]))
+    #     weight = weight.contiguous()
+    #     bias = maybe_contiguous(bias)
+    #     weight1 = maybe_contiguous(weight1)
+    #     bias1 = maybe_contiguous(bias1)
+    #     if rowscale is not None:
+    #         rowscale = rowscale.reshape(-1).contiguous()
+    #     residual_dtype = (
+    #         residual.dtype
+    #         if residual is not None
+    #         else (torch.float32 if residual_in_fp32 else None)
+    #     )
+    #     ctx.residual_dtype = residual_dtype
+    #     ctx.has_bias = bias is not None
+    #     if out is not None:
+    #         out = out.reshape(-1, out.shape[-1])
+    #     if residual_out is not None:
+    #         residual_out = residual_out.reshape(-1, residual_out.shape[-1])
+    #     y, y1, mean, rstd, residual_out, seeds, dropout_mask, dropout_mask1 = _layer_norm_fwd(
+    #         x,
+    #         weight,
+    #         bias,
+    #         eps,
+    #         residual,
+    #         x1,
+    #         weight1,
+    #         bias1,
+    #         dropout_p=dropout_p,
+    #         rowscale=rowscale,
+    #         out_dtype=out_dtype,
+    #         residual_dtype=residual_dtype,
+    #         zero_centered_weight=zero_centered_weight,
+    #         is_rms_norm=is_rms_norm,
+    #         return_dropout_mask=return_dropout_mask,
+    #         out=out,
+    #         residual_out=residual_out,
+    #     )
+    #     ctx.save_for_backward(
+    #         residual_out, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd
+    #     )
+    #     ctx.x_shape_og = x_shape_og
+    #     ctx.eps = eps
+    #     ctx.dropout_p = dropout_p
+    #     ctx.is_rms_norm = is_rms_norm
+    #     ctx.has_residual = residual is not None
+    #     ctx.has_x1 = x1 is not None
+    #     ctx.prenorm = prenorm
+    #     ctx.x_dtype = x.dtype
+    #     ctx.zero_centered_weight = zero_centered_weight
+    #     y = y.reshape(x_shape_og)
+    #     y1 = y1.reshape(x_shape_og) if y1 is not None else None
+    #     residual_out = residual_out.reshape(x_shape_og) if residual_out is not None else None
+    #     dropout_mask = dropout_mask.reshape(x_shape_og) if dropout_mask is not None else None
+    #     dropout_mask1 = dropout_mask1.reshape(x_shape_og) if dropout_mask1 is not None else None
+    #     if not return_dropout_mask:
+    #         if weight1 is None:
+    #             return y if not prenorm else (y, residual_out)
+    #         else:
+    #             return (y, y1) if not prenorm else (y, y1, residual_out)
+    #     else:
+    #         if weight1 is None:
+    #             return (
+    #                 (y, dropout_mask, dropout_mask1)
+    #                 if not prenorm
+    #                 else (y, residual_out, dropout_mask, dropout_mask1)
+    #             )
+    #         else:
+    #             return (
+    #                 (y, y1, dropout_mask, dropout_mask1)
+    #                 if not prenorm
+    #                 else (y, y1, residual_out, dropout_mask, dropout_mask1)
+    #             )
 
     # @staticmethod
     # def backward(ctx, dout, *args):
@@ -1984,8 +1984,8 @@ class RMSNormFunction(torch.autograd.Function):
     # TRITON
     @staticmethod
     def backward(ctx, dy, *args):
-        x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
-        #x, weight, rstd, bias = ctx.saved_tensors
+        #x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
+        x, weight, rstd, bias = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-1])
         # if weight1 is not None:
         #     dy1, args = args[0], args[1:]
