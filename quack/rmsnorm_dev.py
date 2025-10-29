@@ -1500,8 +1500,8 @@ class RMSNormBackward(ReductionBase):
             x = tXrX.load().to(cute.Float32)
             cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
             dout = tXrdO.load().to(cute.Float32)
-            if const_expr(mdResO is not None):
-                dout += tXrdResO.load().to(cute.Float32)
+            # if const_expr(mdResO is not None):
+            #     dout += tXrdResO.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout
             if const_expr(mW is not None):
@@ -1538,13 +1538,15 @@ class RMSNormBackward(ReductionBase):
             if const_expr(self.reload_wdy == "smem"):
                 cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
                 dout = tXrdO.load().to(cute.Float32)
-                if const_expr(mdResO is not None):
-                    dout += tXrdResO.load().to(cute.Float32)
+                # if const_expr(mdResO is not None):
+                #     dout += tXrdResO.load().to(cute.Float32)
                 wdy = dout
                 if const_expr(mW is not None):
                     wdy *= tXrW.load().to(Float32)
 
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
+            if const_expr(mdResO is not None):
+                dx += tXrdResO.load().to(cute.Float32)
             tXrdX.store(dx.to(tXrdX.element_type))
             if row < M or tiler_mn[0] == 1:
                 tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
@@ -1844,7 +1846,7 @@ class RMSNormFunction(torch.autograd.Function):
             eps=eps,
             store_rstd=need_grad,
         )
-        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd, bias) # add bias
+        ctx.save_for_backward(x if residual is None else residual_out, weight, rstd) # add bias
         ctx.has_bias = bias is not None
         ctx.eps = eps
         ctx.x_shape_og = x_shape_og
@@ -1961,76 +1963,76 @@ class RMSNormFunction(torch.autograd.Function):
     #                 else (y, y1, residual_out, dropout_mask, dropout_mask1)
     #             )
 
-    # @staticmethod
-    # def backward(ctx, dout, *args):
-    #     x, weight, rstd = ctx.saved_tensors
-    #     has_bias = ctx.has_bias
-    #     has_residual = ctx.has_residual
-    #     if ctx.prenorm and ctx.residual_dtype is not None:
-    #         dresidual_out = args[0]
-    #         dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
-    #     else:
-    #         dresidual_out = None
-    #     x_shape_og = ctx.x_shape_og
-    #     # Reshape dout to match the flattened shape used in forward
-    #     dout = dout.view(-1, dout.shape[-1])
-    #     dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual)
-    #     dx = dx.view(x_shape_og)
-    #     if dresidual is not None:
-    #         dresidual = dresidual.reshape(x_shape_og)
+    @staticmethod
+    def backward(ctx, dout, *args):
+        x, weight, rstd = ctx.saved_tensors
+        has_bias = ctx.has_bias
+        has_residual = ctx.has_residual
+        if ctx.prenorm and ctx.residual_dtype is not None:
+            dresidual_out = args[0]
+            dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
+        else:
+            dresidual_out = None
+        x_shape_og = ctx.x_shape_og
+        # Reshape dout to match the flattened shape used in forward
+        dout = dout.view(-1, dout.shape[-1])
+        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual)
+        dx = dx.view(x_shape_og)
+        if dresidual is not None:
+            dresidual = dresidual.reshape(x_shape_og)
 
-    #     return dx, dw, db, dresidual, *([None] * 4)
+        return dx, dw, db, dresidual, *([None] * 4)
 
     # TRITON
-    @staticmethod
-    def backward(ctx, dy, *args):
-        #x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
-        x, weight, rstd, bias = ctx.saved_tensors
-        dy = dy.reshape(-1, dy.shape[-1])
-        # if weight1 is not None:
-        #     dy1, args = args[0], args[1:]
-        #     dy1 = dy1.reshape(-1, dy1.shape[-1])
-        #     assert dy1.shape == x.shape
-        # else:
-        dy1 = None
-        if ctx.prenorm:
-            dresidual = args[0]
-            dresidual = dresidual.reshape(-1, dresidual.shape[-1])
-            assert dresidual.shape == x.shape
-        else:
-            dresidual = None
-        dx, dw, db, dresidual_in, _, _, _, _ = _layer_norm_bwd(
-            dy,
-            x,
-            weight,
-            bias,
-            ctx.eps,
-            None, # mean
-            rstd,
-            dresidual,
-            dy1,
-            None,
-            None, # bias1
-            None, # seeds
-            0.0, # dropout
-            None, # rowscale
-            ctx.has_residual,
-            False, # has_x1
-            False, # zero_centered_weight
-            True, # is_rms_norm
-            x.dtype,
-            recompute_output=False,
-        )
-        return (
-            dx.reshape(ctx.x_shape_og),
-            dw,
-            db,
-            dresidual_in.reshape(ctx.x_shape_og) if ctx.has_residual else None,
-            None,
-            None,
-            None,
-            None
-        )
+    # @staticmethod
+    # def backward(ctx, dy, *args):
+    #     #x, weight, bias, weight1, bias1, rowscale, seeds, mean, rstd = ctx.saved_tensors
+    #     x, weight, rstd, bias = ctx.saved_tensors
+    #     dy = dy.reshape(-1, dy.shape[-1])
+    #     # if weight1 is not None:
+    #     #     dy1, args = args[0], args[1:]
+    #     #     dy1 = dy1.reshape(-1, dy1.shape[-1])
+    #     #     assert dy1.shape == x.shape
+    #     # else:
+    #     dy1 = None
+    #     if ctx.prenorm:
+    #         dresidual = args[0]
+    #         dresidual = dresidual.reshape(-1, dresidual.shape[-1])
+    #         assert dresidual.shape == x.shape
+    #     else:
+    #         dresidual = None
+    #     dx, dw, db, dresidual_in, _, _, _, _ = _layer_norm_bwd(
+    #         dy,
+    #         x,
+    #         weight,
+    #         bias,
+    #         ctx.eps,
+    #         None, # mean
+    #         rstd,
+    #         dresidual,
+    #         dy1,
+    #         None,
+    #         None, # bias1
+    #         None, # seeds
+    #         0.0, # dropout
+    #         None, # rowscale
+    #         ctx.has_residual,
+    #         False, # has_x1
+    #         False, # zero_centered_weight
+    #         True, # is_rms_norm
+    #         x.dtype,
+    #         recompute_output=False,
+    #     )
+    #     return (
+    #         dx.reshape(ctx.x_shape_og),
+    #         dw,
+    #         db,
+    #         dresidual_in.reshape(ctx.x_shape_og) if ctx.has_residual else None,
+    #         None,
+    #         None,
+    #         None,
+    #         None
+    #     )
 
 
 def rmsnorm(
