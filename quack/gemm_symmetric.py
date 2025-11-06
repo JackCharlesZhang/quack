@@ -65,7 +65,7 @@ def gemm_symmetric(
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
 
-    acc_dtype = cutlass.Float32
+    acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     if not GemmCls.is_valid_dtypes(
