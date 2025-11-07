@@ -239,7 +239,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
-        def tma_store_fn(src_idx, dst_idx):
+        def tma_store_fn(src_idx, dst_idx, work_tile_info):
+            pid_m = work_tile_info[0]
+            pid_n = work_tile_info[1]
             # Fence and barrier to make sure shared memory store is visible to TMA store
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
@@ -249,7 +251,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
             if is_tma_warp:
                 if const_expr(has_D):
                     copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                copy_postact(src_idx=src_idx, dst_idx=dst_idx)
+                if pid_m != pid_n:
+                    copy_postact(src_idx=src_idx, dst_idx=dst_idx)
             # Can't use if statement here, epi_store_pipeline object isn't captured somehow
             if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
             if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
@@ -286,7 +289,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(delay_tma_store):
                 if const_expr(epi_idx > 0):
-                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, work_tile_info=work_tile_info)
                 src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
             if const_expr(has_D):
@@ -297,10 +300,10 @@ class GemmActMixin(GemmDefaultEpiMixin):
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             if const_expr(not delay_tma_store):
-                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord)
+                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord, work_tile_info=work_tile_info)
 
         if const_expr(delay_tma_store):
-            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, work_tile_info=work_tile_info)
 
         self.epi_end(
             params,
