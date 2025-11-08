@@ -296,11 +296,12 @@ class GemmActMixin(GemmDefaultEpiMixin):
             # Copy from D registers to shared memory
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
-            cute.copy(
-                tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
-                tRS_sPostAct[None, None, None, epi_buffer],
-            )
+            # cute.copy(
+            #     tiled_copy_postact_r2s,
+            #     tiled_copy_postact_r2s.retile(tRS_rPostAct),
+            #     tRS_sPostAct[None, None, None, epi_buffer],
+            # )
+            copy_utils.cvt_copy(tiled_copy_postact_r2s, tRS_rPostAct, tRS_sPostAct[None, None, None, epi_buffer])
             if const_expr(not delay_tma_store):
                 tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord, tile_coord_mnkl=tile_coord_mnkl)
 
