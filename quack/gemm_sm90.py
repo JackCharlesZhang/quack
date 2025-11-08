@@ -407,12 +407,16 @@ class GemmSm90:
             for s in t.stride
         )
     
-        mA, mD, epilogue_args.mPostAct = [
+        mA, mD = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             if t is not None
             else None
-            for t in (mA, mD, epilogue_args.mPostAct)
+            for t in (mA, mD)
         ]
+
+        if epilogue_args.mPostAct is not None:
+            print("HERE")
+            epilogue_args.mPostAct = cute.make_tensor(epilogue_args.mPostAct.iterator, cute.make_layout(epilogue_args.mPostAct.shape, stride=new_stride(epilogue_args.mPostAct))) 
 
         self._setup_attributes(epilogue_args)
 
