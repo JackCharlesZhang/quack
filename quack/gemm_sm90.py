@@ -406,11 +406,12 @@ class GemmSm90:
             cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
             for s in t.stride
         )
-        mA, mD = [
+    
+        mA, mD, epilogue_args.mPostAct = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             if t is not None
             else None
-            for t in (mA, mD)
+            for t in (mA, mD, epilogue_args.mPostAct)
         ]
 
         self._setup_attributes(epilogue_args)

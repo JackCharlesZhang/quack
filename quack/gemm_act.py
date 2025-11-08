@@ -63,16 +63,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
         )
         mPostAct = args.mPostAct
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
-        mPostAct = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (mPostAct)
-        ]
+        
         tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
             mPostAct,
             epi_postact_smem_layout_staged,
