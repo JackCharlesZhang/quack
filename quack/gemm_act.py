@@ -249,9 +249,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
             epilogue_barrier.arrive_and_wait()
             # Copy from shared memory to global memory
             if is_tma_warp:
-                # if const_expr(has_D):
-                #     copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                # if pid_m != pid_n:
+                if const_expr(has_D):
+                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
                 if pid_m != pid_n:
                     copy_postact(src_idx=src_idx, dst_idx=dst_idx)
             # Can't use if statement here, epi_store_pipeline object isn't captured somehow
