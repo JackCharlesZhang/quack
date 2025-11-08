@@ -345,8 +345,10 @@ class GemmActMixin(GemmDefaultEpiMixin):
         else:
             tRS_rPostAct = tRS_rD
         # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        # tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
+        # tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.acc_dtype)
+        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.acc_dtype))
         return tRS_rPostAct_out
 
 
