@@ -387,8 +387,8 @@ def triangular_idx_to_coord(idx: Int32) -> Tuple[Int32, Int32]:
     """
     row = utils.ceil((utils.sqrt(2 * idx + 2.25) - 0.5)) - 1
     col = idx - (row * (row + 1)) // 2
-    # return row, col
-    return col, row
+    return row, col
+    # return col, row
 
 
 class TriangularTileScheduler(TileScheduler):
