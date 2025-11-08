@@ -216,7 +216,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        # epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
@@ -260,7 +261,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
             epilogue_barrier.arrive_and_wait()
 
-        delay_tma_store = True
+        delay_tma_store = False
 
         src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
