@@ -4,7 +4,7 @@ from torch import Tensor
 from quack.gemm_act import GemmActMixin, act_fn_map, gemm_act
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
-from quack.tile_scheduler import TriangularTileScheduler
+from quack.tile_scheduler import TriangularTileScheduler, TileScheduler
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 import cutlass
@@ -16,7 +16,8 @@ from cutlass.cute.runtime import make_ptr
 
 class GemmSymmetricMixin(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
-        return TriangularTileScheduler
+        # return TriangularTileScheduler
+        return TileScheduler
 
 
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
