@@ -16,8 +16,8 @@ from cutlass.cute.runtime import make_ptr
 
 class GemmSymmetricMixin(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
-        # return TriangularTileScheduler
-        return TileScheduler
+        return TriangularTileScheduler
+        # return TileScheduler
 
 
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
