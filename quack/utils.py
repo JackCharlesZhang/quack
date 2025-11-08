@@ -155,21 +155,6 @@ def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
-def floor(a: float | Float32, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "cvt.rni.ftz.s32.f32 $0, $1;",
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
         llvm.inline_asm(
