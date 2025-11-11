@@ -252,8 +252,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
             epilogue_barrier.arrive_and_wait()
             # Copy from shared memory to global memory
             if is_tma_warp:
-                # if const_expr(has_D):
-                #     copy_D(src_idx=src_idx, dst_idx=dst_idx)
+                if const_expr(has_D):
+                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
                 if pid_m != pid_n:
                     copy_postact(src_idx=src_idx, dst_idx=dst_idx)
             # Can't use if statement here, epi_store_pipeline object isn't captured somehow
@@ -295,8 +295,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
                 src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
-            # if const_expr(has_D):
-            #     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+            if const_expr(has_D):
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
             # cute.copy(
             #     tiled_copy_postact_r2s,
             #     tiled_copy_postact_r2s.retile(tRS_rPostAct),
