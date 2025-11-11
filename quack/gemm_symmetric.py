@@ -45,7 +45,7 @@ def gemm_symmetric(
     beta: float | Tensor = 1.0,
 ) -> None:
     # Tranpose D so the "activation" is a write to the mirrored tile
-    PostAct = D.mT
+    PostAct = D.transpose(-2, -1)
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
         A, B, D, C, additional_tensors={"PostAct": PostAct}
