@@ -1020,7 +1020,9 @@ def gemm_symmetric(
     else:
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
     if out is None:
-        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+        out = torch.empty((out_shape[0], out_shape[2], out_shape[1]), dtype=out_dtype, device=A.device)
+        out = out.transpose(-2, -1)
+        print(f"out.shape = {out.shape}, out.stride = {out.stride()}")
 
     alpha_val = alpha if isinstance(alpha, float) else 1.0
     beta_val = beta if isinstance(beta, float) else 1.0
