@@ -56,7 +56,7 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
 
         tma_atom_postact = params.tma_atom_postact
         mPostAct_mnl = params.mPostAct_mnl
-        sRowVec, sColVec, sPostAct = epi_smem_tensors
+        (sPostAct,) = epi_smem_tensors
         get_smem_store_op = (
             partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
             if self.arch == 100
@@ -89,57 +89,18 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
-        epi_tensors = self.epi_begin(
-            params,
-            epi_smem_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            epilogue_barrier,
-            tidx,
-        )
-
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
-        def tma_store_fn(src_idx, dst_idx, tile_coord_mnkl):
-            pid_m = tile_coord_mnkl[0]
-            pid_n = tile_coord_mnkl[1]
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp: 
-                square_tile_m = pid_m // self.cluster_shape_mnk[0] 
-                square_tile_n = pid_n // self.cluster_shape_mnk[1]
-                if const_expr(has_D):
-                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                if square_tile_m != square_tile_n: # don't write twice to the same tile
-                    copy_postact(src_idx=src_idx, dst_idx=dst_idx)
-            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
-            epilogue_barrier.arrive_and_wait()
-
-        delay_tma_store = True
-
-        src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
-            # The global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -152,18 +113,14 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
             if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    copy_C(src_idx=gmem_coord, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            tRS_rPostAct = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(delay_tma_store):
-                if const_expr(epi_idx > 0):
-                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
-                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
@@ -172,22 +129,30 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
-            if const_expr(not delay_tma_store):
-                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord, tile_coord_mnkl=tile_coord_mnkl)
+            # Fence and barrier to make sure shared memory store is visible to TMA store
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            epilogue_barrier.arrive_and_wait()
+            # Get the global memory coordinate for the current epi tile
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            # Copy from shared memory to global memory
+            if is_tma_warp:
+                pid_m = tile_coord_mnkl[0]
+                pid_n = tile_coord_mnkl[1]
+                square_tile_m = pid_m // self.cluster_shape_mnk[0] 
+                square_tile_n = pid_n // self.cluster_shape_mnk[1]
+                if const_expr(has_D):
+                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                if square_tile_m != square_tile_n: # don't write twice to the same tile
+                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
 
-        if const_expr(delay_tma_store):
-            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
-
-        self.epi_end(
-            params,
-            epi_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            tidx,
-        )
+                # if const_expr(has_D):
+                #     copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                # copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
+                epi_store_pipeline.producer_commit()
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
 
         return epi_read_state, epi_producer_state
 

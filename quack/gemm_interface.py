@@ -932,7 +932,6 @@ def gemm_symmetric_out(
         out if out is not None else None,
         C if C is not None else None,
         tile_count_semaphore,
-        activation=None,
         tile_M=128,
         tile_N=256,
         cluster_M=2,
