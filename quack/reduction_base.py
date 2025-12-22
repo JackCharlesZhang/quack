@@ -26,7 +26,9 @@ class ReductionBase:
 
     def _get_tv_layout(self, num_copy_bits=128):
         vecsize = num_copy_bits // self.dtype.width
-        assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
+        if self.N % vecsize != 0:
+            vecsize = 1
+        
         num_threads = self._get_num_threads()
         assert num_threads % cute.arch.WARP_SIZE == 0
 
