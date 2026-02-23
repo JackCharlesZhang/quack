@@ -417,8 +417,7 @@ class GemmSm100(GemmSm90):
                 self.tiled_mma, self.mma_tiler, self.num_acc_stage
             )
         else:
-            SM100_TMEM_CAPACITY_COLUMNS = 512
-            self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+            self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
     @cute.jit
     def __call__(

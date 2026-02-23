@@ -179,7 +179,8 @@ def swizzle_ptr(ptr: cute.Pointer):
 def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
     outer = tensor.layout
     width = tensor.element_type.width
-    inner = tensor.iterator.type.swizzle_type
+    swizzle_type = tensor.iterator.type.swizzle_type
+    inner = cute.make_swizzle(swizzle_type.num_bits, swizzle_type.num_base, swizzle_type.num_shift)
     # Need to recast the swizzle from byte (e.g. <3, 4, 3> to element units (e.g. <3, 3, 3> for
     # for 16 bits and <3, 2, 3> for 32 bits)
     new_layout = cute.recast_layout(
