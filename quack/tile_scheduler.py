@@ -632,7 +632,7 @@ class TriangularTileScheduler(TileScheduler):
         ):
             assert sched_smem is not None
             assert scheduler_pipeline is not None
-            stages = const_expr(cute.size(sched_smem))
+            stages = const_expr(cute.size(sched_smem, mode=[1]))
         if const_expr(params.persistence_mode == PersistenceMode.CLC):
             if is_scheduler_warp:
                 TileScheduler._init_clc_mbarrier(sched_smem, loc=loc, ip=ip)
