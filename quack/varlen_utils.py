@@ -161,9 +161,9 @@ class VarlenManager:
     def offset_batch_A(self, mA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
         if const_expr(self.varlen_m):
-            mA_mk = cute.domain_offset((params.cu_seqlens_m[batch_idx], 0), mA_mkl)
+            mA_mk = cute.domain_offset((params.cu_seqlens_m[batch_idx], None), mA_mkl)
         elif const_expr(self.varlen_k):
-            mA_mk = cute.domain_offset((0, params.cu_seqlens_k[batch_idx]), mA_mkl)
+            mA_mk = cute.domain_offset((None, params.cu_seqlens_k[batch_idx]), mA_mkl)
         else:
             mA_mk = mA_mkl[None, None, batch_idx]
         return mA_mk
@@ -181,7 +181,7 @@ class VarlenManager:
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
         if const_expr(self.varlen_k):
-            mB_nk = cute.domain_offset((0, params.cu_seqlens_k[batch_idx]), mB_nkl)
+            mB_nk = cute.domain_offset((None, params.cu_seqlens_k[batch_idx]), mB_nkl)
         else:
             mB_nk = mB_nkl[None, None, batch_idx]
         return mB_nk

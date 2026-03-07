@@ -164,6 +164,110 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
 #     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
+# Ragged tensor trick for TMA: encodes variable-length sequences into a higher-rank
+# tensor so that TMA's out-of-bounds checking handles sequence boundaries.
+#
+# Given a tensor T with a ragged dimension (variable-length across batches), we create
+# a higher-rank tensor where the ragged dim is replaced with a fixed size `big_int`, and
+# extra dim(s) are appended. When indexing into a specific sequence at (offset, length),
+# `offset_ragged_tensor` computes coordinates such that:
+#   ragged_coord = big_int - length   (OOB check clamps reads past the sequence end)
+#   extra_coord(s) = f(offset, length) (selects the correct memory region)
+#
+# ptr_shift=True: 1-extra-dim approach (adds 1 dim, supports up to 4D input):
+#   Shape:  (*before, big_int, *after, max_int)
+#   Stride: (*original_strides, stride_r)     where stride_r = T.stride[ragged_dim]
+#   Pointer shifted backward by big_int * stride_r elements.
+#   Address for coords (big_int - length) in ragged dim, (offset + length) in extra dim:
+#     addr = (base - big_int * s_r) + (big_int - length) * s_r + (offset + length) * s_r
+#          = base + offset * s_r                                                      [correct]
+#   Works for epilogue TMA store. Does NOT work for TMA load with large big_int
+#   — the shifted pointer must land in physically mapped GPU memory.
+#
+# ptr_shift=False: 2-extra-dim approach (adds 2 dims, supports up to 3D input):
+#   Shape:  (*before, big_int, *after, max_int, max_int)
+#   Stride: (*before_strides, stride_r, *after_strides, 2^34 - stride_r, stride_r)
+#   No pointer shift. Uses 64-bit address wraparound to cancel the ragged offset.
+#   Let W = 2^34 - stride_r. Address for coords (big_int - length) in ragged dim,
+#   big_int in extra dim 0, (offset + length) in extra dim 1:
+#     addr = base + (big_int - length) * s_r + big_int * W + (offset + length) * s_r
+#          = base + big_int * (s_r + W) - length * s_r + (offset + length) * s_r
+#          = base + big_int * 2^34 + offset * s_r
+#   Since big_int = 2^30: big_int * 2^34 = 2^64 ≡ 0 (mod 2^64), so:
+#     addr = base + offset * s_r                                                      [correct]
+#   Works for all TMA paths since the base pointer is never shifted.
+#
+# Ragged tensor was adapted from the implementation from Triton, but here we have an option that
+# only needs 1 extra dimension instead of 2.
+# https://github.com/triton-lang/triton/blob/main/python/triton/tools/ragged_tma.py
+BIG_INT = 2**30
+MAX_INT = 2**31 - 1
+BIG_INT_INV = 2**64 // BIG_INT
+
+
+@dsl_user_op
+def create_ragged_tensor_for_tma(
+    T: cute.Tensor,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    if ptr_shift:
+        assert rank <= 4, "ptr_shift ragged tensor only supports up to 4 dimensions"
+        new_shape = T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT,)
+        new_stride = T.stride + (T.stride[ragged_dim],)
+        ptr_offset = (None,) * ragged_dim + (-BIG_INT,) + (None,) * (rank - ragged_dim - 1)
+        new_ptr = cute.domain_offset(ptr_offset, T).iterator
+        return cute.make_tensor(new_ptr, cute.make_layout(new_shape, stride=new_stride))
+    else:
+        assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
+        stride_r = T.stride[ragged_dim]
+        new_shape = (
+            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
+        )
+        new_stride = (
+            T.stride[:ragged_dim]
+            + (stride_r,)
+            + T.stride[ragged_dim + 1 :]
+            + (BIG_INT_INV - stride_r, stride_r)
+        )
+        return cute.make_tensor(T.iterator, cute.make_layout(new_shape, stride=new_stride))
+
+
+@dsl_user_op
+def offset_ragged_tensor(
+    T: cute.Tensor,
+    offset: Int32,
+    length: Int32,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    big_int = cute.size(T, mode=[ragged_dim])
+    offset_val = big_int - length
+    if ptr_shift:
+        # 1-extra-dim: rank = original_rank + 1
+        assert rank >= ragged_dim + 2
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 2)
+        index_tuple = (None,) * (rank - 1) + (offset + length,)
+    else:
+        # 2-extra-dim: rank = original_rank + 2, last 2 modes are the wraparound dims
+        assert rank >= ragged_dim + 3
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 3)
+        index_tuple = (None,) * (rank - 2) + (big_int, offset + length)
+    return cute.domain_offset(offset_tuple, T[index_tuple])
+
+
 def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
     bit_msk = (1 << b) - 1
     yyy_msk = bit_msk << (m + s)
