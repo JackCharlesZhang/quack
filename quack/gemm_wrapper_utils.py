@@ -236,42 +236,9 @@ class GemmWrapperBase:
         cu_seqlens_m: Optional[Tensor],
         cu_seqlens_k: Optional[Tensor],
         A_idx: Optional[Tensor],
-        max_active_clusters: int,
-        cluster_shape_mnk: Tuple[int, int, int],
-        tensors: Dict[str, GemmTensorInfo],
-        num_epi_tensormaps: int = 0,
-        pingpong: bool = False,
     ) -> Optional[Any]:
         if cu_seqlens_m is None and cu_seqlens_k is None:
             return None
-        # When varlen_m, we assume persistent=True
-        # Grid size depends on num_active_clusters and cluster size
-        cluster_size = cluster_shape_mnk[0] * cluster_shape_mnk[1]
-        num_blocks = max_active_clusters * cluster_size
-        # Calculate number of tensormaps needed
-        if cu_seqlens_m is not None:
-            # For varlen_m: need tensormaps for D and epilogue tensors
-            num_tensormaps = num_epi_tensormaps * (1 if not pingpong else 2)
-            if tensors["D"].tensor is not None:
-                num_tensormaps += 1 if not pingpong else 2  # D tensormap
-        else:
-            # For varlen_k: need tensormaps for A & B
-            num_tensormaps = 2 if A_idx is None else 1
-        # Create tensormap buffer (each tensormap is 128 bytes = 16 int64s)
-        tensormap_size = 128 // 8  # 16 int64s
-        if num_tensormaps > 0:
-            device = cu_seqlens_m.device if cu_seqlens_m is not None else cu_seqlens_k.device
-            tensormaps = torch.empty(
-                (num_blocks, num_tensormaps, tensormap_size),
-                dtype=torch.int64,
-                device=device,
-            )
-            tensormaps_cute = from_dlpack(tensormaps, assumed_align=128).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2)
-            )
-        else:
-            tensormaps_cute = None
-
         return VarlenArguments(
             mCuSeqlensM=(
                 from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(leading_dim=0)
@@ -283,7 +250,6 @@ class GemmWrapperBase:
                 if cu_seqlens_k is not None
                 else None
             ),
-            mTensormaps=tensormaps_cute,
             mAIdx=(
                 from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
                 if A_idx is not None

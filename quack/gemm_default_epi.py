@@ -18,8 +18,6 @@ from quack.varlen_utils import VarlenManager
 
 
 class GemmDefaultEpiMixin:
-    num_epi_tensormaps: int = 0
-
     @dataclass
     class EpilogueArguments(ArgumentsBase):
         alpha: Optional[Float32 | cute.Tensor] = None

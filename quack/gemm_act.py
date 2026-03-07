@@ -27,8 +27,6 @@ import quack.activation
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
-    num_epi_tensormaps: int = 1
-
     @dataclass
     class EpilogueArguments(ArgumentsBase):
         mPostAct: cute.Tensor
@@ -63,7 +61,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
             self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
         )
         tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
+            copy_utils.create_ragged_tensor_for_tma(args.mPostAct, ragged_dim=0, ptr_shift=True)
+            if cute.rank(args.mPostAct) == 2
+            else args.mPostAct,
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             op_type="store",
@@ -95,19 +95,6 @@ class GemmActMixin(GemmDefaultEpiMixin):
         self, params: EpilogueParams, *, loc=None, ip=None
     ) -> list[cute.CopyAtom]:
         return [params.tma_atom_postact]
-
-    def epi_get_tensormap_update_shapes_orders(
-        self,
-        params: EpilogueParams,
-        cu_seqlens_m: Optional[cute.Tensor],
-        batch_idx: Int32,
-        *,
-        loc=None,
-        ip=None,
-    ) -> tuple[list[Int32], list[int]]:
-        shapes = [cu_seqlens_m[batch_idx + 1] if cu_seqlens_m is not None else None]
-        orders = [0 if const_expr(self.postact_layout.is_m_major_c()) else 1]
-        return shapes, orders
 
     @staticmethod
     def epi_smem_bytes_per_stage(
@@ -156,7 +143,6 @@ class GemmActMixin(GemmDefaultEpiMixin):
         self,
         params: EpilogueParams,
         epi_smem_tensors: Tuple[cute.Tensor, ...],
-        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
@@ -198,7 +184,6 @@ class GemmActMixin(GemmDefaultEpiMixin):
         # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
-        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
         batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
@@ -207,7 +192,6 @@ class GemmActMixin(GemmDefaultEpiMixin):
             params.epi_tile_postact,
             sPostAct,
             tile_coord_mnkl,
-            tma_desc_ptr=tma_desc_postact_ptr,
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
@@ -425,17 +409,10 @@ def gemm_act(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()
@@ -520,7 +497,9 @@ class GemmGatedMixin(GemmActMixin):
             self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
         )
         tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
+            copy_utils.create_ragged_tensor_for_tma(args.mPostAct, ragged_dim=0, ptr_shift=True)
+            if cute.rank(args.mPostAct) == 2
+            else args.mPostAct,
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             op_type="store",
@@ -716,17 +695,10 @@ def gemm_gated(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()

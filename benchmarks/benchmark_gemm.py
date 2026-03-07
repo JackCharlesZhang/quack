@@ -375,25 +375,6 @@ def run(
     else:
         cu_seqlens_k, mCuSeqlensK = None, None
 
-    if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
-        if not persistent:
-            total_m = m * l
-            block_size_m = tile_shape_mn[0] * cluster_shape_mnk[0]
-            block_size_n = tile_shape_mn[1] * cluster_shape_mnk[1]
-            total_clusters_m_max = (total_m + l * (block_size_m - 1)) // block_size_m
-            total_clusters_max = total_clusters_m_max * ((n + block_size_n - 1) // block_size_n)
-            total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
-        else:
-            total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
-        num_tensormaps = (2 if not gather_A else 2) if varlen_k else (1 if not pingpong else 2)
-        # 128 bytes per tensormap
-        tensormaps_torch = torch.empty(total_ctas, num_tensormaps, 128 // 8, dtype=torch.int64, device="cuda")
-        tensormaps_tensor = from_dlpack(
-            tensormaps_torch, assumed_align=128
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2))
-    else:
-        tensormaps_tensor = None
-
     if is_sm100:
         gemm = GemmCls(
             acc_dtype,
@@ -442,7 +423,7 @@ def run(
 
     # epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
     epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor, mAIdx)
+    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, mAIdx)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(

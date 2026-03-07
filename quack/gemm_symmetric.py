@@ -27,7 +27,6 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
         self,
         params: GemmActMixin.EpilogueParams,
         epi_smem_tensors: Tuple[cute.Tensor, ...],
-        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
@@ -69,7 +68,6 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
         # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
-        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
         batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
             tma_atom_postact,
@@ -78,7 +76,6 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
             params.epi_tile_postact,
             sPostAct,
             tile_coord_mnkl,
-            tma_desc_ptr=tma_desc_postact_ptr,
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension

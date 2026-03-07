@@ -123,7 +123,6 @@ class GemmSm90:
     """
 
     arch = 90
-    num_epi_tensormaps: int = 0
 
     EpilogueArguments = ArgumentsBase
     EpilogueParams = ParamsBase
@@ -396,6 +395,8 @@ class GemmSm90:
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
         assert (varlen_args.mAIdx is not None) == self.gather_A
+        varlen_m = varlen_args.mCuSeqlensM is not None
+        varlen_k = varlen_args.mCuSeqlensK is not None
 
         # Assume all strides are divisible by 128 bits except the last stride
         def new_stride(t: cute.Tensor):
@@ -418,13 +419,15 @@ class GemmSm90:
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-                mA,
+                copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1)
+                if varlen_k and not self.gather_A
+                else mA,
                 a_smem_layout,
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
             )
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
-            mB,
+            copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
             b_smem_layout,
             (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
             self.cluster_shape_mnk[0],
@@ -437,7 +440,13 @@ class GemmSm90:
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
-                mD,
+                copy_utils.create_ragged_tensor_for_tma(
+                    mD,
+                    ragged_dim=0,
+                    ptr_shift=True,
+                )
+                if varlen_m
+                else mD,
                 self.epi_smem_layout_staged,
                 self.epi_tile,
                 op_type="store"
@@ -453,8 +462,10 @@ class GemmSm90:
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
-        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_args.mCuSeqlensM is not None)
-        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args, epilogue_args)
+        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
+        tile_sched_args = self.get_scheduler_arguments(
+            mA, mB, mD, scheduler_args, varlen_args, epilogue_args
+        )
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
@@ -629,8 +640,6 @@ class GemmSm90:
 
         varlen_manager = VarlenManager.create(
             varlen_params,
-            has_D,
-            self.num_epi_tensormaps,
             # Only used if not varlen_m
             len_m_static=Int32(
                 mA_mkl.shape[0]
@@ -638,8 +647,6 @@ class GemmSm90:
                 else varlen_params.mAIdx.shape[0]
             ),
             len_k_static=Int32(mA_mkl.shape[1]),
-            pingpong=self.pingpong,
-            warp_idx=warp_idx,
         )
 
         TileSchedulerCls = partial(
@@ -656,10 +663,6 @@ class GemmSm90:
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
                 is_tma_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
-                # initialize tensormap for A & B
-                varlen_manager.init_tensormap_AB(tma_atom_a, tma_atom_b, is_tma_warp)
-                tma_desc_a_ptr = varlen_manager.get_tma_desc_a_ptr()
-                tma_desc_b_ptr = varlen_manager.get_tma_desc_b_ptr()
                 # Get mcast mask
                 cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
@@ -681,15 +684,9 @@ class GemmSm90:
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
-                if const_expr(varlen_k):
-                    # wait tensormap initialization complete before update
-                    varlen_manager.fence_tensormap_init()
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
-                    varlen_manager.update_tensormap_AB(
-                        batch_idx, self.a_layout, self.b_layout, is_tma_warp
-                    )
                     # Local_tile partition global tensors
                     if const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
@@ -721,8 +718,6 @@ class GemmSm90:
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
                     )
-                    # Partition shared tensor for TMA load A/B
-                    varlen_manager.fence_tensormap_update_AB(is_tma_warp)
                     len_m = varlen_manager.len_m(batch_idx)
                     len_k = varlen_manager.len_k(batch_idx)
                     #  TMA load A partition_S/D
@@ -737,7 +732,6 @@ class GemmSm90:
                             src_tensor=gA_mk,
                             dst_tensor=sA,
                             mcast_mask=a_mcast_mask,
-                            tma_desc_ptr=tma_desc_a_ptr,
                         )
                     else:
                         tiled_copy_A = self._make_gmem_tiled_copy_A(
@@ -776,7 +770,6 @@ class GemmSm90:
                         src_tensor=gB_nk,
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
-                        tma_desc_ptr=tma_desc_b_ptr,
                     )
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
@@ -811,11 +804,6 @@ class GemmSm90:
                 (not self.pingpong and warp_idx == 0)
                 or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
             )
-            varlen_manager.init_tensormap_epi(
-                tma_atom_d, self.epi_get_tma_atoms(epilogue_params), is_tma_warp
-            )
-            tma_desc_d_ptr = varlen_manager.get_tma_desc_d_ptr()
-            tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
             # Partition global tensor for TiledMMA_A/B/C
             tidx, _, _ = cute.arch.thread_idx()
             warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -871,18 +859,9 @@ class GemmSm90:
                     # TODO: do we need to check if work_tile is valid?
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
-            if const_expr(varlen_m):
-                # wait tensormap initialization complete before update
-                varlen_manager.fence_tensormap_init()
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
-                epi_shapes, epi_orders = self.epi_get_tensormap_update_shapes_orders(
-                    epilogue_params, varlen_params.cu_seqlens_m, batch_idx
-                )
-                varlen_manager.update_tensormap_epi(
-                    batch_idx, self.d_layout, epi_shapes, epi_orders, is_tma_warp
-                )
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 ab_read_state = self.mma(
@@ -901,8 +880,6 @@ class GemmSm90:
                     num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
                 )
 
-                varlen_manager.fence_tensormap_update_epi(is_tma_warp)
-
                 copy_D = None
                 if const_expr(has_D):
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
@@ -912,7 +889,6 @@ class GemmSm90:
                         self.epi_tile,
                         sD,
                         tile_coord_mnkl,
-                        tma_desc_ptr=tma_desc_d_ptr,
                     )
                 copy_C = None
                 if const_expr(has_C):
@@ -945,7 +921,6 @@ class GemmSm90:
                 epi_read_state, epi_producer_state = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
-                    tma_desc_epi_ptrs,
                     epi_pipeline,
                     epi_store_pipeline,
                     epi_read_state,
@@ -1070,11 +1045,7 @@ class GemmSm90:
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
             # A tiny bit faster to rotate the warp that does TMA
-            # However, for varlen_k, we must use the warp_idx == self.ab_load_warp_id
-            # since that's the warp that does the tensormap update.
-            is_tma_warp = warp_idx == self.ab_load_warp_id + (
-                (k_tile % self.num_ab_load_warps) if const_expr(varlen_m) else 0
-            )
+            is_tma_warp = warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps)
             ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_tma_warp)
             smem_idx = ab_producer_state.index
             # A bit faster to load B first while we calculate the indices for A
@@ -1181,7 +1152,6 @@ class GemmSm90:
         self,
         params: EpilogueParams,
         epi_smem_tensors: Tuple[cute.Tensor, ...],
-        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
@@ -1299,7 +1269,7 @@ class GemmSm90:
         mD: Optional[cute.Tensor],
         scheduler_args,
         varlen_args,
-        epilogue_args
+        epilogue_args,
     ):
         """Create scheduler arguments. Override in subclasses for custom schedulers."""
         if const_expr(not self.is_persistent):
@@ -1423,18 +1393,6 @@ class GemmSm90:
         """Subclasses can override this"""
         return []
 
-    def epi_get_tensormap_update_shapes_orders(
-        self,
-        params: EpilogueParams,
-        cu_seqlens_m: cute.Tensor,
-        batch_idx: Int32,
-        *,
-        loc=None,
-        ip=None,
-    ) -> tuple[list[Int32], list[int]]:
-        """Subclasses can override this"""
-        return [], []
-
     @staticmethod
     def epi_smem_bytes_per_stage(
         args: Optional[EpilogueArguments],
@@ -1527,7 +1485,6 @@ class GemmSm90:
         epi_tile: cute.Tile,
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
-        tma_desc_ptr: Optional[cute.Pointer] = None,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         # (bM, bN)
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])
@@ -1544,7 +1501,6 @@ class GemmSm90:
             cta_layout=cute.make_layout(1),
             src_tensor=src_tensor,
             dst_tensor=dst_tensor,
-            tma_desc_ptr=tma_desc_ptr,
         )
 
     def make_ab_pipeline(

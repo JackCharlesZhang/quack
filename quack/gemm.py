@@ -119,18 +119,7 @@ def gemm(
         batch_idx_permute,
         max_swizzle_size,
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen)
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        cu_seqlens_k,
-        A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
-    )
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     current_stream = cutlass_torch.current_stream()
     compile_key = GemmWrapperBase.get_compile_key(

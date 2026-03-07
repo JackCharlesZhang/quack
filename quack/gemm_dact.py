@@ -29,6 +29,7 @@ from quack.cute_dsl_utils import (
 )
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.varlen_utils import VarlenManager
+from quack import copy_utils
 import quack.layout_utils as layout_utils
 import quack.activation
 
@@ -165,17 +166,10 @@ def gemm_dact(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()
@@ -277,7 +271,9 @@ class GemmDGatedMixin(GemmActMixin):
             self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
         )
         tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
+            copy_utils.create_ragged_tensor_for_tma(args.mPostAct, ragged_dim=0, ptr_shift=True)
+            if cute.rank(args.mPostAct) == 2
+            else args.mPostAct,
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             op_type="store",
@@ -664,17 +660,10 @@ def gemm_dgated(
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
-
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()

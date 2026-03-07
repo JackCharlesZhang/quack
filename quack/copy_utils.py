@@ -709,6 +709,7 @@ def cpasync_bulk_get_copy_fn(
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
 
+@dsl_user_op
 def tma_get_copy_fn(
     atom: cute.CopyAtom,
     cta_coord: cute.Coord,
@@ -717,6 +718,9 @@ def tma_get_copy_fn(
     dst_tensor: cute.Tensor,
     filter_zeros: bool = False,
     single_stage: bool = False,
+    *,
+    loc=None,
+    ip=None,
     **kwargs,
 ) -> Callable:
     src_is_smem = const_expr(
@@ -733,17 +737,23 @@ def tma_get_copy_fn(
         cta_layout,
         cute.group_modes(smem_tensor, 0, group_rank_smem),
         cute.group_modes(gmem_tensor, 0, group_rank_gmem),
+        loc=loc,
+        ip=ip,
     )
     if const_expr(filter_zeros):
         s = cute.filter_zeros(s)
         g = cute.filter_zeros(g)
     src, dst = (s, g) if src_is_smem else (g, s)
 
-    def copy_tma(src_idx, dst_idx, **new_kwargs):
-        cute.copy(atom, src[None, src_idx], dst[None, dst_idx], **new_kwargs, **kwargs)
+    @dsl_user_op
+    def copy_tma(src_idx, dst_idx, *, loc=None, ip=None, **new_kwargs):
+        cute.copy(
+            atom, src[None, src_idx], dst[None, dst_idx], **new_kwargs, **kwargs, loc=loc, ip=ip
+        )
 
-    def copy_tma_single_stage(**new_kwargs):
-        cute.copy(atom, src, dst, **new_kwargs, **kwargs)
+    @dsl_user_op
+    def copy_tma_single_stage(*, loc=None, ip=None, **new_kwargs):
+        cute.copy(atom, src, dst, **new_kwargs, **kwargs, loc=loc, ip=ip)
 
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
 
