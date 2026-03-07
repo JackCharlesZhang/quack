@@ -358,6 +358,8 @@ def run(
         cu_seqlens_m, mCuSeqlensM = None, None
 
     if varlen_k:
+        assert a_major == "m", "varlen_k requires a_mjor=m"
+        assert b_major == "n", "varlen_k requires b_mjor=n"
         from einops import rearrange
 
         a, = [rearrange(t, "m k l -> m (l k)") for t in (a,)]

@@ -517,10 +517,9 @@ class GemmSm100(GemmSm90):
             )
             tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
                 a_op,
-                # copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1)
-                # if varlen_k and not self.gather_A
-                # else mA,
-                mA,
+                copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
+                if varlen_k and not self.gather_A
+                else mA,
                 a_smem_layout,
                 self.mma_tiler,
                 self.tiled_mma,
