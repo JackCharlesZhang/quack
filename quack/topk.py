@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import Type, Optional
 
 import torch
@@ -233,26 +233,25 @@ def _topk_fwd(
 
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-    compile_key = (dtype, N, k, softmax)
-    if compile_key not in _topk_fwd.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        x_cute = fake_tensor(dtype, (batch_sym, N), div)
-        values_cute = fake_tensor(dtype, (batch_sym, k), div)
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
-        topk_op = TopK(dtype, N, k, softmax=softmax)
-        _topk_fwd.compile_cache[compile_key] = cute.compile(
-            topk_op,
-            x_cute,
-            values_cute,
-            indices_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _topk_fwd.compile_cache[compile_key](x, values, indices)
+    _compile_topk_fwd(dtype, N, k, softmax)(x, values, indices)
 
 
-_topk_fwd.compile_cache = {}
+@lru_cache(maxsize=None)
+def _compile_topk_fwd(dtype, N, k, softmax):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    x_cute = fake_tensor(dtype, (batch_sym, N), div)
+    values_cute = fake_tensor(dtype, (batch_sym, k), div)
+    indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+    topk_op = TopK(dtype, N, k, softmax=softmax)
+    return cute.compile(
+        topk_op,
+        x_cute,
+        values_cute,
+        indices_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
@@ -467,30 +466,29 @@ def _topk_bwd(
 
     N = dx.size(1)
     dtype = torch2cute_dtype_map[dvalues.dtype]
-    val_dtype = torch2cute_dtype_map[values.dtype] if values is not None else dtype
+    val_dtype = torch2cute_dtype_map[values.dtype] if values is not None else None
     dx_dtype = torch2cute_dtype_map[dx.dtype]
-    compile_key = (dtype, val_dtype, dx_dtype, N, k, softmax)
-    if compile_key not in _topk_bwd.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        dvalues_cute = fake_tensor(dtype, (batch_sym, k), div)
-        values_cute = fake_tensor(val_dtype, (batch_sym, k), div) if values is not None else None
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
-        dx_cute = fake_tensor(dx_dtype, (batch_sym, N), div)
-        topk_bwd_op = TopKBackward(dtype, N, k, softmax=softmax)
-        _topk_bwd.compile_cache[compile_key] = cute.compile(
-            topk_bwd_op,
-            dvalues_cute,
-            values_cute,
-            indices_cute,
-            dx_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _topk_bwd.compile_cache[compile_key](dvalues, values, indices, dx)
+    _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax)(dvalues, values, indices, dx)
 
 
-_topk_bwd.compile_cache = {}
+@lru_cache(maxsize=None)
+def _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    dvalues_cute = fake_tensor(dtype, (batch_sym, k), div)
+    values_cute = fake_tensor(val_dtype, (batch_sym, k), div) if val_dtype is not None else None
+    indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+    dx_cute = fake_tensor(dx_dtype, (batch_sym, N), div)
+    topk_bwd_op = TopKBackward(dtype, N, k, softmax=softmax)
+    return cute.compile(
+        topk_bwd_op,
+        dvalues_cute,
+        values_cute,
+        indices_cute,
+        dx_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def topk_bwd(

@@ -2,7 +2,7 @@
 
 import math
 from typing import Type
-from functools import partial
+from functools import lru_cache, partial
 
 import torch
 
@@ -163,6 +163,21 @@ class Softmax(ReductionBase):
             copy(tXrO, tXgO)
 
 
+@lru_cache(maxsize=None)
+def _compile_softmax_fwd(dtype, out_dtype, N):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
+    softmax_op = Softmax(dtype, N)
+    return cute.compile(
+        softmax_op,
+        x_cute,
+        out_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
 @torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
@@ -176,23 +191,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-    compile_key = (dtype, out_dtype, N)
-    if compile_key not in _softmax_fwd.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
-        softmax_op = Softmax(dtype, N)
-        _softmax_fwd.compile_cache[compile_key] = cute.compile(
-            softmax_op,
-            x_cute,
-            out_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _softmax_fwd.compile_cache[compile_key](x, out)
-
-
-_softmax_fwd.compile_cache = {}
+    _compile_softmax_fwd(dtype, out_dtype, N)(x, out)
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
@@ -331,6 +330,24 @@ class SoftmaxBackward(ReductionBase):
             copy(tdXrdX, tdXgdX)
 
 
+@lru_cache(maxsize=None)
+def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    dy_cute, y_cute, dx_cute = [
+        fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
+    ]
+    softmax_backward_op = SoftmaxBackward(dtype, N)
+    return cute.compile(
+        softmax_backward_op,
+        dy_cute,
+        y_cute,
+        dx_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
 @torch.library.custom_op("quack::_softmax_backward", mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
@@ -346,29 +363,9 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     assert dy.is_cuda and y.is_cuda, "Tensors must be on CUDA device"
     assert dy.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert y.dtype == dy.dtype, "dy and y must have same dtype"
-
     N = dy.size(1)
     dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-    compile_key = (dtype, y_dtype, dx_dtype, N)
-    if compile_key not in _softmax_backward.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        dy_cute, y_cute, dx_cute = [
-            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
-        ]
-        softmax_backward_op = SoftmaxBackward(dtype, N)
-        _softmax_backward.compile_cache[compile_key] = cute.compile(
-            softmax_backward_op,
-            dy_cute,
-            y_cute,
-            dx_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _softmax_backward.compile_cache[compile_key](dy, y, dx)
-
-
-_softmax_backward.compile_cache = {}
+    _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

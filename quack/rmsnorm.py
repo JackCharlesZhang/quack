@@ -2,7 +2,7 @@
 
 import math
 from typing import Optional, Tuple, Type
-from functools import partial
+from functools import lru_cache, partial
 
 import cuda.bindings.driver as cuda
 
@@ -326,7 +326,7 @@ def _rmsnorm_fwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, out, weight, bias, residual, residual_out]
     ]
-    compile_key = (
+    _compile_rmsnorm_fwd(
         dtype,
         out_dtype,
         res_dtype,
@@ -337,38 +337,45 @@ def _rmsnorm_fwd(
         rstd is not None,
         mean is not None,
         is_layernorm,
-    )
-    if compile_key not in _rmsnorm_fwd.compile_cache:
-        batch_sym = cute.sym_int()
-        all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
-        div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
-        x_cute, out_cute, res_cute, res_out_cute = [
-            fake_tensor(dt, (batch_sym, N), div)
-            for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
-        ]
-        weight_cute, bias_cute = [fake_tensor(dt, (N,), div) for dt in [weight_dtype, bias_dtype]]
-        rstd_cute = fake_tensor(Float32, (batch_sym,)) if rstd is not None else None
-        mean_cute = fake_tensor(Float32, (batch_sym,)) if mean is not None else None
-        _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
-            RMSNorm(dtype, N, is_layernorm=is_layernorm),
-            x_cute,
-            weight_cute,
-            bias_cute,
-            res_cute,
-            out_cute,
-            res_out_cute,
-            rstd_cute,
-            mean_cute,
-            Float32(0),  # eps, just for compilation
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _rmsnorm_fwd.compile_cache[compile_key](
-        x, weight, bias, residual, out, residual_out, rstd, mean, eps
-    )
+    )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
-_rmsnorm_fwd.compile_cache = {}
+@lru_cache(maxsize=None)
+def _compile_rmsnorm_fwd(
+    dtype,
+    out_dtype,
+    res_dtype,
+    weight_dtype,
+    bias_dtype,
+    res_out_dtype,
+    N,
+    has_rstd,
+    has_mean,
+    is_layernorm,
+):
+    batch_sym = cute.sym_int()
+    all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
+    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    x_cute, out_cute, res_cute, res_out_cute = [
+        fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
+    ]
+    weight_cute, bias_cute = [fake_tensor(dt, (N,), div) for dt in [weight_dtype, bias_dtype]]
+    rstd_cute = fake_tensor(Float32, (batch_sym,)) if has_rstd else None
+    mean_cute = fake_tensor(Float32, (batch_sym,)) if has_mean else None
+    return cute.compile(
+        RMSNorm(dtype, N, is_layernorm=is_layernorm),
+        x_cute,
+        weight_cute,
+        bias_cute,
+        res_cute,
+        out_cute,
+        res_out_cute,
+        rstd_cute,
+        mean_cute,
+        Float32(0),  # eps, just for compilation
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def rmsnorm_fwd(
@@ -858,7 +865,7 @@ def _rmsnorm_bwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, dout, dx, weight, dresidual, dresidual_out]
     ]
-    compile_key = (
+    _compile_rmsnorm_bwd(
         N,
         dtype,
         dout_dtype,
@@ -867,44 +874,48 @@ def _rmsnorm_bwd(
         db_partial is not None,
         dres_dtype,
         dres_out_dtype,
-    )
-    if compile_key not in _rmsnorm_bwd.compile_cache:
-        batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
-        all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
-        div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
-        x_cute, dout_cute, dx_cute, dres_out_cute, dres_cute = [
-            fake_tensor(dt, (batch_sym, N), div)
-            for dt in [dtype, dout_dtype, dx_dtype, dres_out_dtype, dres_dtype]
-        ]
-        weight_cute = fake_tensor(weight_dtype, (N,), div)
-        rstd_cute = fake_tensor(Float32, (batch_sym,))
-        dw_partial_cute = (
-            fake_tensor(Float32, (batch_partial_sym, N), div) if dw_partial is not None else None
-        )
-        db_partial_cute = (
-            fake_tensor(Float32, (batch_partial_sym, N), div) if db_partial is not None else None
-        )
-        _rmsnorm_bwd.compile_cache[compile_key] = cute.compile(
-            RMSNormBackward(dtype, N),
-            x_cute,
-            weight_cute,
-            dout_cute,
-            dres_out_cute,
-            rstd_cute,
-            dx_cute,
-            dw_partial_cute,
-            dres_cute,
-            db_partial_cute,
-            sm_count,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _rmsnorm_bwd.compile_cache[compile_key](
-        x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count
-    )
+        dw_partial is not None,
+    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
 
 
-_rmsnorm_bwd.compile_cache = {}
+@lru_cache(maxsize=None)
+def _compile_rmsnorm_bwd(
+    N,
+    dtype,
+    dout_dtype,
+    dx_dtype,
+    weight_dtype,
+    has_db_partial,
+    dres_dtype,
+    dres_out_dtype,
+    has_dw_partial,
+):
+    batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
+    all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
+    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    x_cute, dout_cute, dx_cute, dres_out_cute, dres_cute = [
+        fake_tensor(dt, (batch_sym, N), div)
+        for dt in [dtype, dout_dtype, dx_dtype, dres_out_dtype, dres_dtype]
+    ]
+    weight_cute = fake_tensor(weight_dtype, (N,), div)
+    rstd_cute = fake_tensor(Float32, (batch_sym,))
+    dw_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_dw_partial else None
+    db_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_db_partial else None
+    return cute.compile(
+        RMSNormBackward(dtype, N),
+        x_cute,
+        weight_cute,
+        dout_cute,
+        dres_out_cute,
+        rstd_cute,
+        dx_cute,
+        dw_partial_cute,
+        dres_cute,
+        db_partial_cute,
+        0,  # sm_count, just for compilation
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def rmsnorm_bwd(

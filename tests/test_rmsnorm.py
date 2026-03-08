@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, _compile_rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -202,39 +202,39 @@ def test_rmsnorm_compile_cache():
     eps = 1e-6
 
     # Clear cache
-    _rmsnorm_fwd.compile_cache.clear()
-    assert len(_rmsnorm_fwd.compile_cache) == 0
+    _compile_rmsnorm_fwd.cache_clear()
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 0
 
     x1 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight1 = torch.randn(N, device=device, dtype=torch.float32)
 
     # First call should compile
     out1 = rmsnorm_fwd(x1, weight1, eps=eps)
-    assert len(_rmsnorm_fwd.compile_cache) == 1
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 1
 
     # Same shape should reuse cache
     x2 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
     out2 = rmsnorm_fwd(x2, weight2, eps=eps)
-    assert len(_rmsnorm_fwd.compile_cache) == 1
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 1
 
     # Changing batch size should reuse cache
     x2 = torch.randn(M * 2, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
     out2 = rmsnorm_fwd(x2, weight2, eps=eps)
-    assert len(_rmsnorm_fwd.compile_cache) == 1
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 1
 
     # Different shape should create new cache entry
     x3 = torch.randn(M, N * 2, device=device, dtype=torch.float16)
     weight3 = torch.randn(N * 2, device=device, dtype=torch.float32)
     out3 = rmsnorm_fwd(x3, weight3, eps=eps)
-    assert len(_rmsnorm_fwd.compile_cache) == 2
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 2
 
     # Different dtype should create new cache entry
     x4 = torch.randn(M, N, device=device, dtype=torch.float32)
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
     out4 = rmsnorm_fwd(x4, weight4, eps=eps)
-    assert len(_rmsnorm_fwd.compile_cache) == 3
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 3
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
