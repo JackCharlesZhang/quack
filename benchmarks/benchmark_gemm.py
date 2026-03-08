@@ -265,23 +265,13 @@ def run(
             else torch.bfloat16
         )
 
-        # Create dtype torch tensor (cpu)
-        torch_tensor_cpu = cutlass.torch.create_and_permute_torch_tensor(
-            shape,
-            gen_dtype,
-            permute_order=permute_order,
-            # init_type=cutlass.torch.TensorInitType.RANDOM,
-            # init_config=cutlass.torch.RandomInitConfig(
-            #     min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
-            # ),
-            init_type=cutlass.torch.TensorInitType.GAUSSIAN,
-            init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
-        ).to(torch_dtype)
-        # Create dtype torch tensor (gpu)
-        torch_tensor = torch_tensor_cpu.cuda()
+        # Create dtype torch tensor directly on GPU
+        # Allocate in shape order, then permute (non-contiguous) to get correct strides
+        torch_tensor = torch.empty(shape, dtype=gen_dtype, device="cuda").normal_(std=k ** (-0.5)).to(torch_dtype)
+        torch_tensor = torch_tensor.permute(permute_order)
 
-        # Create f32 torch tensor (cpu)
-        f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
+        # Create f32 torch tensor (gpu)
+        f32_torch_tensor = torch_tensor.to(dtype=torch.float32)
 
         # Create dtype cute tensor (gpu)
         torch_tensor_view = (
@@ -315,14 +305,14 @@ def run(
         if varlen_m:
             assert a_major == "k"
             a_idx = torch.randperm(l * m, dtype=torch.int32, device="cuda")
-            a = rearrange(rearrange(a, "m k l -> (m l) k")[a_idx.cpu()], "(m l) k -> m k l", m=m)
+            a = rearrange(rearrange(a, "m k l -> (m l) k")[a_idx], "(m l) k -> m k l", m=m)
             a_torch = rearrange(a_torch, "m k l -> (m l) k")
             mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             a_idx_reshaped = rearrange(a_idx, "(m l) -> l m", m=m).contiguous().transpose(0, 1)
         else:
             assert a_major == "m"
             a_idx = torch.randperm(l * k, dtype=torch.int32, device="cuda")
-            a = rearrange(rearrange(a, "m k l -> (k l) m ")[a_idx.cpu()], "(k l) m -> m k l", k=k)
+            a = rearrange(rearrange(a, "m k l -> (k l) m ")[a_idx], "(k l) m -> m k l", k=k)
             a_torch = rearrange(rearrange(a_torch, "m k l -> (k l) m").contiguous(), "kl m -> m kl")
             mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=0)
             a_idx_reshaped = rearrange(a_idx, "(k l) -> l k", k=k).contiguous().transpose(0, 1)
@@ -470,7 +460,6 @@ def run(
             )
         if c is not None:
             ref = ref + c
-        ref = ref.cpu()
 
         if d_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
             # m major: (l, n, m) -> (m, n, l)
@@ -494,14 +483,13 @@ def run(
                 d_dtype,
                 is_dynamic_layout=True,
             )
-            ref_d = f8_torch_tensor.cpu()
+            ref_d = f8_torch_tensor
         else:
             ref_d = ref.to(cutlass_torch.dtype(d_dtype))
 
-        out = d_torch.cpu().squeeze()
+        out = d_torch.squeeze()
         out_ref = ref_d.squeeze()
-        # breakpoint()
-        torch.testing.assert_close(d_torch.cpu(), ref_d, atol=tolerance, rtol=1e-03)
+        torch.testing.assert_close(d_torch, ref_d, atol=tolerance, rtol=1e-03)
 
     # return
 
