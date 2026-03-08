@@ -1357,6 +1357,7 @@ class GemmSm100(GemmSm90):
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
+            tmem_alloc_barrier.arrive()
             # Wait for accumulator buffer empty
             acc_pipeline.producer_tail(acc_producer_state)
 
@@ -1482,6 +1483,7 @@ class GemmSm100(GemmSm90):
 
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
 
     @cute.jit
