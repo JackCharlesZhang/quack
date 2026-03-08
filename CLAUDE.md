@@ -65,6 +65,10 @@ Key rules:
 
 Tests use pytest with parametrize across dtypes (`float32`, `float16`, `bfloat16`), dimensions, and batch sizes. Each test includes a reference implementation for numerical validation.
 
+## Iteration Speed
+
+When iterating on kernel code, run a small subset of tests (1-3 parametrizations) rather than the full test suite. Use `-k` or pass specific test IDs to pytest. Only run the full suite when finalizing changes.
+
 ## Code Style
 
 - Favor concise, self-explanatory code
