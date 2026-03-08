@@ -9,6 +9,12 @@ from quack.topk import topk
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+TOLERANCES = {
+    torch.bfloat16: (1e-2, 1e-2),
+    torch.float16: (1e-3, 1e-3),
+    torch.float32: (1e-3, 5e-4),
+}
+
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
@@ -21,21 +27,13 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 # @pytest.mark.parametrize("M", [1])
 @pytest.mark.parametrize("softmax", [False, True])
 # @pytest.mark.parametrize("softmax", [False])
-@pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
-# @pytest.mark.parametrize("function", [torch.compile(topk, fullgraph=True)])
-def test_topk(M, N, k, input_dtype, softmax, function):
+@pytest.mark.parametrize("use_compile", [False, True])
+# @pytest.mark.parametrize("use_compile", [False])
+def test_topk(M, N, k, input_dtype, softmax, use_compile):
     """Test TopK forward/backward against PyTorch reference implementation."""
     device = "cuda"
-    # Set tolerance based on dtype
-    if input_dtype == torch.bfloat16:
-        atol = 1e-2
-        rtol = 1e-2
-    elif input_dtype == torch.float16:
-        atol = 1e-3
-        rtol = 1e-3
-    else:
-        atol = 1e-3
-        rtol = 5e-4
+    atol, rtol = TOLERANCES[input_dtype]
+    function = torch.compile(topk, fullgraph=True) if use_compile else topk
 
     torch.random.manual_seed(0)
     # Create input tensors

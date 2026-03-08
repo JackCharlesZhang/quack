@@ -8,6 +8,12 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, _compile_rmsnorm_fwd, rmsnorm_fw
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+TOLERANCES = {
+    torch.bfloat16: 1e-1,
+    torch.float16: 1e-2,
+    torch.float32: 1e-4,
+}
+
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
@@ -43,13 +49,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
     device = "cuda"
-    # Set tolerance based on dtype
-    if input_dtype == torch.bfloat16:
-        atol = 1e-1
-    elif input_dtype == torch.float16:
-        atol = 1e-2
-    else:
-        atol = 1e-4
+    atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
     if weight_dtype is not None:
@@ -124,13 +124,7 @@ def test_rmsnorm_strided_tensor(use_compile):
 def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     """Test RMSNorm forward pass against reference implementation."""
     device = "cuda"
-    # Set tolerance based on dtype
-    if input_dtype == torch.bfloat16:
-        atol = 1e-1
-    elif input_dtype == torch.float16:
-        atol = 1e-2
-    else:
-        atol = 1e-4
+    atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
