@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 from functools import partial
 from dataclasses import dataclass
 
@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.sm90_utils import partition_for_epilogue
@@ -18,13 +18,13 @@ from quack.varlen_utils import VarlenManager
 
 
 class GemmDefaultEpiMixin:
-    @dataclass
-    class EpilogueArguments(ArgumentsBase):
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
-        add_to_output: bool = False
+        add_to_output: cutlass.Constexpr[bool] = False
 
     @dataclass
     class EpilogueParams(ParamsBase):

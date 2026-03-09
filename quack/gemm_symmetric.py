@@ -1,24 +1,36 @@
 from typing import Tuple, Optional, Callable
-from functools import partial
+from functools import lru_cache, partial
+
 from torch import Tensor
-from quack.gemm_act import GemmActMixin, act_fn_map, gemm_act
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.tile_scheduler import TriangularTileScheduler
-from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.varlen_utils import VarlenManager
-import quack.copy_utils as copy_utils
+
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.cute.runtime import make_ptr
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
+from quack.gemm_act import GemmActMixin, act_fn_map
+from quack.gemm_sm90 import GemmSm90
+from quack.gemm_sm100 import GemmSm100
+from quack.gemm_tvm_ffi_utils import (
+    div_for_dtype,
+    perm3d,
+    get_majors,
+    get_dtypes,
+    make_scheduler_args,
+    make_fake_scheduler_args,
+    cached_compile,
+    compile_gemm_kernel,
+)
+from quack.tile_scheduler import TriangularTileScheduler
+from quack.varlen_utils import VarlenManager
+import quack.copy_utils as copy_utils
 
-class GemmSymmetricMixin(GemmActMixin, GemmSm90):
+
+class GemmSymmetricMixin(GemmActMixin):
     def get_scheduler_class(self, varlen_m: bool = False):
         return TriangularTileScheduler
 
@@ -64,8 +76,6 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
         copy_atom_postact_r2s = get_smem_store_op(
             self.postact_layout, self.postact_dtype, self.acc_dtype
         )
-        # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
-        # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
         batch_idx = tile_coord_mnkl[3]
@@ -179,6 +189,108 @@ class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
 
 
+@lru_cache(maxsize=None)
+def _compile_gemm_symmetric(
+    a_dtype,
+    b_dtype,
+    d_dtype,
+    c_dtype,
+    c_major,
+    postact_dtype,
+    a_major,
+    b_major,
+    d_major,
+    postact_major,
+    tile_shape_mn,
+    cluster_shape_mnk,
+    pingpong,
+    persistent,
+    has_semaphore,
+    alpha_mode,
+    beta_mode,
+    device_capacity,
+):
+    GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
+    # Symmetric GEMM: m == n, so reuse the same sym_int for shape checking
+    m, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    a_leading = 1 if a_major == "k" else 0
+    b_leading = 1 if b_major == "k" else 0
+    d_leading = 1 if d_major == "n" else 0
+    c_leading = 1 if c_major == "n" else 0
+    div_a, div_b = div_for_dtype(a_dtype), div_for_dtype(b_dtype)
+    div_d, div_c = div_for_dtype(d_dtype), div_for_dtype(c_dtype) if c_dtype else 1
+    mA = fake_tensor(a_dtype, (m, k, l), leading_dim=a_leading, divisibility=div_a)
+    mB = fake_tensor(b_dtype, (m, k, l), leading_dim=b_leading, divisibility=div_b)
+    mD = fake_tensor(d_dtype, (m, m, l), leading_dim=d_leading, divisibility=div_d)
+    mC = fake_tensor(c_dtype, (m, m, l), leading_dim=c_leading, divisibility=div_c)
+    # PostAct = D.mT, so it has the opposite major from D (m↔n swapped)
+    div_pa = div_for_dtype(postact_dtype)
+    postact_leading = 1 if postact_major == "n" else 0
+    mPostAct = fake_tensor(
+        postact_dtype, (m, m, l), leading_dim=postact_leading, divisibility=div_pa
+    )
+
+    def fake_scalar(mode):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return Float32(1.0)
+        else:
+            return make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=4)
+
+    activation = None  # identity
+    act_fn = act_fn_map[activation]
+    epi_args = GemmCls.EpilogueArguments(
+        mPostAct,
+        act_fn,
+        alpha=fake_scalar(alpha_mode),
+        beta=fake_scalar(beta_mode),
+    )
+    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    varlen_args = None
+    key = (
+        "gemm_symmetric",
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        c_major,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        postact_major,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        pingpong,
+        persistent,
+        has_semaphore,
+        alpha_mode,
+        beta_mode,
+        device_capacity,
+    )
+    return cached_compile(
+        key,
+        lambda: compile_gemm_kernel(
+            GemmCls,
+            a_dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            pingpong,
+            persistent,
+            False,
+            device_capacity,
+            mA,
+            mB,
+            mD,
+            mC,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+        ),
+    )
+
+
 def gemm_symmetric(
     A: Tensor,  # (l, m, k)
     B: Tensor,  # (l, m, k)
@@ -195,108 +307,67 @@ def gemm_symmetric(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
-    # Tranpose D so the "activation" is a write to the mirrored tile
+    # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
 
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}
-    )
-    assert M == N, "M and N must be the same; symmetric gemm only supports square matrices"
-    GemmWrapperBase.permute_tensors(tensor_infos)
-    GemmWrapperBase.extract_dtypes(tensor_infos)
-    major_configs = {
-        "A": ("m", "k", "l"),
-        "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"),
-        "C": ("m", "n", "l"),
-        "PostAct": ("m", "n", "l"),
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
+    PostAct_p = PostAct.permute(1, 2, 0) if PostAct.ndim == 3 else PostAct
+    a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
+    a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
+    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
+    # PostAct = D.mT has swapped major: if D is n-major, PostAct is m-major
+    postact_major = "n" if PostAct_p.stride(1) == 1 else "m"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
+    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
-    acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmCls.is_valid_dtypes(
-        tensor_infos["A"].dtype,
-        tensor_infos["B"].dtype,
-        acc_dtype,
-        tensor_infos["D"].dtype,
-        tensor_infos["A"].major,
-        tensor_infos["B"].major,
-    ):
-        raise TypeError("Skipping due to unsupported combination of types and majors")
+    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
+    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors({k: v for k, v in tensor_infos.items()}, major_configs)
-
-    def scalar_arg(scalar: float | Tensor):
-        if isinstance(scalar, float):
-            return Float32(scalar) if scalar != 1.0 else None
-        else:
-            assert isinstance(scalar, Tensor)
-            return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-
-    activation = None  # Equivalent to identity
-    act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(
-        tensor_infos["PostAct"].cute_tensor, act_fn, scalar_arg(alpha), scalar_arg(beta)
-    )
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
-    )
-    varlen_args = None
-
-    current_stream = cutlass_torch.current_stream()
-    compile_key = GemmWrapperBase.get_compile_key(
-        tensor_infos,
-        activation,
+    compiled_fn = _compile_gemm_symmetric(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        c_major,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        postact_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        alpha_mode,
+        beta_mode,
         device_capacity,
+    )
+
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+
+    def scalar_arg(scalar, mode):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return Float32(scalar)
+        else:
+            return scalar.data_ptr()
+
+    epi_args = GemmActMixin.EpilogueArguments(
+        PostAct_p,
+        None,  # act_fn is Constexpr, baked in at compile time
+        alpha=scalar_arg(alpha, alpha_mode),
+        beta=scalar_arg(beta, beta_mode),
+    )
+    scheduler_args = make_scheduler_args(
+        max_active_clusters,
         max_swizzle_size,
-        2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
-        2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
-        key_tensor_names=("A", "B", "D", "PostAct", "C"),
+        tile_count_semaphore,
     )
-    cache = gemm_act.compile_cache
-    if compile_key not in cache:
-        if device_capacity[0] == 9:
-            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = GemmCls(
-            acc_dtype,
-            tensor_infos["A"].dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            gather_A=False,
-        )
-        cache[compile_key] = cute.compile(
-            gemm_obj,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
+    varlen_args = None
 
-
-gemm_act.compile_cache = {}
+    compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)

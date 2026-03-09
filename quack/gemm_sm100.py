@@ -27,7 +27,7 @@ from cutlass.utils import LayoutEnum
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.pipeline import PipelineTmaCpAsyncUmma
-from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
+from quack.cute_dsl_utils import ParamsBase
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
@@ -425,7 +425,7 @@ class GemmSm100(GemmSm90):
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        epilogue_args: ArgumentsBase,
+        epilogue_args: tuple,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,

@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import Tuple, Optional, Callable
-from functools import partial
+from typing import NamedTuple, Tuple, Optional, Callable
+from functools import lru_cache, partial
 from dataclasses import dataclass
 
 from torch import Tensor
@@ -10,16 +10,31 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.cute_dsl_utils import (
+    ParamsBase,
+    mlir_namedtuple,
+    get_device_capacity,
+    get_max_active_clusters,
+    torch2cute_dtype_map,
+)
 from quack.varlen_utils import VarlenManager
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
+from quack.gemm_tvm_ffi_utils import (
+    get_major,
+    perm3d_single,
+    make_scheduler_args,
+    make_varlen_args,
+    make_fake_scheduler_args,
+    make_fake_varlen_args,
+    div_for_dtype,
+    make_fake_gemm_tensors,
+    cached_compile,
+    compile_gemm_kernel,
+)
 from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
@@ -27,8 +42,8 @@ import quack.activation
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
-    @dataclass
-    class EpilogueArguments(ArgumentsBase):
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
@@ -326,149 +341,6 @@ act_fn_map = {
 }
 
 
-def gemm_act(
-    A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
-    B: Tensor,  # (l, n, k)
-    D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    PostAct: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
-    tile_count_semaphore: Optional[Tensor],  # (1,)
-    activation: Optional[str],
-    tile_M: int,
-    tile_N: int,
-    cluster_M: int,
-    cluster_N: int,
-    pingpong: bool = False,
-    persistent: bool = True,
-    max_swizzle_size: int = 8,
-    rowvec_bias: Optional[Tensor] = None,  # (l, n)
-    colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
-    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
-    A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
-) -> None:
-    if cu_seqlens_m is not None:
-        assert persistent, "varlen_m requires persistent=True"
-        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
-        if D is not None:
-            assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
-        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
-    if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
-        assert cluster_N == 1, "gather_A requires cluster_N=1"
-    assert activation in act_fn_map, f"Unsupported activation {activation}"
-
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
-    )
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
-    GemmWrapperBase.extract_dtypes(tensor_infos)
-    major_configs = {
-        "A": ("m", "k", "l"),
-        "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"),
-        "C": ("m", "n", "l"),
-        "PostAct": ("m", "n", "l"),
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
-
-    device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmActSm100 if device_capacity[0] > 9 else GemmActSm90
-
-    acc_dtype = Float32
-    tile_shape_mn = (tile_M, tile_N)
-    cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmCls.is_valid_dtypes(
-        tensor_infos["A"].dtype,
-        tensor_infos["B"].dtype,
-        acc_dtype,
-        tensor_infos["D"].dtype,
-        tensor_infos["A"].major,
-        tensor_infos["B"].major,
-    ):
-        raise TypeError("Skipping due to unsupported combination of types and majors")
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(
-        tensor_infos["PostAct"].cute_tensor,
-        act_fn,
-        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1
-        )
-        if rowvec_bias is not None
-        else None,
-        mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1 if cu_seqlens_m is None else 0
-        )
-        if colvec_bias is not None
-        else None,
-    )
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
-    )
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        None,  # cu_seqlens_k
-        A_idx,
-    )
-
-    current_stream = cutlass_torch.current_stream()
-    compile_key = GemmWrapperBase.get_compile_key(
-        tensor_infos,
-        activation,
-        tile_shape_mn,
-        cluster_shape_mnk,
-        pingpong,
-        persistent,
-        tile_count_semaphore is not None,
-        device_capacity,
-        max_swizzle_size,
-        rowvec_bias.dtype if rowvec_bias is not None else None,
-        colvec_bias.dtype if colvec_bias is not None else None,
-        cu_seqlens_m is not None,
-        A_idx is not None,
-        key_tensor_names=("A", "B", "D", "PostAct", "C"),
-    )
-    cache = gemm_act.compile_cache
-    if compile_key not in cache:
-        if device_capacity[0] == 9:
-            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = GemmCls(
-            acc_dtype,
-            tensor_infos["A"].dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            gather_A=gather_A,
-        )
-        cache[compile_key] = cute.compile(
-            gemm_obj,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
-
-
-gemm_act.compile_cache = {}
-
-
 class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
@@ -588,12 +460,127 @@ gate_fn_map = {
 }
 
 
-def gemm_gated(
+@lru_cache(maxsize=None)
+def _compile_gemm_act(
+    a_dtype,
+    b_dtype,
+    d_dtype,
+    c_dtype,
+    postact_dtype,
+    a_major,
+    b_major,
+    d_major,
+    c_major,
+    postact_major,
+    tile_shape_mn,
+    cluster_shape_mnk,
+    pingpong,
+    persistent,
+    has_semaphore,
+    activation,
+    rowvec_dtype,
+    colvec_dtype,
+    colvec_ndim,
+    varlen_m,
+    gather_A,
+    device_capacity,
+    gemm_cls_name,
+):
+    GemmCls = (
+        {"act": GemmActSm100, "gated": GemmGatedSm100}[gemm_cls_name]
+        if device_capacity[0] > 9
+        else {"act": GemmActSm90, "gated": GemmGatedSm90}[gemm_cls_name]
+    )
+    pa_leading = 1 if postact_major == "n" else 0
+    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        varlen_m=varlen_m,
+        gather_A=gather_A,
+    )
+    div_pa = div_for_dtype(postact_dtype)
+    pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
+    pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
+    pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
+    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+
+    mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
+    if colvec_ndim == 2:
+        mColVec = fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
+    elif colvec_ndim == 1:
+        mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4)
+    else:
+        mColVec = None
+
+    act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+    epi_args = GemmCls.EpilogueArguments(
+        mPostAct,
+        act_fn,
+        mRowVecBroadcast=mRowVec,
+        mColVecBroadcast=mColVec,
+    )
+    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
+    key = (
+        "gemm_act",
+        gemm_cls_name,
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        postact_major,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        pingpong,
+        persistent,
+        has_semaphore,
+        activation,
+        rowvec_dtype,
+        colvec_dtype,
+        colvec_ndim,
+        varlen_m,
+        gather_A,
+        device_capacity,
+    )
+    return cached_compile(
+        key,
+        lambda: compile_gemm_kernel(
+            GemmCls,
+            a_dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            pingpong,
+            persistent,
+            gather_A,
+            device_capacity,
+            mA,
+            mB,
+            mD,
+            mC,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+        ),
+    )
+
+
+def gemm_act(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
     D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    PostAct: Tensor,  # (l, m, n//2) or (total_m, n//2) if varlen_m
+    PostAct: Tensor,  # (l, m, n) or (total_m, n//2) if gated
     tile_count_semaphore: Optional[Tensor],  # (1,)
     activation: Optional[str],
     tile_M: int,
@@ -608,148 +595,87 @@ def gemm_gated(
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
 ) -> None:
-    if cu_seqlens_m is not None:
+    if activation in gate_fn_map:
+        gemm_cls_name = "gated"
+    else:
+        assert activation in act_fn_map, f"Unsupported activation {activation}"
+        gemm_cls_name = "act"
+
+    varlen_m = cu_seqlens_m is not None
+    gather_A = A_idx is not None
+    if varlen_m:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         if D is not None:
             assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
     if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
+        assert cu_seqlens_m is not None, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    assert activation in gate_fn_map, f"Unsupported activation {activation}"
 
-    # Special validation for PostAct shape
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
-    )
+    A_p = perm3d_single(A, varlen_m)
+    B_p = perm3d_single(B)
+    D_p = perm3d_single(D, varlen_m)
+    C_p = perm3d_single(C, varlen_m)
+    PostAct_p = perm3d_single(PostAct, varlen_m)
 
-    # PostAct shape validation depends on varlen_m
-    if cu_seqlens_m is not None:
-        # varlen_m case: PostAct is 2D (total_m, n//2)
-        assert PostAct.dim() == 2 and PostAct.is_cuda, (
-            "PostAct must be a 2D CUDA tensor for varlen_m"
-        )
-        assert PostAct.shape == (
-            M,
-            N // 2,
-        ), f"PostAct must have shape {(M, N // 2)}, got {PostAct.shape}"
-    else:
-        # Normal case: PostAct is 3D (l, m, n//2)
-        assert PostAct.dim() == 3 and PostAct.is_cuda, "PostAct must be a 3D CUDA tensor"
-        assert PostAct.shape == (
-            L,
-            M,
-            N // 2,
-        ), f"PostAct must have shape {(L, M, N // 2)}, got {PostAct.shape}"
+    a_major = get_major(A_p, "m", "k")
+    b_major = get_major(B_p, "n", "k")
+    d_major = get_major(D_p, "m", "n") if D_p is not None else None
+    c_major = get_major(C_p, "m", "n") if C_p is not None else None
+    postact_major = get_major(PostAct_p, "m", "n")
 
-    tensor_infos["PostAct"] = GemmTensorInfo(PostAct)
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
-    GemmWrapperBase.extract_dtypes(tensor_infos)
-    major_configs = {
-        "A": ("m", "k", "l"),
-        "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"),
-        "C": ("m", "n", "l"),
-        "PostAct": ("m", "n", "l"),  # PostAct has shape (m, n//2, l) after permute
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    a_dtype = torch2cute_dtype_map[A.dtype]
+    b_dtype = torch2cute_dtype_map[B.dtype]
+    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
+    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
+    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
+    colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmGatedSm100 if device_capacity[0] > 9 else GemmGatedSm90
+    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
-    acc_dtype = cutlass.Float32
-    tile_shape_mn = (tile_M, tile_N)
-    cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmCls.is_valid_dtypes(
-        tensor_infos["A"].dtype,
-        tensor_infos["B"].dtype,
-        acc_dtype,
-        tensor_infos["D"].dtype,
-        tensor_infos["A"].major,
-        tensor_infos["B"].major,
-    ):
-        raise TypeError("Skipping due to unsupported combination of types and majors")
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    act_fn = gate_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(
-        tensor_infos["PostAct"].cute_tensor,
-        act_fn,
-        mRowVecBroadcast=(
-            from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
-            if rowvec_bias is not None
-            else None
-        ),
-        mColVecBroadcast=(
-            from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=1 if cu_seqlens_m is None else 0
-            )
-            if colvec_bias is not None
-            else None
-        ),
-    )
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
-    )
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        None,  # cu_seqlens_k
-        A_idx,
-    )
-
-    current_stream = cutlass_torch.current_stream()
-    compile_key = GemmWrapperBase.get_compile_key(
-        tensor_infos,
-        activation,
-        tile_shape_mn,
-        cluster_shape_mnk,
+    compiled_fn = _compile_gemm_act(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        postact_major,
+        (tile_M, tile_N),
+        (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        activation,
+        torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
+        torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
+        colvec_ndim,
+        varlen_m,
+        gather_A,
         device_capacity,
+        gemm_cls_name,
+    )
+
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    epi_args = GemmActMixin.EpilogueArguments(
+        PostAct_p,
+        None,  # act_fn is Constexpr, pass None at call time
+        mRowVecBroadcast=rowvec_bias,
+        mColVecBroadcast=colvec_bias,
+    )
+    scheduler_args = make_scheduler_args(
+        max_active_clusters,
         max_swizzle_size,
-        rowvec_bias.dtype if rowvec_bias is not None else None,
-        colvec_bias.dtype if colvec_bias is not None else None,
-        cu_seqlens_m is not None,
-        A_idx is not None,
-        key_tensor_names=("A", "B", "D", "PostAct", "C"),
+        tile_count_semaphore,
     )
-    cache = gemm_gated.compile_cache
-    if compile_key not in cache:
-        if device_capacity[0] == 9:
-            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = GemmCls(
-            acc_dtype,
-            tensor_infos["A"].dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            gather_A=gather_A,
-        )
-        cache[compile_key] = cute.compile(
-            gemm_obj,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+
+    compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
 
 
-gemm_gated.compile_cache = {}
+gemm_gated = gemm_act

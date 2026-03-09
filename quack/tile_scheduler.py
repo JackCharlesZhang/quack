@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple, Optional
+from typing import NamedTuple, Tuple, Optional
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -11,7 +11,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 import quack.utils as utils
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from quack.cute_dsl_utils import ArgumentsBase, ParamsBase, mlir_namedtuple
 
 
 class RasterOrderOption(IntEnum):
@@ -51,8 +51,8 @@ def get_raster_order_from_option(
 
 
 # Grouping arguments together that should be passed to __call__
-@dataclass
-class TileSchedulerOptions(ArgumentsBase):
+@mlir_namedtuple
+class TileSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     raster_order: cutlass.Constexpr[RasterOrderOption] = RasterOrderOption.Heuristic
     max_swizzle_size: Int32 = Int32(8)
@@ -740,7 +740,7 @@ class TriangularTileScheduler(TileScheduler):
                 _, _, bidz_ = cute.arch.block_idx()
             else:
                 bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
-                cluster_id_in_problem = Int32(cluster_id_in_problem) # divmod returns IntValue
+                cluster_id_in_problem = Int32(cluster_id_in_problem)  # divmod returns IntValue
             if const_expr(bidz is not None):
                 bidz_ = bidz
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)

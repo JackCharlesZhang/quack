@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
+from typing import Optional, NamedTuple
 from dataclasses import dataclass
 
 import cutlass
@@ -8,12 +8,12 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 
 from quack import copy_utils
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 
 
 # Grouping arguments together that should be passed to __call__
-@dataclass
-class VarlenArguments(ArgumentsBase):
+@mlir_namedtuple
+class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None

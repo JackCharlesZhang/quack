@@ -353,7 +353,7 @@ class GemmSm90:
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        epilogue_args: ArgumentsBase,
+        epilogue_args: tuple,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,

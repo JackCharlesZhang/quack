@@ -1,0 +1,61 @@
+# Copyright (c) 2025, Tri Dao.
+
+"""Test that NamedTuple-based arguments work with TVM-FFI compilation."""
+
+import pytest
+import torch
+
+import cutlass.cute as cute
+from cutlass import const_expr
+
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.varlen_utils import VarlenArguments
+
+
+@cute.kernel
+def _copy_if_present(mOut: cute.Tensor, mSrc: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()
+    if tidx < mOut.shape[0]:
+        mOut[tidx] = mSrc[tidx]
+
+
+@cute.jit
+def copy_from_varlen(mOut: cute.Tensor, args: VarlenArguments):
+    if const_expr(args.mCuSeqlensM is not None):
+        _copy_if_present(mOut, args.mCuSeqlensM).launch(grid=(1, 1, 1), block=(128, 1, 1))
+
+
+def _compile_copy_from_varlen():
+    n = cute.sym_int()
+    out_fake = fake_tensor(cute.Int32, (n,), divisibility=1)
+    cu_seqlens_fake = fake_tensor(cute.Int32, (n,), divisibility=1)
+    varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_fake)
+    return cute.compile(copy_from_varlen, out_fake, varlen_args, options="--enable-tvm-ffi")
+
+
+@pytest.mark.parametrize("N", [8, 32, 64])
+def test_varlen_namedtuple_tvm_ffi(N):
+    """Compile a kernel taking VarlenArguments (NamedTuple) via TVM-FFI and run it."""
+    compiled_fn = _compile_copy_from_varlen()
+    cu_seqlens = torch.arange(N, dtype=torch.int32, device="cuda")
+    out = torch.zeros(N, dtype=torch.int32, device="cuda")
+    compiled_fn(out, VarlenArguments(mCuSeqlensM=cu_seqlens))
+    torch.testing.assert_close(out, cu_seqlens)
+
+
+def test_varlen_construction():
+    """Smoke test that VarlenArguments NamedTuple has the right interface."""
+    # Default construction (all None)
+    args = VarlenArguments()
+    assert args.mCuSeqlensM is None
+    assert args.mCuSeqlensK is None
+    assert args.mAIdx is None
+    assert hasattr(args, "_fields")
+    assert args._fields == ("mCuSeqlensM", "mCuSeqlensK", "mAIdx")
+
+    # Keyword construction
+    t = torch.zeros(4, dtype=torch.int32, device="cuda")
+    args2 = VarlenArguments(mCuSeqlensM=t, mCuSeqlensK=None, mAIdx=t)
+    assert args2.mCuSeqlensM is t
+    assert args2.mCuSeqlensK is None
+    assert args2.mAIdx is t

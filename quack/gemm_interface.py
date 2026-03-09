@@ -12,9 +12,7 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
-from quack.gemm_act import gemm_gated as gemm_gated_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
-from quack.gemm_dact import gemm_dgated as gemm_dgated_sm90_sm100
 from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
 
 
@@ -38,6 +36,20 @@ gated_to_pytorch_fn_map = {
 }
 
 
+ActActivation = Literal[None, "relu", "relu_sq", "gelu_tanh_approx"]
+GatedActivation = Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"]
+Activation = Literal[
+    None,
+    "relu",
+    "relu_sq",
+    "gelu_tanh_approx",
+    "swiglu",
+    "swiglu_oai",
+    "reglu",
+    "geglu",
+    "glu",
+]
+
 default_device_capacity = get_device_capacity(torch.device("cuda"))
 
 
@@ -55,18 +67,10 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
-        configs = [
-            conf
-            for conf in configs
-            if conf.kwargs["config"].cluster_n == 1
-        ]
+        configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if get_device_capacity(kwargs["A"].device)[0] == 9:
             # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
-            configs = [
-                conf
-                for conf in configs
-                if conf.kwargs["config"].tile_n != 208
-            ]
+            configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
     return configs
 
 
@@ -164,7 +168,7 @@ def gemm_act_tuned(
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -229,7 +233,7 @@ def gemm_dact_tuned(
     PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     dx_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, N, N) or (total_M, N) if varlen_m
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
@@ -697,7 +701,7 @@ def gemm_act(
     B: Tensor,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: Activation = None,
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
@@ -708,7 +712,8 @@ def gemm_act(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tuple[Optional[Tensor], Tensor]:
-    """GEMM with activation and optional output tensors."""
+    """GEMM with activation (or gated activation) and optional output tensors."""
+    is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
@@ -720,24 +725,43 @@ def gemm_act(
         out_shape = (A.shape[0], B.shape[-1])
     else:
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
+    postact_shape = (*out_shape[:-1], out_shape[-1] // 2) if is_gated else out_shape
     if preact_out is None and store_preact:
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
-        postact_out = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
-    gemm_act_out(
-        A,
-        B,
-        preact_out,
-        postact_out,
-        C,
-        bias,
-        activation,
-        cu_seqlens_m,
-        A_idx,
-        dynamic_scheduler,
-        tuned,
-    )
+        postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
+    if is_gated:
+        gemm_gated_out(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            bias,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tuned,
+        )
+    else:
+        gemm_act_out(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            bias,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tuned,
+        )
     return preact_out, postact_out
+
+
+gemm_gated = gemm_act
 
 
 @torch.library.custom_op(
@@ -753,7 +777,7 @@ def gemm_act_out(
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -769,57 +793,104 @@ def gemm_act_ref(
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: Activation = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
 ) -> Tuple[Optional[Tensor], Tensor]:
+    is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
-        out = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        preact = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     else:
-        out = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
-    postact = act_to_pytorch_fn_map[activation](out).to(postact_dtype)
-    return out.to(out_dtype) if store_preact else None, postact
+        preact = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+    if is_gated:
+        gate = preact[..., ::2]
+        up = preact[..., 1::2]
+        postact = gated_to_pytorch_fn_map[activation](gate, up).to(postact_dtype)
+    else:
+        postact = act_to_pytorch_fn_map[activation](preact).to(postact_dtype)
+    return preact.to(out_dtype) if store_preact else None, postact
+
+
+gemm_gated_ref = gemm_act_ref
 
 
 def gemm_dact(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
-    PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
-    dx_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; or (M, 2*N) for dgated
+    activation: Activation = None,
+    dx_out: Optional[
+        Tensor
+    ] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; double for gated
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m (dgated only)
+    colvec_reduce: bool = False,  # dgated only
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> Tuple[Tensor, Tensor]:
-    """GEMM with activation gradient and optional output tensors."""
+):
+    """GEMM with activation (or gated activation) gradient and optional output tensors."""
+    is_dgated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
-    # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
-        out_shape = (total_m, B.shape[-1])
+        out_shape = (total_m, B.shape[-1] * 2) if is_dgated else (total_m, B.shape[-1])
     elif A.ndim == 2:
-        out_shape = (A.shape[0], B.shape[-1])
+        out_shape = (A.shape[0], B.shape[-1] * 2) if is_dgated else (A.shape[0], B.shape[-1])
     else:
-        out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
+        n = B.shape[-1] * 2 if is_dgated else B.shape[-1]
+        out_shape = (A.shape[0], A.shape[-2], n)
+    postact_shape = (*out_shape[:-1], out_shape[-1] // 2) if is_dgated else out_shape
     if dx_out is None:
         dx_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
-        postact_out = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
-    gemm_dact_out(
-        A, B, PreAct, dx_out, postact_out, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned
-    )
-    return dx_out, postact_out
+        postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
+    if is_dgated:
+        colvec_reduce_final = gemm_dgated_out(
+            A,
+            B,
+            PreAct,
+            dx_out,
+            postact_out,
+            colvec_scale,
+            activation,
+            colvec_reduce,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tuned,
+        )
+        if not colvec_reduce:
+            return dx_out, postact_out
+        else:
+            return dx_out, postact_out, colvec_reduce_final
+    else:
+        gemm_dact_out(
+            A,
+            B,
+            PreAct,
+            dx_out,
+            postact_out,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tuned,
+        )
+        return dx_out, postact_out
+
+
+gemm_dgated = gemm_dact
 
 
 @torch.library.custom_op(
@@ -834,7 +905,7 @@ def gemm_dact_out(
     PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     dx_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    activation: ActActivation = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
@@ -846,115 +917,46 @@ def gemm_dact_out(
 
 
 def gemm_dact_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A
-    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
-    PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A
+    B: Tensor,  # (K, N) or (L, K, N)
+    PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N); or (M, 2*N) for dgated
+    activation: Activation = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
-    """Reference implementation for GEMM with activation gradient."""
+    """Reference implementation for GEMM with activation (or gated activation) gradient."""
+    is_dgated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     dout = gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx).to(out_dtype)
-    postact = act_to_pytorch_fn_map[activation](PreAct)
-    # Compute gradient using autograd
-    if activation is None:
-        dx = dout
+    if is_dgated:
+        gate = PreAct[..., ::2]
+        up = PreAct[..., 1::2]
+        gate_requires_grad, up_requires_grad = gate.requires_grad, up.requires_grad
+        gate.requires_grad_(True)
+        up.requires_grad_(True)
+        postact = gated_to_pytorch_fn_map[activation](gate, up)
+        dgate, dup = torch.autograd.grad(postact, [gate, up], dout, create_graph=False)
+        gate.requires_grad_(gate_requires_grad)
+        up.requires_grad_(up_requires_grad)
+        dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
+        return dx.to(out_dtype), postact.to(postact_dtype)
     else:
-        PreAct_requires_grad = PreAct.requires_grad
-        PreAct.requires_grad_(True)
-        postact_for_grad = act_to_pytorch_fn_map[activation](PreAct)
-        dx = torch.autograd.grad(postact_for_grad, PreAct, dout, create_graph=False)[0]
-        PreAct.requires_grad_(PreAct_requires_grad)
-    return dx.to(out_dtype), postact.to(postact_dtype)
+        postact = act_to_pytorch_fn_map[activation](PreAct)
+        if activation is None:
+            dx = dout
+        else:
+            PreAct_requires_grad = PreAct.requires_grad
+            PreAct.requires_grad_(True)
+            postact_for_grad = act_to_pytorch_fn_map[activation](PreAct)
+            dx = torch.autograd.grad(postact_for_grad, PreAct, dout, create_graph=False)[0]
+            PreAct.requires_grad_(PreAct_requires_grad)
+        return dx.to(out_dtype), postact.to(postact_dtype)
 
 
-def gemm_gated_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A
-    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["glu", "swiglu", "swiglu_oai", "reglu", "geglu"] = "swiglu",
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    store_preact: bool = True,
-) -> Tuple[Optional[Tensor], Tensor]:
-    """Reference implementation for GEMM with gated activation forward.
-
-    Args:
-        A: (M, K) - input tensor
-        B: (K, N) - weight tensor with gate and up projections
-        C: (M, N) - optional bias tensor
-        activation: Type of gated activation
-        out_dtype: Output dtype for preact
-        postact_dtype: Output dtype for postact
-        store_preact: Whether to return the pre-activation
-
-    Returns:
-        (preact, postact) where:
-        - preact: (M, N) pre-activation (if store_preact=True, else None)
-        - postact: (M, N // 2) post-activation output
-    """
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    if C is None:
-        preact = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
-    else:
-        preact = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
-    # Split preact into gate and up projections
-    gate = preact[..., ::2]  # (M, N//2)
-    up = preact[..., 1::2]  # (M, N//2)
-    postact = gated_to_pytorch_fn_map[activation](gate, up)
-    return preact.to(out_dtype) if store_preact else None, postact.to(postact_dtype)
-
-
-def gemm_dgated_ref(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A
-    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
-    PreAct: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
-    activation: Literal["glu", "swiglu", "swiglu_oai", "reglu", "geglu"],
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-) -> Tuple[Tensor, Tensor]:
-    """Reference implementation for GEMM with gated activation gradient.
-
-    Args:
-        A: (M, K) - dout input tensor
-        B: (K, N) - weight tensor
-        PreAct: (M, 2*N) - pre-activation tensor with gate and up projections interleaved
-        activation: Type of gated activation
-        out_dtype: Output dtype for dx
-        postact_dtype: Output dtype for postact
-
-    Returns:
-        (dx, postact) where:
-        - dx: (M, 2*N) gradient w.r.t. PreAct
-        - postact: (M, N) post-activation output
-    """
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
-    dout = gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx).to(out_dtype)
-    # Split PreAct into gate and up projections
-    gate = PreAct[..., ::2]  # (M, N)
-    up = PreAct[..., 1::2]  # (M, N)
-    # Use autograd to compute gradients w.r.t. gate and up
-    gate_requires_grad, up_requires_grad = gate.requires_grad, up.requires_grad
-    gate.requires_grad_(True)
-    up.requires_grad_(True)
-    postact = gated_to_pytorch_fn_map[activation](gate, up)
-    dgate, dup = torch.autograd.grad(postact, [gate, up], dout, create_graph=False)
-    gate.requires_grad_(gate_requires_grad)
-    up.requires_grad_(up_requires_grad)
-    # Interleave gradients back
-    dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
-    return dx.to(out_dtype), postact.to(postact_dtype)
+gemm_dgated_ref = gemm_dact_ref
 
 
 @torch.library.custom_op(
@@ -1050,7 +1052,7 @@ def gemm_gated_tuned(
     postact_out: Tensor,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    activation: GatedActivation = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -1081,7 +1083,7 @@ def gemm_gated_tuned(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    gemm_gated_sm90_sm100(
+    gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         (D if not config.swap_ab else D.mT) if D is not None else None,
@@ -1126,7 +1128,7 @@ def gemm_dgated_tuned(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    activation: GatedActivation = "swiglu",
     # whether to do colvec reduction, returning (M,) or (L, M) or (total_M) if varlen_m
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
@@ -1173,7 +1175,7 @@ def gemm_dgated_tuned(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    gemm_dgated_sm90_sm100(
+    gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         D if not config.swap_ab else D.mT,
@@ -1202,57 +1204,6 @@ def gemm_dgated_tuned(
     return colvec_reduce_final
 
 
-def gemm_gated(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
-    preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    postact_out: Optional[
-        Tensor
-    ] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    store_preact: bool = True,
-    dynamic_scheduler: bool = False,
-    tuned: bool = True,
-) -> Tuple[Optional[Tensor], Tensor]:
-    """GEMM with gated activation and optional output tensors."""
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    varlen_m = cu_seqlens_m is not None
-    # Determine output shape based on gather_A
-    if varlen_m:
-        total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
-        out_shape = (total_m, B.shape[-1])
-    elif A.ndim == 2:
-        out_shape = (A.shape[0], B.shape[-1])
-    else:
-        out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
-    postact_shape = (*out_shape[:-1], out_shape[-1] // 2)
-    if preact_out is None and store_preact:
-        preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-    if postact_out is None:
-        postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    gemm_gated_out(
-        A,
-        B,
-        preact_out,
-        postact_out,
-        C,
-        bias,
-        activation,
-        cu_seqlens_m,
-        A_idx,
-        dynamic_scheduler,
-        tuned,
-    )
-    return preact_out, postact_out
-
-
 @torch.library.custom_op(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
@@ -1266,7 +1217,7 @@ def gemm_gated_out(
     postact_out: Tensor,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    activation: GatedActivation = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -1275,59 +1226,6 @@ def gemm_gated_out(
     """GEMM with gated activation and pre-allocated output tensors."""
     fn = gemm_gated_tuned if tuned else partial(gemm_gated_tuned.fn, config=None)
     fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
-
-
-def gemm_dgated(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    PreAct: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
-    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
-    dx_out: Optional[Tensor] = None,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
-    postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    colvec_reduce: bool = False,
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    dynamic_scheduler: bool = True,
-    tuned: bool = True,
-) -> Tuple[Tensor, Tensor]:
-    """GEMM with gated activation gradient and optional output tensors."""
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
-    varlen_m = cu_seqlens_m is not None
-    # Determine output shape based on gather_A
-    if varlen_m:
-        total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
-        out_shape = (total_m, B.shape[-1] * 2)
-    elif A.ndim == 2:
-        out_shape = (A.shape[0], B.shape[-1] * 2)
-    else:
-        out_shape = (A.shape[0], A.shape[-2], B.shape[-1] * 2)
-    postact_shape = (*out_shape[:-1], out_shape[-1] // 2)
-    if dx_out is None:
-        dx_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-    if postact_out is None:
-        postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    colvec_reduce_final = gemm_dgated_out(
-        A,
-        B,
-        PreAct,
-        dx_out,
-        postact_out,
-        colvec_scale,
-        activation,
-        colvec_reduce,
-        cu_seqlens_m,
-        A_idx,
-        dynamic_scheduler,
-        tuned,
-    )
-    if not colvec_reduce:
-        return dx_out, postact_out
-    else:
-        return dx_out, postact_out, colvec_reduce_final
 
 
 @torch.library.custom_op(
@@ -1343,7 +1241,7 @@ def gemm_dgated_out(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    activation: GatedActivation = "swiglu",
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -1375,7 +1273,7 @@ def gemm_dgated_out_fake(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    activation: GatedActivation = "swiglu",
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m

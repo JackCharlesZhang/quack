@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
+from typing import Tuple, get_origin
 from functools import lru_cache
 from dataclasses import dataclass, fields
 
@@ -15,6 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float16, BFloat16, Float32
 from cutlass.base_dsl.typing import JitArgument
+from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
 
 
@@ -23,6 +24,31 @@ StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None)
 
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
+
+
+# Patch TVM-FFI converter to handle Constexpr type annotations as compile-time constants.
+# Fields annotated with cutlass.Constexpr[T] are emitted as ConstNone (not runtime args).
+# At call time, pass None for these fields; the compile-time value is baked in.
+import cutlass.cute._tvm_ffi_args_spec_converter as _converter_module  # noqa
+
+_original_convert_single_arg = _converter_module._convert_single_arg
+
+
+def _patched_convert_single_arg(arg, arg_name, arg_type, ctx):
+    if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
+        return spec.ConstNone(arg_name)
+    # If arg is a NamedTuple but arg_type doesn't have _fields (e.g. annotated as tuple),
+    # redirect so the converter uses the NamedTuple's own type hints.
+    if (
+        isinstance(arg, tuple)
+        and hasattr(type(arg), "_fields")
+        and (arg_type is None or not hasattr(arg_type, "_fields"))
+    ):
+        return _original_convert_single_arg(arg, arg_name, type(arg), ctx)
+    return _original_convert_single_arg(arg, arg_name, arg_type, ctx)
+
+
+_converter_module._convert_single_arg = _patched_convert_single_arg
 
 
 torch2cute_dtype_map = {
@@ -58,6 +84,46 @@ def _new_from_mlir_values(self, values):
         non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
         values = values[n_items:]
     return self.__class__(**non_constexpr_fields, **constexpr_fields)
+
+
+def _namedtuple_new_from_mlir_values(self, values):
+    """Generic __new_from_mlir_values__ for NamedTuples.
+
+    Applied to NamedTuple classes via the ``@mlir_namedtuple`` decorator.
+
+    Fields that are None or Constexpr (StaticTypes) are preserved from ``self`` (the compile-time
+    template). Only non-static fields consume MLIR values. Multi-value fields (e.g. cute.Tensor)
+    consume the correct number of values via ``cutlass.new_from_mlir_values``.
+
+    Constexpr fields (annotated ``cutlass.Constexpr[T]``) are baked into the compiled kernel via
+    a converter patch (see above). At call time, pass None for these fields.
+    """
+    from cutlass.base_dsl.typing import get_mlir_types
+
+    values = list(values)
+    new_fields = []
+    for field_val in self:
+        if field_val is None or isinstance(field_val, StaticTypes):
+            new_fields.append(field_val)
+        else:
+            n_items = len(get_mlir_types(field_val))
+            new_fields.append(cutlass.new_from_mlir_values(field_val, values[:n_items]))
+            values = values[n_items:]
+    return self.__class__(*new_fields)
+
+
+def mlir_namedtuple(cls):
+    """Decorator that adds MLIR value reconstruction to a NamedTuple class.
+
+    Usage::
+
+        @mlir_namedtuple
+        class MyArgs(NamedTuple):
+            tensor_arg: cute.Tensor
+            const_arg: cutlass.Constexpr[int] = 0
+    """
+    cls.__new_from_mlir_values__ = _namedtuple_new_from_mlir_values
+    return cls
 
 
 @dataclass
