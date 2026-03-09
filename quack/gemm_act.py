@@ -663,7 +663,10 @@ def gemm_act(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+    if device_capacity[0] > 9:
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+    else:
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
 
 
 gemm_gated = gemm_act

@@ -674,7 +674,10 @@ def gemm_dact(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args)
+    if device_capacity[0] > 9:
+        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None)
+    else:
+        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args)
 
 
 gemm_dgated = gemm_dact
