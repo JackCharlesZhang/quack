@@ -10,30 +10,30 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  APPTAINER_IMAGE: ~/attention_26.03.07.sif
-  APPTAINER_FLAGS: --nv --writable-tmpfs
-  QUACK_CACHE_DIR: $HOME/.quack_cache
-
 jobs:
   lint:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install ruff
+        run: pip install ruff
       - name: Ruff check
-        run: /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff check quack/ tests/
+        run: ruff check quack/ tests/
       - name: Ruff format
-        run: /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff format --check quack/ tests/
+        run: ruff format --check quack/ tests/
 
   test:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     needs: lint
+    env:
+      APPTAINER_IMAGE: $HOME/attention_26.03.07.sif
+      QUACK_CACHE_DIR: $HOME/.quack_cache
     steps:
       - uses: actions/checkout@v4
       - name: Install package and run tests
         run: |
-          /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE bash -c '
+          apptainer exec --nv --writable-tmpfs $APPTAINER_IMAGE bash -c '
             pip install -e ".[dev]" &&
             pytest tests/ --compile-only -n 16 --timeout=600 &&
             pytest tests/ -n 8 --timeout=600
