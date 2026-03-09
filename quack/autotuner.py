@@ -52,6 +52,22 @@ def _base32(key):
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
 
 
+def _gpu_warmup(duration_ms=200):
+    """Saturate the GPU to reach thermal steady-state before benchmarking.
+
+    Without this, the first autotuning config gets artificially good numbers
+    because the GPU hasn't been power-throttled yet.
+    """
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    target = duration_ms / 1000
+    t0 = time.time()
+    while time.time() - t0 < target:
+        for _ in range(100):
+            a = a @ a
+        torch.cuda.synchronize()
+
+
 class Autotuner:
     def __init__(
         self,
@@ -123,6 +139,123 @@ class Autotuner:
         if self._do_bench is None:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
+
+    def _precompile(self, *args, configs, **kwargs):
+        """Pre-compile all configs in parallel subprocesses to populate .so cache.
+
+        cute.compile() is not thread-safe (MLIR thread-local state) and fork after
+        CUDA init causes segfaults. So we spawn persistent subprocess workers: each
+        has its own CUDA context, creates FakeTensors matching the parent's tensor
+        metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
+        import overhead across multiple configs. The parent then loads instantly from
+        the .so cache during benchmarking.
+        """
+        from quack.cache_utils import CACHE_ENABLED
+
+        if not CACHE_ENABLED:
+            return
+
+        max_workers = min(len(configs), int(os.getenv("QUACK_COMPILE_WORKERS", "8")))
+        if max_workers <= 1:
+            return
+
+        # Quick check: compile first config in-process. If it loads from .so cache
+        # (<0.5s), the rest are likely cached too — skip spawning workers.
+        t_check = time.time()
+        try:
+            current = dict(kwargs, **configs[0].all_kwargs())
+            self.fn(*args, **current)
+        except Exception:
+            pass
+        if time.time() - t_check < 0.5:
+            return
+
+        verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+        if verbose:
+            print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
+        t0 = time.time()
+
+        import pickle
+        import struct
+        import subprocess
+        import sys
+
+        def _send(stream, msg):
+            data = pickle.dumps(msg)
+            stream.write(struct.pack("<I", len(data)))
+            stream.write(data)
+            stream.flush()
+
+        def _recv(stream):
+            header = stream.read(4)
+            if len(header) < 4:
+                return None
+            length = struct.unpack("<I", header)[0]
+            return pickle.loads(stream.read(length)) if length else None
+
+        # Serialize tensor metadata
+        tensor_meta = []
+        for arg in args:
+            if isinstance(arg, Tensor):
+                tensor_meta.append(
+                    {
+                        "shape": list(arg.shape),
+                        "stride": list(arg.stride()),
+                        "dtype": str(arg.dtype),
+                    }
+                )
+            else:
+                tensor_meta.append(arg)
+
+        fn_module = self.fn.__module__
+        fn_qualname = self.fn.__qualname__
+
+        # Launch persistent worker pool
+        workers = []
+        for _ in range(max_workers):
+            p = subprocess.Popen(
+                [sys.executable, "-m", "quack._compile_worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL if not verbose else None,
+            )
+            ready = _recv(p.stdout)
+            if ready != "READY":
+                p.kill()
+                continue
+            workers.append(p)
+
+        if not workers:
+            return
+
+        # Round-robin dispatch configs to workers
+        pending = [0] * len(workers)
+        for i, config in enumerate(configs):
+            w = workers[i % len(workers)]
+            _send(
+                w.stdin,
+                {
+                    "fn_module": fn_module,
+                    "fn_qualname": fn_qualname,
+                    "tensor_meta": tensor_meta,
+                    "kwargs": kwargs,
+                    "config_kwargs": config.all_kwargs(),
+                },
+            )
+            pending[i % len(workers)] += 1
+
+        # Collect all results
+        for wi, w in enumerate(workers):
+            for _ in range(pending[wi]):
+                _recv(w.stdout)
+
+        # Shutdown workers (close stdin → worker exits)
+        for w in workers:
+            w.stdin.close()
+            w.wait()
+
+        if verbose:
+            print(f"Pre-compilation done in {time.time() - t0:.1f}s")
 
     def _bench(self, *args, config, **meta):
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
@@ -227,6 +360,8 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
+                    self._precompile(*args, configs=pruned_configs, **kwargs)
+                    _gpu_warmup()
                     bench_start = time.time()
                     timings = {
                         config: self._bench(*args, config=config, **kwargs)
