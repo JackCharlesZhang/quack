@@ -652,6 +652,11 @@ def gemm_dact(
         gemm_cls_name,
     )
 
+    from quack.cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY:
+        return
+
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     if is_dgated:
         epi_args = GemmDGatedMixin.EpilogueArguments(

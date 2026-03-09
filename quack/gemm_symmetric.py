@@ -348,6 +348,11 @@ def gemm_symmetric(
         device_capacity,
     )
 
+    from quack.cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY:
+        return
+
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
     def scalar_arg(scalar, mode):

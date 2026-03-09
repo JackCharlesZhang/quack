@@ -224,6 +224,11 @@ def gemm(
         device_capacity,
     )
 
+    from quack.cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY:
+        return
+
     def scalar_arg(scalar, mode):
         if mode == 0:
             return None

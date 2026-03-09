@@ -1283,6 +1283,20 @@ def gemm_dgated_out_fake(
     dynamic_scheduler: bool = True,
     tuned: bool = True,
 ) -> Tensor:
+    _precompile_default_config(
+        gemm_dgated_tuned,
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        colvec_scale=colvec_scale,
+        activation=activation,
+        colvec_reduce=colvec_reduce,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+    )
     if not colvec_reduce:
         return torch.empty(0, dtype=torch.float32, device=A.device)
     else:
@@ -1294,6 +1308,145 @@ def gemm_dgated_out_fake(
         else:
             out_shape = (A.shape[0], A.shape[-2])
         return torch.empty(out_shape, dtype=torch.float32, device=A.device)
+
+
+def _precompile_default_config(autotuned_fn, *args, **kwargs):
+    """Compile the default config in COMPILE_ONLY mode.
+
+    Checks COMPILE_ONLY flag and SymInt guard, then calls the unwrapped function with
+    config=None (which selects the default config), triggering compilation (exports .so)
+    without benchmarking or kernel launch.
+    Tests use tuned=False which also selects the default config, so this is sufficient.
+    """
+    from quack.cache_utils import COMPILE_ONLY
+
+    A = args[0] if args else kwargs.get("A")
+    if not COMPILE_ONLY or A is None or isinstance(A.shape[0], torch.SymInt):
+        return
+    try:
+        autotuned_fn.fn(*args, config=None, **kwargs)
+    except Exception:
+        pass
+
+
+@gemm_add_inplace_op.register_fake
+def gemm_add_inplace_fake(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    beta_tensor: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    batch_idx_permute: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    alpha_val = alpha_tensor if alpha_tensor is not None else alpha
+    beta_val = beta_tensor if beta_tensor is not None else beta
+    add_to_output = isinstance(beta_val, float) and beta_val == 1.0 and cu_seqlens_m is None
+    _precompile_default_config(
+        gemm_tuned,
+        A,
+        B,
+        out,
+        out if not add_to_output else None,
+        alpha=alpha_val,
+        beta=beta_val,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        add_to_output=add_to_output,
+        dynamic_scheduler=dynamic_scheduler,
+    )
+
+
+def _register_precompile_fake(custom_op, autotuned_fn, rewrite=None):
+    """Register a fake that precompiles the default config in COMPILE_ONLY mode.
+
+    For custom_ops that forward args to their autotuned fn. Binds all args by name,
+    strips 'tuned', applies optional rewrite(kw), then calls _precompile_default_config.
+    PyTorch normalizes all custom_op args to positional, so we use inspect.signature
+    to recover keyword names.
+    """
+    import inspect
+
+    sig = inspect.signature(custom_op._init_fn)
+
+    @custom_op.register_fake
+    def _fake(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        kw = dict(bound.arguments)
+        kw.pop("tuned", None)
+        if rewrite is not None:
+            rewrite(kw)
+        _precompile_default_config(autotuned_fn, **kw)
+
+
+def _rewrite_merge_alpha(kwargs):
+    """Merge alpha_tensor into alpha for gemm_tuned; add C=None."""
+    at = kwargs.pop("alpha_tensor", None)
+    if at is not None:
+        kwargs["alpha"] = at
+    kwargs.setdefault("C", None)
+
+
+def _rewrite_merge_alpha_beta(kwargs):
+    """Merge alpha_tensor/beta_tensor into alpha/beta for gemm_tuned."""
+    at = kwargs.pop("alpha_tensor", None)
+    if at is not None:
+        kwargs["alpha"] = at
+    bt = kwargs.pop("beta_tensor", None)
+    if bt is not None:
+        kwargs["beta"] = bt
+
+
+_register_precompile_fake(gemm_out, gemm_tuned, rewrite=_rewrite_merge_alpha)
+_register_precompile_fake(gemm_add_out, gemm_tuned, rewrite=_rewrite_merge_alpha_beta)
+_register_precompile_fake(gemm_act_out, gemm_act_tuned)
+_register_precompile_fake(gemm_dact_out, gemm_dact_tuned)
+_register_precompile_fake(gemm_gated_out, gemm_gated_tuned)
+
+
+@gemm_symmetric_out.register_fake
+def gemm_symmetric_out_fake(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    from quack.cache_utils import COMPILE_ONLY
+
+    if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
+        return
+    # gemm_symmetric is not autotuned, compile the single fixed config directly
+    try:
+        gemm_symmetric_sm90_sm100(
+            A.unsqueeze(0) if A.ndim == 2 else A,
+            (B.mT.unsqueeze(0) if B.ndim == 2 else B.mT),
+            out.unsqueeze(0) if out.ndim == 2 else out,
+            (C.unsqueeze(0) if C.ndim == 2 else C) if C is not None else None,
+            torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None,
+            tile_M=128,
+            tile_N=256,
+            cluster_M=2,
+            cluster_N=1,
+            pingpong=False,
+            persistent=True,
+            max_swizzle_size=8,
+            alpha=alpha,
+            beta=beta,
+        )
+    except Exception:
+        pass
 
 
 # TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?
