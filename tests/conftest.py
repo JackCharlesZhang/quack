@@ -11,7 +11,19 @@ Two-pass workflow (after changing kernel source):
 
 Single-pass workflow (cache already warm):
   pytest tests/test_softmax.py                         # all .so cache hits
+
+Multi-GPU with xdist:
+  pytest tests/ -n 4                                   # workers round-robin across GPUs
 """
+
+import os
+import subprocess
+import json
+import time
+import logging
+import tempfile
+from pathlib import Path
+from getpass import getuser
 
 import pytest
 
@@ -30,8 +42,46 @@ def pytest_addoption(parser):
     )
 
 
+def _get_gpu_ids():
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        return [g.strip() for g in visible.split(",")]
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip().splitlines()
+    except (FileNotFoundError,):
+        pass
+    logging.warning("Failed to get gpu ids, use default '0'")
+    return ["0"]
+
+
 def pytest_configure(config):
     global _compile_only, _fake_mode
+
+    # Assign GPUs to xdist workers round-robin
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker_id:
+        tmp = Path(tempfile.gettempdir()) / getuser() / "quack_tests"
+        tmp.mkdir(parents=True, exist_ok=True)
+        worker_num = int(worker_id.replace("gw", ""))
+        cached_gpu_ids = tmp / "gpu_ids.json"
+        if worker_num == 0:
+            gpu_ids = _get_gpu_ids()
+            with cached_gpu_ids.open(mode="w") as f:
+                json.dump(gpu_ids, f)
+        else:
+            while not cached_gpu_ids.exists():
+                time.sleep(0.1)
+            with cached_gpu_ids.open() as f:
+                gpu_ids = json.load(f)
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
+
     try:
         _compile_only = config.getoption("--compile-only", default=False)
     except (ValueError, AttributeError):
