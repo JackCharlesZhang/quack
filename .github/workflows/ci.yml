@@ -27,11 +27,11 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - name: Install package and run tests
+      - name: Compile and run tests
         run: |
           apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
+            export PYTHONPATH=\$PWD:\$PYTHONPATH &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
-            pip install -e '.[dev]' &&
             pytest tests/ --compile-only -n 16 --timeout=600 &&
             pytest tests/ -n 8 --timeout=600
           "
