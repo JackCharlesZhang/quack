@@ -1,16 +1,28 @@
 # Copyright (c) 2025, Tri Dao
 from typing import Literal
+from functools import partial
 
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.amp import custom_fwd, custom_bwd
 
 from einops import rearrange
 
 from quack.linear import linear_act_func, act_linear_func
 from quack.linear import linear_gated_func, gated_linear_func
+from quack.linear import linear_fwd_convert_type
 from quack.gemm_act import gate_fn_map
-from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+from quack.gemm_interface import (
+    act_to_pytorch_fn_map,
+    gated_to_pytorch_fn_map,
+    gemm,
+    gemm_add_inplace,
+    gemm_gated,
+    gemm_dgated,
+    gemm_act,
+    gemm_dact,
+)
 
 Activation = Literal[
     "gelu_tanh_approx",
@@ -24,7 +36,160 @@ Activation = Literal[
 ]
 
 
-def mlp_func(x, weight1, weight2, activation: str, fuse_grad_accum=False, tuned=True):
+class MLPRecomputeFunc(torch.autograd.Function):
+    """MLP with activation recomputation: saves only x (not preact) to reduce memory.
+
+    In backward, recomputes preact = x @ W1.T (one extra matmul) instead of loading it
+    from saved tensors. This trades compute for memory:
+      - Saves: batch * 2 * hidden * dtype_size bytes of activation memory
+      - Costs: one extra GEMM (x @ W1.T) during backward
+
+    This is the non-gated variant (gemm_act/gemm_dact). For gated activations
+    (swiglu, reglu, etc.), use MLPGatedRecomputeFunc.
+    """
+
+    matmul_fwd = gemm
+    matmul_fwd_act = gemm_act
+    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
+
+    @staticmethod
+    def _recompute_postact(preact, activation):
+        """Recompute postact from preact using the activation function (no GEMM)."""
+        return act_to_pytorch_fn_map[activation](preact)
+
+    @classmethod
+    @custom_fwd(device_type="cuda")
+    def forward(cls, ctx, x, weight1, weight2, activation, fuse_grad_accum=False):
+        ctx.weight_dtype = weight1.dtype
+        ctx.fuse_grad_accum = fuse_grad_accum
+        ctx.activation = activation
+        weight1_og, weight2_og = weight1, weight2
+        x, weight1, weight2 = linear_fwd_convert_type(x, weight1, weight2)
+        batch_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        _preact, postact = cls.matmul_fwd_act(x_flat, weight1.T, activation=activation)
+        out = cls.matmul_fwd(postact, weight2.T)
+        # Save only x and weights — no preact (the whole point of recompute)
+        needs_input_grad = ctx.needs_input_grad
+        any_grad = needs_input_grad[0] or needs_input_grad[1] or needs_input_grad[2]
+        need_dact = needs_input_grad[0] or needs_input_grad[1]  # gemm_dact for dpreact
+        saved_x = x if any_grad else None  # recompute preact = x @ W1.T
+        saved_w1 = weight1 if any_grad else None  # recompute + dx
+        saved_w2 = weight2 if need_dact else None  # only gemm_dact needs W2
+        ctx.save_for_backward(
+            saved_x,
+            saved_w1,
+            saved_w2,
+            weight1_og if fuse_grad_accum else None,
+            weight2_og if fuse_grad_accum else None,
+        )
+        return out.reshape(*batch_shape, out.shape[-1])
+
+    @classmethod
+    @custom_bwd(device_type="cuda")
+    def backward(cls, ctx, dout):
+        x, weight1, weight2, weight1_og, weight2_og = ctx.saved_tensors
+        batch_shape = dout.shape[:-1]
+        dout = dout.reshape(-1, dout.shape[-1]).contiguous()
+        # Recompute preact = x @ W1.T (the extra matmul we trade for memory)
+        x_flat = x.reshape(-1, x.shape[-1]) if x is not None else None
+        need_dact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+        any_grad = need_dact or ctx.needs_input_grad[2]
+        if need_dact:
+            preact = cls.matmul_fwd(x_flat, weight1.T)
+            # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
+            dpreact, postact = cls.matmul_bwd_dact(dout, weight2, preact, activation=ctx.activation)
+        elif any_grad:
+            # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
+            preact = cls.matmul_fwd(x_flat, weight1.T)
+            postact = cls._recompute_postact(preact, ctx.activation)
+            dpreact = None
+        else:
+            dpreact, postact = None, None
+        # dW2 = dout.T @ postact
+        dweight2 = _compute_weight_grad(
+            ctx,
+            dout,
+            postact,
+            weight2_og,
+            cls.matmul_bwd_dw,
+            cls.matmul_bwd_dw_inplace,
+            ctx.needs_input_grad[2],
+        )
+        # dx = dpreact @ W1
+        if ctx.needs_input_grad[0]:
+            dx = cls.matmul_bwd_dx(dpreact, weight1)
+            dx = dx.reshape(*batch_shape, dx.shape[-1])
+        else:
+            dx = None
+        # dW1 = dpreact.T @ x
+        dweight1 = _compute_weight_grad(
+            ctx,
+            dpreact,
+            x_flat,
+            weight1_og,
+            cls.matmul_bwd_dw,
+            cls.matmul_bwd_dw_inplace,
+            ctx.needs_input_grad[1],
+        )
+        return dx, dweight1, dweight2, None, None
+
+
+class MLPRecomputeUntunedFunc(MLPRecomputeFunc):
+    matmul_fwd = partial(gemm, tuned=False)
+    matmul_fwd_act = partial(gemm_act, tuned=False)
+    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+class MLPGatedRecomputeFunc(MLPRecomputeFunc):
+    """Gated activation variant (swiglu, reglu, etc.)."""
+
+    matmul_fwd_act = gemm_gated
+    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True)
+
+    @staticmethod
+    def _recompute_postact(preact, activation):
+        return gated_to_pytorch_fn_map[activation](preact[..., ::2], preact[..., 1::2])
+
+
+class MLPGatedRecomputeUntunedFunc(MLPGatedRecomputeFunc):
+    matmul_fwd = partial(gemm, tuned=False)
+    matmul_fwd_act = partial(gemm_gated, tuned=False)
+    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+def _compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn, needs_grad):
+    if not needs_grad:
+        return None
+    x = x.reshape(-1, x.shape[-1])
+    if not ctx.fuse_grad_accum or weight_og.grad is None or torch.compiler.is_compiling():
+        return matmul_fn(dout.T, x, out_dtype=ctx.weight_dtype)
+    else:
+        matmul_inplace_fn(dout.T, x, weight_og.grad)
+        dweight = weight_og.grad
+        weight_og.grad = None
+        return dweight
+
+
+def mlp_func(
+    x, weight1, weight2, activation: str, fuse_grad_accum=False, tuned=True, recompute=False
+):
+    if recompute:
+        gated = activation in gate_fn_map
+        if gated:
+            cls = MLPGatedRecomputeFunc if tuned else MLPGatedRecomputeUntunedFunc
+        else:
+            cls = MLPRecomputeFunc if tuned else MLPRecomputeUntunedFunc
+        return cls.apply(x, weight1, weight2, activation, fuse_grad_accum)
     gated = activation in gate_fn_map
     fc1_fn = linear_gated_func if gated else linear_act_func
     fc2_fn = gated_linear_func if gated else act_linear_func
@@ -61,6 +226,7 @@ class MLP(nn.Module):
         dtype=None,
         fuse_grad_accum: bool = False,
         tuned: bool = True,
+        recompute: bool = False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -81,6 +247,7 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
         self.fuse_grad_accum = fuse_grad_accum
         self.tuned = tuned
+        self.recompute = recompute
 
     def forward(self, input: Tensor) -> Tensor:
         if (
@@ -99,6 +266,7 @@ class MLP(nn.Module):
                 activation=self.activation,
                 fuse_grad_accum=self.fuse_grad_accum,
                 tuned=self.tuned,
+                recompute=self.recompute,
             )
         else:
             y = self.fc1(input)

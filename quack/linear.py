@@ -10,6 +10,16 @@ from torch.amp import custom_fwd, custom_bwd
 
 from quack.gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
 from quack.gemm_interface import gemm_gated, gemm_dgated
+from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+
+
+def _ensure_contiguous(t):
+    """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
+    (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
+    """
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    return t if t.stride(-1) == 1 else t.contiguous()
 
 
 def linear_fwd_convert_type(*tensors):
@@ -89,7 +99,7 @@ class LinearFunc(torch.autograd.Function):
         """
         x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
         batch_shape = dout.shape[:-1]
-        dout = dout.reshape(-1, dout.shape[-1])
+        dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
         dbias = (
             dout.sum(0, dtype=ctx.bias_dtype)
             if ctx.bias_dtype is not None and ctx.needs_input_grad[2]
@@ -169,6 +179,11 @@ def linear_act_func(
 class DActLinearFunc(LinearFunc):
     matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
 
+    @staticmethod
+    def _recompute_postact(preact, activation):
+        """Recompute postact from preact using the activation function (no GEMM)."""
+        return act_to_pytorch_fn_map[activation](preact)
+
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
     @custom_fwd(device_type="cuda")
@@ -186,9 +201,14 @@ class DActLinearFunc(LinearFunc):
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
         out = cls.matmul_fwd_fn(x, weight.T)
-        # Store preact instead of x, we will recompute x in the backward pass
+        # Store preact instead of x, we will recompute x (postact) in backward.
+        # dpreact needs gemm_dact(dout, weight, preact) → needs both weight and preact.
+        # dweight needs postact: if dpreact is also needed, postact comes from gemm_dact;
+        # otherwise we can recompute postact = act(preact) cheaply without weight.
+        need_preact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+        need_weight = ctx.needs_input_grad[0]  # only gemm_dact needs weight
         linear_fwd_postprocess(
-            ctx, preact, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
+            ctx, preact, weight, weight_og, needs_x_w_grad=(need_weight, need_preact)
         )
         ctx.activation = activation
         return out.reshape(*batch_shape, out.shape[-1])
@@ -202,11 +222,17 @@ class DActLinearFunc(LinearFunc):
         # weight_og is None if not ctx.fuse_grad_accum
         preact, weight, weight_og = ctx.saved_tensors
         batch_shape = dout.shape[:-1]
-        dout = dout.reshape(-1, dout.shape[-1])
-        preact = preact.reshape(-1, preact.shape[-1])
+        dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
         if ctx.needs_input_grad[0]:
+            # Need dpreact: gemm_dact(dout, weight, preact) → (dpreact, postact)
+            preact = preact.reshape(-1, preact.shape[-1])
             assert weight is not None
             dpreact, x = cls.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
+        elif ctx.needs_input_grad[1]:
+            # Only need dweight: recompute postact from preact cheaply (no GEMM needed)
+            preact = preact.reshape(-1, preact.shape[-1])
+            x = cls._recompute_postact(preact, ctx.activation)
+            dpreact = None
         else:
             dpreact, x = None, None
         dpreact = dpreact.reshape(*batch_shape, dpreact.shape[-1]) if dpreact is not None else None
@@ -251,8 +277,12 @@ def linear_gated_func(
 class DGatedLinearFunc(DActLinearFunc):
     matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True)
 
+    @staticmethod
+    def _recompute_postact(preact, activation):
+        return gated_to_pytorch_fn_map[activation](preact[..., ::2], preact[..., 1::2])
 
-class DGatedLinearUntunedFunc(DActLinearFunc):
+
+class DGatedLinearUntunedFunc(DGatedLinearFunc):
     # Passing in tuned=False to disable tuning at runtime
     matmul_fwd_fn = partial(gemm, tuned=False)
     matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)

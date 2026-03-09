@@ -4,7 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.linear import linear_func, linear_act_func
+from quack.linear import linear_func, linear_act_func, act_linear_func, gated_linear_func
+from quack.linear import linear_gated_func
 from quack.gemm_interface import (
     gemm_add_inplace,
     gemm_dact,
@@ -247,3 +248,77 @@ def test_gemm_dgated(n, k, has_colvec_scale, colvec_reduce, input_dtype, activat
         assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
             colvec_reduce_pt - colvec_reduce_ref
         ).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
+@pytest.mark.parametrize("freeze", ["x", "weight"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_dact_linear_partial_grad(input_dtype, freeze, activation):
+    """DActLinearFunc / DGatedLinearFunc backward with one input frozen.
+
+    Regression test: gemm_dact recomputes postact from preact, which is needed for
+    both dpreact and dweight. Previously, freezing weight caused preact to not be saved.
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, in_features, out_features = 256, 512, 512
+    gated = activation in ("swiglu", "swiglu_oai", "reglu", "geglu", "glu")
+    freeze_x = freeze == "x"
+    x = torch.randn(m, in_features, device=device, dtype=input_dtype, requires_grad=not freeze_x)
+    w1_out = 2 * out_features if gated else out_features
+    w1 = (
+        torch.randn(w1_out, in_features, device=device, dtype=input_dtype) / math.sqrt(in_features)
+    ).requires_grad_(not freeze_x)
+    w2 = (
+        torch.randn(in_features, out_features, device=device, dtype=input_dtype)
+        / math.sqrt(out_features)
+    ).requires_grad_(freeze_x)
+    # fc1 forward
+    fc1_fn = linear_gated_func if gated else linear_act_func
+    preact, postact = fc1_fn(x, w1, activation, store_preact=True, tuned=False)
+    # fc2 forward + backward
+    fc2_fn = gated_linear_func if gated else act_linear_func
+    out = fc2_fn(preact, w2, postact, activation=activation, tuned=False)
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    if freeze_x:
+        # x and w1 frozen, only w2 gets grad
+        assert x.grad is None
+        assert w1.grad is None
+        assert w2.grad is not None
+    else:
+        # w2 frozen, x and w1 get grad
+        assert x.grad is not None
+        assert w1.grad is not None
+        assert w2.grad is None
+
+
+@pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
+@pytest.mark.parametrize("freeze", ["x", "weight"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_linear_act_partial_grad(input_dtype, freeze, activation):
+    """LinearActFunc / LinearGatedFunc backward with one input frozen.
+
+    Regression test: ensure gradient flows correctly when x or weight is frozen.
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, in_features, out_features = 256, 512, 512
+    gated = activation in ("swiglu", "swiglu_oai", "reglu", "geglu", "glu")
+    freeze_x = freeze == "x"
+    x = torch.randn(m, in_features, device=device, dtype=input_dtype, requires_grad=not freeze_x)
+    fc1_out = 2 * out_features if gated else out_features
+    w = (
+        torch.randn(fc1_out, in_features, device=device, dtype=input_dtype) / math.sqrt(in_features)
+    ).requires_grad_(freeze_x)
+    fc1_fn = linear_gated_func if gated else linear_act_func
+    preact, postact = fc1_fn(x, w, activation, store_preact=True, tuned=False)
+    # preact is the differentiable output; postact is marked non-differentiable
+    dout = torch.randn_like(preact)
+    preact.backward(dout)
+    if freeze_x:
+        assert x.grad is None
+        assert w.grad is not None
+    else:
+        assert x.grad is not None
+        assert w.grad is None
