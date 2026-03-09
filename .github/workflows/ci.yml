@@ -24,7 +24,12 @@ jobs:
 
   test:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [h100, b300]
+    runs-on: [self-hosted, '${{ matrix.gpu }}']
+    name: test (${{ matrix.gpu }})
     steps:
       - uses: actions/checkout@v4
       - name: Compile and run tests
