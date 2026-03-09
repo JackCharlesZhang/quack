@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APPTAINER_IMAGE: ~/attention_26.03.07.sif
+  APPTAINER_FLAGS: --nv --writable-tmpfs
+  QUACK_CACHE_DIR: $HOME/.quack_cache
+
+jobs:
+  lint:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ruff check
+        run: apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff check quack/ tests/
+      - name: Ruff format
+        run: apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff format --check quack/ tests/
+
+  test:
+    runs-on: self-hosted
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install package and run tests
+        run: |
+          apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE bash -c '
+            pip install -e ".[dev]" &&
+            pytest tests/ --compile-only -n 16 --timeout=600 &&
+            pytest tests/ -n 8 --timeout=600
+          '
+        timeout-minutes: 15

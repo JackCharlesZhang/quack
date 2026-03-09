@@ -17,6 +17,8 @@ dependencies = [
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.1"]
 dev = [
     "pre-commit",
+    "pytest",
+    "pytest-xdist",
     "ruff",
 ]
 
