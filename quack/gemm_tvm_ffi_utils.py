@@ -188,6 +188,8 @@ def compile_gemm_kernel(
     scheduler_args,
     varlen_args,
     post_init=None,
+    mSFA=None,
+    mSFB=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] == 9:
@@ -196,6 +198,7 @@ def compile_gemm_kernel(
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    sf_args = () if device_capacity[0] == 9 else (mSFA, mSFB)
     return cute.compile(
         gemm_obj,
         mA,
@@ -206,5 +209,6 @@ def compile_gemm_kernel(
         scheduler_args,
         varlen_args,
         stream,
+        *sf_args,
         options="--enable-tvm-ffi",
     )
