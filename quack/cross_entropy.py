@@ -25,15 +25,15 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 class CrossEntropy(ReductionBase):
     def __init__(self, dtype: Type[cutlass.Numeric], N: int, online_softmax: bool = True):
+        self.online_softmax = online_softmax
         # 2 stages: 1 for max, 1 for sum
         super().__init__(
             dtype,
             N,
-            stage=2 if not online_softmax else 1,
-            reduction_dtype=Float32 if not online_softmax else Int64,
+            stage=2 if not self.online_softmax else 1,
+            reduction_dtype=Float32 if not self.online_softmax else Int64,
         )
-        self.online_softmax = online_softmax
-        self.reload_from = None if N <= 16384 or online_softmax else "smem"
+        self.reload_from = None if N <= 16384 or self.online_softmax else "smem"
 
     def _threads_per_row(self):
         N = self.N
