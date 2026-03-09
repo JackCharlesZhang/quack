@@ -72,7 +72,6 @@ When iterating on kernel code, run a small subset of tests (1-3 parametrizations
 ## Code Style
 
 - Favor concise, self-explanatory code
-- Avoid unnecessary comments
 - Avoid unnecessary line breaks
 - Empty lines should not have any space
 - Line length: 100 (ruff)
