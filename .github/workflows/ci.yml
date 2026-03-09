@@ -25,16 +25,14 @@ jobs:
   test:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
-    env:
-      APPTAINER_IMAGE: $HOME/attention_26.03.07.sif
-      QUACK_CACHE_DIR: $HOME/.quack_cache
     steps:
       - uses: actions/checkout@v4
       - name: Install package and run tests
         run: |
-          apptainer exec --nv --writable-tmpfs $APPTAINER_IMAGE bash -c '
-            pip install -e ".[dev]" &&
+          apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
+            export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
+            pip install -e '.[dev]' &&
             pytest tests/ --compile-only -n 16 --timeout=600 &&
             pytest tests/ -n 8 --timeout=600
-          '
+          "
         timeout-minutes: 15
