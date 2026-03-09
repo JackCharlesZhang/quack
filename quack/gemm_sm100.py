@@ -209,6 +209,11 @@ class GemmSm100(GemmSm90):
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         self.num_epi_warps = len(self.epilog_warp_id)
+        # Register reallocation for gather_A (3 warp groups, 504 regs total, 168 per WG default).
+        # Give epilogue WG more registers to avoid spilling in heavy epilogues (e.g. colvec_reduce).
+        # Without gather_A there are only 2 WGs (512 total, 256 per WG = max), no reallocation needed.
+        self.num_regs_other = 120
+        self.num_regs_epi = 256
         self.threads_per_cta = cute.arch.WARP_SIZE * (
             self.num_ab_load_warps
             + len(
@@ -903,6 +908,8 @@ class GemmSm100(GemmSm90):
 
         # Specialized AB load warps
         if warp_idx == self.ab_load_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
             is_tma_warp = True
             # Compute multicast mask for A/B buffer full
             block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
@@ -1063,6 +1070,7 @@ class GemmSm100(GemmSm90):
                 warp_idx >= self.ab_load_warp_id + 1
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
                 # Persistent tile scheduling loop
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
@@ -1136,6 +1144,8 @@ class GemmSm100(GemmSm90):
         # Specialized scheduler warp. Will also prefetch A indices if gatherA
         if const_expr(self.is_persistent or self.gather_A):
             if warp_idx == self.scheduler_warp_id:
+                if const_expr(self.gather_A):
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
                 is_scheduler_warp = True
                 if const_expr(cute.size(cluster_layout_vmnk) > 1):
                     is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
@@ -1220,6 +1230,8 @@ class GemmSm100(GemmSm90):
         # Specialized TMA epi load warp
         if const_expr(mC_mnl is not None):
             if warp_idx == self.epi_load_warp_id:
+                if const_expr(self.gather_A):
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
@@ -1258,6 +1270,8 @@ class GemmSm100(GemmSm90):
 
         # Specialized MMA warp
         if warp_idx == self.mma_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Retrieving tensor memory ptr and make accumulator tensor
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1365,6 +1379,8 @@ class GemmSm100(GemmSm90):
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_increase(self.num_regs_epi)
             # Alloc tensor memory buffer
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
