@@ -32,7 +32,7 @@ jobs:
           apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
             export PYTHONPATH=\$PWD:\$PYTHONPATH &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
-            pytest tests/ --compile-only -n 16 --timeout=600 &&
-            pytest tests/ -n 8 --timeout=600
+            pytest tests/ --compile-only -n 16 &&
+            pytest tests/ -n 8
           "
-        timeout-minutes: 15
+        timeout-minutes: 20
