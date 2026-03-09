@@ -25,7 +25,6 @@ jobs:
   test:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
-    needs: lint
     env:
       APPTAINER_IMAGE: $HOME/attention_26.03.07.sif
       QUACK_CACHE_DIR: $HOME/.quack_cache

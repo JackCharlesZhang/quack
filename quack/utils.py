@@ -137,7 +137,7 @@ def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
             )
         )
     return Float32(
-            nvvm.fmin(
+        nvvm.fmin(
             Float32(a).ir_value(loc=loc, ip=ip),
             Float32(b).ir_value(loc=loc, ip=ip),
             loc=loc,

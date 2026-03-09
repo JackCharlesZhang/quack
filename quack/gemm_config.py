@@ -79,7 +79,5 @@ def get_all_configs(
             GemmConfigCls(
                 tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8
             )
-            for (m, n, (cm, cn)), sab in itertools.product(
-                tile_mn_cluster_vals, swap_ab_vals
-            )
+            for (m, n, (cm, cn)), sab in itertools.product(tile_mn_cluster_vals, swap_ab_vals)
         ]
