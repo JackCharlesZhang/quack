@@ -38,7 +38,7 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
-import quack.activation
+from quack.activation import act_fn_map, gate_fn_map
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
@@ -333,14 +333,6 @@ class GemmActSm100(GemmActMixin, GemmSm100):
     pass
 
 
-act_fn_map = {
-    None: None,
-    "relu": quack.activation.relu,
-    "relu_sq": quack.activation.relu_sq,
-    "gelu_tanh_approx": quack.activation.gelu_tanh_approx,
-}
-
-
 class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
@@ -449,15 +441,6 @@ class GemmGatedSm90(GemmGatedMixin, GemmSm90):
 
 class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
-
-
-gate_fn_map = {
-    "swiglu": quack.activation.swiglu,
-    "swiglu_oai": quack.activation.swiglu_oai,
-    "reglu": quack.activation.reglu,
-    "geglu": quack.activation.geglu,
-    "glu": quack.activation.glu,
-}
 
 
 @lru_cache(maxsize=None)

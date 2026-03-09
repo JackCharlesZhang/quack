@@ -7,11 +7,12 @@ from quack.mlp import MLP
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", ["gelu_tanh_approx", "relu", "swiglu", "reglu", "geglu"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_features", [512])
 @pytest.mark.parametrize("in_features", [512])
-def test_mlp(in_features, hidden_features, dtype, activation):
+def test_mlp(in_features, hidden_features, dtype, activation, use_compile):
     device = "cuda"
     torch.random.manual_seed(0)
     batch = 256
@@ -22,13 +23,15 @@ def test_mlp(in_features, hidden_features, dtype, activation):
     if gated:
         assert mlp.fc1.out_features == 2 * hidden_features
         assert mlp.fc2.in_features == hidden_features
+    w1_ref = mlp.fc1.weight.detach().clone().float()
+    w2_ref = mlp.fc2.weight.detach().clone().float()
+    if use_compile:
+        mlp = torch.compile(mlp, fullgraph=True)
     x = torch.randn(batch, in_features, device=device, dtype=dtype, requires_grad=True)
     out = mlp(x)
     assert out.shape == (batch, in_features)
     # Reference
     x_ref = x.detach().clone().float().requires_grad_(True)
-    w1_ref = mlp.fc1.weight.detach().clone().float()
-    w2_ref = mlp.fc2.weight.detach().clone().float()
     y_ref = F.linear(x_ref, w1_ref)
     if gated:
         y_ref = gated_to_pytorch_fn_map[activation](y_ref[..., ::2], y_ref[..., 1::2])
@@ -55,7 +58,7 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     w1_ref = mlp.fc1.weight.detach().clone().float()
     w2_ref = mlp.fc2.weight.detach().clone().float()
     if use_compile:
-        mlp = torch.compile(mlp)
+        mlp = torch.compile(mlp, fullgraph=True)
     x = torch.randn(256, 512, device=device, dtype=dtype, requires_grad=True)
     out = mlp(x)
     out.sum().backward()
@@ -73,9 +76,10 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     assert (x.grad.float() - x_ref.grad).abs().max() < 1e-2
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_mlp_recompute(dtype, activation):
+def test_mlp_recompute(dtype, activation, use_compile):
     """recompute=True should match normal mode and float32 reference."""
     device = "cuda"
     torch.random.manual_seed(0)
@@ -85,7 +89,8 @@ def test_mlp_recompute(dtype, activation):
     x = torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=True)
     dout = torch.randn(batch, dim, device=device, dtype=dtype)
     # Standard forward/backward
-    out_std = mlp(x)
+    mlp_std = torch.compile(mlp, fullgraph=True) if use_compile else mlp
+    out_std = mlp_std(x)
     out_std.backward(dout)
     dx_std = x.grad.clone()
     dw1_std = mlp.fc1.weight.grad.clone()
@@ -94,7 +99,8 @@ def test_mlp_recompute(dtype, activation):
     x.grad = None
     mlp.zero_grad()
     mlp.recompute = True
-    out_rec = mlp(x)
+    mlp_rec = torch.compile(mlp, fullgraph=True) if use_compile else mlp
+    out_rec = mlp_rec(x)
     out_rec.backward(dout)
     dx_rec = x.grad.clone()
     dw1_rec = mlp.fc1.weight.grad.clone()

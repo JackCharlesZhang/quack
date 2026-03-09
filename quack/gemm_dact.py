@@ -41,7 +41,7 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.varlen_utils import VarlenManager
 from quack import copy_utils
 import quack.layout_utils as layout_utils
-import quack.activation
+from quack.activation import dact_fn_map, dgate_fn_map
 
 
 class GemmDActMixin(GemmActMixin):
@@ -92,14 +92,6 @@ class GemmDActSm90(GemmDActMixin, GemmSm90):
 
 class GemmDActSm100(GemmDActMixin, GemmSm100):
     pass
-
-
-dact_fn_map = {
-    None: None,
-    "relu": quack.activation.drelu,
-    "relu_sq": quack.activation.drelu_sq,
-    "gelu_tanh_approx": quack.activation.dgelu_tanh_approx,
-}
 
 
 class GemmDGatedMixin(GemmActMixin):
@@ -412,15 +404,6 @@ class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
 
 class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
     pass
-
-
-dgate_fn_map = {
-    "swiglu": quack.activation.dswiglu,
-    "swiglu_oai": quack.activation.dswiglu_oai,
-    "reglu": quack.activation.dreglu,
-    "geglu": quack.activation.dgeglu,
-    "glu": quack.activation.dglu,
-}
 
 
 @lru_cache(maxsize=None)

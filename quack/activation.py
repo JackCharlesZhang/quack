@@ -530,3 +530,39 @@ def dgeglu(
         dy = cute.arch.mul_packed_f32x2(gelu_x, dout)
         geglu_out = cute.arch.mul_packed_f32x2(gelu_x, y)
         return dx, dy, geglu_out
+
+
+# ============================================================================
+# Activation name -> function maps
+# ============================================================================
+
+act_fn_map = {
+    None: None,
+    "silu": silu,
+    "relu": relu,
+    "relu_sq": relu_sq,
+    "gelu_tanh_approx": gelu_tanh_approx,
+}
+
+dact_fn_map = {
+    None: None,
+    "relu": drelu,
+    "relu_sq": drelu_sq,
+    "gelu_tanh_approx": dgelu_tanh_approx,
+}
+
+gate_fn_map = {
+    "swiglu": swiglu,
+    "swiglu_oai": swiglu_oai,
+    "reglu": reglu,
+    "geglu": geglu,
+    "glu": glu,
+}
+
+dgate_fn_map = {
+    "swiglu": dswiglu,
+    "swiglu_oai": dswiglu_oai,
+    "reglu": dreglu,
+    "geglu": dgeglu,
+    "glu": dglu,
+}

@@ -12,7 +12,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
-from quack.gemm_act import GemmActMixin, act_fn_map
+from quack.activation import act_fn_map
+from quack.gemm_act import GemmActMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_tvm_ffi_utils import (

@@ -5,14 +5,14 @@ from functools import partial
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.amp import custom_fwd, custom_bwd
 
 from einops import rearrange
 
 from quack.linear import linear_act_func, act_linear_func
 from quack.linear import linear_gated_func, gated_linear_func
 from quack.linear import linear_fwd_convert_type
-from quack.gemm_act import gate_fn_map
+from quack.linear import _recompute_act_postact, _recompute_gated_postact
+from quack.activation import gate_fn_map
 from quack.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
@@ -36,6 +36,41 @@ Activation = Literal[
 ]
 
 
+# --- Ops bundles for MLP recompute variants ---
+
+
+class _MLPOps:
+    matmul_fwd = gemm
+    matmul_fwd_act = gemm_act
+    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
+    recompute_postact = staticmethod(_recompute_act_postact)
+
+
+class _MLPUntunedOps:
+    matmul_fwd = partial(gemm, tuned=False)
+    matmul_fwd_act = partial(gemm_act, tuned=False)
+    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+    recompute_postact = staticmethod(_recompute_act_postact)
+
+
+class _MLPGatedOps(_MLPOps):
+    matmul_fwd_act = gemm_gated
+    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True)
+    recompute_postact = staticmethod(_recompute_gated_postact)
+
+
+class _MLPGatedUntunedOps(_MLPUntunedOps):
+    matmul_fwd_act = partial(gemm_gated, tuned=False)
+    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    recompute_postact = staticmethod(_recompute_gated_postact)
+
+
 class MLPRecomputeFunc(torch.autograd.Function):
     """MLP with activation recomputation: saves only x (not preact) to reduce memory.
 
@@ -44,127 +79,90 @@ class MLPRecomputeFunc(torch.autograd.Function):
       - Saves: batch * 2 * hidden * dtype_size bytes of activation memory
       - Costs: one extra GEMM (x @ W1.T) during backward
 
-    This is the non-gated variant (gemm_act/gemm_dact). For gated activations
-    (swiglu, reglu, etc.), use MLPGatedRecomputeFunc.
+    Ops class selects between non-gated (gemm_act/gemm_dact) and gated (gemm_gated/gemm_dgated)
+    variants, as well as tuned/untuned.
     """
 
-    matmul_fwd = gemm
-    matmul_fwd_act = gemm_act
-    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
-
     @staticmethod
-    def _recompute_postact(preact, activation):
-        """Recompute postact from preact using the activation function (no GEMM)."""
-        return act_to_pytorch_fn_map[activation](preact)
-
-    @classmethod
-    @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight1, weight2, activation, fuse_grad_accum=False):
-        ctx.weight_dtype = weight1.dtype
-        ctx.fuse_grad_accum = fuse_grad_accum
-        ctx.activation = activation
-        weight1_og, weight2_og = weight1, weight2
+    def forward(ctx, x, weight1, weight2, activation, fuse_grad_accum, ops):
         x, weight1, weight2 = linear_fwd_convert_type(x, weight1, weight2)
-        batch_shape = x.shape[:-1]
-        x_flat = x.reshape(-1, x.shape[-1])
-        _preact, postact = cls.matmul_fwd_act(x_flat, weight1.T, activation=activation)
-        out = cls.matmul_fwd(postact, weight2.T)
-        # Save only x and weights — no preact (the whole point of recompute)
-        needs_input_grad = ctx.needs_input_grad
-        any_grad = needs_input_grad[0] or needs_input_grad[1] or needs_input_grad[2]
-        need_dact = needs_input_grad[0] or needs_input_grad[1]  # gemm_dact for dpreact
-        saved_x = x if any_grad else None  # recompute preact = x @ W1.T
-        saved_w1 = weight1 if any_grad else None  # recompute + dx
-        saved_w2 = weight2 if need_dact else None  # only gemm_dact needs W2
-        ctx.save_for_backward(
-            saved_x,
-            saved_w1,
-            saved_w2,
-            weight1_og if fuse_grad_accum else None,
-            weight2_og if fuse_grad_accum else None,
-        )
-        return out.reshape(*batch_shape, out.shape[-1])
-
-    @classmethod
-    @custom_bwd(device_type="cuda")
-    def backward(cls, ctx, dout):
-        x, weight1, weight2, weight1_og, weight2_og = ctx.saved_tensors
-        batch_shape = dout.shape[:-1]
-        dout = dout.reshape(-1, dout.shape[-1]).contiguous()
-        # Recompute preact = x @ W1.T (the extra matmul we trade for memory)
-        x_flat = x.reshape(-1, x.shape[-1]) if x is not None else None
-        need_dact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
-        any_grad = need_dact or ctx.needs_input_grad[2]
-        if need_dact:
-            preact = cls.matmul_fwd(x_flat, weight1.T)
-            # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
-            dpreact, postact = cls.matmul_bwd_dact(dout, weight2, preact, activation=ctx.activation)
-        elif any_grad:
-            # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
-            preact = cls.matmul_fwd(x_flat, weight1.T)
-            postact = cls._recompute_postact(preact, ctx.activation)
-            dpreact = None
-        else:
-            dpreact, postact = None, None
-        # dW2 = dout.T @ postact
-        dweight2 = _compute_weight_grad(
-            ctx,
-            dout,
-            postact,
-            weight2_og,
-            cls.matmul_bwd_dw,
-            cls.matmul_bwd_dw_inplace,
-            ctx.needs_input_grad[2],
-        )
-        # dx = dpreact @ W1
-        if ctx.needs_input_grad[0]:
-            dx = cls.matmul_bwd_dx(dpreact, weight1)
-            dx = dx.reshape(*batch_shape, dx.shape[-1])
-        else:
-            dx = None
-        # dW1 = dpreact.T @ x
-        dweight1 = _compute_weight_grad(
-            ctx,
-            dpreact,
-            x_flat,
-            weight1_og,
-            cls.matmul_bwd_dw,
-            cls.matmul_bwd_dw_inplace,
-            ctx.needs_input_grad[1],
-        )
-        return dx, dweight1, dweight2, None, None
-
-
-class MLPRecomputeUntunedFunc(MLPRecomputeFunc):
-    matmul_fwd = partial(gemm, tuned=False)
-    matmul_fwd_act = partial(gemm_act, tuned=False)
-    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
-
-
-class MLPGatedRecomputeFunc(MLPRecomputeFunc):
-    """Gated activation variant (swiglu, reglu, etc.)."""
-
-    matmul_fwd_act = gemm_gated
-    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True)
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx.weight_dtype = weight1.dtype
+            ctx.fuse_grad_accum = fuse_grad_accum
+            ctx.activation = activation
+            ctx.ops = ops
+            weight1_og, weight2_og = weight1, weight2
+            batch_shape = x.shape[:-1]
+            x_flat = x.reshape(-1, x.shape[-1])
+            _preact, postact = ops.matmul_fwd_act(x_flat, weight1.T, activation=activation)
+            out = ops.matmul_fwd(postact, weight2.T)
+            # Save only x and weights — no preact (the whole point of recompute)
+            needs_input_grad = ctx.needs_input_grad
+            any_grad = needs_input_grad[0] or needs_input_grad[1] or needs_input_grad[2]
+            need_dact = needs_input_grad[0] or needs_input_grad[1]  # gemm_dact for dpreact
+            saved_x = x if any_grad else None  # recompute preact = x @ W1.T
+            saved_w1 = weight1 if any_grad else None  # recompute + dx
+            saved_w2 = weight2 if need_dact else None  # only gemm_dact needs W2
+            ctx.save_for_backward(
+                saved_x,
+                saved_w1,
+                saved_w2,
+                weight1_og if fuse_grad_accum else None,
+                weight2_og if fuse_grad_accum else None,
+            )
+            return out.reshape(*batch_shape, out.shape[-1])
 
     @staticmethod
-    def _recompute_postact(preact, activation):
-        return gated_to_pytorch_fn_map[activation](preact[..., ::2], preact[..., 1::2])
-
-
-class MLPGatedRecomputeUntunedFunc(MLPGatedRecomputeFunc):
-    matmul_fwd = partial(gemm, tuned=False)
-    matmul_fwd_act = partial(gemm_gated, tuned=False)
-    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+    def backward(ctx, dout):
+        with torch.amp.autocast("cuda", enabled=False):
+            ops = ctx.ops
+            x, weight1, weight2, weight1_og, weight2_og = ctx.saved_tensors
+            batch_shape = dout.shape[:-1]
+            dout = dout.reshape(-1, dout.shape[-1]).contiguous()
+            # Recompute preact = x @ W1.T (the extra matmul we trade for memory)
+            x_flat = x.reshape(-1, x.shape[-1]) if x is not None else None
+            need_dact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+            any_grad = need_dact or ctx.needs_input_grad[2]
+            if need_dact:
+                preact = ops.matmul_fwd(x_flat, weight1.T)
+                # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
+                dpreact, postact = ops.matmul_bwd_dact(
+                    dout, weight2, preact, activation=ctx.activation
+                )
+            elif any_grad:
+                # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
+                preact = ops.matmul_fwd(x_flat, weight1.T)
+                postact = ops.recompute_postact(preact, ctx.activation)
+                dpreact = None
+            else:
+                dpreact, postact = None, None
+            # dW2 = dout.T @ postact
+            dweight2 = _compute_weight_grad(
+                ctx,
+                dout,
+                postact,
+                weight2_og,
+                ops.matmul_bwd_dw,
+                ops.matmul_bwd_dw_inplace,
+                ctx.needs_input_grad[2],
+            )
+            # dx = dpreact @ W1
+            if ctx.needs_input_grad[0]:
+                dx = ops.matmul_bwd_dx(dpreact, weight1)
+                dx = dx.reshape(*batch_shape, dx.shape[-1])
+            else:
+                dx = None
+            # dW1 = dpreact.T @ x
+            dweight1 = _compute_weight_grad(
+                ctx,
+                dpreact,
+                x_flat,
+                weight1_og,
+                ops.matmul_bwd_dw,
+                ops.matmul_bwd_dw_inplace,
+                ctx.needs_input_grad[1],
+            )
+            return dx, dweight1, dweight2, None, None, None
 
 
 def _compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn, needs_grad):
@@ -186,10 +184,10 @@ def mlp_func(
     if recompute:
         gated = activation in gate_fn_map
         if gated:
-            cls = MLPGatedRecomputeFunc if tuned else MLPGatedRecomputeUntunedFunc
+            ops = _MLPGatedOps if tuned else _MLPGatedUntunedOps
         else:
-            cls = MLPRecomputeFunc if tuned else MLPRecomputeUntunedFunc
-        return cls.apply(x, weight1, weight2, activation, fuse_grad_accum)
+            ops = _MLPOps if tuned else _MLPUntunedOps
+        return MLPRecomputeFunc.apply(x, weight1, weight2, activation, fuse_grad_accum, ops)
     gated = activation in gate_fn_map
     fc1_fn = linear_gated_func if gated else linear_act_func
     fc2_fn = gated_linear_func if gated else act_linear_func

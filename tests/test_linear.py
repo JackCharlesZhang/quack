@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func, act_linear_func, gated_linear_func
 from quack.linear import linear_gated_func
+from quack.mlp import mlp_func
 from quack.gemm_interface import (
     gemm_add_inplace,
     gemm_dact,
@@ -322,3 +323,113 @@ def test_linear_act_partial_grad(input_dtype, freeze, activation):
     else:
         assert x.grad is not None
         assert w.grad is None
+
+
+@pytest.mark.parametrize(
+    "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
+)
+def test_autocast(fn_name):
+    """Autocast: float32 inputs are cast to bfloat16 for the kernel.
+
+    Regression test for https://github.com/Dao-AILab/quack/issues/54.
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, in_features, out_features = 256, 512, 512
+
+    x = torch.randn(m, in_features, device=device, dtype=torch.float32, requires_grad=True)
+    w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
+    w /= math.sqrt(in_features)
+    w.requires_grad_(True)
+
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        if fn_name == "linear_func":
+            out = linear_func(x, w, tuned=False)
+        elif fn_name == "linear_act_func":
+            out, _postact = linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
+        elif fn_name == "linear_gated_func":
+            w_gated = (
+                torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
+                / math.sqrt(in_features)
+            ).requires_grad_(True)
+            out, _postact = linear_gated_func(x, w_gated, activation="swiglu", tuned=False)
+            w = w_gated  # for grad check below
+        elif fn_name == "mlp_func":
+            w2 = torch.randn(
+                in_features,
+                out_features,
+                device=device,
+                dtype=torch.float32,
+                requires_grad=True,
+            ) / math.sqrt(out_features)
+            out = mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
+
+    assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
+    out.sum().backward()
+    assert x.grad is not None
+    assert w.grad is not None
+
+
+@pytest.mark.parametrize(
+    "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
+)
+def test_autocast_compile(fn_name):
+    """Autocast under torch.compile(fullgraph=True).
+
+    Regression test for https://github.com/Dao-AILab/quack/issues/54.
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, in_features, out_features = 256, 512, 512
+
+    x = torch.randn(m, in_features, device=device, dtype=torch.float32, requires_grad=True)
+    w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
+    w /= math.sqrt(in_features)
+    w.requires_grad_(True)
+
+    if fn_name == "linear_func":
+
+        @torch.compile(fullgraph=True)
+        def fn(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_func(x, w, tuned=False)
+
+        out = fn(x, w)
+    elif fn_name == "linear_act_func":
+
+        @torch.compile(fullgraph=True)
+        def fn(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
+
+        out, _postact = fn(x, w)
+    elif fn_name == "linear_gated_func":
+        w_gated = (
+            torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
+            / math.sqrt(in_features)
+        ).requires_grad_(True)
+
+        @torch.compile(fullgraph=True)
+        def fn(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_gated_func(x, w, activation="swiglu", tuned=False)
+
+        out, _postact = fn(x, w_gated)
+        w = w_gated
+    elif fn_name == "mlp_func":
+        w2 = (
+            torch.randn(in_features, out_features, device=device, dtype=torch.float32)
+            / math.sqrt(out_features)
+        ).requires_grad_(True)
+
+        @torch.compile(fullgraph=True)
+        def fn(x, w, w2):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
+
+        out = fn(x, w, w2)
+
+    assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
+    out.sum().backward()
+    assert x.grad is not None
+    assert w.grad is not None

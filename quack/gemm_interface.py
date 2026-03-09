@@ -1232,7 +1232,7 @@ def gemm_gated_out(
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor?",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1247,10 +1247,10 @@ def gemm_dgated_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> Optional[Tensor]:
+) -> Tensor:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
     fn = gemm_dgated_tuned if tuned else partial(gemm_dgated_tuned.fn, config=None)
-    return fn(
+    result = fn(
         A,
         B,
         PreAct,
@@ -1263,25 +1263,28 @@ def gemm_dgated_out(
         A_idx,
         dynamic_scheduler,
     )
+    if result is None:  # Have to return a tensor, not None, to make torch compile happy
+        return torch.empty(0, device=A.device, dtype=torch.float32)
+    return result
 
 
 @torch.library.register_fake("quack::gemm_dgated_out")
 def gemm_dgated_out_fake(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
-    PreAct: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
-    dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
-    postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: GatedActivation = "swiglu",
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    dx_out: Tensor,
+    postact_out: Tensor,
+    colvec_scale: Optional[Tensor] = None,
+    activation: str = "swiglu",
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    A_idx: Optional[Tensor] = None,
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> Optional[Tensor]:
+) -> Tensor:
     if not colvec_reduce:
-        return None
+        return torch.empty(0, dtype=torch.float32, device=A.device)
     else:
         if cu_seqlens_m is not None:
             total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
