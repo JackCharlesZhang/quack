@@ -17,13 +17,14 @@ env:
 
 jobs:
   lint:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - name: Ruff check
-        run: apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff check quack/ tests/
+        run: /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff check quack/ tests/
       - name: Ruff format
-        run: apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff format --check quack/ tests/
+        run: /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE ruff format --check quack/ tests/
 
   test:
     runs-on: self-hosted
@@ -32,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install package and run tests
         run: |
-          apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE bash -c '
+          /usr/bin/apptainer exec $APPTAINER_FLAGS $APPTAINER_IMAGE bash -c '
             pip install -e ".[dev]" &&
             pytest tests/ --compile-only -n 16 --timeout=600 &&
             pytest tests/ -n 8 --timeout=600
