@@ -210,7 +210,7 @@ class GemmSm100(GemmSm90):
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         self.num_epi_warps = len(self.epilog_warp_id)
         # Register reallocation for gather_A (3 warp groups, 504 regs total, 168 per WG default).
-        # Give epilogue WG more registers to avoid spilling in heavy epilogues (e.g. colvec_reduce).
+        # Heavy epilogues (e.g. colvec_reduce in DGated) override these to avoid register spilling.
         # Without gather_A there are only 2 WGs (512 total, 256 per WG = max), no reallocation needed.
         self.num_regs_other = 120
         self.num_regs_epi = 256
@@ -1228,10 +1228,10 @@ class GemmSm100(GemmSm90):
                     tile_scheduler.producer_tail()
 
         # Specialized TMA epi load warp
-        if const_expr(mC_mnl is not None):
-            if warp_idx == self.epi_load_warp_id:
-                if const_expr(self.gather_A):
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+        if warp_idx == self.epi_load_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
+            if const_expr(mC_mnl is not None):
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )

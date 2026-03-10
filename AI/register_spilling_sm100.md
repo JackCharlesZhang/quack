@@ -40,9 +40,25 @@ open("kernel.cubin", "wb").write(data[positions[1]:])
 nvdisasm -gi kernel.cubin | grep -cE '\bSTL\b|\bLDL\b'
 ```
 
+## Deadlock Bug: epi_load warp missing setmaxregister_decrease
+
+After adding the setmaxregister fix, plain GEMM (no C matrix) with `gather_A=True` hung. Root cause:
+
+The epi_load warp's `setmaxregister_decrease` was inside `if const_expr(mC_mnl is not None):`. When there's no C matrix, the warp never freed its registers. This caused `setmaxregister_increase(256)` on the epilogue WG to block forever:
+
+- WG2 only freed `48 × 96 = 4608` regs (3/4 warps decreased)
+- WG1 freed `48 × 128 = 6144` regs (all 4 warps)
+- Epilogue needed `88 × 128 = 11264` regs → **11264 > 10752 freed → deadlock**
+
+Fix: moved `setmaxregister_decrease` outside the `mC_mnl` guard so it always executes.
+
+**Key lesson**: every warp in a WG must call `setmaxregister_decrease` when the epilogue WG calls `setmaxregister_increase`, otherwise the inc blocks waiting for registers that were never freed.
+
 ## Constraints for setmaxregister on SM100
 
 - Total register budget = `(max_regs_per_thread) × num_warp_groups`, max is 512
 - Must be divisible by `num_warp_groups` (e.g. 504 for 3 WGs, 512 for 2 WGs)
 - Each WG's allocation must be divisible by 8
-- Too many regs can cause hangs — stay within the total budget
+- `setmaxregister_increase` blocks until other warps have freed enough registers via `decrease`
+- Every warp that shares a WG with others must call `decrease` — if any warp skips it (e.g. due to compile-time guard), the `increase` on other WGs can deadlock
+- Source-level reordering of CuTe-DSL code has **no effect** on register allocation — the MLIR/LLVM optimizer normalizes instruction order via SSA. Only `setmaxregister` hints change PTXAS behavior.
