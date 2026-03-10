@@ -22,6 +22,7 @@ import json
 import time
 import logging
 import tempfile
+import traceback
 from pathlib import Path
 from getpass import getuser
 
@@ -30,6 +31,12 @@ import pytest
 
 _compile_only = False
 _fake_mode = None
+
+
+def _is_compilation_error(exc_info):
+    """Check if the error originated from kernel compilation (not FakeTensorMode)."""
+    tb_str = "".join(traceback.format_exception(*exc_info))
+    return "compile_and_cache" in tb_str
 
 
 def pytest_addoption(parser):
@@ -117,12 +124,14 @@ def pytest_runtest_setup(item):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """In --compile-only mode, swallow all errors — we only care about compilation."""
+    """In --compile-only mode, let compilation errors propagate but swallow the rest."""
     if not _compile_only:
         yield
         return
     outcome = yield
     if outcome.excinfo is not None:
+        if _is_compilation_error(outcome.excinfo):
+            return  # let it fail
         outcome.force_result(None)
 
 
