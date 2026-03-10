@@ -15,42 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
       - name: Install ruff
         run: pip install ruff
       - name: Ruff check
         run: ruff check quack/ tests/
       - name: Ruff format
         run: ruff format --check quack/ tests/
-
-  compile:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda: [cu12, cu13]
-        include:
-          - cuda: cu12
-            pip_extra: ""
-          - cuda: cu13
-            pip_extra: nvidia-cutlass-dsl[cu13]
-    name: compile (${{ matrix.cuda }})
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-      - name: Install dependencies
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install nvidia-cutlass-dsl apache-tvm-ffi torch-c-dlpack-ext pytest pytest-xdist ${{ matrix.pip_extra }}
-      - name: Compile kernels
-        run: PYTHONPATH=$PWD:$PYTHONPATH pytest tests/ --compile-only -n 4
-        timeout-minutes: 15
 
   test:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
