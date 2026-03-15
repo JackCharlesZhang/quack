@@ -346,7 +346,10 @@ def sm90_get_smem_load_op(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int],
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
+    major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -355,14 +358,22 @@ def get_smem_store_atom(
             num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
         )
     else:
+        num_matrices = (
+            4
+            if major_mode_size is None or major_mode_size % 16 == 0
+            else (2 if major_mode_size % 8 == 0 else 1)
+        )
         return cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=num_matrices),
             element_type,
         )
 
 
 def get_smem_load_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int],
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
+    major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -371,8 +382,13 @@ def get_smem_load_atom(
             num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
         )
     else:
+        num_matrices = (
+            4
+            if major_mode_size is None or major_mode_size % 16 == 0
+            else (2 if major_mode_size % 8 == 0 else 1)
+        )
         return cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=num_matrices),
             element_type,
         )
 
@@ -384,9 +400,10 @@ def get_smem_store_C(
     arch: int,
     transpose: bool = False,
     position_independent=False,
+    major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    copy_atom = get_smem_store_atom(arch, dtype, transpose, major_mode_size=major_mode_size)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
