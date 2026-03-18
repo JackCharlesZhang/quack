@@ -27,5 +27,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/gpu-test
-        with:
-          arch: ${{ matrix.gpu == 'h100' && '90' || '100' }}
