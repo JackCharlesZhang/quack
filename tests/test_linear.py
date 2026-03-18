@@ -459,7 +459,7 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
         pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
-    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     out_sr = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=sr_seed)
     out_rn = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RN)
     out_ref = torch.mm(A.float(), B.float())
@@ -467,7 +467,7 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
     assert out_sr.dtype == input_dtype
     # SR should be close to reference; may differ by up to 1 ULP more than RNE
     # so use a looser multiplier and atol
-    assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-2
+    assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-3
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])

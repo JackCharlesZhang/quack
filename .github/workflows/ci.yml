@@ -37,7 +37,7 @@ jobs:
           apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
             export PYTHONPATH=\$PWD:\$PYTHONPATH &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
-            pytest tests/ --compile-only -n 16 &&
+            pytest tests/ --compile-only -n 24 &&
             FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 40000 {print \$1}' | paste -sd,) &&
             if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 40GB free memory'; exit 1; fi &&
             echo \"Running tests on GPUs: \$FREE_GPUS\" &&

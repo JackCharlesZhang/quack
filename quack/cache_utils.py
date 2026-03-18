@@ -18,6 +18,7 @@ import pickle
 import sys
 import tempfile
 import time
+from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
 
@@ -31,6 +32,7 @@ COMPILE_ONLY: bool = False
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
+CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
 def _noop_kernel(*args, **kwargs):
@@ -116,13 +118,17 @@ def jit_cache(fn):
     The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
     """
     cache = {}
+    hits = 0
+    misses = 0
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        nonlocal hits, misses
         cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
 
         # 1. In-memory hit
         if cache_key in cache:
+            hits += 1
             return _noop_kernel if COMPILE_ONLY else cache[cache_key]
 
         # 2. Disk hit
@@ -139,11 +145,13 @@ def jit_cache(fn):
                         m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
                         loaded = m[EXPORT_FUNC_NAME]
                         cache[cache_key] = loaded
+                        hits += 1
                         return _noop_kernel if COMPILE_ONLY else loaded
             except RuntimeError:
                 pass
 
         # 3. Compile
+        misses += 1
         compiled_fn = fn(*args, **kwargs)
 
         # 4. Store
@@ -162,5 +170,16 @@ def jit_cache(fn):
 
         return _noop_kernel if COMPILE_ONLY else compiled_fn
 
+    def cache_clear():
+        nonlocal hits, misses
+        cache.clear()
+        hits = 0
+        misses = 0
+
+    def cache_info():
+        return CacheInfo(hits=hits, misses=misses, maxsize=None, currsize=len(cache))
+
     wrapper.cache = cache
+    wrapper.cache_clear = cache_clear
+    wrapper.cache_info = cache_info
     return wrapper
