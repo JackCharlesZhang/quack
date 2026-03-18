@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,7 +25,11 @@ jobs:
         run: ruff format --check quack/ tests/
 
   test:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'pull_request_target'
+    environment: gpu-ci
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +38,8 @@ jobs:
     name: test (${{ matrix.gpu }})
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Compile and run tests
         run: |
           apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
