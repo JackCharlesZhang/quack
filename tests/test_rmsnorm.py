@@ -57,15 +57,18 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
         weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     else:
         weight = None
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_() if weight is not None else None
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    # Compile ref for large inputs to avoid OOMs.
+    compile_ref = N >= 256 * 1024 and M >= 8 * 1024
+    ref_function = torch.compile(rmsnorm_ref) if compile_ref else rmsnorm_ref
     out = function(x, weight, eps=eps)
-    # Run ref forward without autograd to save memory (no intermediate graph stored)
-    with torch.no_grad():
-        out_ref = rmsnorm_ref(x, weight, eps=eps)
+    out_ref = ref_function(x_ref, weight_ref, eps=eps)
+
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
-    del out_ref
     # Backward pass
     if N > 128 * 1024 and input_dtype == torch.float32:
         # Skip backward pass due to not enough smem
@@ -73,10 +76,6 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
     out.backward(grad_out)
-    # Run ref backward separately with fresh tensors to avoid peak memory overlap
-    x_ref = x.detach().clone().requires_grad_()
-    weight_ref = weight.detach().clone().requires_grad_() if weight is not None else None
-    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     out_ref.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
