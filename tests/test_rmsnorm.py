@@ -57,35 +57,34 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
         weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     else:
         weight = None
-    x_ref = x.detach().clone().requires_grad_()
-    weight_ref = weight.detach().clone().requires_grad_() if weight is not None else None
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out = function(x, weight, eps=eps)
-    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
-
+    # Run ref forward without autograd to save memory (no intermediate graph stored)
+    with torch.no_grad():
+        out_ref = rmsnorm_ref(x, weight, eps=eps)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    del out_ref
     # Backward pass
     if N > 128 * 1024 and input_dtype == torch.float32:
-        # Skip backward pass for due to not enough smem
+        # Skip backward pass due to not enough smem
         return
     grad_out = torch.randn_like(out)
-    # Run ref backward first, save grads, then free ref graph to reduce peak memory
-    out_ref.backward(grad_out)
-    x_ref_grad = x_ref.grad.clone()
-    weight_ref_grad = weight_ref.grad.clone() if weight_ref is not None else None
-    del out_ref, x_ref, weight_ref
-    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     out.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref_grad, atol=atol, rtol=1e-3)
+    # Run ref backward separately with fresh tensors to avoid peak memory overlap
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_() if weight is not None else None
+    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+    out_ref.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
             weight_atol = 1e-4
         else:
-            weight_atol = 2 * (weight_ref_grad + 0.3 - 0.3 - weight_ref_grad).abs().max()
-        torch.testing.assert_close(weight.grad, weight_ref_grad, atol=weight_atol, rtol=1e-3)
+            weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
+        torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
