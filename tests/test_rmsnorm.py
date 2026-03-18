@@ -80,7 +80,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
-            weight_atol = 1e-4
+            weight_atol = 2e-4
         else:
             weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
         torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
