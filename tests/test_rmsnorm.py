@@ -48,6 +48,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
+    torch.cuda.empty_cache()
     device = "cuda"
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
