@@ -6,55 +6,47 @@ step may trigger dozens of compilations (different dtypes, tile sizes, activatio
 serial compilation dominates wall-clock time. This doc explains the multi-layer caching and
 parallel compilation design that makes it fast.
 
-## Layer 1: In-Memory Cache (`@lru_cache`)
+## Layer 1: `@jit_cache` Decorator (`cache_utils.py`)
 
-Each `_compile_*` function (e.g. `_compile_gemm` in `gemm.py`, `_compile_gemm_act` in
-`gemm_act.py`) is decorated with `@lru_cache(maxsize=None)`. The arguments are all hashable
-compile-time parameters: dtypes, tensor majors, tile shape, cluster shape, activation, etc.
-
-Within a single process, calling the same kernel config twice skips compilation entirely.
-
-```
-gemm(A, B, D, ...)
-  ├─ extract dtypes, majors, tile sizes from real tensors
-  └─ _compile_gemm(a_dtype, b_dtype, ..., tile_shape_mn, ...)  # @lru_cache
-       └─ ... (compile or cache hit)
-```
-
-**Limitation**: `lru_cache` is process-local and lost on restart.
-
-## Layer 2: Filesystem `.so` Cache (`cache_utils.py`)
-
-`compile_and_cache(key, compile_fn)` provides a persistent filesystem cache.
-
-### Cache Key
+Each `_compile_*` function (e.g. `_compile_gemm` in `gemm.py`, `_compile_softmax_fwd` in
+`softmax.py`) is decorated with `@jit_cache`. This single decorator provides both in-memory
+and persistent disk caching:
 
 ```python
-key = (
-    "gemm",           # kernel family
-    a_dtype, b_dtype, d_dtype, c_dtype, c_major,  # types
-    a_major, b_major, d_major,                     # layout
-    tile_shape_mn, cluster_shape_mnk,              # tile config
-    pingpong, persistent, ...                       # flags
-    device_capacity,                                # SM version
-)
+@jit_cache
+def _compile_softmax_fwd(dtype, out_dtype, N):
+    # ... build fake tensors ...
+    return cute.compile(softmax_op, ...)
 ```
 
-The key is hashed with SHA-256. The cache directory includes a **source fingerprint** —
-a SHA-256 of all `quack/*.py` files plus Python/CUTLASS/TVM-FFI versions. Any source change
-invalidates the entire cache, preventing stale `.so` files.
+### In-Memory Cache
+
+A per-function `dict` keyed on the function's positional/keyword args. Within a single
+process, calling the same kernel config twice skips compilation and disk I/O entirely.
+
+### Disk Cache
+
+On in-memory miss, checks for a cached `.o` (object file) on disk. The disk key is
+`(fn.__qualname__, *args, **sorted_kwargs)`, hashed with SHA-256. The cache directory
+includes a **source fingerprint** — a SHA-256 of all `quack/*.py` files plus
+Python/CUTLASS/TVM-FFI versions. Any source change invalidates the entire cache.
+
+With cutlass-dsl >= 4.4.2, `tvm_ffi` can load `.o` files directly — no need to link
+`.o` → `.so` via distutils. This eliminates the `distutils.ccompiler` dependency.
 
 ### Cache Miss Flow
 
 ```
-compile_and_cache(key, compile_fn)
-  ├─ hash key → SHA-256 hex
-  ├─ Shared lock: check if .so exists → load via dlopen (~1ms) ✓
+@jit_cache wrapper(dtype, out_dtype, N)
+  ├─ In-memory dict lookup → hit ✓ (~0ns)
   │
-  ├─ Cache miss → call compile_fn()
+  ├─ hash (fn.__qualname__, *args) → SHA-256 hex
+  ├─ Shared lock: check if .o exists → load via tvm_ffi (~1ms) ✓
+  │
+  ├─ Cache miss → call fn(dtype, out_dtype, N)
   │    └─ cute.compile(...) → MLIR → PTX → binary
   │
-  └─ Exclusive lock: export_to_c() → .o → link .so → write to cache
+  └─ Exclusive lock: export_to_c() → write .o to cache
 ```
 
 ### Concurrency Safety
@@ -62,19 +54,29 @@ compile_and_cache(key, compile_fn)
 Multiple processes may compile the same key simultaneously (e.g. parallel test workers).
 `FileLock` (using `fcntl.flock`) serializes access:
 
-- **Shared lock** for reads — multiple readers can load `.so` concurrently
-- **Exclusive lock** for writes — only one writer exports `.so`, others wait
-- **Double-check**: after acquiring exclusive lock, re-check if `.so` already exists
+- **Shared lock** for reads — multiple readers can load `.o` concurrently
+- **Exclusive lock** for writes — only one writer exports `.o`, others wait
+- **Double-check**: after acquiring exclusive lock, re-check if `.o` already exists
   (another process may have written it while we were compiling)
 
 ### Environment Controls
 
 | Variable | Default | Description |
 |---|---|---|
-| `QUACK_CACHE_ENABLED` | `1` | Set to `0` to disable filesystem cache |
+| `QUACK_CACHE_ENABLED` | `1` | Set to `0` to disable disk cache (in-memory cache still active) |
 | `QUACK_CACHE_DIR` | `/tmp/$USER/quack_cache` | Override cache location |
 
-## Layer 3: Autotuning Result Cache (`autotuner.py`)
+### Before `@jit_cache` (Historical)
+
+Previously, caching was split across two layers:
+- `@lru_cache(maxsize=None)` on each `_compile_*` function (in-memory)
+- `compile_and_cache(key, compile_fn)` called inside the function body (disk)
+
+Each call site manually constructed a `key` tuple and wrapped compilation in an inner
+`_compile()` closure. `@jit_cache` unifies both layers into a single decorator,
+eliminating the manual key construction and closure boilerplate.
+
+## Layer 2: Autotuning Result Cache (`autotuner.py`)
 
 The autotuner benchmarks many configs (e.g. ~44 for GEMM) to find the fastest. Results are
 cached to disk as JSON via `FileCacheManager` (Triton's cache infrastructure).
@@ -128,12 +130,12 @@ Parent process (CUDA initialized, has real tensors)
 ```
 
 Each worker (`_compile_worker.py`):
-1. Sets `COMPILE_ONLY = True` (compilation produces `.so` but never launches kernels)
+1. Sets `COMPILE_ONLY = True` (compilation produces `.o` but never launches kernels)
 2. Signals `"READY"` to parent
 3. Loops reading tasks from stdin (length-prefixed pickle protocol)
 4. Creates `FakeTensor`s matching parent tensor metadata (shape/stride/dtype, no GPU memory)
-5. Calls the kernel function under `FakeTensorMode()` → triggers `compile_and_cache()` →
-   exports `.so`
+5. Calls the kernel function under `FakeTensorMode()` → triggers `@jit_cache` →
+   exports `.o`
 6. Stays alive for the next task (amortizes `import quack` overhead, ~2-3s)
 
 The parent does round-robin dispatch, collects acks, then closes stdin to shut workers down.
@@ -141,7 +143,7 @@ The parent does round-robin dispatch, collects acks, then closes stdin to shut w
 ### Quick-Check Optimization
 
 Before spawning workers, the parent compiles the first config in-process. If this completes
-in <0.5s, the `.so` cache is likely warm — skip parallel compilation entirely:
+in <0.5s, the `.o` cache is likely warm — skip parallel compilation entirely:
 
 ```python
 t_check = time.time()
@@ -179,21 +181,24 @@ Compilation only needs metadata (shapes, strides, dtypes) to generate correct co
 
 `cache_utils.COMPILE_ONLY` is a global boolean (default `False`). When `True`:
 
-1. `compile_and_cache()` still compiles and exports `.so`, but returns `_noop_kernel`
+1. `@jit_cache` still compiles and exports `.o`, but returns `_noop_kernel`
    instead of the real compiled function
 2. Early returns in `gemm.py`, `gemm_act.py`, `gemm_dact.py`, `gemm_symmetric.py` after
    compilation prevents reaching runtime code that calls `data_ptr()` (which crashes on
    FakeTensors)
 
 ```python
-# In gemm.py:
-compiled_fn = _compile_gemm(...)
+# In gemm.py — the critical boundary
+compiled_fn = _compile_gemm(...)   # ← compilation happens here
 
 from quack.cache_utils import COMPILE_ONLY
 if COMPILE_ONLY:
-    return  # skip runtime path (data_ptr, kernel launch, etc.)
+    return                          # ← avoid data_ptr() below
 
-# ... runtime code that uses data_ptr(), scalar_arg(), etc.
+max_active_clusters = get_max_active_clusters(...)
+def scalar_arg(scalar, mode):
+    if mode == 2:
+        return scalar.data_ptr()   # ← would crash on FakeTensor
 ```
 
 ## Two-Pass Test Workflow (`conftest.py`)
@@ -204,7 +209,7 @@ The same machinery enables parallel test compilation:
 # Pass 1: compile all kernels in parallel (no GPU memory needed)
 pytest tests/test_softmax.py --compile-only -n 64
 
-# Pass 2: run tests (instant .so cache hits)
+# Pass 2: run tests (instant .o cache hits)
 pytest tests/test_softmax.py
 ```
 
@@ -256,7 +261,7 @@ Key details:
 
 - **`not isinstance(A.shape[0], torch.SymInt)` guard**: Under `torch.compile`, dynamo traces
   with symbolic shapes where `A.shape[0]` is a `SymInt`. We must not compile with SymInts
-  (they crash `@lru_cache` and produce invalid code). `COMPILE_ONLY` mode uses concrete shapes.
+  (they crash `@jit_cache` and produce invalid code). `COMPILE_ONLY` mode uses concrete shapes.
 
 - **`_precompile_default_config()`**: Calls `autotuned_fn.fn(*args, config=None, **kwargs)`.
   `config=None` selects the default config (128x192 for SM90, 256x256 for SM100). Tests use
@@ -307,12 +312,12 @@ User calls gemm(A, B, ...)
             ├─ Cache hit → call fn with best config
             └─ Cache miss → _precompile() + benchmark all configs
                  ├─ Spawn subprocess workers
-                 ├─ Workers: FakeTensor + COMPILE_ONLY → .so files
-                 ├─ Parent: benchmark each config (instant .so loads)
+                 ├─ Workers: FakeTensor + COMPILE_ONLY → .o files
+                 ├─ Parent: benchmark each config (instant .o loads)
                  └─ Cache best config
             └─ fn(A, B, out, config=best)
                  └─ gemm_sm90_sm100(...)
-                      ├─ _compile_gemm(...) → @lru_cache → compile_and_cache() → .so
+                      ├─ _compile_gemm(...) → @jit_cache → .o
                       └─ compiled_fn(real_A, real_B, real_D, ...)
 ```
 
@@ -328,29 +333,29 @@ pytest --compile-only
                            └─ _precompile_default_config(gemm_tuned, ...)
                                 └─ gemm_tuned.fn(A, B, out, config=None, ...)
                                      └─ gemm_sm90_sm100(...)
-                                          ├─ _compile_gemm(...) → .so exported
+                                          ├─ _compile_gemm(...) → .o exported
                                           └─ COMPILE_ONLY → return (no launch)
 ```
 
 ### `--compile-only` then Normal Run
 
 ```
-# Pass 1: all .so files written to cache
+# Pass 1: all .o files written to cache
 pytest --compile-only -n 64   # 64 workers, each compiles its test cases
 
 # Pass 2: instant cache hits
 pytest
-  └─ _compile_gemm(...) → @lru_cache miss → compile_and_cache()
-       └─ Shared lock: .so exists → dlopen (~1ms) ✓
+  └─ _compile_gemm(...) → @jit_cache in-memory miss → disk hit
+       └─ Shared lock: .o exists → load via tvm_ffi (~1ms) ✓
 ```
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `cache_utils.py` | `.so` cache: `compile_and_cache()`, `FileLock`, `COMPILE_ONLY` flag |
+| `cache_utils.py` | `@jit_cache` decorator (in-memory + `.o` disk cache), `FileLock`, `COMPILE_ONLY` flag |
 | `compile_utils.py` | `make_fake_tensor()` — symbolic CuTe tensors for compilation |
-| `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors()`, `cached_compile()`, `compile_gemm_kernel()` |
+| `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors()`, `compile_gemm_kernel()` |
 | `autotuner.py` | `Autotuner._precompile()` — subprocess worker pool, `FileCacheManager` |
 | `_compile_worker.py` | Persistent subprocess: `FakeTensorMode` + `COMPILE_ONLY` loop |
 | `gemm_interface.py` | `register_fake` for all GEMM `custom_op`s, `_precompile_default_config()` |

@@ -2,7 +2,6 @@
 # GEMM compilation via TVM-FFI with fake tensors and NamedTuple args.
 
 from typing import Optional
-from functools import lru_cache
 
 from torch import Tensor
 
@@ -10,6 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
+from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import GemmDefaultEpiMixin, GemmDefaultSm90, GemmDefaultSm100
@@ -23,12 +23,11 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     make_fake_varlen_args,
     make_fake_gemm_tensors,
-    cached_compile,
     compile_gemm_kernel,
 )
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_gemm(
     a_dtype,
     b_dtype,
@@ -100,53 +99,22 @@ def _compile_gemm(
     scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l)
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
-    key = ("gemm",) + (
+    return compile_gemm_kernel(
+        GemmCls,
         a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
-        has_semaphore,
-        rowvec_dtype,
-        colvec_dtype,
-        colvec_ndim,
-        alpha_mode,
-        beta_mode,
-        add_to_output,
-        varlen_m,
-        varlen_k,
         gather_A,
-        has_batch_idx_permute,
         device_capacity,
-        rounding_mode,
-        sr_seed_mode,
-    )
-    return cached_compile(
-        key,
-        lambda: compile_gemm_kernel(
-            GemmCls,
-            a_dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong,
-            persistent,
-            gather_A,
-            device_capacity,
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-        ),
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
     )
 
 

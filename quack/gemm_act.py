@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
 from typing import NamedTuple, Tuple, Optional, Callable
-from functools import lru_cache, partial
+from functools import partial
 from dataclasses import dataclass
 
 from torch import Tensor
@@ -33,9 +33,9 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_varlen_args,
     div_for_dtype,
     make_fake_gemm_tensors,
-    cached_compile,
     compile_gemm_kernel,
 )
+from quack.cache_utils import jit_cache
 from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
@@ -513,7 +513,7 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_gemm_act(
     a_dtype,
     b_dtype,
@@ -593,53 +593,22 @@ def _compile_gemm_act(
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
-    key = (
-        "gemm_act",
-        gemm_cls_name,
+    return compile_gemm_kernel(
+        GemmCls,
         a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        postact_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        postact_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
-        has_semaphore,
-        activation,
-        rowvec_dtype,
-        colvec_dtype,
-        colvec_ndim,
-        varlen_m,
         gather_A,
         device_capacity,
-        rounding_mode,
-        sr_seed_mode,
-    )
-    return cached_compile(
-        key,
-        lambda: compile_gemm_kernel(
-            GemmCls,
-            a_dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong,
-            persistent,
-            gather_A,
-            device_capacity,
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-        ),
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
     )
 
 

@@ -11,13 +11,13 @@ Controls:
 """
 
 import fcntl
+import functools
 import hashlib
 import os
 import pickle
 import sys
 import tempfile
 import time
-from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
 
@@ -28,6 +28,9 @@ import tvm_ffi
 CACHE_ENABLED: bool = os.getenv("QUACK_CACHE_ENABLED", "1") == "1"
 CACHE_DIR: str | None = os.getenv("QUACK_CACHE_DIR", None)
 COMPILE_ONLY: bool = False
+
+EXPORT_FUNC_NAME = "func"
+LOCK_TIMEOUT = 60
 
 
 def _noop_kernel(*args, **kwargs):
@@ -43,7 +46,7 @@ def get_cache_path() -> Path:
     return cache_dir
 
 
-@lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
 def _compute_source_fingerprint() -> str:
     """Hash all quack Python sources plus runtime ABI stamps into a short fingerprint."""
     quack_root = Path(__file__).resolve().parent
@@ -59,6 +62,10 @@ def _compute_source_fingerprint() -> str:
         h.update(len(content).to_bytes(8, "little"))
         h.update(content)
     return h.hexdigest()
+
+
+def _key_to_hash(key: tuple) -> str:
+    return hashlib.sha256(pickle.dumps(key)).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -98,70 +105,62 @@ class FileLock:
 
 
 # ---------------------------------------------------------------------------
-# Persistent cache
+# JIT cache decorator
 # ---------------------------------------------------------------------------
 
-EXPORT_FUNC_NAME = "func"
-LOCK_TIMEOUT = 60
 
+def jit_cache(fn):
+    """Decorator that caches compiled CuTe DSL kernels in-memory and on disk.
 
-def _key_to_hash(key: tuple) -> str:
-    return hashlib.sha256(pickle.dumps(key)).hexdigest()
-
-
-def _load_from_o(o_path: Path) -> object:
-    m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
-    return m[EXPORT_FUNC_NAME]
-
-
-def _export_to_o(compiled_fn, o_path: Path) -> None:
-    o_path.parent.mkdir(parents=True, exist_ok=True)
-    compiled_fn.export_to_c(
-        object_file_path=str(o_path),
-        function_name=EXPORT_FUNC_NAME,
-    )
-
-
-def compile_and_cache(key: tuple, compile_fn):
-    """Check persistent .o cache; on miss, call compile_fn() and export.
-
-    Args:
-        key: Hashable tuple identifying this compilation (include source fingerprint).
-        compile_fn: Zero-arg callable that returns a compiled CuTe DSL function.
-
-    Returns:
-        The compiled function (either loaded from .o or freshly compiled).
+    The decorated function should return a compiled kernel (i.e. call cute.compile).
+    The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
     """
-    if not CACHE_ENABLED:
-        compiled_fn = compile_fn()
+    cache = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
+
+        # 1. In-memory hit
+        if cache_key in cache:
+            return _noop_kernel if COMPILE_ONLY else cache[cache_key]
+
+        # 2. Disk hit
+        disk_key = (fn.__qualname__,) + cache_key
+        if CACHE_ENABLED:
+            sha = _key_to_hash(disk_key)
+            cache_path = get_cache_path() / _compute_source_fingerprint()
+            cache_path.mkdir(parents=True, exist_ok=True)
+            o_path = cache_path / f"{sha}.o"
+            lock_path = cache_path / f"{sha}.lock"
+            try:
+                with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
+                    if o_path.exists():
+                        m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
+                        loaded = m[EXPORT_FUNC_NAME]
+                        cache[cache_key] = loaded
+                        return _noop_kernel if COMPILE_ONLY else loaded
+            except RuntimeError:
+                pass
+
+        # 3. Compile
+        compiled_fn = fn(*args, **kwargs)
+
+        # 4. Store
+        cache[cache_key] = compiled_fn
+        if CACHE_ENABLED:
+            try:
+                with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
+                    if not o_path.exists():
+                        o_path.parent.mkdir(parents=True, exist_ok=True)
+                        compiled_fn.export_to_c(
+                            object_file_path=str(o_path),
+                            function_name=EXPORT_FUNC_NAME,
+                        )
+            except Exception as e:
+                print(f"quack cache: export failed for key {sha}: {e}")
+
         return _noop_kernel if COMPILE_ONLY else compiled_fn
 
-    cache_path = get_cache_path() / _compute_source_fingerprint()
-    cache_path.mkdir(parents=True, exist_ok=True)
-
-    sha = _key_to_hash(key)
-    o_path = cache_path / f"{sha}.o"
-    lock_path = cache_path / f"{sha}.lock"
-
-    # Try loading under shared lock
-    try:
-        with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
-            if o_path.exists():
-                if COMPILE_ONLY:
-                    return _noop_kernel
-                return _load_from_o(o_path)
-    except RuntimeError:
-        pass
-
-    # Cache miss — compile
-    compiled_fn = compile_fn()
-
-    # Export under exclusive lock
-    try:
-        with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
-            if not o_path.exists():
-                _export_to_o(compiled_fn, o_path)
-    except Exception as e:
-        print(f"quack cache: export failed for key {sha}: {e}")
-
-    return _noop_kernel if COMPILE_ONLY else compiled_fn
+    wrapper.cache = cache
+    return wrapper

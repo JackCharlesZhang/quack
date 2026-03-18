@@ -1,5 +1,5 @@
 from typing import Tuple, Optional, Callable
-from functools import lru_cache, partial
+from functools import partial
 
 from torch import Tensor
 
@@ -23,9 +23,9 @@ from quack.gemm_tvm_ffi_utils import (
     get_dtypes,
     make_scheduler_args,
     make_fake_scheduler_args,
-    cached_compile,
     compile_gemm_kernel,
 )
+from quack.cache_utils import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
@@ -215,7 +215,7 @@ class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_gemm_symmetric(
     a_dtype,
     b_dtype,
@@ -274,46 +274,22 @@ def _compile_gemm_symmetric(
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = None
-    key = (
-        "gemm_symmetric",
+    return compile_gemm_kernel(
+        GemmCls,
         a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        c_major,
-        postact_dtype,
-        a_major,
-        b_major,
-        d_major,
-        postact_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
-        has_semaphore,
-        alpha_mode,
-        beta_mode,
+        False,
         device_capacity,
-    )
-    return cached_compile(
-        key,
-        lambda: compile_gemm_kernel(
-            GemmCls,
-            a_dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong,
-            persistent,
-            False,
-            device_capacity,
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-        ),
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
     )
 
 

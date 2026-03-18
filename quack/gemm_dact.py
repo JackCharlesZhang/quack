@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Tri Dao.
 from typing import NamedTuple, Optional, Tuple, Callable, Type
-from functools import lru_cache, partial
+from functools import partial
 from dataclasses import dataclass
 import operator
 
@@ -35,9 +35,9 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_varlen_args,
     div_for_dtype,
     make_fake_gemm_tensors,
-    cached_compile,
     compile_gemm_kernel,
 )
+from quack.cache_utils import jit_cache
 from quack.varlen_utils import VarlenManager
 from quack import copy_utils
 from quack.rounding import RoundingMode
@@ -407,7 +407,7 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
     pass
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_gemm_dact(
     a_dtype,
     b_dtype,
@@ -499,54 +499,23 @@ def _compile_gemm_dact(
 
     scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
-    key = (
-        "gemm_dact",
-        gemm_cls_name,
+    return compile_gemm_kernel(
+        GemmCls,
         a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        postact_dtype,
-        implicit_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        postact_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
-        has_semaphore,
-        activation,
-        colvec_scale_dtype,
-        colvec_scale_ndim,
-        colvec_reduce_dtype,
-        colvec_reduce_ndim,
-        varlen_m,
         gather_A,
         device_capacity,
-    )
-    return cached_compile(
-        key,
-        lambda: compile_gemm_kernel(
-            GemmCls,
-            a_dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong,
-            persistent,
-            gather_A,
-            device_capacity,
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            post_init=post_init,
-        ),
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        post_init=post_init,
     )
 
 
