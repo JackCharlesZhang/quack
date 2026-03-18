@@ -71,16 +71,21 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
         # Skip backward pass for due to not enough smem
         return
     grad_out = torch.randn_like(out)
+    # Run ref backward first, save grads, then free ref graph to reduce peak memory
+    out_ref.backward(grad_out)
+    x_ref_grad = x_ref.grad.clone()
+    weight_ref_grad = weight_ref.grad.clone() if weight_ref is not None else None
+    del out_ref, x_ref, weight_ref
+    torch.cuda.empty_cache()
     torch.cuda.synchronize()
     out.backward(grad_out)
-    out_ref.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_ref_grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
             weight_atol = 1e-4
         else:
-            weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
-        torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
+            weight_atol = 2 * (weight_ref_grad + 0.3 - 0.3 - weight_ref_grad).abs().max()
+        torch.testing.assert_close(weight.grad, weight_ref_grad, atol=weight_atol, rtol=1e-3)
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
