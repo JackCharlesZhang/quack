@@ -59,6 +59,19 @@ def default_config(device):
         return GemmConfig(tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False)
 
 
+def nvmmh_config(A, B, device_capacity):
+    """Use nvMatmulHeuristics to pick a config for pure GEMM (no varlen/gather/epilogue).
+
+    Returns None if unavailable, caller should fall back to default_config.
+    """
+    try:
+        from quack.nvmmh_heuristic import nvmmh_default_config
+
+        return nvmmh_default_config(A, B, device_capacity)
+    except Exception:
+        return None
+
+
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
     device_capacity = get_device_capacity(kwargs["A"].device)[0]
@@ -100,7 +113,20 @@ def gemm_tuned(
     sr_seed: int | Tensor = 0,
 ) -> None:
     if config is None:
-        config = default_config(A.device)
+        # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
+        is_pure_gemm = (
+            cu_seqlens_m is None
+            and cu_seqlens_k is None
+            and A_idx is None
+            and C is None
+            and bias is None
+            and not add_to_output
+        )
+        if is_pure_gemm:
+            device_capacity = get_device_capacity(A.device)[0]
+            config = nvmmh_config(A, B, device_capacity)
+        if config is None:
+            config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
