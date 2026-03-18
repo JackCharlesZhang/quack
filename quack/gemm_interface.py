@@ -1332,7 +1332,7 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     """Compile the default config in COMPILE_ONLY mode.
 
     Checks COMPILE_ONLY flag and SymInt guard, then calls the unwrapped function with
-    config=None (which selects the default config), triggering compilation (exports .so)
+    config=None (which selects the default config), triggering compilation (exports .o)
     without benchmarking or kernel launch.
     Tests use tuned=False which also selects the default config, so this is sufficient.
     """
