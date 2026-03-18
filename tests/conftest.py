@@ -2,15 +2,19 @@
 """pytest configuration for quack kernel tests.
 
 Supports:
-  --compile-only    Compile all kernels (populating .so cache), skip actual execution.
+  --compile-only    Compile all kernels (populating .o cache), skip actual execution.
                     Uses FakeTensorMode (no GPU memory) so you can use many xdist workers.
+                    Works without a GPU if QUACK_ARCH and CUTE_DSL_ARCH are set.
 
 Two-pass workflow (after changing kernel source):
   pytest tests/test_softmax.py --compile-only -n 64   # parallel compile, no GPU memory
-  pytest tests/test_softmax.py                         # instant .so loads
+  pytest tests/test_softmax.py                         # instant .o loads
+
+CPU-only compilation (no GPU needed):
+  QUACK_ARCH=90 CUTE_DSL_ARCH=sm_90a pytest tests/ --compile-only -n 64
 
 Single-pass workflow (cache already warm):
-  pytest tests/test_softmax.py                         # all .so cache hits
+  pytest tests/test_softmax.py                         # all .o cache hits
 
 Multi-GPU with xdist:
   pytest tests/ -n 4                                   # workers round-robin across GPUs
@@ -37,7 +41,7 @@ def pytest_addoption(parser):
         "--compile-only",
         action="store_true",
         default=False,
-        help="Compile all kernels and export .so cache, skip actual kernel execution. "
+        help="Compile all kernels and export .o cache, skip actual kernel execution. "
         "Use with -n N (pytest-xdist) for parallel compilation.",
     )
 
@@ -64,9 +68,14 @@ def _get_gpu_ids():
 def pytest_configure(config):
     global _compile_only, _fake_mode
 
-    # Assign GPUs to xdist workers round-robin
+    try:
+        _compile_only = config.getoption("--compile-only", default=False)
+    except (ValueError, AttributeError):
+        _compile_only = False
+
+    # Assign GPUs to xdist workers round-robin (skip for CPU-only compile)
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id:
+    if worker_id and not (_compile_only and not _has_gpu()):
         tmp = Path(tempfile.gettempdir()) / getuser() / "quack_tests"
         tmp.mkdir(parents=True, exist_ok=True)
         worker_num = int(worker_id.replace("gw", ""))
@@ -82,19 +91,23 @@ def pytest_configure(config):
                 gpu_ids = json.load(f)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
-    try:
-        _compile_only = config.getoption("--compile-only", default=False)
-    except (ValueError, AttributeError):
-        _compile_only = False
     if _compile_only:
         import torch
         from torch._subclasses.fake_tensor import FakeTensorMode
         import quack.cache_utils
 
         quack.cache_utils.COMPILE_ONLY = True
-        torch.cuda.init()
+        if torch.cuda.is_available():
+            torch.cuda.init()
         _fake_mode = FakeTensorMode()
         _fake_mode.__enter__()
+
+
+def _has_gpu():
+    """Check for GPU without initializing CUDA."""
+    import torch
+
+    return torch.cuda.is_available()
 
 
 def pytest_unconfigure(config):

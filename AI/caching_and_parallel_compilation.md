@@ -231,53 +231,61 @@ os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
 Worker 0 discovers available GPUs and writes to a shared JSON file; other workers read it.
 
-### The GEMM `custom_op` Problem
+### The `custom_op` / `register_fake` Requirement
 
-GEMM functions use `@torch.library.custom_op(device_types="cuda")`, which causes PyTorch
-to auto-generate a no-op `register_fake` for `mutates_args` ops. Under `FakeTensorMode`,
-this no-op short-circuits the entire function body — the autotuner, compilation, everything.
-Result: **0 compilations** for all GEMM variants during `--compile-only`.
+All kernels use `@torch.library.custom_op(device_types="cuda")`. Under `FakeTensorMode`,
+PyTorch dispatches to the op's `register_fake` implementation instead of the real CUDA
+function body. Without an explicit `register_fake`, PyTorch auto-generates a no-op for
+`mutates_args` ops — the real function body never executes, so **0 compilations** happen
+during `--compile-only`.
 
-Non-GEMM kernels (softmax, rmsnorm, cross_entropy) don't have this problem because their
-`register_fake` implementations explicitly call `_compile_*()` when `COMPILE_ONLY` is set.
-
-### The Fix: Explicit `register_fake` for GEMM
-
-Each GEMM `custom_op` gets an explicit `register_fake` that triggers compilation under
-`COMPILE_ONLY`. The pattern:
+Every `custom_op` therefore needs an explicit `register_fake` that triggers compilation
+when `COMPILE_ONLY` is set. The pattern is the same across all kernels:
 
 ```python
-@gemm_out.register_fake
-def gemm_out_fake(A, B, out, bias=None, alpha=1.0, ...):
+@_softmax_fwd.register_fake
+def _softmax_fwd_fake(x, out):
     from quack.cache_utils import COMPILE_ONLY
 
-    if COMPILE_ONLY and not isinstance(A.shape[0], torch.SymInt):
-        _precompile_default_config(
-            gemm_tuned, A, B, out, C=None, bias=bias, alpha=alpha, ...
-        )
+    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
+        N = x.size(1)
+        dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
+        _compile_softmax_fwd(dtype, out_dtype, N)
+        _compile_softmax_backward(dtype, out_dtype, out_dtype, N)
 ```
 
 Key details:
 
-- **`not isinstance(A.shape[0], torch.SymInt)` guard**: Under `torch.compile`, dynamo traces
-  with symbolic shapes where `A.shape[0]` is a `SymInt`. We must not compile with SymInts
+- **`not isinstance(..., torch.SymInt)` guard**: Under `torch.compile`, dynamo traces
+  with symbolic shapes where dimensions are `SymInt`. We must not compile with SymInts
   (they crash `@jit_cache` and produce invalid code). `COMPILE_ONLY` mode uses concrete shapes.
 
-- **`_precompile_default_config()`**: Calls `autotuned_fn.fn(*args, config=None, **kwargs)`.
-  `config=None` selects the default config (128x192 for SM90, 256x256 for SM100). Tests use
-  `tuned=False` which bypasses the autotuner and uses the same default, so this is sufficient.
+- **Non-GEMM kernels** (softmax, rmsnorm, cross_entropy, topk, causal_conv1d) have
+  straightforward `register_fake` — they call `_compile_*()` directly with the concrete
+  shapes from the fake tensors.
 
-- **`gemm_symmetric_out`** is special: it's not autotuned, so its `register_fake` calls
-  `gemm_symmetric_sm90_sm100()` directly with fixed tile parameters.
+- **GEMM kernels** are more involved because they go through the autotuner. A generic
+  helper `_register_precompile_fake()` handles the boilerplate: it uses `inspect.signature`
+  to rebind positional args by name (PyTorch normalizes all `custom_op` args to positional),
+  then calls `_precompile_default_config()`.
 
-Ops with explicit `register_fake`:
+### GEMM-Specific `register_fake` Details
+
+`_precompile_default_config()` calls `autotuned_fn.fn(*args, config=None, **kwargs)`.
+`config=None` selects the default config (128x192 for SM90, 256x256 for SM100). Tests use
+`tuned=False` which bypasses the autotuner and uses the same default, so this is sufficient.
+
+`gemm_symmetric_out` is special: it's not autotuned, so its `register_fake` calls
+`gemm_symmetric_sm90_sm100()` directly with fixed tile parameters.
+
+Ops using `_register_precompile_fake`:
 - `gemm_out`, `gemm_add_out`, `gemm_add_inplace_op` — all route through `gemm_tuned`
 - `gemm_act_out` — routes through `gemm_act_tuned`
 - `gemm_dact_out` — routes through `gemm_dact_tuned`
 - `gemm_gated_out` — routes through `gemm_gated_tuned`
 - `gemm_dgated_out` — routes through `gemm_dgated_tuned` (also returns a tensor for
   `colvec_reduce`, so its `register_fake` was already needed for shape inference)
-- `gemm_symmetric_out` — calls `gemm_symmetric_sm90_sm100` directly
+- `gemm_symmetric_out` — calls `gemm_symmetric_sm90_sm100` directly (manual `register_fake`)
 
 ### Why Early Return After Compilation
 
@@ -358,6 +366,7 @@ pytest
 | `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors()`, `compile_gemm_kernel()` |
 | `autotuner.py` | `Autotuner._precompile()` — subprocess worker pool, `FileCacheManager` |
 | `_compile_worker.py` | Persistent subprocess: `FakeTensorMode` + `COMPILE_ONLY` loop |
-| `gemm_interface.py` | `register_fake` for all GEMM `custom_op`s, `_precompile_default_config()` |
+| `gemm_interface.py` | `_register_precompile_fake()`, `_precompile_default_config()` for GEMM `custom_op`s |
+| `softmax.py`, `rmsnorm.py`, `cross_entropy.py`, `topk.py`, `causal_conv1d.py` | `register_fake` with `COMPILE_ONLY` compilation |
 | `conftest.py` | `--compile-only` pytest plugin, GPU round-robin, `FakeTensorMode` setup |
 | `gemm.py` / `gemm_act.py` / `gemm_dact.py` / `gemm_symmetric.py` | `COMPILE_ONLY` early returns |

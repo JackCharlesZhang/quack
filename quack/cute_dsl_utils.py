@@ -4,6 +4,9 @@ from typing import Tuple, get_origin
 from functools import lru_cache
 from dataclasses import dataclass, fields
 
+import os
+import re
+
 import torch
 
 try:
@@ -65,8 +68,25 @@ def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
+def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
+    """Parse arch string (e.g. 'sm_90', 'sm90', '90', 'sm_100a') to (major, minor) tuple."""
+    match = re.match(r"^(?:sm_?)?(\d+)(\d)([af]?)$", arch_str.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid QUACK_ARCH format: {arch_str!r} (expected e.g. '90', 'sm_90')")
+    major, minor, _ = match.groups()
+    return int(major), int(minor)
+
+
 @lru_cache
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+    """Return (major, minor) device capability.
+
+    Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
+    without a GPU present.
+    """
+    arch_override = os.environ.get("QUACK_ARCH")
+    if arch_override is not None:
+        return _parse_arch_str(arch_override)
     return torch.cuda.get_device_capability(device)
 
 

@@ -1,19 +1,46 @@
 name: GPU Test
-description: Compile and run tests inside apptainer
+description: Compile kernels on CPU, then run tests on GPU inside apptainer
+
+inputs:
+  arch:
+    description: 'Target SM architecture (e.g. 90 for H100, 100 for B300)'
+    required: true
 
 runs:
   using: composite
   steps:
-    - name: Compile and run tests
+    - name: Compile kernels (CPU only)
       shell: bash
       run: |
-        apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
+        CACHE_DIR=$HOME/.quack_cache_${{ github.run_id }}
+        mkdir -p "$CACHE_DIR"
+        apptainer exec --writable-tmpfs \
+          --bind "$CACHE_DIR":/cache \
+          ~/attention_26.03.07.sif bash -c "
           export PYTHONPATH=\$PWD:\$PYTHONPATH &&
-          export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
-          pytest tests/ --compile-only -n 24 &&
+          export QUACK_CACHE_DIR=/cache &&
+          export QUACK_ARCH=${{ inputs.arch }} &&
+          export CUTE_DSL_ARCH=sm_${{ inputs.arch }}a &&
+          pytest tests/ --compile-only -n 24
+        "
+
+    - name: Run tests (GPU)
+      shell: bash
+      run: |
+        CACHE_DIR=$HOME/.quack_cache_${{ github.run_id }}
+        apptainer exec --nv --writable-tmpfs \
+          --bind "$CACHE_DIR":/cache \
+          ~/attention_26.03.07.sif bash -c "
+          export PYTHONPATH=\$PWD:\$PYTHONPATH &&
+          export QUACK_CACHE_DIR=/cache &&
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 40000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 40GB free memory'; exit 1; fi &&
           echo \"Running tests on GPUs: \$FREE_GPUS\" &&
           NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
           CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS
         "
+
+    - name: Clean up cache
+      if: always()
+      shell: bash
+      run: rm -rf "$HOME/.quack_cache_${{ github.run_id }}"

@@ -39,3 +39,5 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/gpu-test
+        with:
+          arch: ${{ matrix.gpu == 'h100' && '90' || '100' }}
