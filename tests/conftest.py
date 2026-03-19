@@ -65,6 +65,17 @@ def _get_gpu_ids():
     return ["0"]
 
 
+def _setup_worker_logging(worker_id, tmp):
+    """Configure per-worker file logging for easier debugging of parallel runs."""
+    log_file = tmp / f"tests_{worker_id}.log"
+    handler = logging.FileHandler(log_file, mode="w")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    logging.info("Worker %s logging to %s", worker_id, log_file)
+
+
 def pytest_configure(config):
     global _compile_only, _fake_mode
 
@@ -90,6 +101,7 @@ def pytest_configure(config):
             with cached_gpu_ids.open() as f:
                 gpu_ids = json.load(f)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
+        _setup_worker_logging(worker_id, tmp)
 
     if _compile_only:
         import torch
@@ -115,6 +127,24 @@ def pytest_unconfigure(config):
     if _fake_mode is not None:
         _fake_mode.__exit__(None, None, None)
         _fake_mode = None
+
+
+def pytest_collection_finish(session):
+    """Print a summary of collected tests grouped by file and function."""
+    if not session.items:
+        return
+    from collections import defaultdict
+
+    counts = defaultdict(lambda: defaultdict(int))
+    for item in session.items:
+        file_name = item.location[0]
+        func_name = item.originalname if hasattr(item, "originalname") else item.name
+        counts[file_name][func_name] += 1
+    summary = {f: dict(funcs) for f, funcs in sorted(counts.items())}
+    total = len(session.items)
+    session.config.pluginmanager.get_plugin("terminalreporter").write_line(
+        f"Collected {total} tests: {json.dumps(summary, indent=2)}"
+    )
 
 
 @pytest.hookimpl(hookwrapper=True)
