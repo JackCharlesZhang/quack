@@ -1,7 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 from dataclasses import dataclass
-
 
 import cutlass
 import cutlass.cute as cute
@@ -10,7 +9,6 @@ from cutlass import Int32, Float32, const_expr
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import Scalar, RowVecLoad, ColVecLoad
-from quack.epi_utils import assume_broadcast_strides
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.rounding import RoundingMode
@@ -44,35 +42,25 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         mColVecBroadcast: Optional[cute.Tensor] = None
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
-        mRowVecBroadcast, mColVecBroadcast = assume_broadcast_strides(
-            args.mRowVecBroadcast, args.mColVecBroadcast
-        )
-        return self.EpilogueParams(
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-            sr_seed=args.sr_seed,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        return self.EpilogueParams(**d)
 
-    # epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors,
-    # epi_begin, epi_begin_loop are all inherited from ComposableEpiMixin.
+    # epi_smem_bytes_per_stage, epi_get_smem_struct,
+    # epi_get_smem_tensors, epi_get_tma_atoms, epi_begin, epi_begin_loop, epi_end
+    # are all inherited from ComposableEpiMixin via _epi_ops.
 
     @cute.jit
     def epi_visit_subtile(
         self,
-        params: EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
+        params,
+        epi_loop_tensors,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         alpha = epi_loop_tensors["alpha"]
         beta = epi_loop_tensors["beta"]
-        sr_seed = epi_loop_tensors["sr_seed"]
         tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         rD = tRS_rD.load()

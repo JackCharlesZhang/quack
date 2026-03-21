@@ -16,6 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, const_expr
 
+from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
@@ -76,6 +77,12 @@ class EpiOp:
     def __init__(self, name):
         self.name = name
 
+    # --- Host-side: args → params ---
+    def to_params(self, gemm, args):
+        """Convert this op's arg field(s) to param dict entries.
+        Returns dict of {param_name: value}. Like EVT's to_underlying_arguments."""
+        return {}
+
     # --- Host-side: smem allocation ---
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
         """Bytes of smem needed per stage. arg_tensor is the EpilogueArguments field."""
@@ -132,6 +139,9 @@ class Scalar(EpiOp):
         super().__init__(name)
         self.dtype = dtype
 
+    def to_params(self, gemm, args):
+        return {self.name: getattr(args, self.name)}
+
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
         result = None
@@ -152,6 +162,9 @@ class VecLoad(EpiOp):
     """
 
     dim = None  # 0 for col (M), 1 for row (N)
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
     def _tile_size(self, cta_tile_shape_mnk):
         return cta_tile_shape_mnk[self.dim]
@@ -310,6 +323,19 @@ class TileStore(EpiOp):
         super().__init__(name)
         self.epi_tile_fn = epi_tile_fn
 
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
+        tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
+            gemm, tensor, epi_tile=epi_tile
+        )
+        return {
+            "tma_atom_postact": tma_atom,
+            f"{self.name}_mnl": tma_tensor,
+            "epi_postact_smem_layout_staged": smem_layout,
+            "epi_tile_postact": epi_tile_out,
+        }
+
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
         if arg_tensor is None:
             return 0
@@ -353,6 +379,9 @@ class ColVecReduce(EpiOp):
     This op handles the register allocation (begin), per-subtile slicing (begin_loop),
     and final warp reduction + gmem write (end).
     """
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):

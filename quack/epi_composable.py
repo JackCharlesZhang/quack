@@ -3,11 +3,13 @@
 
 Subclasses declare _epi_ops as a tuple of EpiOp instances. The mixin auto-generates
 epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
-and epi_begin_loop by querying each op.
+epi_begin_loop, and epi_end by querying each op.
 
 epi_begin and epi_begin_loop return dicts keyed by op name, so epi_visit_subtile
-can access values by name (e.g. epi_loop_tensors["alpha"]) instead of fragile
-positional unpacking.
+can access values by name (e.g. epi_loop_tensors["alpha"]).
+
+EpilogueArguments, EpilogueParams, and epi_to_underlying_arguments stay manual
+on each mixin — each Gemm+Epilogue variant writes its own conversion logic.
 """
 
 import cutlass.cute as cute
@@ -39,6 +41,16 @@ class ComposableEpiMixin:
         if cls._epi_ops:
             cls._epi_smem_map = _compute_smem_map(cls._epi_ops)
             cls._epi_has_async_ops = any(op.needs_async_fence() for op in cls._epi_ops)
+
+    # --- Host-side: args → params ---
+
+    def _epi_ops_to_params_dict(self, args):
+        """Merge each op's to_params into a single dict. Subclasses call this,
+        add custom fields, then construct self.EpilogueParams(**d)."""
+        d = {}
+        for op in self._epi_ops:
+            d.update(op.to_params(self, args))
+        return d
 
     # --- Host-side: smem allocation (queried from ops) ---
 

@@ -21,7 +21,6 @@ from quack.cute_dsl_utils import (
     torch2cute_dtype_map,
 )
 from quack.epi_ops import TileStore
-from quack.epi_utils import assume_broadcast_strides, setup_epi_tensor
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_default_epi import GemmDefaultEpiMixin
@@ -76,22 +75,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        tma_atom, tma_tensor, smem_layout, epi_tile = setup_epi_tensor(self, args.mPostAct)
-        mRowVecBroadcast, mColVecBroadcast = assume_broadcast_strides(
-            args.mRowVecBroadcast, args.mColVecBroadcast
-        )
-        return self.EpilogueParams(
-            tma_atom,
-            tma_tensor,
-            smem_layout,
-            epi_tile,
-            args.act_fn,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-            sr_seed=args.sr_seed,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        return self.EpilogueParams(**d)
 
     # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
     # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
@@ -212,40 +198,25 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
-        self.rounding_mode = args.rounding_mode
-        self.postact_dtype = args.mPostAct.element_type
-        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        assert self.postact_dtype.width == 16, "GemmGated only supports 16bit postact for now"
+        assert args.mPostAct.element_type.width == 16, (
+            "GemmGated only supports 16bit postact for now"
+        )
         assert self.d_layout is None or self.d_layout.is_n_major_c()
-        assert self.postact_layout.is_n_major_c()
+        assert cutlass.utils.LayoutEnum.from_tensor(args.mPostAct).is_n_major_c()
         if self.arch == 90:
             assert self.cta_tile_shape_mnk[1] % 32 == 0, (
                 "GemmGatedSm90 requires tileN to be divisible by 32"
             )
-
+        self.rounding_mode = args.rounding_mode
+        self.postact_dtype = args.mPostAct.element_type
+        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         self.cta_tile_shape_postact_mn = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1] // 2,
         )
-        epi_tile_postact = _gated_epi_tile_fn(self, self.epi_tile)
-        tma_atom, tma_tensor, smem_layout, epi_tile_postact = setup_epi_tensor(
-            self, args.mPostAct, epi_tile=epi_tile_postact
-        )
-        mRowVecBroadcast, mColVecBroadcast = assume_broadcast_strides(
-            args.mRowVecBroadcast, args.mColVecBroadcast
-        )
-        return self.EpilogueParams(
-            tma_atom,
-            tma_tensor,
-            smem_layout,
-            epi_tile_postact,
-            args.act_fn,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-            sr_seed=args.sr_seed,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        return self.EpilogueParams(**d)
 
     @cute.jit
     def epi_visit_subtile(

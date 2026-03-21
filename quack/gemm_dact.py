@@ -21,7 +21,6 @@ from quack.cute_dsl_utils import (
     get_device_capacity,
     get_max_active_clusters,
 )
-from quack.epi_utils import assume_broadcast_strides, setup_epi_tensor
 from quack.gemm_tvm_ffi_utils import (
     get_major,
     perm3d_single,
@@ -109,7 +108,7 @@ class GemmDGatedMixin(GemmActMixin):
         mPostAct_mnl: cute.Tensor
         epi_postact_smem_layout_staged: cute.ComposedLayout
         epi_tile_postact: cute.Tile
-        act_bwd_fn: cutlass.Constexpr[Callable]
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -120,33 +119,18 @@ class GemmDGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
-        self.rounding_mode = args.rounding_mode
-        self.postact_dtype = args.mPostAct.element_type
-        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
         # for reusing the existing load/store code.
         assert self.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
-
+        self.rounding_mode = args.rounding_mode
+        self.postact_dtype = args.mPostAct.element_type
+        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        tma_atom, tma_tensor, smem_layout, epi_tile = setup_epi_tensor(self, args.mPostAct)
-        mRowVecBroadcast, mColVecBroadcast, mColVecReduce = assume_broadcast_strides(
-            args.mRowVecBroadcast, args.mColVecBroadcast, args.mColVecReduce
-        )
-        return self.EpilogueParams(
-            tma_atom,
-            tma_tensor,
-            smem_layout,
-            epi_tile,
-            args.act_bwd_fn,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-            mColVecReduce=mColVecReduce,
-            sr_seed=args.sr_seed,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_bwd_fn"] = args.act_bwd_fn
+        return self.EpilogueParams(**d)
 
     # epi_begin, epi_begin_loop, epi_end are inherited from ComposableEpiMixin via _epi_ops.
 
