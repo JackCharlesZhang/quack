@@ -12,7 +12,7 @@ from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_act import GemmActMixin
-from quack.epi_ops import ColVecReduce
+from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -200,31 +200,8 @@ class GemmDGatedMixin(GemmActMixin):
                     (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
                 )
         if const_expr(tDrColVecReduce is not None):
-            # Need to multiply before D is scaled by colvec_scale
-            if const_expr(self.arch < 100):
-                for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
-                    tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
-            else:
-                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(
-                    tDrColVecReduce, tDrColVecReduce.layout
-                )
-                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
-                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(
-                    tRS_rOut, tDrColVecReduce.layout
-                )
-                for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
-                    row_sum = cute.arch.mul_packed_f32x2(
-                        (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1])
-                    )
-                    for n in cutlass.range(
-                        1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True
-                    ):
-                        row_sum = cute.arch.fma_packed_f32x2(
-                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
-                            (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
-                            row_sum,
-                        )
-                    tDrColVecReduce_mn[m, 0] += row_sum[0] + row_sum[1]
+            # Accumulate postact * dout before D is scaled by colvec_scale
+            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rOut, rScale=tRS_rD)
 
         if const_expr(tDrColVec is not None):  # Scale Out by colvec
             if const_expr(self.arch < 100):

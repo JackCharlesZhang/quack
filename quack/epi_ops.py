@@ -20,6 +20,7 @@ from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
+import quack.layout_utils as layout_utils
 
 
 class EpiContext:
@@ -369,6 +370,44 @@ class TileStore(EpiOp):
         if hasattr(params, "tma_atom_postact"):
             return [params.tma_atom_postact]
         return []
+
+
+@cute.jit
+def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
+    """Accumulate transform_fn(input) or input * rScale into a ColVecReduce buffer.
+
+    If transform_fn is provided, accumulates transform_fn(input[i]).
+    If rScale is provided, accumulates input[i] * rScale[i] (uses mul/fma for SM100).
+    If neither, accumulates input directly (identity).
+    """
+    if const_expr(tDrReduce is not None):
+        if const_expr(transform_fn is None):
+            transform_fn = lambda x: x
+        if const_expr(gemm.arch < 100):
+            for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+                val = transform_fn(tRS_rInput[i])
+                tDrReduce[i] += val * rScale[i] if const_expr(rScale is not None) else val
+        else:
+            tDrReduce_mn = layout_utils.convert_layout_zero_stride(tDrReduce, tDrReduce.layout)
+            tRS_rInput_mn = layout_utils.convert_layout_zero_stride(tRS_rInput, tDrReduce.layout)
+            if const_expr(rScale is not None):
+                rScale_mn = layout_utils.convert_layout_zero_stride(rScale, tDrReduce.layout)
+            for m in cutlass.range(cute.size(tDrReduce_mn, mode=[0]), unroll_full=True):
+                inp = lambda n: (tRS_rInput_mn[m, 2 * n], tRS_rInput_mn[m, 2 * n + 1])
+                val0 = transform_fn(inp(0))
+                if const_expr(rScale is not None):
+                    row_sum = cute.arch.mul_packed_f32x2(val0, (rScale_mn[m, 0], rScale_mn[m, 1]))
+                else:
+                    row_sum = val0
+                for n in cutlass.range(1, cute.size(tDrReduce_mn, mode=[1]) // 2, unroll_full=True):
+                    val = transform_fn(inp(n))
+                    if const_expr(rScale is not None):
+                        row_sum = cute.arch.fma_packed_f32x2(
+                            val, (rScale_mn[m, 2 * n], rScale_mn[m, 2 * n + 1]), row_sum
+                        )
+                    else:
+                        row_sum = cute.arch.add_packed_f32x2(val, row_sum)
+                tDrReduce_mn[m, 0] += row_sum[0] + row_sum[1]
 
 
 class ColVecReduce(EpiOp):
