@@ -17,7 +17,6 @@ except ImportError:
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float16, BFloat16, Float32
-from cutlass.base_dsl.typing import JitArgument
 from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
 
@@ -156,30 +155,5 @@ class ParamsBase:
             values += obj_values
             self._values_pos.append(len(obj_values))
         return values
-
-    __new_from_mlir_values__ = _new_from_mlir_values
-
-
-@dataclass
-class ArgumentsBase(JitArgument):
-    def __c_pointers__(self):
-        _, non_constexpr_fields = _partition_fields(self)
-        c_ptrs = []
-        for obj in non_constexpr_fields.values():
-            if hasattr(obj, "__c_pointers__"):
-                c_ptrs.extend(obj.__c_pointers__())
-        return c_ptrs
-
-    def __get_mlir_types__(self):
-        _, non_constexpr_fields = _partition_fields(self)
-        types, self._values_pos = [], []
-        for obj in non_constexpr_fields.values():
-            if hasattr(obj, "__get_mlir_types__"):
-                obj_types = obj.__get_mlir_types__()
-                types.extend(obj_types)
-                self._values_pos.append(len(obj_types))
-            else:
-                self._values_pos.append(0)
-        return types
 
     __new_from_mlir_values__ = _new_from_mlir_values

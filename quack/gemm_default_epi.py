@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 
-from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
+from quack.cute_dsl_utils import mlir_namedtuple
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.rounding import RoundingMode
@@ -30,7 +30,7 @@ class GemmDefaultEpiMixin:
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @dataclass
-    class EpilogueParams(ParamsBase):
+    class EpilogueParams:
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None

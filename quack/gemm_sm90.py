@@ -19,7 +19,9 @@ from cutlass import Int32, Float32, Float16, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 
-from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
+from dataclasses import dataclass
+
+from quack.cute_dsl_utils import ParamsBase
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
@@ -125,7 +127,10 @@ class GemmSm90:
 
     arch = 90
 
-    EpilogueArguments = ArgumentsBase
+    @dataclass
+    class EpilogueArguments:
+        pass
+
     EpilogueParams = ParamsBase
 
     def __init__(
@@ -547,14 +552,14 @@ class GemmSm90:
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
-        epilogue_params: ParamsBase,
+        epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
-        tile_sched_params: ParamsBase,
+        tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
         """
