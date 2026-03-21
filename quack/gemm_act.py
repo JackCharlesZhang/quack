@@ -20,6 +20,7 @@ from quack.cute_dsl_utils import (
     get_max_active_clusters,
     torch2cute_dtype_map,
 )
+from quack.epi_ops import TileStore
 from quack.epi_utils import assume_broadcast_strides, setup_epi_tensor
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
@@ -42,6 +43,8 @@ from quack.rounding import RoundingMode
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
+    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"))
+
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
@@ -90,52 +93,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
             sr_seed=args.sr_seed,
         )
 
-    def epi_get_tma_atoms(
-        self, params: EpilogueParams, *, loc=None, ip=None
-    ) -> list[cute.CopyAtom]:
-        return [params.tma_atom_postact]
-
-    @staticmethod
-    def epi_smem_bytes_per_stage(
-        args: EpilogueArguments, cta_tile_shape_mnk: Tuple[int, int, int], epi_tile: cute.Tile
-    ) -> int:
-        postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
-            args, cta_tile_shape_mnk, epi_tile
-        )
-        return postact_bytes_per_stage + rowvec_colvec_bytes
-
-    def epi_get_smem_struct(self, params: EpilogueParams):
-        row_vec_smem_size = 0 if params.mRowVecBroadcast is None else self.cta_tile_shape_mnk[1]
-        col_vec_smem_size = 0 if params.mColVecBroadcast is None else self.cta_tile_shape_mnk[0]
-        row_vec_dtype = (
-            params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
-        )
-        col_vec_dtype = (
-            params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
-        )
-
-        @cute.struct
-        class EpiSharedStorage:
-            sRowVec: cute.struct.Align[cute.struct.MemRange[row_vec_dtype, row_vec_smem_size], 16]
-            sColVec: cute.struct.Align[cute.struct.MemRange[col_vec_dtype, col_vec_smem_size], 16]
-            sPostAct: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.postact_dtype, cute.cosize(params.epi_postact_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-
-        return EpiSharedStorage
-
-    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
-        sRowVec, sColVec = super().epi_get_smem_tensors(params, storage)
-        sPostAct = storage.epi.sPostAct.get_tensor(
-            params.epi_postact_smem_layout_staged.outer,
-            swizzle=params.epi_postact_smem_layout_staged.inner,
-        )
-        return (sRowVec, sColVec, sPostAct)
+    # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
+    # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
     def epi_setup_postact(
         self,
@@ -148,7 +107,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         tidx,
     ):
         """Setup postact TMA copies and partitions before the epilogue loop."""
-        sPostAct = epi_smem_tensors[2]
+        sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
         get_smem_store_op = (
             partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
             if self.arch == 100
@@ -237,7 +196,19 @@ class GemmActSm100(GemmActMixin, GemmSm100):
     pass
 
 
+def _gated_epi_tile_fn(gemm, epi_tile):
+    """Halve the N dimension of the epi_tile for gated postact."""
+    if isinstance(epi_tile[1], cute.Layout):
+        return (epi_tile[0], cute.recast_layout(2, 1, epi_tile[1]))
+    return (epi_tile[0], epi_tile[1] // 2)
+
+
 class GemmGatedMixin(GemmActMixin):
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        TileStore("mPostAct", epi_tile_fn=_gated_epi_tile_fn),
+    )
+
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
@@ -256,11 +227,7 @@ class GemmGatedMixin(GemmActMixin):
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1] // 2,
         )
-        if isinstance(self.epi_tile[1], cute.Layout):
-            epi_tile_postact_1 = cute.recast_layout(2, 1, self.epi_tile[1])
-        else:
-            epi_tile_postact_1 = self.epi_tile[1] // 2
-        epi_tile_postact = (self.epi_tile[0], epi_tile_postact_1)
+        epi_tile_postact = _gated_epi_tile_fn(self, self.epi_tile)
         tma_atom, tma_tensor, smem_layout, epi_tile_postact = setup_epi_tensor(
             self, args.mPostAct, epi_tile=epi_tile_postact
         )
@@ -279,21 +246,6 @@ class GemmGatedMixin(GemmActMixin):
             mColVecBroadcast=mColVecBroadcast,
             sr_seed=args.sr_seed,
         )
-
-    @staticmethod
-    def epi_smem_bytes_per_stage(
-        args: GemmActMixin.EpilogueArguments,
-        cta_tile_shape_mnk: Tuple[int, int, int],
-        epi_tile: cute.Tile,
-    ) -> int:
-        postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (
-            postact_dtype.width // 8
-        )
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
-            args, cta_tile_shape_mnk, epi_tile
-        )
-        return postact_bytes_per_stage + rowvec_colvec_bytes
 
     @cute.jit
     def epi_visit_subtile(

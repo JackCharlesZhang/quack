@@ -17,20 +17,10 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 
 @cute.jit
-def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+def load_scalar_or_pointer(x, dtype=Float32):
     if const_expr(isinstance(x, cute.Pointer)):
-        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+        return dtype(cute.make_tensor(x, cute.make_layout(1))[0])
     else:
-        assert isinstance(x, Float32)
-        return x
-
-
-@cute.jit
-def load_int_scalar_or_pointer(x: Int32 | cute.Pointer) -> Int32:
-    if const_expr(isinstance(x, cute.Pointer)):
-        return Int32(cute.make_tensor(x, cute.make_layout(1))[0])
-    else:
-        assert isinstance(x, Int32)
         return x
 
 

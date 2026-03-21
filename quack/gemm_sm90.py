@@ -1251,7 +1251,7 @@ class GemmSm90:
             if const_expr(postact_ctx is not None):
                 tRS_rPostAct_out = self.epi_convert_postact(
                     tRS_rPostAct,
-                    epi_loop_tensors[2],
+                    epi_loop_tensors["sr_seed"],
                     tidx,
                     tile_coord_mnkl,
                     num_prev_subtiles,
@@ -1268,7 +1268,7 @@ class GemmSm90:
                     and self.acc_dtype == cutlass.Float32
                     and self.d_dtype == cutlass.BFloat16
                 ):
-                    seed = epi_loop_tensors[2] + (
+                    seed = epi_loop_tensors["sr_seed"] + (
                         tile_coord_mnkl[0] * 65537
                         + tile_coord_mnkl[1] * 257
                         + tile_coord_mnkl[3] * 17

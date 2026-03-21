@@ -127,7 +127,12 @@ class GemmSymmetricMixin(GemmActMixin):
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             tRS_rPostAct_out = self.epi_convert_postact(
-                tRS_rPostAct, epi_loop_tensors[2], tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+                tRS_rPostAct,
+                epi_loop_tensors["sr_seed"],
+                tidx,
+                tile_coord_mnkl,
+                num_prev_subtiles,
+                epi_idx,
             )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
@@ -140,7 +145,7 @@ class GemmSymmetricMixin(GemmActMixin):
                     and self.acc_dtype == cutlass.Float32
                     and self.d_dtype == cutlass.BFloat16
                 ):
-                    seed = epi_loop_tensors[2] + (
+                    seed = epi_loop_tensors["sr_seed"] + (
                         tile_coord_mnkl[0] * 65537
                         + tile_coord_mnkl[1] * 257
                         + tile_coord_mnkl[3] * 17
