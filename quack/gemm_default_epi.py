@@ -9,6 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
+from quack.epi_utils import assume_broadcast_strides
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.rounding import RoundingMode
@@ -41,17 +42,9 @@ class GemmDefaultEpiMixin:
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
         self.rounding_mode = args.rounding_mode
-        # Assume all strides are divisible by 32 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
+        mRowVecBroadcast, mColVecBroadcast = assume_broadcast_strides(
+            args.mRowVecBroadcast, args.mColVecBroadcast
         )
-        mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
-        ]
         return self.EpilogueParams(
             alpha=args.alpha,
             beta=args.beta,
@@ -211,6 +204,31 @@ class GemmDefaultEpiMixin:
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] += tDrColVec[i]
         return None
+
+    def epi_setup_postact(
+        self,
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Setup postact output before the epilogue loop.
+
+        Returns (tiled_copy_postact_r2s, tRS_sPostAct, copy_postact) if the epilogue
+        produces a postact tensor, or None otherwise. Override in subclasses that produce
+        a postact output (e.g. GemmActMixin).
+        """
+        return None
+
+    @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert postact from acc_dtype to output dtype. Override for custom postprocessing."""
+        return tRS_rPostAct
 
     @staticmethod
     def epi_smem_bytes_per_stage(

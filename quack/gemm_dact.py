@@ -10,9 +10,6 @@ from torch import Tensor
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
-import cutlass.utils.blackwell_helpers as sm100_utils
-
-import quack.sm90_utils as sm90_utils
 from quack.sm90_utils import partition_for_epilogue
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
@@ -26,6 +23,7 @@ from quack.cute_dsl_utils import (
     get_device_capacity,
     get_max_active_clusters,
 )
+from quack.epi_utils import assume_broadcast_strides, setup_epi_tensor
 from quack.gemm_tvm_ffi_utils import (
     get_major,
     perm3d_single,
@@ -39,7 +37,6 @@ from quack.gemm_tvm_ffi_utils import (
 )
 from quack.cache_utils import jit_cache
 from quack.varlen_utils import VarlenManager
-from quack import copy_utils
 from quack.rounding import RoundingMode
 import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
@@ -134,35 +131,15 @@ class GemmDGatedMixin(GemmActMixin):
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
 
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        epi_tile_postact = self.epi_tile
-        utils_cls = sm100_utils if self.arch >= 100 else sm90_utils
-        epi_postact_smem_layout_staged = utils_cls.make_smem_layout_epi(
-            self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
+        tma_atom, tma_tensor, smem_layout, epi_tile = setup_epi_tensor(self, args.mPostAct)
+        mRowVecBroadcast, mColVecBroadcast, mColVecReduce = assume_broadcast_strides(
+            args.mRowVecBroadcast, args.mColVecBroadcast, args.mColVecReduce
         )
-        tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            copy_utils.create_ragged_tensor_for_tma(args.mPostAct, ragged_dim=0, ptr_shift=True)
-            if cute.rank(args.mPostAct) == 2
-            else args.mPostAct,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            op_type="store",
-        )
-        # Assume all strides are divisible by 32 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
-        mRowVecBroadcast, mColVecBroadcast, mColVecReduce = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (args.mRowVecBroadcast, args.mColVecBroadcast, args.mColVecReduce)
-        ]
         return self.EpilogueParams(
-            tma_atom_postact,
-            tma_tensor_postact,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
+            tma_atom,
+            tma_tensor,
+            smem_layout,
+            epi_tile,
             args.act_bwd_fn,
             alpha=args.alpha,
             beta=args.beta,
