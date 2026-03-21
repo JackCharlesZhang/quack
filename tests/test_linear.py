@@ -18,8 +18,11 @@ from quack.gemm_interface import (
     gemm_dact_ref,
     gemm_gated_ref,
     gemm_dgated_ref,
+    gemm_rms,
+    gemm_rms_ref,
 )
 from quack.rounding import RoundingMode
+from quack.rms_final_reduce import rms_final_reduce
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -501,3 +504,43 @@ def test_gemm_sr_different_seeds(m, k, n, input_dtype):
     out2 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=2)
     # Different seeds should give different outputs (with high probability)
     assert not torch.equal(out1, out2)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("N", [1, 4, 8, 16, 64, 128])
+@pytest.mark.parametrize("M", [1, 37, 960, 1920])
+def test_rms_final_reduce(M, N, input_dtype):
+    """Test rms_final_reduce: rstd[m] = rsqrt(sum_n(x[m,n]) * scale + eps)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    total_cols = 4096  # pretend the GEMM had this many columns
+    scale = 1.0 / total_cols
+    eps = 1e-6
+    x = torch.randn((M, N), device=device, dtype=input_dtype).abs()  # partial sums are non-negative
+    rstd = rms_final_reduce(x, scale=scale, eps=eps)
+    rstd_ref = torch.rsqrt(x.float().sum(dim=-1) * scale + eps)
+    assert (rstd - rstd_ref).abs().max() < 1e-5
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("has_C", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504, 2048])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("m", [960, 1920])
+def test_gemm_rms(m, k, n, input_dtype, has_C, use_compile):
+    """Test GEMM + RMS: D = A @ B (+ C), rstd = rsqrt(mean(D^2) + eps)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    eps = 1e-6
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    C = torch.randn((m, n), device=device, dtype=input_dtype) if has_C else None
+    fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
+    D, rstd = fn(A, B, C=C, eps=eps, tuned=False)
+    D_ref, rstd_ref = gemm_rms_ref(
+        A.float(), B.float(), C=C.float() if C is not None else None, eps=eps
+    )
+    D_pt, rstd_pt = gemm_rms_ref(A, B, C=C, eps=eps)
+    assert (D - D_ref).abs().max() < 2 * (D_pt - D_ref).abs().max() + 1e-5
+    assert (rstd - rstd_ref).abs().max() < 2 * (rstd_pt - rstd_ref).abs().max() + 1e-3

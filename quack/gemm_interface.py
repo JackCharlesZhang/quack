@@ -14,6 +14,8 @@ from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
 from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
+from quack.gemm_sq_reduce import gemm_sq_reduce as gemm_sq_reduce_sm90_sm100
+from quack.rms_final_reduce import rms_final_reduce
 from quack.rounding import RoundingMode
 
 
@@ -1487,6 +1489,159 @@ def gemm_symmetric_out_fake(
         )
     except Exception:
         pass
+
+
+## ── gemm_rms ────────────────────────────────────────────────────────────────
+
+
+def _prune_gemm_rms_configs(configs, named_args: dict, **kwargs):
+    """ColVecReduce requires no swap_ab."""
+    configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    return prune_invalid_gemm_configs(configs, named_args | kwargs)
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    key=["dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": _prune_gemm_rms_configs},
+)
+def _gemm_rms_tuned(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    config: Optional[GemmConfig] = None,
+) -> Tensor:
+    if config is None:
+        config = default_config(A.device)
+    og_ndim_2 = A.ndim == 2
+    N = B.shape[-1]
+    if A.ndim == 2:
+        A = A.unsqueeze(0)
+    B = B.mT
+    if B.ndim == 2:
+        B = B.unsqueeze(0)
+    if out.ndim == 2:
+        out = out.unsqueeze(0)
+    if C is not None and C.ndim == 2:
+        C = C.unsqueeze(0)
+    # Allocate partial reduction buffer
+    tile_n = config.tile_n
+    n_tiles = (N + tile_n - 1) // tile_n
+    colvec_reduce = torch.empty(
+        (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
+    )
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_sq_reduce_sm90_sm100(
+        A,
+        B,
+        out,
+        C,
+        colvec_reduce,
+        tile_count_semaphore,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+    )
+    # Final reduction: rstd = rsqrt(sum(partials) / N + eps)
+    scale = 1.0 / N
+    flat_reduce = colvec_reduce.reshape(-1, n_tiles)
+    rstd_flat = rms_final_reduce(flat_reduce, scale=scale, eps=eps)
+    rstd = rstd_flat.reshape(A.shape[:-1])
+    if og_ndim_2:
+        rstd = rstd.squeeze(0)
+    return rstd
+
+
+@torch.library.custom_op(
+    "quack::gemm_rms_out",
+    mutates_args=("out",),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
+)
+def _gemm_rms_out(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    """GEMM + RMS: D = A @ B (+ C), returns rstd = rsqrt(mean(D^2) + eps)."""
+    fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
+    return fn(A, B, out, C=C, eps=eps, dynamic_scheduler=dynamic_scheduler)
+
+
+@torch.library.register_fake("quack::gemm_rms_out")
+def _gemm_rms_out_fake(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    _precompile_default_config(
+        _gemm_rms_tuned, A, B, out, C=C, eps=eps, dynamic_scheduler=dynamic_scheduler
+    )
+    rstd_shape = A.shape[:-1]
+    return torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
+
+
+def gemm_rms_ref(
+    A: Tensor,
+    B: Tensor,
+    C: Optional[Tensor] = None,
+    eps: float = 1e-6,
+) -> Tuple[Tensor, Tensor]:
+    """Reference: D = A @ B (+ C), rstd[m] = rsqrt(mean_n(D[m,n]^2) + eps)."""
+    fn = torch.bmm if A.ndim == 3 else torch.mm
+    D = fn(A, B)
+    if C is not None:
+        D = D + C
+    rstd = torch.rsqrt(D.float().square().mean(dim=-1) + eps)
+    return D, rstd
+
+
+def gemm_rms(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    out_dtype: Optional[torch.dtype] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tuple[Tensor, Tensor]:
+    """GEMM + RMS statistics: D = A @ B (+ C), rstd[m] = rsqrt(mean_n(D[m,n]^2) + eps).
+
+    Returns (D, rstd).
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    N = B.shape[-1]
+    if out is None:
+        out_shape = (*A.shape[:-1], N)
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    rstd = _gemm_rms_out(
+        A,
+        B,
+        out,
+        C=C,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
+    return out, rstd
 
 
 # TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?
