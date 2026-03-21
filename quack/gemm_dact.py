@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026, Tri Dao.
-from typing import NamedTuple, Optional, Tuple, Callable, Type
+from typing import NamedTuple, Optional, Tuple, Callable
 from functools import partial
 from dataclasses import dataclass
 import operator
@@ -114,7 +114,6 @@ class GemmDGatedMixin(GemmActMixin):
         epi_postact_smem_layout_staged: cute.ComposedLayout
         epi_tile_postact: cute.Tile
         act_bwd_fn: cutlass.Constexpr[Callable]
-        implicit_dtype: Type[cutlass.Numeric]
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -165,7 +164,6 @@ class GemmDGatedMixin(GemmActMixin):
             epi_postact_smem_layout_staged,
             epi_tile_postact,
             args.act_bwd_fn,
-            self.implicit_dtype,
             alpha=args.alpha,
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
@@ -237,7 +235,7 @@ class GemmDGatedMixin(GemmActMixin):
         alpha, beta, sr_seed, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
         assert alpha is None and beta is None and tDrRowVec is None  # We don't use these for now
         assert tRS_rC is not None
-        implicit_dtype = params.implicit_dtype
+        implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
         tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
         tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
