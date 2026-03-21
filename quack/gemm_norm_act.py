@@ -36,7 +36,6 @@ from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
 )
 import quack.utils as utils
-import quack.layout_utils as layout_utils
 
 
 @cute.jit
@@ -50,27 +49,21 @@ def _norm_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] *= tDrColVec[i]
         else:
-            tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
-            tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
-            for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
-                for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
-                    tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1] = cute.arch.mul_packed_f32x2(
-                        (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
-                        (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                    )
+            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
+                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
+                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                    (tDrColVec[2 * i], tDrColVec[2 * i + 1]),
+                )
     if const_expr(tDrRowVec is not None):
         if const_expr(gemm.arch < 100):
             for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
                 tRS_rD[i] *= tDrRowVec[i]
         else:
-            tDrRowVec_mn = layout_utils.convert_layout_zero_stride(tDrRowVec, tDrRowVec.layout)
-            tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrRowVec.layout)
-            for n in cutlass.range(cute.size(tDrRowVec_mn, mode=[0]), unroll_full=True):
-                for m in cutlass.range(cute.size(tDrRowVec_mn, mode=[1]) // 2, unroll_full=True):
-                    tRS_rD_mn[n, 2 * m], tRS_rD_mn[n, 2 * m + 1] = cute.arch.mul_packed_f32x2(
-                        (tRS_rD_mn[n, 2 * m], tRS_rD_mn[n, 2 * m + 1]),
-                        (tDrRowVec_mn[n, 0], tDrRowVec_mn[n, 0]),
-                    )
+            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
+                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
+                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                    (tDrRowVec[2 * i], tDrRowVec[2 * i + 1]),
+                )
 
 
 class GemmNormActMixin(GemmActMixin):

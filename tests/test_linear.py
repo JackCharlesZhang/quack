@@ -562,7 +562,7 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile):
     torch.random.manual_seed(0)
     m = 1024
     A = torch.randn(m, k, device=device, dtype=input_dtype)
-    B = torch.randn(k, n, device=device, dtype=input_dtype)
+    B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
     C = torch.randn(m, n, device=device, dtype=input_dtype) if has_C else None
     norm_weight = torch.randn(n, device=device, dtype=input_dtype)
     rstd = torch.randn(m, device=device, dtype=torch.float32)
@@ -609,7 +609,7 @@ def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
     torch.random.manual_seed(0)
     m = 1024
     A = torch.randn(m, k, device=device, dtype=input_dtype)
-    B = torch.randn(k, n, device=device, dtype=input_dtype)
+    B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
     norm_weight = torch.randn(n, device=device, dtype=input_dtype)
     rstd = torch.randn(m, device=device, dtype=torch.float32)
 
