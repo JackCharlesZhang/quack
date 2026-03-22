@@ -10,6 +10,8 @@ to generate epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors,
 epi_begin, and epi_begin_loop automatically.
 """
 
+import math
+import operator
 from functools import partial
 
 import cutlass
@@ -70,6 +72,52 @@ class EpiContext:
             tidx=tidx,
             reference_src=tiled_copy_t2r is None,
         )
+
+
+def _get_lane_warp_layouts(tiled_copy, reference_src=True):
+    """Derive lane and warp layouts along M and N from the epilogue tiled_copy.
+
+    Follows the CUTLASS Sm90RowReduction / Sm90ColReduction pattern.
+    Uses layout_src_tv_tiled (SM90, reference_src=True) or
+    layout_dst_tv_tiled (SM100, reference_src=False), matching the C++ impl's
+    get_layoutS_TV / get_layoutD_TV selection.
+
+    Returns (lane_layout_MN, warp_layout_MN) where each is a 2D layout (M, N):
+      lane_layout_MN[0] = lane_M: (lanes_in_M):(lane_stride_M) — e.g. 8:4
+      lane_layout_MN[1] = lane_N: (lanes_in_N):(lane_stride_N) — e.g. 4:1
+      warp_layout_MN[0] = warp_M: (warps_in_M):(warp_stride_M) — e.g. 4:1
+      warp_layout_MN[1] = warp_N: (warps_in_N):(warp_stride_N) — e.g. 1:0
+
+    For RowVecReduce (reduce along M): shuffle across lane_M, smem reduce across warp_M.
+    For ColVecReduce (reduce along N): shuffle across lane_N, direct write (warps_in_N == 1).
+    """
+    # right_inverse of the TV layout gives tile_element_idx -> tv_idx.
+    # SM90: use src (register) layout; SM100: use dst (smem) layout.
+    layout_tv = tiled_copy.layout_src_tv_tiled if reference_src else tiled_copy.layout_dst_tv_tiled
+    ref_layout = cute.right_inverse(layout_tv)
+    tile_M_size, tile_N_size = cute.size(tiled_copy.tiler_mn[0]), cute.size(tiled_copy.tiler_mn[1])
+    ref_layout_MN = cute.composition(
+        ref_layout, cute.make_layout((tile_M_size, tile_N_size))
+    )  # (tile_M, tile_N) -> tv_idx
+
+    num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
+
+    # tv2lane: tv_idx -> lane_idx  (lane = tv_idx % 32)
+    tv2lane = cute.make_layout((cute.arch.WARP_SIZE, num_warps, 1), stride=(1, 0, 0))
+    ref2lane = cute.composition(tv2lane, ref_layout_MN)  # (tile_M, tile_N) -> lane_idx
+    # select mode [0] = M part, [1] = N part; filter removes stride-0
+    lane_M = cute.filter(cute.select(ref2lane, [0]))  # lane_m -> lane_idx
+    lane_N = cute.filter(cute.select(ref2lane, [1]))  # lane_n -> lane_idx
+    lane_layout_MN = layout_utils.concat_layout(lane_M, lane_N)  # (lane_M, lane_N) -> lane_idx
+
+    # tv2warp: tv_idx -> warp_idx  (warp = tv_idx / 32)
+    tv2warp = cute.make_layout((cute.arch.WARP_SIZE, num_warps, 1), stride=(0, 1, 0))
+    ref2warp = cute.composition(tv2warp, ref_layout_MN)  # (tile_M, tile_N) -> warp_idx
+    warp_M = cute.filter(cute.select(ref2warp, [0]))  # warp_m -> warp_idx
+    warp_N = cute.filter(cute.select(ref2warp, [1]))  # warp_n -> warp_idx
+    warp_layout_MN = layout_utils.concat_layout(warp_M, warp_N)  # (warp_M, warp_N) -> warp_idx
+
+    return lane_layout_MN, warp_layout_MN
 
 
 class EpiOp:
@@ -535,30 +583,44 @@ class ColVecReduce(EpiOp):
         varlen_manager,
         tidx,
     ):
-        """Warp reduction (sm90) + direct gmem write with predication."""
+        """Intra-warp shuffle reduction across N lanes, then direct gmem write."""
         if const_expr(param is not None):
-            import operator
-            import quack.layout_utils as layout_utils
+            tDrReduce = state
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
 
+            # ── Derive lane layout from tiled_copy ──
+            lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
+            # For ColVecReduce: reduce across N lanes (lanes_in_N threads share same M row)
+            lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+            # Typically lanes_in_N is 4 for Sm90
+            assert lanes_in_N == 1 << int(math.log2(lanes_in_N)), (
+                "lanes_in_N must be a power of 2 for butterfly reduction"
+            )
+
+            # ── Intra-warp shuffle reduction across N lanes ──
+            if const_expr(lanes_in_N > 1):
+                assert lane_layout_MN.stride[1] == 1
+                tDrReduce_flt = cute.filter_zeros(tDrReduce)
+                for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
+                    tDrReduce_flt[i] = cute.arch.warp_reduction(
+                        tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
+                    )
+
+            warp_N = warp_layout_MN[1]
+            assert cute.size(warp_N) == 1, (
+                "ColVecReduce assumes all reduction cols are within the same warp"
+            )
+
+            # ── Direct gmem write (no inter-warp reduction needed: warps_in_N == 1) ──
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
                 epi_tile=epi_tile,
-                tiled_copy=tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s,
+                tiled_copy=tiled_copy,
                 tidx=tidx,
                 reference_src=tiled_copy_t2r is None,
             )
             tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
-            tDrReduce = state
-            tDrReduce_flt = cute.filter_zeros(tDrReduce)
-            if const_expr(gemm.arch < 100):
-                for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
-                    tDrReduce_flt[i] = cute.arch.warp_reduction(
-                        tDrReduce_flt[i], operator.add, threads_in_group=4
-                    )
-            else:
-                assert gemm.d_layout.is_n_major_c(), (
-                    "GemmDGated only supports n-major output for now"
-                )
             batch_idx = tile_coord_mnkl[3]
             limit_n = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
             if tile_coord_mnkl[1] < limit_n:
