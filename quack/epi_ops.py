@@ -259,7 +259,11 @@ class RowVecLoad(VecLoad):
 
 class ColVecLoad(VecLoad):
     """Loads a col vector (M,) via cp_async, broadcasts along N with stride (1,0).
-    Supports varlen_m via domain_offset."""
+
+    Optimization: with N-major subtile loop, consecutive epi_n iterations for the same
+    epi_m share the same column data. The smem→register copy only runs when epi_n == 0.
+    Supports varlen_m via domain_offset.
+    """
 
     dim = 0
 
@@ -276,6 +280,7 @@ class ColVecLoad(VecLoad):
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
         tDsV = None
+        tDrV_cvt = None
         if const_expr(param is not None):
             dtype = param.element_type
             num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
@@ -306,7 +311,24 @@ class ColVecLoad(VecLoad):
             )
             if const_expr(ctx.tiled_copy_t2r is not None):
                 tDsV = ctx.tiled_copy_r2s.retile(tDsV)
-        return tDsV
+            # Pre-allocate register tensor reused across begin_loop calls
+            tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
+            tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
+        return [tDsV, tDrV_cvt]
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        tDsV, tDrV_cvt = state[0], state[1]
+        if const_expr(tDsV is not None):
+            # Col vector is constant across N subtiles — only copy on first N subtile.
+            # Assumes N-major epi subtile order: epi_tile_layout = ordered_layout(..., order=(1,0))
+            epi_n = epi_coord[1]
+            if epi_n == 0:
+                tDsV_cur = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, epi_coord]
+                tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
+                cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
+                tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
+        return tDrV_cvt
 
 
 class TileStore(EpiOp):
