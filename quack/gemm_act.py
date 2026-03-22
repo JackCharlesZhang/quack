@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
+from __future__ import annotations
 from typing import NamedTuple, Tuple, Optional, Callable
 from functools import partial
-from dataclasses import dataclass
 
 from torch import Tensor
 
@@ -43,6 +43,8 @@ from quack.rounding import RoundingMode
 
 class GemmActMixin(GemmDefaultEpiMixin):
     _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"))
+    _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
+    _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
@@ -55,22 +57,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    @dataclass
-    class EpilogueParams(ParamsBase):
-        tma_atom_postact: cute.CopyAtom
-        mPostAct_mnl: cute.Tensor
-        epi_postact_smem_layout_staged: cute.ComposedLayout
-        epi_tile_postact: cute.Tile
-        act_fn: cutlass.Constexpr[Optional[Callable]] = None
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
-        sr_seed: Optional[Int32 | cute.Tensor] = None
+    # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
@@ -106,10 +95,10 @@ class GemmActMixin(GemmDefaultEpiMixin):
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
         batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
-            params.tma_atom_postact,
-            varlen_manager.offset_batch_epi(params.mPostAct_mnl, batch_idx),
+            params.tma_atom_mPostAct,
+            varlen_manager.offset_batch_epi(params.mPostAct, batch_idx),
             self.cta_tile_shape_postact_mn,
-            params.epi_tile_postact,
+            params.epi_tile_mPostAct,
             sPostAct,
             tile_coord_mnkl,
         )
@@ -151,7 +140,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
     @cute.jit
     def epi_visit_subtile(
         self,
-        params: EpilogueParams,
+        params,
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,

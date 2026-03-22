@@ -3,14 +3,17 @@
 
 Subclasses declare _epi_ops as a tuple of EpiOp instances. The mixin auto-generates
 epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
-epi_begin_loop, and epi_end by querying each op.
+epi_begin_loop, epi_end, and EpilogueParams by querying each op.
 
 epi_begin and epi_begin_loop return dicts keyed by op name, so epi_visit_subtile
 can access values by name (e.g. epi_loop_tensors["alpha"]).
 
-EpilogueArguments, EpilogueParams, and epi_to_underlying_arguments stay manual
-on each mixin — each Gemm+Epilogue variant writes its own conversion logic.
+EpilogueParams is auto-generated from _epi_ops (via param_fields()) plus any
+_extra_param_fields declared on the subclass. Subclasses still define
+EpilogueArguments and epi_to_underlying_arguments manually.
 """
+
+from dataclasses import make_dataclass, MISSING
 
 import cutlass.cute as cute
 from cutlass import const_expr
@@ -29,10 +32,27 @@ def _compute_smem_map(ops):
     return smem_map
 
 
+def _make_epi_params(epi_ops, extra_fields, bases):
+    """Build EpilogueParams dataclass from epi_ops + extra fields.
+
+    Required fields (default=MISSING) are placed first, then optional fields.
+    """
+    required, optional = [], []
+    for op in epi_ops:
+        for name, typ, default in op.param_fields():
+            (required if default is MISSING else optional).append((name, typ, default))
+    for name, typ, default in extra_fields:
+        (required if default is MISSING else optional).append((name, typ, default))
+    fields = [(n, t) for n, t, _ in required] + [(n, t, d) for n, t, d in optional]
+    return make_dataclass("EpilogueParams", fields, bases=bases)
+
+
 class ComposableEpiMixin:
     """Base mixin that composes EpiOps into the standard epilogue hooks."""
 
     _epi_ops = ()
+    _extra_param_fields = ()  # [(name, type, default), ...] for non-op params (e.g. act_fn)
+    _epi_param_bases = ()  # Base classes for EpilogueParams (e.g. (ParamsBase,))
     _epi_smem_map = {}
     _epi_has_async_ops = False
 
@@ -41,6 +61,11 @@ class ComposableEpiMixin:
         if cls._epi_ops:
             cls._epi_smem_map = _compute_smem_map(cls._epi_ops)
             cls._epi_has_async_ops = any(op.needs_async_fence() for op in cls._epi_ops)
+            # Auto-generate EpilogueParams if not explicitly defined on this class
+            if "EpilogueParams" not in cls.__dict__:
+                cls.EpilogueParams = _make_epi_params(
+                    cls._epi_ops, cls._extra_param_fields, cls._epi_param_bases
+                )
 
     # --- Host-side: args → params ---
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Tri Dao.
+from __future__ import annotations
 from typing import NamedTuple, Optional, Tuple, Callable
-from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -42,12 +42,11 @@ class GemmDActMixin(GemmActMixin):
     # Different from GemmActSm90, here act_bwd_fn must take in 2 arguments (x, dout)
     # and return 2 arguments (dx, out)
     EpilogueArguments = GemmActMixin.EpilogueArguments
-    EpilogueParams = GemmActMixin.EpilogueParams
 
     @cute.jit
     def epi_visit_subtile(
         self,
-        params: EpilogueParams,
+        params,
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
@@ -89,6 +88,8 @@ class GemmDGatedMixin(GemmActMixin):
     # Different from GemmActMixin, here act_bwd_fn must take in 3 arguments (x, y, dout)
     # and return 3 arguments (dx, dy, out)
     _epi_ops = (*GemmActMixin._epi_ops, ColVecReduce("mColVecReduce"))
+    _extra_param_fields = (("act_bwd_fn", cutlass.Constexpr, None),)
+    _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
@@ -102,23 +103,9 @@ class GemmDGatedMixin(GemmActMixin):
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    @dataclass
-    class EpilogueParams(ParamsBase):
-        tma_atom_postact: cute.CopyAtom
-        mPostAct_mnl: cute.Tensor
-        epi_postact_smem_layout_staged: cute.ComposedLayout
-        epi_tile_postact: cute.Tile
-        act_bwd_fn: cutlass.Constexpr[Callable] = None
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
-        mColVecReduce: Optional[cute.Tensor] = None
-        sr_seed: Optional[Int32 | cute.Tensor] = None
+    # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
         # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
         # for reusing the existing load/store code.
         assert self.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
@@ -137,7 +124,7 @@ class GemmDGatedMixin(GemmActMixin):
     @cute.jit
     def epi_visit_subtile(
         self,
-        params: EpilogueParams,
+        params,
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,

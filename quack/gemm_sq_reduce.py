@@ -3,7 +3,6 @@
 # D_raw = A @ B (+ C), reduce[m] = sum_n(D_raw[m,n]^2), D_out = D_raw * rowvec.
 
 from typing import NamedTuple, Optional
-from dataclasses import dataclass
 
 from torch import Tensor
 
@@ -58,14 +57,7 @@ class GemmSqReduceMixin(GemmDefaultEpiMixin):
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: None = None
 
-    @dataclass
-    class EpilogueParams:
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
-        mColVecReduce: Optional[cute.Tensor] = None
-        sr_seed: None = None
+    # EpilogueParams auto-generated from _epi_ops
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode

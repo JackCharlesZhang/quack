@@ -79,6 +79,11 @@ class EpiOp:
         self.name = name
 
     # --- Host-side: args → params ---
+    def param_fields(self):
+        """Return [(field_name, type, default), ...] for auto-generating EpilogueParams.
+        Must match the keys returned by to_params()."""
+        return []
+
     def to_params(self, gemm, args):
         """Convert this op's arg field(s) to param dict entries.
         Returns dict of {param_name: value}. Like EVT's to_underlying_arguments."""
@@ -140,6 +145,9 @@ class Scalar(EpiOp):
         super().__init__(name)
         self.dtype = dtype
 
+    def param_fields(self):
+        return [(self.name, object, None)]
+
     def to_params(self, gemm, args):
         return {self.name: getattr(args, self.name)}
 
@@ -163,6 +171,9 @@ class VecLoad(EpiOp):
     """
 
     dim = None  # 0 for col (M), 1 for row (N)
+
+    def param_fields(self):
+        return [(self.name, object, None)]
 
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
@@ -334,9 +345,6 @@ class ColVecLoad(VecLoad):
 class TileStore(EpiOp):
     """Tile-sized output tensor stored via TMA (e.g. postact).
 
-    The params object must have: tma_atom_postact, mPostAct_mnl,
-    epi_postact_smem_layout_staged, epi_tile_postact.
-
     Args:
         name: field name in EpilogueArguments/Params (e.g. "mPostAct")
         epi_tile_fn: optional (gemm, epi_tile) -> epi_tile for half-tile (GemmGated)
@@ -346,6 +354,25 @@ class TileStore(EpiOp):
         super().__init__(name)
         self.epi_tile_fn = epi_tile_fn
 
+    def _tma_atom_key(self):
+        return f"tma_atom_{self.name}"
+
+    def _smem_layout_key(self):
+        return f"epi_{self.name}_smem_layout_staged"
+
+    def _epi_tile_key(self):
+        return f"epi_tile_{self.name}"
+
+    def param_fields(self):
+        from dataclasses import MISSING
+
+        return [
+            (self._tma_atom_key(), object, MISSING),
+            (self.name, object, MISSING),
+            (self._smem_layout_key(), object, MISSING),
+            (self._epi_tile_key(), object, MISSING),
+        ]
+
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
@@ -353,10 +380,10 @@ class TileStore(EpiOp):
             gemm, tensor, epi_tile=epi_tile
         )
         return {
-            "tma_atom_postact": tma_atom,
-            f"{self.name}_mnl": tma_tensor,
-            "epi_postact_smem_layout_staged": smem_layout,
-            "epi_tile_postact": epi_tile_out,
+            self._tma_atom_key(): tma_atom,
+            self.name: tma_tensor,
+            self._smem_layout_key(): smem_layout,
+            self._epi_tile_key(): epi_tile_out,
         }
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
@@ -367,30 +394,34 @@ class TileStore(EpiOp):
         return cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
 
     def smem_struct_field(self, gemm, params):
-        if not hasattr(gemm, "postact_dtype"):
+        smem_layout_key = self._smem_layout_key()
+        if not hasattr(params, smem_layout_key):
             return (f"s_{self.name}", cute.struct.MemRange[Float32, 0])
         return (
             f"s_{self.name}",
             cute.struct.Align[
                 cute.struct.MemRange[
                     gemm.postact_dtype,
-                    cute.cosize(params.epi_postact_smem_layout_staged),
+                    cute.cosize(getattr(params, smem_layout_key)),
                 ],
                 gemm.buffer_align_bytes,
             ],
         )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        if not hasattr(params, "epi_postact_smem_layout_staged"):
+        smem_layout_key = self._smem_layout_key()
+        if not hasattr(params, smem_layout_key):
             return None
+        smem_layout = getattr(params, smem_layout_key)
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
-            params.epi_postact_smem_layout_staged.outer,
-            swizzle=params.epi_postact_smem_layout_staged.inner,
+            smem_layout.outer,
+            swizzle=smem_layout.inner,
         )
 
     def tma_atoms(self, gemm, params):
-        if hasattr(params, "tma_atom_postact"):
-            return [params.tma_atom_postact]
+        tma_key = self._tma_atom_key()
+        if hasattr(params, tma_key):
+            return [getattr(params, tma_key)]
         return []
 
 
@@ -465,6 +496,9 @@ class ColVecReduce(EpiOp):
     This op handles the register allocation (begin), per-subtile slicing (begin_loop),
     and final warp reduction + gmem write (end).
     """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
 
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}

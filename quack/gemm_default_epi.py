@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
 from typing import NamedTuple, Optional
-from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
@@ -34,22 +33,12 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    @dataclass
-    class EpilogueParams:
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
-        sr_seed: Optional[Int32 | cute.Tensor] = None
+    # EpilogueParams auto-generated from _epi_ops
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
         d = self._epi_ops_to_params_dict(args)
         return self.EpilogueParams(**d)
-
-    # epi_smem_bytes_per_stage, epi_get_smem_struct,
-    # epi_get_smem_tensors, epi_get_tma_atoms, epi_begin, epi_begin_loop, epi_end
-    # are all inherited from ComposableEpiMixin via _epi_ops.
 
     @cute.jit
     def epi_visit_subtile(
