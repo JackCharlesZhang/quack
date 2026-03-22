@@ -144,7 +144,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
             tRS_rPostAct_out.store(TensorSSA(raw_vec, src_vec.shape, self.postact_dtype))
         else:
-            tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
+            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
             tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
         return tRS_rPostAct_out
 

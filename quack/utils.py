@@ -184,7 +184,7 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
         tXpX: Predicate tensor indicating valid elements
         fill_value: Value to fill OOB locations with
     """
-    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), None, 0])
+    tXrX_fill = cute.make_rmem_tensor_like(tXsX[(None, 0), None, 0])
     tXrX_fill.fill(fill_value)
     for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
         for rest_k in cutlass.range_constexpr(tXsX.shape[2]):

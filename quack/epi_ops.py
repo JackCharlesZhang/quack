@@ -246,7 +246,7 @@ class VecLoad(EpiOp):
             tDsV_cur = cute.group_modes(state, 3, cute.rank(state))[None, None, None, epi_coord]
             tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
             cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
-            tDrV_cvt = cute.make_fragment_like(tDrV, gemm.acc_dtype)
+            tDrV_cvt = cute.make_rmem_tensor_like(tDrV, gemm.acc_dtype)
             tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
         return tDrV_cvt
 

@@ -104,7 +104,7 @@ class Softmax(ReductionBase):
         tXsX = thr_copy_X.partition_D(sX)
         tXgO = thr_copy_X.partition_D(gO)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
-        tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
+        tXrX, tXrO = [cute.make_rmem_tensor_like(thr) for thr in (tXgX, tXgO)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
@@ -306,7 +306,7 @@ class SoftmaxBackward(ReductionBase):
         tYsY = thr_copy.partition_D(sY)
         tdXgdX = thr_copy.partition_D(gdX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
-        tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
+        tdYrdY, tYrY, tdXrdX = [cute.make_rmem_tensor_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (

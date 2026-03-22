@@ -131,7 +131,7 @@ class CrossEntropy(ReductionBase):
         tXgX = thr_copy.partition_S(gX)
         tXsX = thr_copy.partition_D(sX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
-        tXrX = cute.make_fragment_like(tXgX)
+        tXrX = cute.make_rmem_tensor_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
@@ -227,11 +227,11 @@ class CrossEntropy(ReductionBase):
             probs = exp_x * denom_inv
             gdX = cute.local_tile(mdX, tiler_mn, (bidx, cluster_y))
             tXgdX = thr_copy.partition_D(gdX)
-            tXrdX = cute.make_fragment_like(tXgdX)
+            tXrdX = cute.make_rmem_tensor_like(tXgdX)
             tXcFull = thr_copy.partition_S(cX)
             # Compute gradient: probs for all classes, (probs - 1) for target class
             # If ignored, gradient is already zero
-            tXrdX_f32 = cute.make_fragment_like(tXrX, Float32)
+            tXrdX_f32 = cute.make_rmem_tensor_like(tXrX, Float32)
             tXrdX_f32.store(probs)
             if not should_ignore:
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
@@ -486,7 +486,7 @@ class CrossEntropyBackward:
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
         tXcFull = thr_copy.partition_S(cX)
         tXgdX = thr_copy.partition_D(gdX)
-        tXrX, tXrdX = [cute.make_fragment_like(thr) for thr in (tXgX, tXgdX)]
+        tXrX, tXrdX = [cute.make_rmem_tensor_like(thr) for thr in (tXgX, tXgdX)]
 
         is_even_N = const_expr(shape[1] % tiler_mn[1] == 0)
         tXpX = (
@@ -518,7 +518,7 @@ class CrossEntropyBackward:
         log2_e = math.log2(math.e)
         probs = cute.math.exp2(x * log2_e - (lse * log2_e), fastmath=True)
         prob_shifted = probs - 1.0
-        mask = cute.make_fragment_like(tXrX, Boolean)
+        mask = cute.make_rmem_tensor_like(tXrX, Boolean)
         for i in cutlass.range(cute.size(tXcFull), unroll_full=True):
             mask[i] = tXcFull[i][1] == target
         grad = cute.where(mask.load(), prob_shifted, probs)

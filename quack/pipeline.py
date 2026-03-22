@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025-2026, Tri Dao.
 
 from typing import Optional
 from dataclasses import dataclass

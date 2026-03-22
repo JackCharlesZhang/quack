@@ -152,11 +152,11 @@ class RMSNorm(ReductionBase):
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
-        tXrW = cute.make_fragment_like(tXgW) if const_expr(mW is not None) else None
-        tXrB = cute.make_fragment_like(tXgB) if const_expr(mB is not None) else None
-        tXrX, tXrO = [cute.make_fragment_like(t) for t in (tXgX, tXgO)]
+        tXrW = cute.make_rmem_tensor_like(tXgW) if const_expr(mW is not None) else None
+        tXrB = cute.make_rmem_tensor_like(tXgB) if const_expr(mB is not None) else None
+        tXrX, tXrO = [cute.make_rmem_tensor_like(t) for t in (tXgX, tXgO)]
         if const_expr(mRes is not None):
-            tXrRes = cute.make_fragment_like(tXgRes)
+            tXrRes = cute.make_rmem_tensor_like(tXgRes)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
@@ -190,7 +190,7 @@ class RMSNorm(ReductionBase):
             cute.autovec_copy(tXsRes, tXrRes)
             x += tXrRes.load().to(cute.Float32)
         if const_expr(mResO is not None):
-            tXrResO = cute.make_fragment_like(tXgResO)
+            tXrResO = cute.make_rmem_tensor_like(tXgResO)
             tXrResO.store(x.to(tXrResO.element_type))
             if row < shape[0]:
                 copy(tXrResO, tXgResO)
@@ -620,14 +620,14 @@ class RMSNormBackward(ReductionBase):
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
 
         tXrX, tXrdO, tXrdX = [
-            cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)
+            cute.make_rmem_tensor_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)
         ]
         tXrdResO = None
         if const_expr(mdResO is not None):
-            tXrdResO = cute.make_fragment_like(tXgdResO[None, None, None, 0])
+            tXrdResO = cute.make_rmem_tensor_like(tXgdResO[None, None, None, 0])
         tXrdRes = None
         if const_expr(mdRes is not None):
-            tXrdRes = cute.make_fragment_like(tXgdRes[None, None, None, 0])
+            tXrdRes = cute.make_rmem_tensor_like(tXgdRes[None, None, None, 0])
 
         # This doesn't change across iterations
         tXpX = (
@@ -643,11 +643,11 @@ class RMSNormBackward(ReductionBase):
         if const_expr(mdW is not None):
             tXgdW = thr_copy_X.partition_S(gdW)
             # Always compute partial weight gradients in fp32
-            tXrdW = cute.make_fragment_like(tXgdW, Float32)
+            tXrdW = cute.make_rmem_tensor_like(tXgdW, Float32)
         if const_expr(mdB is not None):
             tXgdB = thr_copy_X.partition_S(gdB)
             # Always compute partial bias gradients in fp32
-            tXrdB = cute.make_fragment_like(tXgdB, Float32)
+            tXrdB = cute.make_rmem_tensor_like(tXgdB, Float32)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
 
@@ -656,7 +656,7 @@ class RMSNormBackward(ReductionBase):
         tXrW = None
         if const_expr(mW is not None):
             tXgW = thr_copy_X.partition_S(gW)
-            tXrW = cute.make_fragment_like(tXgW)
+            tXrW = cute.make_rmem_tensor_like(tXgW)
             # Need this, otherwise rW can have arbitrary values that changes the reduction
             if const_expr(not is_even_N):
                 tXrW.fill(0.0)
@@ -793,7 +793,7 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.barrier()
                 if row == 0:
                     for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
-                        tXrdW_other = cute.make_fragment_like(tXrdW)
+                        tXrdW_other = cute.make_rmem_tensor_like(tXrdW)
                         tXsdW_other = cute.make_tensor(
                             tXsdW.iterator + i * sdW.stride[0], tXsdW.layout
                         )
@@ -814,7 +814,7 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.barrier()
                 if row == 0:
                     for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
-                        tXrdB_other = cute.make_fragment_like(tXrdB)
+                        tXrdB_other = cute.make_rmem_tensor_like(tXrdB)
                         tXsdB_other = cute.make_tensor(
                             tXsdB.iterator + i * sdB.stride[0], tXsdB.layout
                         )

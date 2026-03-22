@@ -89,7 +89,7 @@ class RmsFinalReduce(ReductionBase):
         tXgX = thr_copy.partition_S(gX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
 
-        tXrX = cute.make_fragment_like(tXgX)
+        tXrX = cute.make_rmem_tensor_like(tXgX)
         cute.filter_zeros(tXrX).fill(0)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
