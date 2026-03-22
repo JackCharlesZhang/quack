@@ -23,6 +23,7 @@ from quack.gemm_interface import (
     gemm_norm_act,
     gemm_norm_act_ref,
 )
+from quack.gemm_config import GemmConfig
 from quack.rounding import RoundingMode
 from quack.rms_final_reduce import rms_final_reduce
 
@@ -528,59 +529,83 @@ def test_rms_final_reduce(M, N, input_dtype):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("has_norm_weight", [False, True])
 @pytest.mark.parametrize("has_C", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1504, 2048])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960, 1920])
-def test_gemm_rms(m, k, n, input_dtype, has_C, use_compile):
-    """Test GEMM + RMS: D = A @ B (+ C), rstd = rsqrt(mean(D^2) + eps)."""
+def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
+    """Test GEMM + RMS + optional rowvec scaling.
+
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    """
     device = "cuda"
     torch.random.manual_seed(0)
     eps = 1e-6
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
     C = torch.randn((m, n), device=device, dtype=input_dtype) if has_C else None
+    norm_weight = torch.randn(n, device=device, dtype=input_dtype) if has_norm_weight else None
     fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D, rstd = fn(A, B, C=C, eps=eps, tuned=False)
+    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, eps=eps, tuned=False)
     D_ref, rstd_ref = gemm_rms_ref(
-        A.float(), B.float(), C=C.float() if C is not None else None, eps=eps
+        A.float(),
+        B.float(),
+        C=C.float() if C is not None else None,
+        norm_weight=norm_weight,
+        eps=eps,
     )
-    D_pt, rstd_pt = gemm_rms_ref(A, B, C=C, eps=eps)
+    D_pt, rstd_pt = gemm_rms_ref(A, B, C=C, norm_weight=norm_weight, eps=eps)
     assert (D - D_ref).abs().max() < 2 * (D_pt - D_ref).abs().max() + 1e-5
     assert (rstd - rstd_ref).abs().max() < 2 * (rstd_pt - rstd_ref).abs().max() + 1e-3
 
 
+@pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", [None, "silu", "relu", "gelu_tanh_approx"])
 @pytest.mark.parametrize("has_C", [False, True])
 @pytest.mark.parametrize("n", [2048])
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile):
+def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_ab):
+    from quack.gemm_interface import gemm_norm_act_tuned
+
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1024
     A = torch.randn(m, k, device=device, dtype=input_dtype)
     B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
     C = torch.randn(m, n, device=device, dtype=input_dtype) if has_C else None
-    norm_weight = torch.randn(n, device=device, dtype=input_dtype)
     rstd = torch.randn(m, device=device, dtype=torch.float32)
-    fn = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
-    preact, postact = fn(
-        A,
-        B,
-        norm_weight=norm_weight,
-        rstd=rstd,
-        C=C,
-        activation=activation,
-        store_preact=True,
-        tuned=False,
-    )
+    if not swap_ab:
+        fn = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
+        preact, postact = fn(
+            A,
+            B,
+            rstd=rstd,
+            C=C,
+            activation=activation,
+            store_preact=True,
+            tuned=False,
+        )
+    else:
+        preact = torch.empty(m, n, device=device, dtype=input_dtype)
+        postact = torch.empty(m, n, device=device, dtype=input_dtype)
+        gemm_norm_act_tuned.fn(
+            A,
+            B,
+            preact,
+            postact,
+            C,
+            rstd,
+            activation,
+            False,
+            config=GemmConfig(swap_ab=True),
+        )
     preact_ref, postact_ref = gemm_norm_act_ref(
         A.float(),
         B.float(),
-        norm_weight=norm_weight,
         rstd=rstd,
         C=C.float() if C is not None else None,
         activation=activation,
@@ -589,7 +614,6 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile):
     preact_pt, postact_pt = gemm_norm_act_ref(
         A,
         B,
-        norm_weight=norm_weight,
         rstd=rstd,
         C=C,
         activation=activation,
@@ -610,14 +634,11 @@ def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
     m = 1024
     A = torch.randn(m, k, device=device, dtype=input_dtype)
     B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
-    norm_weight = torch.randn(n, device=device, dtype=input_dtype)
     rstd = torch.randn(m, device=device, dtype=torch.float32)
-
     fn = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
     preact, postact = fn(
         A,
         B,
-        norm_weight=norm_weight,
         rstd=rstd,
         activation=activation,
         store_preact=True,
@@ -626,7 +647,6 @@ def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
     preact_ref, postact_ref = gemm_norm_act_ref(
         A.float(),
         B.float(),
-        norm_weight=norm_weight,
         rstd=rstd,
         activation=activation,
         store_preact=True,
@@ -634,7 +654,6 @@ def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
     preact_pt, postact_pt = gemm_norm_act_ref(
         A,
         B,
-        norm_weight=norm_weight,
         rstd=rstd,
         activation=activation,
         store_preact=True,
@@ -671,21 +690,13 @@ def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
     W1 = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
     w = torch.randn(k, device=device, dtype=input_dtype)
 
-    # Step 1: fused gemm_rms → D = x @ W2 + residual, rstd
+    # Step 1: fused gemm_rms with norm_weight → D_normed = (x @ W2 + residual) * w, rstd
     fn_rms = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D, rstd = fn_rms(x, W2, C=residual, eps=eps, tuned=False)
+    D_normed, rstd = fn_rms(x, W2, C=residual, norm_weight=w, eps=eps, tuned=False)
 
-    # Step 2: pre-fuse norm_weight into W1, then fused gemm_norm_act
-    # rmsnorm(D) @ W1 = (D @ diag(w) @ W1) * rstd
-    W1_fused = w.unsqueeze(1) * W1  # (k, n)
+    # Step 2: fused gemm_norm_act → postact = activation((D_normed @ W1) * rstd)
     fn_norm_act = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
-    _, postact = fn_norm_act(
-        D,
-        W1_fused,
-        rstd=rstd,
-        activation=activation,
-        tuned=False,
-    )
+    _, postact = fn_norm_act(D_normed, W1, rstd=rstd, activation=activation, tuned=False)
 
     # Reference: PyTorch fp32
     D_ref = x.float() @ W2.float() + residual.float()

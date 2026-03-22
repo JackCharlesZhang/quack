@@ -373,6 +373,31 @@ class TileStore(EpiOp):
 
 
 @cute.jit
+def vec_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
+    """Multiply tRS_rD by colvec and/or rowvec in-place. Uses packed f32x2 on SM100+."""
+    if const_expr(tDrColVec is not None):
+        if const_expr(gemm.arch < 100):
+            for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
+                tRS_rD[i] *= tDrColVec[i]
+        else:
+            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
+                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
+                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                    (tDrColVec[2 * i], tDrColVec[2 * i + 1]),
+                )
+    if const_expr(tDrRowVec is not None):
+        if const_expr(gemm.arch < 100):
+            for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
+                tRS_rD[i] *= tDrRowVec[i]
+        else:
+            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
+                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
+                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
+                    (tDrRowVec[2 * i], tDrRowVec[2 * i + 1]),
+                )
+
+
+@cute.jit
 def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
     """Accumulate transform_fn(input) or input * rScale into a ColVecReduce buffer.
 

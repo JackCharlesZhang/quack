@@ -21,6 +21,7 @@ from quack.cute_dsl_utils import (
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_act import GemmActMixin, GemmGatedMixin
+from quack.epi_ops import vec_multiply
 from quack.activation import act_fn_map, gate_fn_map
 from quack.cache_utils import jit_cache
 from quack.rounding import RoundingMode
@@ -36,34 +37,6 @@ from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
 )
 import quack.utils as utils
-
-
-@cute.jit
-def _norm_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
-    """Multiply tRS_rD by colvec (rstd) and rowvec (norm_weight) in-place.
-
-    Uses packed f32x2 ops on SM100+.
-    """
-    if const_expr(tDrColVec is not None):
-        if const_expr(gemm.arch < 100):
-            for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
-                tRS_rD[i] *= tDrColVec[i]
-        else:
-            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
-                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
-                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
-                    (tDrColVec[2 * i], tDrColVec[2 * i + 1]),
-                )
-    if const_expr(tDrRowVec is not None):
-        if const_expr(gemm.arch < 100):
-            for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
-                tRS_rD[i] *= tDrRowVec[i]
-        else:
-            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
-                tRS_rD[2 * i], tRS_rD[2 * i + 1] = cute.arch.mul_packed_f32x2(
-                    (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
-                    (tDrRowVec[2 * i], tDrRowVec[2 * i + 1]),
-                )
 
 
 class GemmNormActMixin(GemmActMixin):
@@ -96,7 +69,7 @@ class GemmNormActMixin(GemmActMixin):
                 rD += beta * tRS_rC.load().to(tRS_rD.element_type)
         tRS_rD.store(rD)
         # Multiply by colvec (rstd) and rowvec (norm_weight)
-        _norm_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
+        vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Apply activation
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
@@ -147,7 +120,7 @@ class GemmNormGatedMixin(GemmGatedMixin):
                 rD += beta * tRS_rC.load().to(tRS_rD.element_type)
         tRS_rD.store(rD)
         # Multiply by colvec (rstd) and rowvec (norm_weight)
-        _norm_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
+        vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Gated activation on normalized D
         tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)

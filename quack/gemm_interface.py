@@ -1511,6 +1511,7 @@ def _gemm_rms_tuned(
     B: Tensor,  # (K, N) or (L, K, N)
     out: Tensor,  # (M, N) or (L, M, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
@@ -1528,6 +1529,8 @@ def _gemm_rms_tuned(
         out = out.unsqueeze(0)
     if C is not None and C.ndim == 2:
         C = C.unsqueeze(0)
+    if norm_weight is not None and norm_weight.ndim == 1:
+        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
     # Allocate partial reduction buffer
     tile_n = config.tile_n
     n_tiles = (N + tile_n - 1) // tile_n
@@ -1551,6 +1554,7 @@ def _gemm_rms_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
+        rowvec=norm_weight,
     )
     # Final reduction: rstd = rsqrt(sum(partials) / N + eps)
     scale = 1.0 / N
@@ -1566,20 +1570,32 @@ def _gemm_rms_tuned(
     "quack::gemm_rms_out",
     mutates_args=("out",),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
 )
 def _gemm_rms_out(
     A: Tensor,
     B: Tensor,
     out: Tensor,
     C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
-    """GEMM + RMS: D = A @ B (+ C), returns rstd = rsqrt(mean(D^2) + eps)."""
+    """GEMM + RMS + optional rowvec scaling.
+
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    """
     fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
-    return fn(A, B, out, C=C, eps=eps, dynamic_scheduler=dynamic_scheduler)
+    return fn(
+        A,
+        B,
+        out,
+        C=C,
+        norm_weight=norm_weight,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+    )
 
 
 @torch.library.register_fake("quack::gemm_rms_out")
@@ -1588,12 +1604,20 @@ def _gemm_rms_out_fake(
     B: Tensor,
     out: Tensor,
     C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tensor:
     _precompile_default_config(
-        _gemm_rms_tuned, A, B, out, C=C, eps=eps, dynamic_scheduler=dynamic_scheduler
+        _gemm_rms_tuned,
+        A,
+        B,
+        out,
+        C=C,
+        norm_weight=norm_weight,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
     )
     rstd_shape = A.shape[:-1]
     return torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
@@ -1603,14 +1627,17 @@ def gemm_rms_ref(
     A: Tensor,
     B: Tensor,
     C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
     eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor]:
-    """Reference: D = A @ B (+ C), rstd[m] = rsqrt(mean_n(D[m,n]^2) + eps)."""
+    """Reference: D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D = D_raw * norm_weight."""
     fn = torch.bmm if A.ndim == 3 else torch.mm
     D = fn(A, B)
     if C is not None:
         D = D + C
     rstd = torch.rsqrt(D.float().square().mean(dim=-1) + eps)
+    if norm_weight is not None:
+        D = D * norm_weight
     return D, rstd
 
 
@@ -1618,15 +1645,17 @@ def gemm_rms(
     A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     out_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tuple[Tensor, Tensor]:
-    """GEMM + RMS statistics: D = A @ B (+ C), rstd[m] = rsqrt(mean_n(D[m,n]^2) + eps).
+    """GEMM + RMS statistics + optional rowvec scaling.
 
-    Returns (D, rstd).
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    Returns (D_out, rstd).
     """
     out_dtype = A.dtype if out_dtype is None else out_dtype
     N = B.shape[-1]
@@ -1638,6 +1667,7 @@ def gemm_rms(
         B,
         out,
         C=C,
+        norm_weight=norm_weight,
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
@@ -1659,7 +1689,6 @@ def gemm_norm_act_tuned(
     preact_out: Optional[Tensor],  # (M, N) or (L, M, N) — None if not storing preact
     postact_out: Tensor,  # (M, N) or (L, M, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
-    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     rstd: Optional[Tensor] = None,  # (M,) or (L, M)
     activation: ActActivation = None,
     dynamic_scheduler: bool = False,
@@ -1682,8 +1711,6 @@ def gemm_norm_act_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
-    if norm_weight is not None and norm_weight.ndim == 1:
-        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
@@ -1704,8 +1731,8 @@ def gemm_norm_act_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
-        rowvec=norm_weight if not config.swap_ab else None,
-        colvec=rstd,
+        colvec=rstd if not config.swap_ab else None,
+        rowvec=rstd if config.swap_ab else None,
     )
 
 
@@ -1720,7 +1747,6 @@ def gemm_norm_gated_tuned(
     preact_out: Optional[Tensor],  # (M, N) or (L, M, N)
     postact_out: Tensor,  # (M, N//2) or (L, M, N//2)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
-    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     rstd: Optional[Tensor] = None,  # (M,) or (L, M)
     activation: GatedActivation = "swiglu",
     dynamic_scheduler: bool = False,
@@ -1743,8 +1769,6 @@ def gemm_norm_gated_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
-    if norm_weight is not None and norm_weight.ndim == 1:
-        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
@@ -1765,8 +1789,8 @@ def gemm_norm_gated_tuned(
         config.pingpong,
         persistent=True,
         max_swizzle_size=config.max_swizzle_size,
-        rowvec=norm_weight if not config.swap_ab else None,
-        colvec=rstd,
+        colvec=rstd if not config.swap_ab else None,
+        rowvec=rstd if config.swap_ab else None,
     )
 
 
@@ -1774,7 +1798,7 @@ def gemm_norm_gated_tuned(
     "quack::gemm_norm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? norm_weight=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_norm_act_out(
     A: Tensor,
@@ -1782,14 +1806,13 @@ def gemm_norm_act_out(
     preact_out: Optional[Tensor],
     postact_out: Tensor,
     C: Optional[Tensor] = None,
-    norm_weight: Optional[Tensor] = None,
     rstd: Optional[Tensor] = None,
     activation: ActActivation = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     fn = gemm_norm_act_tuned if tuned else partial(gemm_norm_act_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, norm_weight, rstd, activation, dynamic_scheduler)
+    fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
 @torch.library.register_fake("quack::gemm_norm_act_out")
@@ -1799,7 +1822,6 @@ def _gemm_norm_act_out_fake(
     preact_out,
     postact_out,
     C=None,
-    norm_weight=None,
     rstd=None,
     activation=None,
     dynamic_scheduler=False,
@@ -1812,7 +1834,7 @@ def _gemm_norm_act_out_fake(
     "quack::gemm_norm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? norm_weight=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_norm_gated_out(
     A: Tensor,
@@ -1820,14 +1842,13 @@ def gemm_norm_gated_out(
     preact_out: Optional[Tensor],
     postact_out: Tensor,
     C: Optional[Tensor] = None,
-    norm_weight: Optional[Tensor] = None,
     rstd: Optional[Tensor] = None,
     activation: GatedActivation = "swiglu",
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     fn = gemm_norm_gated_tuned if tuned else partial(gemm_norm_gated_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, norm_weight, rstd, activation, dynamic_scheduler)
+    fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
 @torch.library.register_fake("quack::gemm_norm_gated_out")
@@ -1837,7 +1858,6 @@ def _gemm_norm_gated_out_fake(
     preact_out,
     postact_out,
     C=None,
-    norm_weight=None,
     rstd=None,
     activation="swiglu",
     dynamic_scheduler=False,
@@ -1849,7 +1869,6 @@ def _gemm_norm_gated_out_fake(
 def gemm_norm_act(
     A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
-    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     rstd: Optional[Tensor] = None,  # (M,) or (L, M)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) — residual
     activation: Activation = None,
@@ -1861,9 +1880,9 @@ def gemm_norm_act(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> Tuple[Optional[Tensor], Tensor]:
-    """GEMM + normalize + activation: PostAct = act((A @ B + C) * rstd * norm_weight).
+    """GEMM + normalize + activation: PostAct = act((A @ B + C) * rstd).
 
-    rstd is a column vector (M,), norm_weight is a row vector (N,).
+    rstd is a column vector (M,).
     Returns (preact, postact) where preact is the normalized value before activation.
     """
     is_gated = activation in gated_to_pytorch_fn_map
@@ -1885,7 +1904,6 @@ def gemm_norm_act(
             preact_out,
             postact_out,
             C,
-            norm_weight,
             rstd,
             activation,
             dynamic_scheduler,
@@ -1898,7 +1916,6 @@ def gemm_norm_act(
             preact_out,
             postact_out,
             C,
-            norm_weight,
             rstd,
             activation,
             dynamic_scheduler,
@@ -1913,7 +1930,6 @@ gemm_norm_gated = gemm_norm_act
 def gemm_norm_act_ref(
     A: Tensor,
     B: Tensor,
-    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     rstd: Optional[Tensor] = None,  # (M,) or (L, M)
     C: Optional[Tensor] = None,
     activation: Activation = None,
@@ -1921,7 +1937,7 @@ def gemm_norm_act_ref(
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
-    """Reference: preact = (A @ B + C) * rstd * norm_weight, postact = act(preact)."""
+    """Reference: preact = (A @ B + C) * rstd, postact = act(preact)."""
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
@@ -1929,20 +1945,8 @@ def gemm_norm_act_ref(
     D = fn(A, B)
     if C is not None:
         D = D + C
-    # Apply normalization: D * rstd (colvec) * norm_weight (rowvec)
     if rstd is not None:
-        if rstd.ndim == 1:
-            D = D * rstd.unsqueeze(-1)
-        else:
-            D = D * rstd.unsqueeze(-1)
-    if norm_weight is not None:
-        if D.ndim == 2:
-            D = D * norm_weight
-        else:
-            if norm_weight.ndim == 1:
-                D = D * norm_weight
-            else:
-                D = D * norm_weight.unsqueeze(-2)
+        D = D * rstd.unsqueeze(-1)
     preact = D.to(out_dtype) if store_preact else None
     _act_map = {**act_to_pytorch_fn_map, "silu": F.silu}
     if is_gated:
