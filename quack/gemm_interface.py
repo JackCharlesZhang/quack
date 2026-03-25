@@ -989,7 +989,7 @@ def gemm_symmetric_out(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    tile_m = 256 if default_device_capacity[0] == 10 else 128
+    tile_m = 256 if get_device_capacity(A.device)[0] == 10 else 128
     gemm_symmetric_sm90_sm100(
         A,
         B,
@@ -1429,7 +1429,7 @@ def gemm_symmetric_out_fake(
     if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
         return
     # gemm_symmetric is not autotuned, compile the single fixed config directly
-    tile_m = 256 if default_device_capacity[0] == 10 else 128
+    tile_m = 256 if get_device_capacity(A.device)[0] == 10 else 128
     try:
         gemm_symmetric_sm90_sm100(
             A.unsqueeze(0) if A.ndim == 2 else A,
