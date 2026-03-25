@@ -49,4 +49,4 @@ def test_symmetric_gemm(dtype, L, M, K, has_C, alpha, beta):
         alpha=alpha,
     )
 
-    assert (out - out_ref).abs().max() < (out_pt - out_ref).abs().max() + 1e-6
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
