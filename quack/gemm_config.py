@@ -10,6 +10,8 @@ class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192
     pingpong: bool = True
+    # by default, we use dynamic persistent tile scheduler on SM100 but not on SM90
+    is_dynamic_persistent: bool = True
     cluster_m: int = 2
     cluster_n: int = 1
     swap_ab: bool = False
@@ -55,6 +57,7 @@ def _get_sm90_configs(
             cluster_n=cluster_n,
             swap_ab=swap_ab,
             device_capacity=9,
+            is_dynamic_persistent=False,  # default to not use dynamic persistent on SM90
         )
         for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
             tile_mn_vals,
@@ -82,11 +85,20 @@ def _get_sm100_configs(
     GemmConfigCls = partial(
         GemmConfig, pingpong=False, device_capacity=10
     )  # There's no pingpong on Sm100
+    use_clc_vals = [True, False]
     return [
         GemmConfigCls(
-            tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
         )
-        for (m, n, (cm, cn)), sab in itertools.product(tile_mn_cluster_vals, swap_ab_vals)
+        for (m, n, (cm, cn)), sab, use_clc in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals
+        )
     ]
 
 

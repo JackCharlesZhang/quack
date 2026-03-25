@@ -62,7 +62,7 @@ def make_scheduler_args(
     max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None
 ):
     return TileSchedulerOptions(
-        max_active_clusters=max_active_clusters,
+        max_active_clusters=Int32(max_active_clusters),
         raster_order=None,
         max_swizzle_size=max_swizzle_size,
         tile_count_semaphore=(
@@ -173,6 +173,7 @@ def compile_gemm_kernel(
     pingpong,
     persistent,
     gather_A,
+    is_dynamic_persistent,
     device_capacity,
     mA,
     mB,
@@ -188,7 +189,15 @@ def compile_gemm_kernel(
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] == 9:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-    gemm_obj = GemmCls(Float32, a_dtype, tile_shape_mn, cluster_shape_mnk, gather_A=gather_A)
+    elif device_capacity[0] == 10:
+        GemmCls = partial(GemmCls, use_clc_persistence=is_dynamic_persistent)
+    gemm_obj = GemmCls(
+        Float32,
+        a_dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        gather_A=gather_A,
+    )
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
