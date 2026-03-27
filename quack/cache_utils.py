@@ -52,21 +52,27 @@ def get_cache_path() -> Path:
     return cache_dir
 
 
+def _hash_source_dir(h, root: Path) -> None:
+    """Hash all Python sources under *root* into *h*."""
+    for src in sorted(root.rglob("*.py")):
+        if not src.is_file():
+            continue
+        h.update(src.relative_to(root).as_posix().encode())
+        content = src.read_bytes()
+        h.update(len(content).to_bytes(8, "little"))
+        h.update(content)
+
+
 @functools.lru_cache(maxsize=1)
 def _compute_source_fingerprint() -> str:
-    """Hash all quack Python sources plus runtime ABI stamps into a short fingerprint."""
-    quack_root = Path(__file__).resolve().parent
+    """Hash quack + extra source dirs plus runtime ABI stamps into a fingerprint."""
     h = hashlib.sha256()
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
-    for src in sorted(quack_root.rglob("*.py")):
-        if not src.is_file():
-            continue
-        h.update(src.relative_to(quack_root).as_posix().encode())
-        content = src.read_bytes()
-        h.update(len(content).to_bytes(8, "little"))
-        h.update(content)
+    _hash_source_dir(h, Path(__file__).resolve().parent)
+    for extra_dir in EXTRA_SOURCE_DIRS:
+        _hash_source_dir(h, Path(extra_dir).resolve())
     return h.hexdigest()
 
 
