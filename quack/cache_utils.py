@@ -30,6 +30,10 @@ CACHE_ENABLED: bool = os.getenv("QUACK_CACHE_ENABLED", "1") == "1"
 CACHE_DIR: str | None = os.getenv("QUACK_CACHE_DIR", None)
 COMPILE_ONLY: bool = False
 
+# Downstream projects can append directories here to include their sources
+# in the cache fingerprint. Must be set before the first jit_cache call.
+EXTRA_SOURCE_DIRS: list[Path] = []
+
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
