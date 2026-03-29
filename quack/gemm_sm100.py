@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026, Tri Dao.
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
@@ -210,6 +211,10 @@ class GemmSm100(GemmSm90):
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         self.num_epi_warps = len(self.epilog_warp_id)
+        self.epilogue_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.Epilogue),
+            num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
+        )
         # Register reallocation for gather_A (3 warp groups, 504 regs total, 168 per WG default).
         # Heavy epilogues (e.g. colvec_reduce in DGated) override these to avoid register spilling.
         # Without gather_A there are only 2 WGs (512 total, 256 per WG = max), no reallocation needed.
@@ -1393,11 +1398,6 @@ class GemmSm100(GemmSm90):
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
-            epilogue_barrier = pipeline.NamedBarrier(
-                barrier_id=int(NamedBarrierGemm.Epilogue),
-                num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
-            )
-
             # Partition for epilogue
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = self.epilog_tmem_copy_and_partition(
@@ -1479,7 +1479,7 @@ class GemmSm100(GemmSm90):
                     copy_C,
                     tile_coord_mnkl,
                     varlen_manager,
-                    epilogue_barrier,
+                    self.epilogue_barrier,
                     tile_scheduler,
                     epi_tidx,
                     is_tma_warp,

@@ -14,7 +14,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
+from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100, GemmDefaultSm120
 from quack.gemm_sm90 import TileSchedulerOptions
 
 from quack.cute_dsl_utils import get_device_capacity
@@ -141,6 +141,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--add_to_output", action="store_true", help="Add to output")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
+    parser.add_argument("--sm120", action="store_true", help="Use SM120 warp-level MMA (on SM90 HW)")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
     args = parser.parse_args()
@@ -181,6 +182,7 @@ def run(
     gather_A: bool,
     add_to_output: bool,
     fp8_fast_accum: bool,
+    sm120: bool = False,
     **kwargs,
 ):
     """
@@ -235,7 +237,7 @@ def run(
     # Unpack parameters
     m, n, k, l = mnkl
     cluster_shape_mnk = (*cluster_shape_mn, 1)
-    GemmCls = GemmDefaultSm100 if is_sm100 else GemmDefaultSm90
+    GemmCls = GemmDefaultSm100 if is_sm100 else (GemmDefaultSm120 if sm120 else GemmDefaultSm90)
 
     # Skip unsupported types
     if not GemmCls.is_valid_dtypes(
@@ -376,6 +378,15 @@ def run(
             cluster_shape_mnk,
             gather_A=gather_A,
             use_clc_persistence=dynamic_persistent,
+        )
+    elif sm120:
+        gemm = GemmCls(
+            acc_dtype,
+            a_dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            is_persistent=persistent,
+            gather_A=gather_A,
         )
     else:
         gemm = GemmCls(
@@ -600,5 +611,6 @@ if __name__ == "__main__":
         args.gather_A,
         args.add_to_output,
         args.fp8_fast_accum,
+        args.sm120,
     )
     print("PASS")

@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026, Tri Dao.
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
@@ -234,6 +235,10 @@ class GemmSm90:
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
+        self.epilogue_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.Epilogue),
+            num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
+        )
         self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.ab_load_warp_id = self.mma_warp_groups * 4
 
@@ -267,20 +272,8 @@ class GemmSm90:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-    def _setup_attributes(self, epilogue_args: EpilogueArguments):
-        """Set up configurations that are dependent on GEMM inputs
-
-        This method configures various attributes based on the input tensor properties
-        (data types, leading dimensions) and kernel settings:
-        - Configuring tiled MMA
-        - Computing MMA/cluster/tile shapes
-        - Computing cluster layout
-        - Computing multicast CTAs for A/B
-        - Computing epilogue subtile
-        - Setting up A/B/C stage counts in shared memory
-        - Computing A/B/C shared memory layout
-        """
-
+    def _setup_tiled_mma(self):
+        """Set up tiled MMA and tile K dimension. Override for different MMA types."""
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -312,6 +305,21 @@ class GemmSm90:
             self.cta_tile_shape_mnk[1],
             mma_inst_shape_k * mma_inst_tile_k,
         )
+
+    def _setup_attributes(self, epilogue_args: EpilogueArguments):
+        """Set up configurations that are dependent on GEMM inputs
+
+        This method configures various attributes based on the input tensor properties
+        (data types, leading dimensions) and kernel settings:
+        - Configuring tiled MMA
+        - Computing MMA/cluster/tile shapes
+        - Computing cluster layout
+        - Computing multicast CTAs for A/B
+        - Computing epilogue subtile
+        - Setting up A/B/C stage counts in shared memory
+        - Computing A/B/C shared memory layout
+        """
+        self._setup_tiled_mma()
 
         self.cluster_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
@@ -885,11 +893,6 @@ class GemmSm90:
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
 
-                epilogue_barrier = pipeline.NamedBarrier(
-                    barrier_id=int(NamedBarrierGemm.Epilogue),
-                    num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
-                )
-
                 copy_D = None
                 if const_expr(has_D):
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
@@ -917,7 +920,7 @@ class GemmSm90:
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
                 # (R2S, R2S_M, R2S_N, num_epi)
-                tRS_rAcc = cute.flat_divide(acc, tRS_rD.layout)
+                tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
                 load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
@@ -949,7 +952,7 @@ class GemmSm90:
                     copy_C,
                     tile_coord_mnkl,
                     varlen_manager,
-                    epilogue_barrier,
+                    self.epilogue_barrier,
                     tile_scheduler,
                     tidx,
                     is_tma_warp,
@@ -1387,6 +1390,10 @@ class GemmSm90:
                 persistence_mode=persistence_mode,
             )
         return tile_sched_args
+
+    def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
+        """Retile accumulator for epilogue subtile access. SM90 uses flat_divide."""
+        return cute.flat_divide(acc, tRS_rD.layout)
 
     @cute.jit
     def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):

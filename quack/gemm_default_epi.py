@@ -10,6 +10,7 @@ from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import Scalar, RowVecLoad, ColVecLoad
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.rounding import RoundingMode
 import quack.utils as utils
 
@@ -100,4 +101,8 @@ class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):
 
 
 class GemmDefaultSm100(GemmDefaultEpiMixin, GemmSm100):
+    pass
+
+
+class GemmDefaultSm120(GemmDefaultEpiMixin, GemmSm120):
     pass
