@@ -55,6 +55,7 @@ def _compile_gemm(
     device_capacity,
     rounding_mode,
     sr_seed_mode,
+    has_trace_ptr,
 ):
     GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
@@ -118,6 +119,7 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
+        has_trace_ptr=has_trace_ptr,
     )
 
 
@@ -147,6 +149,7 @@ def gemm(
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -216,6 +219,7 @@ def gemm(
         device_capacity,
         rounding_mode,
         sr_seed_mode,
+        trace_ptr is not None,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -251,6 +255,8 @@ def gemm(
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     if device_capacity[0] > 9:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+        compiled_fn(
+            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
+        )
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, trace_ptr)

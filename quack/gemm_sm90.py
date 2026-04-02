@@ -375,6 +375,7 @@ class GemmSm90:
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes
@@ -542,6 +543,7 @@ class GemmSm90:
             self.epi_c_smem_layout_staged,
             tile_sched_params,
             TileSchedulerCls,
+            trace_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -573,6 +575,7 @@ class GemmSm90:
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -600,6 +603,11 @@ class GemmSm90:
         :param epi_smem_layout: Shared memory layout for epilogue
         :type epi_smem_layout: cute.ComposedLayout
         """
+
+        from quack.trace import TraceContext
+
+        GEMM_REGIONS = ("tma_load", "mma", "epilogue")
+        tctx = TraceContext.create(trace_ptr, region_names=GEMM_REGIONS)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -703,6 +711,7 @@ class GemmSm90:
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
                 while work_tile.is_valid_tile:
+                    tctx.b("tma_load")
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
                     # Local_tile partition global tensors
@@ -804,6 +813,7 @@ class GemmSm90:
                             k_tile_cnt,
                             varlen_m=varlen_m,
                         )
+                    tctx.e("tma_load")
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
@@ -882,9 +892,11 @@ class GemmSm90:
                 batch_idx = tile_coord_mnkl[3]
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                tctx.b("mma")
                 ab_read_state = self.mma(
                     ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
                 )
+                tctx.e("mma")
                 if const_expr(varlen_k):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
@@ -892,6 +904,7 @@ class GemmSm90:
                 # EPILOGUE
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
+                tctx.b("epilogue")
 
                 copy_D = None
                 if const_expr(has_D):
@@ -966,6 +979,8 @@ class GemmSm90:
                         epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
 
+                tctx.e("epilogue")
+
                 if const_expr(not self.pingpong):
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
@@ -993,6 +1008,8 @@ class GemmSm90:
             if const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
+
+        tctx.flush()
 
     @cute.jit
     def load_AB(
