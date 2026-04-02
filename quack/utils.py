@@ -7,8 +7,9 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
@@ -193,6 +194,34 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
                     cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
             else:
                 cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+
+
+# ---------------------------------------------------------------------------
+# General-purpose DSL store / vector helpers
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def make_vector(elem_type, *values, loc=None, ip=None):
+    """Build an MLIR vector <N x elem_type> from N scalar DSL values.
+
+    Example: make_vector(cutlass.Uint32, v0, v1) -> <2 x i32> MLIR vector
+    """
+    from cutlass._mlir import ir
+
+    n = len(values)
+    mlir_ty = elem_type.mlir_type
+    vec_ty = ir.VectorType.get([n], mlir_ty)
+    vec = llvm.mlir_undef(vec_ty, loc=loc, ip=ip)
+    for i, v in enumerate(values):
+        vec = vector.insertelement(
+            elem_type(v).ir_value(loc=loc, ip=ip),
+            vec,
+            position=_arith.constant(T.i32(), i, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    return vec
 
 
 @dsl_user_op

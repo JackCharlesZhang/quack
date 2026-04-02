@@ -13,6 +13,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
+
+from quack.utils import make_vector
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
 
@@ -1029,3 +1031,87 @@ def gather_m_get_tma_copy_fn(
                 tma_gather4_load_fn(smem_ptr, tma_bar_ptr, col_idx, row_indices)
 
     return copy_fn
+
+
+# ---------------------------------------------------------------------------
+# Store helpers
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+@cute.jit
+def store(
+    ptr: cute.Pointer,
+    val,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store a scalar value via cute.arch.store.
+
+    ptr:  cute.Pointer (any address space).
+    val:  DSL Numeric value.
+    pred: None → unconditional.  DSL Boolean → skipped when pred == 0.
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, type(val)(val), cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, type(val)(val), cop=cop, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def store_v2(
+    ptr: cute.Pointer,
+    v0,
+    v1,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Vectorized store of 2 elements via cute.arch.store.
+
+    Packs v0, v1 into an MLIR <2 x T> vector.
+    ptr:  cute.Pointer (any address space, must be aligned for vector width).
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    vec = make_vector(type(v0), v0, v1, loc=loc, ip=ip)
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def store_v4(
+    ptr: cute.Pointer,
+    v0,
+    v1,
+    v2,
+    v3,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Vectorized store of 4 elements via cute.arch.store.
+
+    Packs v0–v3 into an MLIR <4 x T> vector.
+    ptr:  cute.Pointer (any address space, must be aligned for vector width).
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    vec = make_vector(type(v0), v0, v1, v2, v3, loc=loc, ip=ip)
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
