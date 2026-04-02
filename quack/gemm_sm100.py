@@ -442,6 +442,7 @@ class GemmSm100(GemmSm90):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -720,6 +721,7 @@ class GemmSm100(GemmSm90):
             self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
+            trace_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -761,10 +763,16 @@ class GemmSm100(GemmSm90):
         epi_tile: cute.Tile,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+
+        from quack.trace import TraceContext
+
+        GEMM_REGIONS = ("tma_load", "mma", "epilogue")
+        tctx = TraceContext.create(trace_ptr, region_names=GEMM_REGIONS)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -1049,6 +1057,7 @@ class GemmSm100(GemmSm90):
                         mcast_mask=sfb_mcast_mask,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                tctx.b("tma_load")
                 ab_producer_state = self.load_AB(
                     ab_pipeline,
                     ab_producer_state,
@@ -1058,6 +1067,7 @@ class GemmSm100(GemmSm90):
                     copy_SFA,
                     copy_SFB,
                 )
+                tctx.e("tma_load")
                 if const_expr(epi_load_barrier is not None):
                     # In the first work tile, the epi load warp will wait for the signal
                     # from the mainloop load warp to start loading C, to avoid interfering
@@ -1352,6 +1362,7 @@ class GemmSm100(GemmSm90):
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
+                tctx.b("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
                     acc_pipeline,
@@ -1373,6 +1384,7 @@ class GemmSm100(GemmSm90):
                     tCtSFA_compact_s2t,
                     tCtSFB_compact_s2t,
                 )
+                tctx.e("mma")
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -1458,6 +1470,7 @@ class GemmSm100(GemmSm90):
                     clear_acc=varlen_k and k_len == 0,
                 )
 
+                tctx.b("epilogue")
                 epi_read_state, _ = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
@@ -1484,6 +1497,7 @@ class GemmSm100(GemmSm90):
                     epi_tidx,
                     is_tma_warp,
                 )
+                tctx.e("epilogue")
 
                 # Async arrive accumulator buffer empty
                 with cute.arch.elect_one():
@@ -1502,6 +1516,8 @@ class GemmSm100(GemmSm90):
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+        tctx.flush()
 
     @cute.jit
     def load_A_gather_A(
