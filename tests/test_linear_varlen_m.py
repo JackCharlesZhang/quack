@@ -102,9 +102,9 @@ def test_gemm_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    out_ref = gemm_ref(
-        A.float(), B.float(), bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
-    )
+    A_f, B_f = A.float(), B.float()
+    out_ref = gemm_ref(A_f, B_f, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+    del A_f, B_f
     out_pt = gemm_ref(A, B, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     assert out.shape == (total_m, n), (
         f"Output shape mismatch: {out.shape} vs expected ({total_m}, {n})"
@@ -169,15 +169,17 @@ def test_gemm_add_varlen_m(
     )
     alpha_val = alpha.item() if torch.is_tensor(alpha) else alpha
     beta_val = beta.item() if torch.is_tensor(beta) else beta
+    A_f, B_f, C_f = A.float(), B.float(), C.float()
     out_ref = gemm_add_ref(
-        A.float(),
-        B.float(),
-        C.float(),
+        A_f,
+        B_f,
+        C_f,
         alpha=alpha_val,
         beta=beta_val,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del A_f, B_f, C_f
     out_pt = gemm_add_ref(
         A, B, C, alpha=alpha_val, beta=beta_val, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
@@ -246,16 +248,18 @@ def test_gemm_add_inplace_varlen_m(
     )
     alpha_val = alpha.item() if torch.is_tensor(alpha) else alpha
     beta_val = beta.item() if torch.is_tensor(beta) else beta
+    A_f, B_f, out_og_f = A.float(), B.float(), out_og.float()
     out_ref = gemm_add_ref(
-        A.float(),
-        B.float(),
-        out_og.float(),
-        out=None,  # Don't use in-place for reference
+        A_f,
+        B_f,
+        out_og_f,
+        out=None,
         alpha=alpha_val,
         beta=beta_val,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del A_f, B_f, out_og_f
     out_pt = gemm_add_ref(
         A,
         B,
@@ -321,14 +325,16 @@ def test_gemm_act_varlen_m(
     assert preact.shape == (total_m, n)
     assert postact.shape == (total_m, n)
     # Compare with reference
+    A_f, B_f, C_f = A.float(), B.float(), C.float()
     preact_ref, postact_ref = gemm_act_ref(
-        A.float(),
-        B.float(),
-        C.float(),
+        A_f,
+        B_f,
+        C_f,
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del A_f, B_f, C_f
     preact_pt, postact_pt = gemm_act_ref(
         A, B, C, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
@@ -384,14 +390,16 @@ def test_gemm_dact_varlen_m(
     assert dx.shape == (total_m, n)
     assert postact.shape == (total_m, n)
     # Compare with reference
+    A_f, B_f, P_f = A.float(), B.float(), PreAct.float()
     dx_ref, postact_ref = gemm_dact_ref(
-        A.float(),
-        B.float(),
-        PreAct.float(),
+        A_f,
+        B_f,
+        P_f,
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del A_f, B_f, P_f
     dx_pt, postact_pt = gemm_dact_ref(
         A, B, PreAct, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
@@ -449,15 +457,17 @@ def test_gemm_gated_varlen_m(
     assert preact.shape == (total_m, n)
     assert postact.shape == (total_m, n // 2)
     # Compare with reference
+    A_f, B_f, C_f = A.float(), B.float(), C.float()
     preact_ref, postact_ref = gemm_gated_ref(
-        A.float(),
-        B.float(),
-        C.float(),
+        A_f,
+        B_f,
+        C_f,
         bias=bias,
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del A_f, B_f, C_f
     preact_pt, postact_pt = gemm_gated_ref(
         A, B, C, bias=bias, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
@@ -527,24 +537,27 @@ def test_gemm_dgated_varlen_m(
     assert dx.shape == (total_m, 2 * n)
     assert postact.shape == (total_m, n)
     # Compare with reference
+    A_f, B_f, P_f = A.float(), B.float(), PreAct.float()
     dx_ref, postact_ref = gemm_dgated_ref(
-        A.float(),
-        B.float(),
-        PreAct.float(),
+        A_f,
+        B_f,
+        P_f,
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
+    del P_f
     dx_pt, postact_pt = gemm_dgated_ref(
         A, B, PreAct, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
     if colvec_reduce:
         colvec_reduce_ref = (
-            postact_ref * gemm_ref(A.float(), B.float(), cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+            postact_ref * gemm_ref(A_f, B_f, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
         ).sum(dim=-1)
         colvec_reduce_pt = (
             postact_pt * gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
         ).sum(dim=-1)
+    del A_f, B_f
     if has_colvec_scale:
         dx_ref *= colvec_scale.float()[:, None]
         postact_ref *= colvec_scale.float()[:, None]
