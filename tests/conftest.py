@@ -193,11 +193,13 @@ def pytest_runtest_call(item):
 
 @pytest.fixture(autouse=True)
 def _free_gpu_memory_after_test():
-    """Free cached GPU memory after each test to prevent OOM from accumulation."""
+    """Free GPU memory after each test to prevent OOM from accumulation."""
     yield
     if not _compile_only:
+        import gc
         import torch
 
+        gc.collect()
         torch.cuda.empty_cache()
 
 
