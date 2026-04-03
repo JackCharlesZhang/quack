@@ -158,11 +158,33 @@ def pytest_runtest_setup(item):
         outcome.force_result(None)
 
 
+def _is_oom(exc_type, exc_val):
+    """Check if an exception is a CUDA out-of-memory error."""
+    import torch
+
+    if issubclass(exc_type, torch.OutOfMemoryError):
+        return True
+    if issubclass(exc_type, RuntimeError) and "out of memory" in str(exc_val).lower():
+        return True
+    return False
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """In --compile-only mode, swallow all errors — we only care about compilation."""
+    """In --compile-only mode, swallow all errors — we only care about compilation.
+    In normal mode, retry once on CUDA OOM after freeing GPU memory.
+    """
     if not _compile_only:
-        yield
+        outcome = yield
+        if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
+            import gc
+            import torch
+
+            logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
+            gc.collect()
+            torch.cuda.empty_cache()
+            outcome.force_result(None)
+            item.runtest()
         return
     outcome = yield
     if outcome.excinfo is not None:
