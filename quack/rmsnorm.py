@@ -23,6 +23,15 @@ from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
 
+def _ensure_contiguous(t):
+    """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
+    (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
+    """
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    return t if t.stride(-1) == 1 else t.contiguous()
+
+
 class RMSNorm(ReductionBase):
     def __init__(self, dtype: Type[cutlass.Numeric], N: int, is_layernorm: bool = False):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
@@ -1054,10 +1063,10 @@ class RMSNormFunction(torch.autograd.Function):
         prenorm=False,
     ):
         x_shape_og = x.shape
-        # Flatten input
-        x = x.reshape(-1, x.shape[-1])
+        # Flatten input, ensuring last dim is contiguous
+        x = _ensure_contiguous(x.reshape(-1, x.shape[-1]))
         if residual is not None:
-            residual = residual.reshape(-1, residual.shape[-1])
+            residual = _ensure_contiguous(residual.reshape(-1, residual.shape[-1]))
         need_grad = any(ctx.needs_input_grad[:3])
         out, residual_out, rstd = rmsnorm_fwd(
             x,
@@ -1086,12 +1095,12 @@ class RMSNormFunction(torch.autograd.Function):
         has_bias = ctx.has_bias
         if ctx.prenorm and ctx.residual_dtype is not None:
             dresidual_out = args[0]
-            dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
+            dresidual_out = _ensure_contiguous(dresidual_out.reshape(-1, dresidual_out.shape[-1]))
         else:
             dresidual_out = None
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
-        dout = dout.view(-1, dout.shape[-1])
+        dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
         dx, dw, db, dresidual = rmsnorm_bwd(
             x,
             weight,
