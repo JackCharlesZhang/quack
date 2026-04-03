@@ -191,6 +191,16 @@ def pytest_runtest_call(item):
         outcome.force_result(None)
 
 
+@pytest.fixture(autouse=True)
+def _free_gpu_memory_after_test():
+    """Free cached GPU memory after each test to prevent OOM from accumulation."""
+    yield
+    if not _compile_only:
+        import torch
+
+        torch.cuda.empty_cache()
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
     """In --compile-only mode, swallow teardown errors."""
