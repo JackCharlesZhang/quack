@@ -16,12 +16,11 @@ from quack.trace import TraceContext, TraceSession
 ITERS = 1000
 BLOCK_THREADS = 128
 GRID = 4
-REGION_NAMES = ("loop_body", "kernel_total")
 
 
 @cute.kernel
 def trace_record_kernel(trace_ptr: Optional[Int64], iters: Int32):
-    ctx = TraceContext.create(trace_ptr, region_names=REGION_NAMES)
+    ctx = TraceContext.create(trace_ptr)
     ctx.b("kernel_total")
     for i in cutlass.range(iters):
         ctx.b("loop_body")
@@ -42,7 +41,7 @@ def main():
 
     # sess.ptr is None when QUACK_TRACE != 1 → TraceContext.create becomes a no-op.
     with TraceSession(out_path, grid_size=GRID, block_size=BLOCK_THREADS,
-                      region_names=list(REGION_NAMES)) as sess:
+                      ) as sess:
         launch(sess.ptr, ITERS)
 
     if sess.ptr is not None:

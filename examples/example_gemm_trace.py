@@ -31,8 +31,7 @@ def main():
     # grid_size = math.ceil(M / TILE_M) * math.ceil(N / TILE_N)
     grid_size = 132
 
-    with TraceSession(OUT_PATH, grid_size=grid_size, block_size=g.threads_per_cta,
-                      region_names=["tma_load", "mma", "epilogue"]) as sess:
+    with TraceSession(OUT_PATH, grid_size=grid_size, block_size=g.threads_per_cta) as sess:
         gemm(A, B, D, C=None, tile_count_semaphore=None,
              tile_M=TILE_M, tile_N=TILE_N,
              cluster_M=CLUSTER_M, cluster_N=CLUSTER_N,

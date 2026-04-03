@@ -606,8 +606,7 @@ class GemmSm90:
 
         from quack.trace import TraceContext
 
-        GEMM_REGIONS = ("tma_load", "mma", "epilogue")
-        tctx = TraceContext.create(trace_ptr, region_names=GEMM_REGIONS)
+        tctx = TraceContext.create(trace_ptr)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -892,14 +891,16 @@ class GemmSm90:
                 batch_idx = tile_coord_mnkl[3]
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                if const_expr(self.pingpong):
+                    self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 tctx.b("mma")
                 ab_read_state = self.mma(
                     ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
                 )
-                tctx.e("mma")
                 if const_expr(varlen_k):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
+                tctx.e("mma")
 
                 # EPILOGUE
                 if const_expr(self.pingpong):
@@ -1123,8 +1124,6 @@ class GemmSm90:
         k_pipe_mmas = 1
         ab_release_state = ab_read_state.clone()
         num_prologue_mma = min(k_pipe_mmas, k_tile_cnt)
-        if const_expr(self.pingpong):
-            self.pingpong_barrier_sync(warp_group_idx, stage="mma")
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)

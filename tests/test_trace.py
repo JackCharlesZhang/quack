@@ -30,7 +30,7 @@ ALL_WARPS_REGIONS = ("inner", "outer")
 
 @cute.kernel
 def _kernel_all_warps(trace_ptr: Int64, iters: Int32):
-    ctx = TraceContext.create(trace_ptr, region_names=ALL_WARPS_REGIONS)
+    ctx = TraceContext.create(trace_ptr)
     ctx.b("outer")
     for i in cutlass.range(iters):
         ctx.b("inner")
@@ -56,7 +56,7 @@ SAMPLED_REGIONS = ("work",)
 
 @cute.kernel
 def _kernel_sampled(trace_ptr: Int64, iters: Int32):
-    ctx = TraceContext.create(trace_ptr, region_names=SAMPLED_REGIONS, warp_ids=SAMPLED_WARP_IDS)
+    ctx = TraceContext.create(trace_ptr, warp_ids=SAMPLED_WARP_IDS)
     for i in cutlass.range(iters):
         ctx.b("work")
         ctx.e("work")
@@ -128,7 +128,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -144,7 +143,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -158,7 +156,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -172,7 +169,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -186,7 +182,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -200,7 +195,6 @@ class TestAllWarps:
             path,
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         ) as sess:
             _launch_all_warps(sess.ptr, self.ITERS)
 
@@ -225,7 +219,6 @@ class TestNoResetNeeded:
         sess = TraceSession(
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         )
 
         # First run
@@ -249,7 +242,6 @@ class TestNoResetNeeded:
         sess = TraceSession(
             grid_size=ALL_WARPS_GRID,
             block_size=ALL_WARPS_BLOCK,
-            region_names=list(ALL_WARPS_REGIONS),
         )
 
         _launch_all_warps(sess.ptr, self.ITERS)
@@ -276,7 +268,6 @@ class TestWarpSampling:
             path,
             grid_size=SAMPLED_GRID,
             block_size=SAMPLED_BLOCK,
-            region_names=list(SAMPLED_REGIONS),
             warp_ids=list(SAMPLED_WARP_IDS),
         ) as sess:
             _launch_sampled(sess.ptr, self.ITERS)
@@ -291,7 +282,6 @@ class TestWarpSampling:
             path,
             grid_size=SAMPLED_GRID,
             block_size=SAMPLED_BLOCK,
-            region_names=list(SAMPLED_REGIONS),
             warp_ids=list(SAMPLED_WARP_IDS),
         ) as sess:
             _launch_sampled(sess.ptr, self.ITERS)
@@ -306,7 +296,6 @@ class TestWarpSampling:
             path,
             grid_size=SAMPLED_GRID,
             block_size=SAMPLED_BLOCK,
-            region_names=list(SAMPLED_REGIONS),
             warp_ids=list(SAMPLED_WARP_IDS),
         ) as sess:
             _launch_sampled(sess.ptr, self.ITERS)
@@ -334,7 +323,7 @@ class TestIntegerIDs:
         assert len(instants) == self.ITERS
 
     def test_numeric_region_names(self, tmp_path):
-        """Without region_names, IDs should appear as string numbers."""
+        """Integer IDs with no named regions show as string numbers."""
         path = str(tmp_path / "trace.json")
         with TraceSession(path, grid_size=INTID_GRID, block_size=INTID_BLOCK) as sess:
             _launch_intid(sess.ptr, self.ITERS)

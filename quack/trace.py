@@ -24,34 +24,47 @@ auto-calibrates the clock64-to-nanosecond conversion:
     ratio = (final_gt - init_gt) / (final_clk - init_clk)
     event_ns = init_gt + (event_clk - init_clk) * ratio
 
-**Delta encoding (inspired by ThunderKittens).**
-Each event stores a u32 delta from init_clock64 rather than a full u64
-timestamp.  Block and warp identity (constant per slot) are stored once in
-per-slot metadata instead of per event.  This halves the event record to
-8 bytes (from 16) and the store to a single st.global.cs.v2.u32.  The u32
-delta wraps after ~2 seconds at 2.1 GHz — far longer than any realistic
-kernel duration.
+**Compact events (inspired by ThunderKittens).**
+Each event is 8 bytes: a raw 32-bit %clock value and a packed (region_id,
+event_type) tag, stored with a single v2.u32 streaming store.  The device
+writes the raw clock — no subtraction needed.  The host computes deltas
+during post-processing using init_clock from metadata with proper u32
+wraparound.  Block and warp identity (constant per slot) are stored once
+in per-slot metadata instead of per event.
+
+**Minimal live registers.**
+The TraceContext dataclass carries only 3 DSL values across loop iterations:
+  - slot_ptr (64-bit)  — base of this warp's interleaved [metadata|events]
+  - cnt     (32-bit)  — circular buffer write index
+  - is_active (1-bit) — predicate for stores (warp leader AND warp sampling)
+init_clk is NOT stored — the device writes raw clock values and the host
+subtracts init_clk during post-processing.  This saves one register vs
+computing deltas on device.
+
+**Interleaved per-slot layout.**
+Each warp's metadata and events are contiguous in memory:
+    [meta₀ events₀ | meta₁ events₁ | ...]
+This means the device needs only ONE pointer (slot_ptr) instead of separate
+metadata and event pointers, saving another register.
 
 **Warp sampling.**
 An optional warp_ids parameter restricts profiling to specific warps.
-Non-selected warps execute predicated stores (@p st.global...) that the GPU
-hardware evaluates to no-ops — zero store bandwidth and no branch divergence.
+Non-selected warps execute predicated stores that the GPU evaluates to
+hardware no-ops — zero store bandwidth and no branch divergence.
 
-**Single-buffer layout.**
-Host allocates one contiguous torch tensor.  A single Int64 pointer is passed
-to the kernel; the device computes sub-buffer offsets from compile-time
-constants (warps_per_block, per_warp_cap, METADATA_SIZE).
-    [counters (u32 × total_slots, 8-aligned) | metadata (40B × total_slots) | events (8B × total)]
+**Auto-interned region names.**
+ctx.b("mma") / ctx.e("mma") auto-assign integer IDs via a module-level
+registry at JIT time.  The host reads the same registry at write_trace time.
+No region_names parameter needed on either side.
 
 Usage
 -----
 Host:
-    with TraceSession("trace.json", grid_size=G, block_size=B,
-                      region_names=["load", "mma"]) as sess:
+    with TraceSession("trace.json", grid_size=G, block_size=B) as sess:
         my_kernel[grid, block](..., sess.ptr)
 
 Device (safe to call from all lanes):
-    ctx = Tracenontext.create(trace_ptr, region_names=("load", "mma"))
+    ctx = TraceContext.create(trace_ptr)
     ctx.b("load"); ctx.e("load")
     ctx.flush()
 """
@@ -64,12 +77,13 @@ import os
 import struct
 from typing import Optional
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int32, Int64, const_expr
 from cutlass.base_dsl.arch import Arch
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T
@@ -86,7 +100,9 @@ EVENT_BEGIN = 0
 EVENT_END = 1
 EVENT_MARK = 2
 
-# Per-event record: (u32 delta_from_init_clock64, u16 region_id, u16 event_type)
+# Per-event record: (u32 raw_clock, u16 region_id, u16 event_type)
+# raw_clock is the 32-bit %clock value at event time; the host converts to
+# nanoseconds by subtracting init_clock and applying the calibration ratio.
 EVENT_SIZE = 8
 EVENT_STRUCT = struct.Struct("<IHH")
 
@@ -146,30 +162,54 @@ def enabled() -> bool:
     return os.environ.get(QUACK_TRACE_ENV, "") == "1"
 
 
+# Module-level registry: auto-populated by TraceContext at JIT time,
+# read by TraceSession at write_trace time.  No need for the user to
+# pass region_names to both sides.
+_REGION_REGISTRY: dict[int, str] = {}
+
+
+def _intern_region(name: str) -> int:
+    """Assign a stable integer ID to a region name.  JIT-time only."""
+    for rid, n in _REGION_REGISTRY.items():
+        if n == name:
+            return rid
+    rid = len(_REGION_REGISTRY)
+    _REGION_REGISTRY[rid] = name
+    return rid
+
+
+def _reset_region_registry():
+    """Clear the registry.  Called by TraceContext.create so each kernel starts fresh."""
+    _REGION_REGISTRY.clear()
+
+
 # ---------------------------------------------------------------------------
 # Contiguous buffer layout (shared between host and device)
 # ---------------------------------------------------------------------------
-# All three sub-buffers live in one torch allocation so the kernel only needs
-# a single Int64 pointer argument.
+# Per-slot data is interleaved: metadata followed by events for each slot.
+# This means the device only needs ONE pointer per warp (the slot base).
 #
-#   ┌─────────────────────────┐  offset 0
-#   │ metadata  (40B × slots) │  per-slot timer anchors + identity + cnt
-#   ├─────────────────────────┤
-#   │ events    (8B × total)  │  circular per-warp event buffers
-#   └─────────────────────────┘
-# Event count (cnt) lives in the metadata's former padding field at offset 36,
-# so no separate counters sub-buffer is needed.
+#   ┌──────────────────────────────────────┐  slot 0
+#   │ metadata (40B) │ events (8B × cap)   │
+#   ├──────────────────────────────────────┤  slot 1
+#   │ metadata (40B) │ events (8B × cap)   │
+#   ├──────────────────────────────────────┤  ...
+#   │ ...                                  │
+#   └──────────────────────────────────────┘
+#
+# In u32 elements: slot_size = META_ELEMS + per_warp_cap * EVENT_ELEMS
+
+META_ELEMS = METADATA_SIZE // 4  # 10 u32 elements per slot's metadata
+EVENT_ELEMS = EVENT_SIZE // 4  # 2 u32 elements per event
 
 
-def _buf_offsets(total_slots: int, per_warp_cap: int) -> tuple[int, int]:
-    """Return (metadata_off, events_off) in bytes."""
-    events_off = total_slots * METADATA_SIZE
-    return 0, events_off
+def _slot_size(per_warp_cap: int) -> int:
+    """Per-slot size in bytes (metadata + events)."""
+    return METADATA_SIZE + per_warp_cap * EVENT_SIZE
 
 
 def _buf_total_bytes(total_slots: int, per_warp_cap: int) -> int:
-    _, events_off = _buf_offsets(total_slots, per_warp_cap)
-    return events_off + total_slots * per_warp_cap * EVENT_SIZE
+    return total_slots * _slot_size(per_warp_cap)
 
 
 # ---------------------------------------------------------------------------
@@ -182,20 +222,25 @@ def _buf_total_bytes(total_slots: int, per_warp_cap: int) -> int:
 
 
 def _read_globaltimer():
-    return cutlass.Int64(nvvm.read_ptx_sreg_globaltimer(T.i64()))
+    return Int64(nvvm.read_ptx_sreg_globaltimer(T.i64()))
 
 
 def _read_clock64():
-    return cutlass.Int64(nvvm.read_ptx_sreg_clock64(T.i64()))
+    return Int64(nvvm.read_ptx_sreg_clock64(T.i64()))
+
+
+def _read_clock():
+    """Read %clock (32-bit, low half of clock64). Used in the hot path for delta encoding."""
+    return cutlass.Int32(nvvm.read_ptx_sreg_clock(T.i32()))
 
 
 def _read_smid():
-    return cutlass.Uint32(nvvm.read_ptx_sreg_smid(T.i32()))
+    return cutlass.Int32(nvvm.read_ptx_sreg_smid(T.i32()))
 
 
 def _gmem_ptr(dtype, addr):
     """Create a cute global-memory pointer from an Int64 address."""
-    return cute.make_ptr(dtype, cutlass.Int64(addr), cute.AddressSpace.gmem)
+    return cute.make_ptr(dtype, Int64(addr), cute.AddressSpace.gmem)
 
 
 def _is_warp_leader():
@@ -224,23 +269,20 @@ class TraceContext(ParamsBase):
 
     Usage::
 
-        ctx = TraceContext.create(trace_ptr, PER_WARP_CAP, WARPS_PER_BLOCK,
-                                  region_names=("load", "mma"), warp_ids=(0, 2))
+        ctx = TraceContext.create(trace_ptr)
         ctx.b("load"); ctx.e("load")
         ctx.flush()
     """
 
     # Compile-time constants (auto-detected as static by ParamsBase)
     per_warp_cap: int = 0
-    name_to_id: dict = field(default_factory=dict)
+    warp_ids: tuple | None = None
 
     # DSL values (auto-serialized by ParamsBase across cutlass.range loops).
-    # Pointers are pre-offset to this warp's slot in create(), so _record/flush
-    # don't need slot or base — just cnt for the circular buffer index.
-    meta_ptr: cute.Pointer = None  # -> this warp's metadata (10 x u32)
-    event_ptr: cute.Pointer = None  # -> this warp's event buffer
-    cnt: cutlass.Uint32 = None
-    init_clk: cutlass.Int64 = None
+    # slot_ptr points to this warp's interleaved [metadata | events] region.
+    # Metadata at slot_ptr+0, events at slot_ptr+META_ELEMS.
+    slot_ptr: cute.Pointer = None
+    cnt: cutlass.Int32 = None
     is_active: cutlass.Boolean = None
 
     # ── Public factory ──────────────────────────────────────────────────────
@@ -248,9 +290,8 @@ class TraceContext(ParamsBase):
     @classmethod
     def create(
         cls,
-        buf_ptr: Optional[cutlass.Int64],
+        buf_ptr: Optional[Int64],
         per_warp_cap: int = 4096,
-        region_names: tuple[str, ...] | list[str] = (),
         warp_ids: tuple[int, ...] | list[int] | None = None,
     ):
         """Create and initialize a TraceContext.  Safe to call from all lanes.
@@ -258,53 +299,39 @@ class TraceContext(ParamsBase):
         Only lane 0 (warp leader) performs stores; all other lanes execute
         the arithmetic but skip the writes via predication.  The caller does
         NOT need an ``if is_warp_leader():`` guard.
+
+        Region names are auto-interned by ctx.b("name") / ctx.e("name") via a
+        module-level registry — no explicit region_names list needed.
         """
         assert (per_warp_cap & (per_warp_cap - 1)) == 0, "per_warp_cap must be power of 2"
+        _reset_region_registry()
         warp_ids = tuple(warp_ids) if warp_ids is not None else None
-        name_to_id = {name: i for i, name in enumerate(region_names)}
 
-        if not enabled() or cutlass.const_expr(buf_ptr is None):
+        if not enabled() or const_expr(buf_ptr is None):
             return cls(
                 per_warp_cap=per_warp_cap,
-                name_to_id=name_to_id,
-                meta_ptr=None,
-                event_ptr=None,
+                warp_ids=warp_ids,
+                slot_ptr=None,
                 cnt=None,
-                init_clk=None,
                 is_active=None,
             )
 
-        META_ELEMS = METADATA_SIZE // 4  # 10 u32 elements per slot
-        EVENT_ELEMS = EVENT_SIZE // 4  # 2 u32 elements per event
+        SLOT_ELEMS = META_ELEMS + per_warp_cap * EVENT_ELEMS  # u32 elements per slot
 
         bdx, bdy, bdz = cute.arch.block_dim()
-        warps_per_block = (
-            cutlass.Uint32(bdx) * cutlass.Uint32(bdy) * cutlass.Uint32(bdz)
-            + cute.arch.WARP_SIZE
-            - 1
-        ) // cute.arch.WARP_SIZE
+        warps_per_block = (bdx * bdy * bdz + cute.arch.WARP_SIZE - 1) // cute.arch.WARP_SIZE
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         smid = _read_smid()
 
         # Linearize blockIdx across all grid dimensions.
         bidx, bidy, bidz = cute.arch.block_idx()
         gdx, gdy, gdz = cute.arch.grid_dim()
-        linear_block = (
-            cutlass.Uint32(bidx)
-            + cutlass.Uint32(bidy) * cutlass.Uint32(gdx)
-            + (cutlass.Uint32(bidz) * cutlass.Uint32(gdx) * cutlass.Uint32(gdy))
-        )
-        total_blocks = cutlass.Uint32(gdx) * cutlass.Uint32(gdy) * cutlass.Uint32(gdz)
-        total_slots = total_blocks * warps_per_block
-
-        # Derive base pointers, then offset to this warp's slot.
-        # Layout: [metadata (META_ELEMS * total_slots) | events]
-        buf = _gmem_ptr(cutlass.Uint32, cutlass.Int64(buf_ptr))
+        linear_block = bidx + bidy * gdx + bidz * gdx * gdy
         slot = linear_block * warps_per_block + warp_idx
 
-        meta_ptr = buf + slot * META_ELEMS  # this warp's metadata
-        events_base = buf + total_slots * META_ELEMS  # start of events region
-        event_ptr = events_base + slot * per_warp_cap * EVENT_ELEMS  # this warp's events
+        # Single pointer to this warp's interleaved [metadata | events] region.
+        buf = _gmem_ptr(Int32, Int64(buf_ptr))
+        slot_ptr = buf + slot * SLOT_ELEMS
 
         # is_active gates all stores: warp leader only, AND warp sampling if set.
         is_leader = _is_warp_leader()
@@ -320,46 +347,42 @@ class TraceContext(ParamsBase):
         packed = (warp_idx & 0x3F) | ((smid & 0x3FF) << 6)
         info = linear_block | (packed << 16)
 
-        # Read both timers; init_clk is kept for delta encoding in _record().
+        # Read timers for metadata (host-side calibration).
         gt = _read_globaltimer()
-        init_clk = _read_clock64()
+        clk64 = _read_clock64()
 
-        # Write init metadata for this slot. cnt is written by flush().
-        store(meta_ptr, gt, is_active, cop="cs")  # offset 0: init_gt
-        store(meta_ptr + 2, init_clk, is_active, cop="cs")  # offset 8: init_clk
-        store(meta_ptr + 8, info, is_active, cop="cs")  # offset 32: info
+        # Write init metadata at slot_ptr. cnt is written by flush().
+        store(slot_ptr, gt, is_active, cop="cs")  # offset 0: init_gt
+        store(slot_ptr + 2, clk64, is_active, cop="cs")  # offset 8: init_clk64
+        store(slot_ptr + 8, info, is_active, cop="cs")  # offset 32: info
 
         return cls(
             per_warp_cap=per_warp_cap,
-            name_to_id=name_to_id,
-            meta_ptr=meta_ptr,
-            event_ptr=event_ptr,
-            cnt=cutlass.Uint32(0),
-            init_clk=init_clk,
+            warp_ids=warp_ids,
+            slot_ptr=slot_ptr,
+            cnt=Int32(0),
             is_active=is_active,
         )
 
     def flush(self):
         """Write final timer pair and event count.  Safe to call from all lanes."""
-        if self.event_ptr is None:
+        if self.slot_ptr is None:
             return
         gt = _read_globaltimer()
         clk = _read_clock64()
-        store(self.meta_ptr + 4, gt, self.is_active, cop="cs")  # final_gt
-        store(self.meta_ptr + 6, clk, self.is_active, cop="cs")  # final_clk
-        store(self.meta_ptr + 9, self.cnt, self.is_active, cop="cs")  # cnt
+        store(self.slot_ptr + 4, gt, self.is_active, cop="cs")  # final_gt
+        store(self.slot_ptr + 6, clk, self.is_active, cop="cs")  # final_clk
+        store(self.slot_ptr + 9, self.cnt, self.is_active, cop="cs")  # cnt
 
     # ── Recording ───────────────────────────────────────────────────────────
 
     def _record(self, region_id: int, event_type: int):
-        if self.event_ptr is None:
+        if self.slot_ptr is None:
             return
-        # Delta = u32(clock64 - init_clock64).  Wraps at ~2 s @ 2.1 GHz.
-        EVENT_ELEMS = EVENT_SIZE // 4  # 2
-        delta = cutlass.Uint32(_read_clock64() - self.init_clk)
-        ptr = self.event_ptr + (self.cnt & (self.per_warp_cap - 1)) * EVENT_ELEMS
-        tag = cutlass.Uint32(region_id) | (cutlass.Uint32(event_type) << 16)
-        store_v2(ptr, delta, tag, self.is_active, cop="cs")
+        clk = _read_clock()  # raw 32-bit clock; host subtracts init_clk
+        evt_off = META_ELEMS + (self.cnt & (self.per_warp_cap - 1)) * EVENT_ELEMS
+        tag = Int32(region_id) | (Int32(event_type) << 16)
+        store_v2(self.slot_ptr + evt_off, clk, tag, self.is_active, cop="cs")
         self.cnt += 1
 
     # Integer-ID API
@@ -372,15 +395,15 @@ class TraceContext(ParamsBase):
     def record_m(self, region_id: int):
         self._record(region_id, EVENT_MARK)
 
-    # Named-region API (string → int resolved at JIT time, zero runtime cost)
+    # Named-region API (string → int resolved at JIT time via module registry)
     def b(self, name: str):
-        self._record(self.name_to_id[name], EVENT_BEGIN)
+        self._record(_intern_region(name), EVENT_BEGIN)
 
     def e(self, name: str):
-        self._record(self.name_to_id[name], EVENT_END)
+        self._record(_intern_region(name), EVENT_END)
 
     def m(self, name: str):
-        self._record(self.name_to_id[name], EVENT_MARK)
+        self._record(_intern_region(name), EVENT_MARK)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -435,12 +458,19 @@ class _SlotMeta:
         return (self.info >> 16) & 0xFFFF
 
     @property
+    def init_clk32(self) -> int:
+        """Low 32 bits of init_clock64 (%clock at init time)."""
+        return self.init_clk & 0xFFFFFFFF
+
+    @property
     def ratio(self) -> float:
         """clock64 ticks → nanoseconds conversion factor for this slot."""
         dclk = self.final_clk - self.init_clk
         return (self.final_gt - self.init_gt) / dclk if dclk > 0 else 1.0
 
-    def delta_to_ns(self, delta: int) -> float:
+    def clock_to_ns(self, raw_clock32: int) -> float:
+        """Convert a raw 32-bit clock value to absolute nanoseconds."""
+        delta = (raw_clock32 - self.init_clk32) & 0xFFFFFFFF  # u32 wraparound
         return self.init_gt + delta * self.ratio
 
 
@@ -461,8 +491,7 @@ class TraceSession:
 
     Can be used as a context manager for automatic sync + write:
 
-        with TraceSession("trace.json", grid_size=G, block_size=B,
-                          region_names=["load", "mma"]) as sess:
+        with TraceSession("trace.json", grid_size=G, block_size=B) as sess:
             my_kernel[grid, block](..., sess.ptr)
         # trace.json written here
     """
@@ -474,7 +503,6 @@ class TraceSession:
         per_warp_cap: int = 4096,
         grid_size: int = 1,
         block_size: int = 128,
-        region_names: list[str] | None = None,
         warp_ids: list[int] | tuple[int, ...] | None = None,
         device: str | torch.device = "cuda",
     ):
@@ -483,7 +511,6 @@ class TraceSession:
         self.per_warp_cap = per_warp_cap
         self.total_blocks = grid_size
         self.warps_per_block = (block_size + 31) // 32
-        self.region_names = region_names or []
         self.warp_ids = tuple(warp_ids) if warp_ids is not None else None
         self.device = device
 
@@ -526,31 +553,31 @@ class TraceSession:
 
     def _read_metadata(self, raw) -> list[_SlotMeta]:
         total_slots = self.total_blocks * self.warps_per_block
-        meta_off, _ = _buf_offsets(total_slots, self.per_warp_cap)
+        slot_bytes = _slot_size(self.per_warp_cap)
         return [
-            _SlotMeta(*METADATA_STRUCT.unpack_from(raw, meta_off + s * METADATA_SIZE))
-            for s in range(total_slots)
+            _SlotMeta(*METADATA_STRUCT.unpack_from(raw, s * slot_bytes)) for s in range(total_slots)
         ]
 
     def _read_events(self, raw, metas) -> list[_Event]:
         total_slots = self.total_blocks * self.warps_per_block
-        _, events_off = _buf_offsets(total_slots, self.per_warp_cap)
+        slot_bytes = _slot_size(self.per_warp_cap)
         events = []
         for s in range(total_slots):
             cnt = metas[s].cnt
             n = min(cnt, self.per_warp_cap)
             start = (cnt & (self.per_warp_cap - 1)) if cnt > self.per_warp_cap else 0
-            slot_base = s * self.per_warp_cap
+            # Events start after metadata within this slot.
+            slot_events_off = s * slot_bytes + METADATA_SIZE
             meta = metas[s]
             for i in range(n):
                 idx = (start + i) & (self.per_warp_cap - 1)
-                delta, eid, etype = EVENT_STRUCT.unpack_from(
+                raw_clk, eid, etype = EVENT_STRUCT.unpack_from(
                     raw,
-                    events_off + (slot_base + idx) * EVENT_SIZE,
+                    slot_events_off + idx * EVENT_SIZE,
                 )
                 events.append(
                     _Event(
-                        ts=int(meta.delta_to_ns(delta)),
+                        ts=int(meta.clock_to_ns(raw_clk)),
                         id=eid,
                         type=etype,
                         block=meta.block,
@@ -570,7 +597,7 @@ class TraceSession:
         return events
 
     def _region_name(self, rid: int) -> str:
-        return self.region_names[rid] if rid < len(self.region_names) else str(rid)
+        return _REGION_REGISTRY.get(rid, str(rid))
 
     # ── Chrome Trace JSON output ────────────────────────────────────────────
 

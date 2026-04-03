@@ -771,8 +771,7 @@ class GemmSm100(GemmSm90):
 
         from quack.trace import TraceContext
 
-        GEMM_REGIONS = ("tma_load", "mma", "epilogue")
-        tctx = TraceContext.create(trace_ptr, region_names=GEMM_REGIONS)
+        tctx = TraceContext.create(trace_ptr)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
