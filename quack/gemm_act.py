@@ -424,9 +424,7 @@ def gemm_act(
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
     if rounding_mode == RoundingMode.RS:
-        assert device_capacity[0] >= 10, (
-            "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
-        )
+        assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (

@@ -457,15 +457,15 @@ def test_autocast_compile(fn_name):
 @pytest.mark.parametrize("k", [256, 768])
 @pytest.mark.parametrize("m", [480, 960])
 def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
-    """Test GEMM with stochastic rounding on SM100+.
+    """Test GEMM with stochastic rounding on SM100/SM110.
 
     Validates that SR produces results close to RNE (within BF16 tolerance)
     and that the output has correct shape and dtype.
     """
     device = "cuda"
     cap = torch.cuda.get_device_capability()
-    if cap[0] < 10:
-        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    if cap[0] != 10:
+        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
@@ -481,11 +481,11 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 def test_gemm_sr_requires_sm100(input_dtype):
-    """Assert that SR raises on SM90."""
+    """Assert that SR raises on non-SM100 hardware."""
     device = "cuda"
     cap = torch.cuda.get_device_capability()
-    if cap[0] >= 10:
-        pytest.skip("This test is for SM90 hardware")
+    if cap[0] == 10:
+        pytest.skip("This test is for non-SM100 hardware")
     torch.random.manual_seed(0)
     A = torch.randn((128, 256), device=device, dtype=input_dtype)
     B = torch.randn((256, 128), device=device, dtype=input_dtype)
@@ -501,8 +501,8 @@ def test_gemm_sr_different_seeds(m, k, n, input_dtype):
     """Different SR seeds should produce different results (non-deterministic rounding)."""
     device = "cuda"
     cap = torch.cuda.get_device_capability()
-    if cap[0] < 10:
-        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    if cap[0] != 10:
+        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
