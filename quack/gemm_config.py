@@ -25,21 +25,21 @@ def _get_sm90_configs(
     tune_coop: bool = True,
 ) -> List[GemmConfig]:
     tile_n_vals = [128, 160, 192, 208]
-    tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [
+    tile_mn_vals_coop = [(256, tile_n) for tile_n in tile_n_vals] + [
         (128, 224),
         (128, 256),
         # (192, 256),  # Getting IOT instruction (core dumped) in the bwd
     ]
-    tile_mn_pingpong_vals = [(128, tile_n) for tile_n in tile_n_vals] + [(192, 128)]
+    tile_mn_vals_pingpong = [(128, tile_n) for tile_n in tile_n_vals] + [(192, 128)]
     if epilogue in ["gated"]:
-        tile_mn_coop_vals = [(m, n) for m, n in tile_mn_coop_vals if n % 32 == 0 and m != 192]
-        tile_mn_pingpong_vals = [(m, n) for m, n in tile_mn_pingpong_vals if n % 32 == 0]
+        tile_mn_vals_coop = [(m, n) for m, n in tile_mn_vals_coop if n % 32 == 0 and m != 192]
+        tile_mn_vals_pingpong = [(m, n) for m, n in tile_mn_vals_pingpong if n % 32 == 0]
     elif epilogue in ["lse"]:
-        tile_mn_coop_vals = [(m, n) for m, n in tile_mn_coop_vals if m != 192]
+        tile_mn_vals_coop = [(m, n) for m, n in tile_mn_vals_coop if m != 192]
     tile_mn_vals = []
     if tune_coop:
-        tile_mn_vals += [(m, n, False) for m, n in tile_mn_coop_vals]
-    tile_mn_vals += [(m, n, True) for m, n in tile_mn_pingpong_vals]
+        tile_mn_vals += [(m, n, False) for m, n in tile_mn_vals_coop]
+    tile_mn_vals += [(m, n, True) for m, n in tile_mn_vals_pingpong]
     cluster = [(1, 2), (2, 1)]
     # cluster = [(1, 1), (1, 2), (2, 1)]
     if epilogue in ["lse"]:
@@ -104,27 +104,29 @@ def _get_sm100_configs(
 
 def _get_sm120_configs(
     epilogue: Optional[str] = None,
+    tune_coop: bool = True,
 ) -> List[GemmConfig]:
-    tile_mn_vals = [
-        (128, 128),
-        (128, 64),
-        (64, 128),
-        # (128, 192),
-    ]
+    tile_mn_vals_coop = [(128, 128), (128, 64), (64, 128), (128, 160), (128, 192)]
+    tile_mn_vals_pingpong = [(128, 128), (128, 64), (64, 128), (128, 160)]
+    tile_mn_vals = []
+    if tune_coop:
+        tile_mn_vals += [(m, n, False) for m, n in tile_mn_vals_coop]
+    tile_mn_vals += [(m, n, True) for m, n in tile_mn_vals_pingpong]
     swap_ab_vals = [False, True]
     if epilogue in ["lse", "gated"]:
         swap_ab_vals = [False]
-    GemmConfigCls = partial(
-        GemmConfig,
-        pingpong=False,
-        device_capacity=12,
-        is_dynamic_persistent=False,
-        cluster_m=1,
-        cluster_n=1,
-    )
     return [
-        GemmConfigCls(tile_m=m, tile_n=n, swap_ab=sab, max_swizzle_size=8)
-        for (m, n), sab in itertools.product(tile_mn_vals, swap_ab_vals)
+        GemmConfig(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            pingpong=pingpong,
+            cluster_m=1,
+            cluster_n=1,
+            swap_ab=swap_ab,
+            device_capacity=12,
+            is_dynamic_persistent=True,
+        )
+        for (tile_m, tile_n, pingpong), swap_ab in itertools.product(tile_mn_vals, swap_ab_vals)
     ]
 
 
@@ -141,5 +143,5 @@ def get_all_configs(
     return (
         _get_sm90_configs(epilogue, tune_coop)
         + _get_sm100_configs(epilogue)
-        + _get_sm120_configs(epilogue)
+        + _get_sm120_configs(epilogue, tune_coop)
     )

@@ -687,7 +687,6 @@ class GemmSm90:
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
-                is_tma_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
                 # Get mcast mask
                 cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
@@ -714,6 +713,7 @@ class GemmSm90:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
                     # Local_tile partition global tensors
+                    copy_A, prefetch_A = None, None
                     if const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
                         # (bM, bK, RestK)
@@ -722,33 +722,7 @@ class GemmSm90:
                             cute.select(self.cta_tile_shape_mnk, [0, 2]),
                             (tile_coord_mnkl[0], None),
                         )
-                    else:
-                        mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
-                        if const_expr(varlen_m):
-                            gAIdx = cute.local_tile(
-                                mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],)
-                            )
-                            # (M, K)
-                            mA_mk = mA_mkl
-                        else:
-                            assert varlen_k
-                            # (tile_K, RestK)
-                            gAIdx = cute.flat_divide(mAIdx_mk, (self.cta_tile_shape_mnk[2],))
-                            # (tile_M, K)
-                            mA_mk = cute.local_tile(
-                                mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
-                            )
-                    # (bN, bK, RestK)
-                    gB_nk = cute.local_tile(
-                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
-                        cute.select(self.cta_tile_shape_mnk, [1, 2]),
-                        (tile_coord_mnkl[1], None),
-                    )
-                    len_m = varlen_manager.len_m(batch_idx)
-                    len_k = varlen_manager.len_k(batch_idx)
-                    #  TMA load A partition_S/D
-                    copy_A = None
-                    if const_expr(not self.gather_A):
+                        #  TMA load A partition_S/D
                         copy_A, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_a,
                             cta_coord=block_in_cluster_coord_mnk[1],
@@ -760,32 +734,15 @@ class GemmSm90:
                             mcast_mask=a_mcast_mask,
                         )
                     else:
-                        tiled_copy_A = self._make_gmem_tiled_copy_A(
-                            mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
+                        copy_A, prefetch_A = self._make_gather_A_copy(
+                            mA_mkl, sA, varlen_manager, tile_coord_mnkl, batch_idx
                         )
-                        tidx = (
-                            cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
-                        )
-                        thr_copy_A = tiled_copy_A.get_slice(tidx)
-                        copy_A, prefetch_A = None, None
-                        if const_expr(varlen_m):
-                            copy_A = copy_utils.gather_m_get_copy_fn(
-                                thr_copy_A,
-                                mA_mk,
-                                sA,
-                                gAIdx,
-                                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
-                                limit_k=len_k,
-                            )
-                        else:
-                            copy_A, prefetch_A = copy_utils.gather_k_get_copy_fn(
-                                thr_copy_A,
-                                mA_mk,
-                                sA,
-                                gAIdx,
-                                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
-                                limit_k=len_k,
-                            )
+                    # (bN, bK, RestK)
+                    gB_nk = cute.local_tile(
+                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                        cute.select(self.cta_tile_shape_mnk, [1, 2]),
+                        (tile_coord_mnkl[1], None),
+                    )
                     # TMA load B partition_S/D
                     copy_B, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_b,
@@ -797,6 +754,7 @@ class GemmSm90:
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
                     )
+                    len_k = varlen_manager.len_k(batch_idx)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
                         ab_producer_state = self.load_AB(
@@ -979,7 +937,6 @@ class GemmSm90:
                     if is_tma_warp:
                         epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
-
                 tctx.e("epilogue")
 
                 if const_expr(not self.pingpong):
@@ -1108,6 +1065,54 @@ class GemmSm90:
             ab_pipeline.producer_cpasync_commit(ab_producer_state)
             ab_producer_state.advance()
         return ab_producer_state
+
+    @cute.jit
+    def _make_gather_A_copy(
+        self,
+        mA_mkl: cute.Tensor,
+        sA: cute.Tensor,
+        varlen_manager: VarlenManager,
+        tile_coord_mnkl,
+        batch_idx: Int32,
+    ):
+        """Create copy_A and prefetch_A for gather_A (shared by SM90/SM120 DMA)."""
+        varlen_m = varlen_manager.varlen_m
+        mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
+        if const_expr(varlen_m):
+            gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],))
+            mA_mk = mA_mkl
+        else:
+            gAIdx = cute.flat_divide(mAIdx_mk, (self.cta_tile_shape_mnk[2],))
+            mA_mk = cute.local_tile(
+                mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
+            )
+        len_m = varlen_manager.len_m(batch_idx)
+        len_k = varlen_manager.len_k(batch_idx)
+        tiled_copy_A = self._make_gmem_tiled_copy_A(
+            mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
+        )
+        dma_tidx = cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
+        thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
+        copy_A, prefetch_A = None, None
+        if const_expr(varlen_m):
+            copy_A = copy_utils.gather_m_get_copy_fn(
+                thr_copy_A,
+                mA_mk,
+                sA,
+                gAIdx,
+                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                limit_k=len_k,
+            )
+        else:
+            copy_A, prefetch_A = copy_utils.gather_k_get_copy_fn(
+                thr_copy_A,
+                mA_mk,
+                sA,
+                gAIdx,
+                limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                limit_k=len_k,
+            )
+        return copy_A, prefetch_A
 
     @cute.jit
     def mma(

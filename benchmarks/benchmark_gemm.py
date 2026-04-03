@@ -239,9 +239,7 @@ def run(
     GemmCls = GemmDefaultSm100 if is_sm100 else (GemmDefaultSm120 if is_sm120 else GemmDefaultSm90)
 
     # Skip unsupported types
-    if not GemmCls.is_valid_dtypes(
-        a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major
-    ):
+    if not GemmCls.is_valid_dtypes(a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major):
         raise TypeError(
             f"Skipping due to unsupported combination of types and majors: {a_dtype}, {b_dtype}, {acc_dtype}, {d_dtype}, {a_major=}, {b_major=}"
         )
@@ -269,7 +267,11 @@ def run(
 
         # Create dtype torch tensor directly on GPU
         # Allocate in shape order, then permute (non-contiguous) to get correct strides
-        torch_tensor = torch.empty(shape, dtype=gen_dtype, device="cuda").normal_(std=k ** (-0.5)).to(torch_dtype)
+        torch_tensor = (
+            torch.empty(shape, dtype=gen_dtype, device="cuda")
+            .normal_(std=k ** (-0.5))
+            .to(torch_dtype)
+        )
         torch_tensor = torch_tensor.permute(permute_order)
 
         # Create f32 torch tensor (gpu)
@@ -354,12 +356,16 @@ def run(
         assert b_major == "n", "varlen_k requires b_mjor=n"
         from einops import rearrange
 
-        a, = [rearrange(t, "m k l -> m (l k)") for t in (a,)]
+        (a,) = [rearrange(t, "m k l -> m (l k)") for t in (a,)]
         if not gather_A:
-            a_torch, = [rearrange(t, "m k l -> m (l k)") for t in (a_torch,)]
+            (a_torch,) = [rearrange(t, "m k l -> m (l k)") for t in (a_torch,)]
         b, b_torch = [rearrange(t, "n k l -> n (l k)") for t in (b, b_torch)]
-        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if a_major == "k" else 0)
-        mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if b_major == "k" else 0)
+        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(
+            leading_dim=1 if a_major == "k" else 0
+        )
+        mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(
+            leading_dim=1 if b_major == "k" else 0
+        )
         # TODO: generate random cu_seqlens_k
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
         mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
@@ -384,6 +390,7 @@ def run(
             a_dtype,
             tile_shape_mn,
             cluster_shape_mnk,
+            pingpong=pingpong,
             is_persistent=persistent,
             gather_A=gather_A,
         )
@@ -414,15 +421,19 @@ def run(
         tile_count_semaphore = None
     if permute_batch:
         batch_idx_permute = torch.randperm(l, dtype=torch.int32, device="cuda")
-        batch_idx_permute_tensor = from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        batch_idx_permute_tensor = from_dlpack(
+            batch_idx_permute, assumed_align=4
+        ).mark_layout_dynamic(leading_dim=0)
     else:
         batch_idx_permute_tensor = None
     scheduler_args = TileSchedulerOptions(
         Int32(max_active_clusters),
         tile_count_semaphore=make_ptr(
             Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
-        ) if tile_count_semaphore is not None else None,
-        batch_idx_permute=batch_idx_permute_tensor
+        )
+        if tile_count_semaphore is not None
+        else None,
+        batch_idx_permute=batch_idx_permute_tensor,
     )
 
     # epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
@@ -465,7 +476,11 @@ def run(
             assert varlen_k
             ref = torch.stack(
                 [
-                    torch.einsum("mk,nk->mn", a[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]], b[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]])
+                    torch.einsum(
+                        "mk,nk->mn",
+                        a[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]],
+                        b[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]],
+                    )
                     for i in range(l)
                 ],
                 dim=-1,

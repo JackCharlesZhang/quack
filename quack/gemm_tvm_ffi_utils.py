@@ -188,9 +188,9 @@ def compile_gemm_kernel(
     has_trace_ptr=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
-    if device_capacity[0] == 9:
+    if device_capacity[0] in [9, 12]:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-    elif device_capacity[0] == 10:
+    elif device_capacity[0] in [10, 11]:
         GemmCls = partial(GemmCls, use_clc_persistence=is_dynamic_persistent)
     gemm_obj = GemmCls(
         Float32,
