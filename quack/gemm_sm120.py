@@ -152,7 +152,7 @@ class GemmSm120(GemmSm90):
         tCrA_copy_view = smem_tiled_copy_A.retile(tCrA)
         tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
         load_sA = partial(cute.copy, smem_tiled_copy_A)
-        load_sB = partial(cute.copy, smem_tiled_copy_A)
+        load_sB = partial(cute.copy, smem_tiled_copy_B)
 
         num_k_blocks = cute.size(tCrA, mode=[2])
         acc.fill(0.0)
@@ -216,7 +216,7 @@ class GemmSm120(GemmSm90):
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        _trace_ptr: Optional[cutlass.Int64] = None, # TODO: unused
+        _trace_ptr: Optional[cutlass.Int64] = None,  # TODO: unused
     ):
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)

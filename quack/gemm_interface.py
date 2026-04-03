@@ -56,16 +56,8 @@ Activation = Literal[
 
 
 def default_config(device):
-    if get_device_capacity(device)[0] != 10:
-        return GemmConfig(
-            tile_m=128,
-            tile_n=192,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=True,
-            is_dynamic_persistent=False,
-        )
-    else:
+    cap = get_device_capacity(device)[0]
+    if cap in [10, 11]:
         return GemmConfig(
             tile_m=256,
             tile_n=256,
@@ -73,6 +65,26 @@ def default_config(device):
             cluster_n=1,
             pingpong=False,
             is_dynamic_persistent=True,
+            device_capacity=10,
+        )
+    elif cap == 12:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=False,
+            device_capacity=12,
+        )
+    else:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=192,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=False,
         )
 
 

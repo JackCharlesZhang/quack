@@ -23,6 +23,7 @@ from quack.cute_dsl_utils import (
 from quack.epi_ops import TileStore
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_tvm_ffi_utils import (
     get_major,
@@ -171,6 +172,10 @@ class GemmActSm100(GemmActMixin, GemmSm100):
     pass
 
 
+class GemmActSm120(GemmActMixin, GemmSm120):
+    pass
+
+
 def _gated_epi_tile_fn(gemm, epi_tile):
     """Halve the N dimension of the epi_tile for gated postact."""
     if isinstance(epi_tile[1], cute.Layout):
@@ -250,6 +255,10 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
 
+class GemmGatedSm120(GemmGatedMixin, GemmSm120):
+    pass
+
+
 @jit_cache
 def _compile_gemm_act(
     a_dtype,
@@ -278,11 +287,11 @@ def _compile_gemm_act(
     rounding_mode=RoundingMode.RN,
     sr_seed_mode=0,
 ):
-    GemmCls = (
-        {"act": GemmActSm100, "gated": GemmGatedSm100}[gemm_cls_name]
-        if device_capacity[0] > 9
-        else {"act": GemmActSm90, "gated": GemmGatedSm90}[gemm_cls_name]
-    )
+    sm_to_cls = {
+        "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
+        "gated": {9: GemmGatedSm90, 10: GemmGatedSm100, 11: GemmGatedSm100, 12: GemmGatedSm120},
+    }
+    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     pa_leading = 1 if postact_major == "n" else 0
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
@@ -413,7 +422,7 @@ def gemm_act(
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] >= 10, (
             "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
@@ -485,10 +494,10 @@ def gemm_act(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
 
 
 gemm_gated = gemm_act

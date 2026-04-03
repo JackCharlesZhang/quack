@@ -13,6 +13,7 @@ from quack.activation import act_fn_map
 from quack.gemm_act import GemmActMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.gemm_tvm_ffi_utils import (
     div_for_dtype,
     perm3d,
@@ -204,6 +205,10 @@ class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
 
 
+class GemmSymmetricSm120(GemmSymmetricMixin, GemmSm120):
+    pass
+
+
 @jit_cache
 def _compile_gemm_symmetric(
     a_dtype,
@@ -225,7 +230,13 @@ def _compile_gemm_symmetric(
     beta_mode,
     device_capacity,
 ):
-    GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
+    sm_to_cls = {
+        9: GemmSymmetricSm90,
+        10: GemmSymmetricSm100,
+        11: GemmSymmetricSm100,
+        12: GemmSymmetricSm120,
+    }
+    GemmCls = sm_to_cls[device_capacity[0]]
     # Symmetric GEMM: m == n, so reuse the same sym_int for shape checking
     m, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
     a_leading = 1 if a_major == "k" else 0
@@ -314,7 +325,7 @@ def gemm_symmetric(
     postact_major = "n" if PostAct_p.stride(1) == 1 else "m"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
@@ -377,7 +388,7 @@ def gemm_symmetric(
     )
     varlen_args = None
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)

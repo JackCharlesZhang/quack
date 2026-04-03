@@ -19,6 +19,7 @@ from quack.cute_dsl_utils import (
 from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate, vec_multiply
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.rounding import RoundingMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -95,6 +96,10 @@ class GemmSqReduceSm100(GemmSqReduceMixin, GemmSm100):
     pass
 
 
+class GemmSqReduceSm120(GemmSqReduceMixin, GemmSm120):
+    pass
+
+
 @jit_cache
 def _compile_gemm_sq_reduce(
     a_dtype,
@@ -115,7 +120,13 @@ def _compile_gemm_sq_reduce(
     rowvec_dtype,
     device_capacity,
 ):
-    GemmCls = GemmSqReduceSm100 if device_capacity[0] > 9 else GemmSqReduceSm90
+    sm_to_cls = {
+        9: GemmSqReduceSm90,
+        10: GemmSqReduceSm100,
+        11: GemmSqReduceSm100,
+        12: GemmSqReduceSm120,
+    }
+    GemmCls = sm_to_cls[device_capacity[0]]
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
         b_dtype,
@@ -192,7 +203,7 @@ def gemm_sq_reduce(
     D_raw = A @ B (+ C), colvec_reduce[m] = sum_n(D_raw[m,n]^2), D_out = D_raw * rowvec.
     """
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -240,7 +251,7 @@ def gemm_sq_reduce(
     )
     varlen_args = make_varlen_args(None, None, None)
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)

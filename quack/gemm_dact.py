@@ -10,6 +10,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_act import GemmActMixin
 from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate
@@ -81,6 +82,10 @@ class GemmDActSm90(GemmDActMixin, GemmSm90):
 
 
 class GemmDActSm100(GemmDActMixin, GemmSm100):
+    pass
+
+
+class GemmDActSm120(GemmDActMixin, GemmSm120):
     pass
 
 
@@ -223,6 +228,10 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
     pass
 
 
+class GemmDGatedSm120(GemmDGatedMixin, GemmSm120):
+    pass
+
+
 @jit_cache
 def _compile_gemm_dact(
     a_dtype,
@@ -252,10 +261,16 @@ def _compile_gemm_dact(
     gemm_cls_name,
 ):
     is_dgated = gemm_cls_name == "dgated"
-    if is_dgated:
-        GemmCls = GemmDGatedSm100 if device_capacity[0] > 9 else GemmDGatedSm90
-    else:
-        GemmCls = GemmDActSm100 if device_capacity[0] > 9 else GemmDActSm90
+    sm_to_cls = {
+        "dact": {9: GemmDActSm90, 10: GemmDActSm100, 11: GemmDActSm100, 12: GemmDActSm120},
+        "dgated": {
+            9: GemmDGatedSm90,
+            10: GemmDGatedSm100,
+            11: GemmDGatedSm100,
+            12: GemmDGatedSm120,
+        },
+    }
+    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
         b_dtype,
@@ -413,7 +428,7 @@ def gemm_dact(
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
@@ -477,10 +492,10 @@ def gemm_dact(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None)
 
 
 gemm_dgated = gemm_dact

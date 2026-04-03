@@ -141,7 +141,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--add_to_output", action="store_true", help="Add to output")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
-    parser.add_argument("--sm120", action="store_true", help="Use SM120 warp-level MMA (on SM90 HW)")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
     args = parser.parse_args()
@@ -182,7 +181,6 @@ def run(
     gather_A: bool,
     add_to_output: bool,
     fp8_fast_accum: bool,
-    sm120: bool = False,
     **kwargs,
 ):
     """
@@ -218,7 +216,8 @@ def run(
         persistent = True
 
     device_capacity = get_device_capacity(torch.device("cuda"))
-    is_sm100 = device_capacity[0] == 10
+    is_sm100 = device_capacity[0] in [10, 11]
+    is_sm120 = device_capacity[0] == 12
     if is_sm100:
         persistent = True  # SM100 always uses persistent scheduling
 
@@ -237,7 +236,7 @@ def run(
     # Unpack parameters
     m, n, k, l = mnkl
     cluster_shape_mnk = (*cluster_shape_mn, 1)
-    GemmCls = GemmDefaultSm100 if is_sm100 else (GemmDefaultSm120 if sm120 else GemmDefaultSm90)
+    GemmCls = GemmDefaultSm100 if is_sm100 else (GemmDefaultSm120 if is_sm120 else GemmDefaultSm90)
 
     # Skip unsupported types
     if not GemmCls.is_valid_dtypes(
@@ -379,7 +378,7 @@ def run(
             gather_A=gather_A,
             use_clc_persistence=dynamic_persistent,
         )
-    elif sm120:
+    elif is_sm120:
         gemm = GemmCls(
             acc_dtype,
             a_dtype,
@@ -611,6 +610,5 @@ if __name__ == "__main__":
         args.gather_A,
         args.add_to_output,
         args.fp8_fast_accum,
-        args.sm120,
     )
     print("PASS")

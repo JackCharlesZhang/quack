@@ -12,7 +12,12 @@ from cutlass.cute.runtime import make_ptr
 from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
-from quack.gemm_default_epi import GemmDefaultEpiMixin, GemmDefaultSm90, GemmDefaultSm100
+from quack.gemm_default_epi import (
+    GemmDefaultEpiMixin,
+    GemmDefaultSm90,
+    GemmDefaultSm100,
+    GemmDefaultSm120,
+)
 from quack.rounding import RoundingMode
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
@@ -57,7 +62,13 @@ def _compile_gemm(
     sr_seed_mode,
     has_trace_ptr,
 ):
-    GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
+    sm_to_cls = {
+        9: GemmDefaultSm90,
+        10: GemmDefaultSm100,
+        11: GemmDefaultSm100,
+        12: GemmDefaultSm120,
+    }
+    GemmCls = sm_to_cls[device_capacity[0]]
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
         b_dtype,
@@ -171,7 +182,7 @@ def gemm(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] >= 10, (
             "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
@@ -254,7 +265,7 @@ def gemm(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(
             A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
         )

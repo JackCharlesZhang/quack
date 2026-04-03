@@ -102,14 +102,44 @@ def _get_sm100_configs(
     ]
 
 
+def _get_sm120_configs(
+    epilogue: Optional[str] = None,
+) -> List[GemmConfig]:
+    tile_mn_vals = [
+        (128, 128),
+        (128, 64),
+        (64, 128),
+        # (128, 192),
+    ]
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    GemmConfigCls = partial(
+        GemmConfig,
+        pingpong=False,
+        device_capacity=12,
+        is_dynamic_persistent=False,
+        cluster_m=1,
+        cluster_n=1,
+    )
+    return [
+        GemmConfigCls(tile_m=m, tile_n=n, swap_ab=sab, max_swizzle_size=8)
+        for (m, n), sab in itertools.product(tile_mn_vals, swap_ab_vals)
+    ]
+
+
 def get_all_configs(
     epilogue: Optional[str] = None,
     tune_coop: bool = True,
 ) -> List[GemmConfig]:
-    """Return autotuning configs for all supported device capabilities (sm90 + sm100).
+    """Return autotuning configs for all supported device capabilities (sm90 + sm100 + sm120).
 
     Each GemmConfig is tagged with its target device_capacity, so the caller can
     filter at runtime based on the actual device. This avoids querying the device
     (and initializing a CUDA context) at import time.
     """
-    return _get_sm90_configs(epilogue, tune_coop) + _get_sm100_configs(epilogue)
+    return (
+        _get_sm90_configs(epilogue, tune_coop)
+        + _get_sm100_configs(epilogue)
+        + _get_sm120_configs(epilogue)
+    )

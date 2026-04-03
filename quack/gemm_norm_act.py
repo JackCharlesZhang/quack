@@ -20,6 +20,7 @@ from quack.cute_dsl_utils import (
 )
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_sm120 import GemmSm120
 from quack.gemm_act import GemmActMixin, GemmGatedMixin
 from quack.epi_ops import vec_multiply
 from quack.activation import act_fn_map, gate_fn_map
@@ -94,6 +95,10 @@ class GemmNormActSm100(GemmNormActMixin, GemmSm100):
     pass
 
 
+class GemmNormActSm120(GemmNormActMixin, GemmSm120):
+    pass
+
+
 class GemmNormGatedMixin(GemmGatedMixin):
     """GEMM + normalize + gated activation: PostAct = gated_act((A @ B + C) * colvec * rowvec)."""
 
@@ -144,6 +149,10 @@ class GemmNormGatedSm100(GemmNormGatedMixin, GemmSm100):
     pass
 
 
+class GemmNormGatedSm120(GemmNormGatedMixin, GemmSm120):
+    pass
+
+
 @jit_cache
 def _compile_gemm_norm_act(
     a_dtype,
@@ -172,11 +181,21 @@ def _compile_gemm_norm_act(
     rounding_mode=RoundingMode.RN,
     sr_seed_mode=0,
 ):
-    GemmCls = (
-        {"norm_act": GemmNormActSm100, "norm_gated": GemmNormGatedSm100}[gemm_cls_name]
-        if device_capacity[0] > 9
-        else {"norm_act": GemmNormActSm90, "norm_gated": GemmNormGatedSm90}[gemm_cls_name]
-    )
+    sm_to_cls = {
+        "norm_act": {
+            9: GemmNormActSm90,
+            10: GemmNormActSm100,
+            11: GemmNormActSm100,
+            12: GemmNormActSm120,
+        },
+        "norm_gated": {
+            9: GemmNormGatedSm90,
+            10: GemmNormGatedSm100,
+            11: GemmNormGatedSm100,
+            12: GemmNormGatedSm120,
+        },
+    }
+    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     pa_leading = 1 if postact_major == "n" else 0
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
@@ -307,7 +326,7 @@ def gemm_norm_act_fn(
     colvec_ndim = colvec.ndim if colvec is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] >= 10, "Stochastic rounding requires SM100+"
 
@@ -375,7 +394,7 @@ def gemm_norm_act_fn(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    if device_capacity[0] > 9:
+    if device_capacity[0] in [10, 11]:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
