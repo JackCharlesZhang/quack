@@ -61,13 +61,17 @@ class GemmSm120(GemmSm90):
         self.cta_tile_shape_mnk = (tile_M, tile_N, 1)
 
         # Warp-level MMA uses (2, 2, 1) atom layout like the example
-        self.atom_layout_mnk = (2, 2, 1)
+        # TODO: autotune (2, 2, 1) and (4, 2, 1)
+        self.atom_layout_mnk = (4, 2, 1)
         self.mma_inst_mnk = (16, 8, 16)
         self.num_mma_warps = math.prod(self.atom_layout_mnk)
-        self.threads_per_cta = (self.num_mma_warps + 1) * cute.arch.WARP_SIZE
         # For compatibility with SM90 code that uses warp groups
         self.num_threads_per_warp_group = 128
-        self.mma_warp_groups = 1
+        assert self.num_mma_warps % 4 == 0
+        self.mma_warp_groups = self.num_mma_warps // 4
+        # threads_per_cta must be a multiple of 128 (warp group size) so that
+        # the DMA warp's setmaxnreg.dec.sync has a complete warp group to sync with.
+        self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
 
         self.num_mcast_ctas_a = cluster_shape_mnk[1]
         if gather_A:
@@ -291,7 +295,7 @@ class GemmSm120(GemmSm90):
         tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
         tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
         acc_shape = tiled_mma.partition_shape_C(self.cta_tile_shape_mnk[:2])
-        accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+        acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
@@ -303,56 +307,62 @@ class GemmSm120(GemmSm90):
         k_tile_cnt = cute.ceil_div(mA_mkl.shape[1], self.cta_tile_shape_mnk[2])
 
         # =====================================================================
-        # DMA warp — reuses SM90's load_AB via tma_get_copy_fn
+        # DMA warp group — all warps >= num_mma_warps must enter to participate
+        # in setmaxnreg.dec.sync (warp-group-level barrier).
+        # Only warp num_mma_warps actually does TMA loads.
         # =====================================================================
-        if warp_idx == self.num_mma_warps:
+        if warp_idx >= self.num_mma_warps:
+            # All warps in this warp group must execute setmaxnreg (warp-group barrier).
             cute.arch.setmaxregister_decrease(self.num_regs_load)
-            tile_scheduler = TileSchedulerCls()
-            work_tile = tile_scheduler.initial_work_tile_info()
-            ab_producer_state = make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.ab_stage
-            )
-            while work_tile.is_valid_tile:
-                tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
-                mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
-                gA_mk = cute.local_tile(
-                    mA_mk,
-                    cute.select(self.cta_tile_shape_mnk, [0, 2]),
-                    (tile_coord_mnkl[0], None),
+            # Only the first DMA warp does actual work; the rest are padding
+            # for the warp-group-level setmaxnreg barrier.
+            if warp_idx == self.num_mma_warps:
+                tile_scheduler = TileSchedulerCls()
+                work_tile = tile_scheduler.initial_work_tile_info()
+                ab_producer_state = make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.ab_stage
                 )
-                gB_nk = cute.local_tile(
-                    varlen_manager.offset_batch_B(mB_nkl, batch_idx),
-                    cute.select(self.cta_tile_shape_mnk, [1, 2]),
-                    (tile_coord_mnkl[1], None),
-                )
-                copy_A, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_a,
-                    cta_coord=cluster_coord_mnk[1],
-                    cta_layout=cute.make_layout(
-                        cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
-                    ),
-                    src_tensor=gA_mk,
-                    dst_tensor=sA,
-                    mcast_mask=a_mcast_mask,
-                )
-                copy_B, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_b,
-                    cta_coord=cluster_coord_mnk[0],
-                    cta_layout=cute.make_layout(
-                        cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
-                    ),
-                    src_tensor=gB_nk,
-                    dst_tensor=sB,
-                    mcast_mask=b_mcast_mask,
-                )
-                ab_producer_state = self.load_AB(
-                    ab_pipeline, ab_producer_state, copy_A, copy_B, k_tile_cnt
-                )
-                tile_scheduler.advance_to_next_work(is_scheduler_warp=True)
-                work_tile = tile_scheduler.get_current_work()
-            ab_pipeline.producer_tail(ab_producer_state)
-            tile_scheduler.producer_tail()
+                while work_tile.is_valid_tile:
+                    tile_coord_mnkl = work_tile.tile_idx
+                    batch_idx = tile_coord_mnkl[3]
+                    mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
+                    gA_mk = cute.local_tile(
+                        mA_mk,
+                        cute.select(self.cta_tile_shape_mnk, [0, 2]),
+                        (tile_coord_mnkl[0], None),
+                    )
+                    gB_nk = cute.local_tile(
+                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                        cute.select(self.cta_tile_shape_mnk, [1, 2]),
+                        (tile_coord_mnkl[1], None),
+                    )
+                    copy_A, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_a,
+                        cta_coord=cluster_coord_mnk[1],
+                        cta_layout=cute.make_layout(
+                            cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
+                        ),
+                        src_tensor=gA_mk,
+                        dst_tensor=sA,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    copy_B, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_b,
+                        cta_coord=cluster_coord_mnk[0],
+                        cta_layout=cute.make_layout(
+                            cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
+                        ),
+                        src_tensor=gB_nk,
+                        dst_tensor=sB,
+                        mcast_mask=b_mcast_mask,
+                    )
+                    ab_producer_state = self.load_AB(
+                        ab_pipeline, ab_producer_state, copy_A, copy_B, k_tile_cnt
+                    )
+                    tile_scheduler.advance_to_next_work(is_scheduler_warp=True)
+                    work_tile = tile_scheduler.get_current_work()
+                ab_pipeline.producer_tail(ab_producer_state)
+                tile_scheduler.producer_tail()
 
         # =====================================================================
         # MMA warps
@@ -395,7 +405,7 @@ class GemmSm120(GemmSm90):
                     ab_pipeline,
                     ab_read_state,
                     tiled_mma,
-                    accumulators,
+                    acc,
                     k_tile_cnt,
                     smem_tiled_copy_A,
                     smem_tiled_copy_B,
@@ -434,7 +444,7 @@ class GemmSm120(GemmSm90):
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
-                tRS_rAcc = self.epi_retile_acc(accumulators, tRS_rD, tiled_copy_r2s)
+                tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
                 load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
@@ -443,7 +453,7 @@ class GemmSm120(GemmSm90):
                 else:
                     tiled_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
 
-                self.epi_visit_acc(epilogue_params, accumulators, tiled_mma, tile_coord_mnkl, tidx)
+                self.epi_visit_acc(epilogue_params, acc, tiled_mma, tile_coord_mnkl, tidx)
 
                 epi_read_state, epi_producer_state = self.epilogue(
                     epilogue_params,
