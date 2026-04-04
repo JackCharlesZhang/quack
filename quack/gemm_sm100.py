@@ -23,7 +23,7 @@ from cutlass.cute.nvgpu.warp import (
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack.pipeline import PipelineTmaCpAsyncUmma
+from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
@@ -158,6 +158,7 @@ class GemmSm100(GemmSm90):
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
+        use_tma_gather: bool = False,
         use_clc_persistence: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
@@ -193,8 +194,11 @@ class GemmSm100(GemmSm90):
         self.pingpong = False  # for compatibility with GemmSm90
         self.use_clc_persistence = use_clc_persistence
         self.gather_A = gather_A
+        self.use_tma_gather = use_tma_gather
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
+        if use_tma_gather:
+            assert gather_A, "TMA gather requires gather_A=True"
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -393,9 +397,14 @@ class GemmSm100(GemmSm90):
         )
         self.a_smem_load_layout_staged = self.a_smem_layout_staged
         if const_expr(self.gather_A):
-            self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
-                self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
-            )
+            if const_expr(self.use_tma_gather and varlen_args.mCuSeqlensM is not None):
+                self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_tma_gather_a(
+                    self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+                )
+            else:
+                self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
+                    self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+                )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
         )
@@ -494,6 +503,8 @@ class GemmSm100(GemmSm90):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        if const_expr(self.use_tma_gather):
+            assert varlen_m and not varlen_k, "TMA gather currently only supports varlen_m"
 
         # Assume all strides are divisible by 128 bits except the last stride
         def new_stride(t: cute.Tensor):
@@ -542,6 +553,24 @@ class GemmSm100(GemmSm90):
                 self.cluster_layout_vmnk.shape,
                 internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
             )
+        elif const_expr(self.use_tma_gather and varlen_m):
+            a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+                self.cluster_shape_mnk, self.tiled_mma.thr_id
+            )
+            tile_K = self.cta_tile_shape_mnk[2]
+            # The gather4 descriptor loads one row; the instruction writes 4 rows contiguously.
+            tma_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 3),
+                0,
+                cute.make_layout((1, tile_K), stride=(tile_K, 1)),
+            )
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                a_op,
+                mA,
+                tma_smem_layout,
+                (1, tile_K),
+                internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
+            )
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mnk, self.tiled_mma.thr_id
         )
@@ -588,7 +617,7 @@ class GemmSm100(GemmSm90):
             )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        if const_expr(not self.gather_A):
+        if const_expr(not self.gather_A or self.use_tma_gather):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
         if const_expr(self.blockscaled):
             sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
@@ -700,7 +729,7 @@ class GemmSm100(GemmSm90):
             self.tiled_mma,
             self.tiled_mma_sfb,
             tma_atom_a,
-            tma_tensor_a if const_expr(not self.gather_A) else mA,
+            tma_tensor_a if const_expr(not self.gather_A or self.use_tma_gather) else mA,
             tma_atom_b,
             tma_tensor_b,
             tma_atom_sfa,
@@ -782,6 +811,8 @@ class GemmSm100(GemmSm90):
         assert not (varlen_m and varlen_k)
         if const_expr(self.gather_A):
             assert varlen_m or varlen_k
+        if const_expr(self.use_tma_gather):
+            assert varlen_m and not varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -1033,6 +1064,21 @@ class GemmSm100(GemmSm90):
                         dst_tensor=sA,
                         mcast_mask=a_mcast_mask,
                     )
+                elif const_expr(self.use_tma_gather):
+                    a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
+                    copy_A = copy_utils.gather_m_get_tma_copy_fn(
+                        tma_atom_a,
+                        mA_mk,
+                        sA,
+                        sAIdx[None, a_prefetch_consumer_state.index],
+                        warp_idx - self.ab_load_warp_id,
+                        num_warps=self.num_ab_load_warps,
+                        num_cta=2 if self.use_2cta_instrs else 1,
+                    )
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+                    a_prefetch_consumer_state.advance()
                 else:
                     len_m = varlen_manager.len_m(batch_idx)
                     tiled_copy_A = self._make_gmem_tiled_copy_A(
@@ -1118,6 +1164,14 @@ class GemmSm100(GemmSm90):
                         k_tile_cnt,
                         copy_SFA,
                         copy_SFB,
+                    )
+                elif const_expr(self.use_tma_gather):
+                    ab_producer_state = self.load_AB_tma_gather_A(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        copy_B,
+                        k_tile_cnt,
                     )
                 else:
                     ab_producer_state, a_prefetch_consumer_state = self.load_AB_gather_A(
@@ -1569,6 +1623,34 @@ class GemmSm100(GemmSm90):
         return ab_producer_state, a_prefetch_consumer_state
 
     @cute.jit
+    def load_AB_tma_gather_A(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_producer_state: cutlass.pipeline.PipelineState,
+        copy_A: Callable,
+        copy_B: Callable,
+        k_tile_cnt: Int32,
+    ) -> cutlass.pipeline.PipelineState:
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        peek_ab_empty_status = Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            is_tma_warp = warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps)
+            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_tma_warp)
+            tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+            smem_idx = ab_producer_state.index
+            if is_tma_warp:
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            ab_pipeline.producer_commit(ab_producer_state)
+            ab_producer_state.advance()
+            peek_ab_empty_status = Boolean(True)
+            if k_tile + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        return ab_producer_state
+
+    @cute.jit
     def mma(
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
@@ -1600,7 +1682,9 @@ class GemmSm100(GemmSm90):
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
         # arrive at an mbarrier on the non-leader CTA side, then the mma warp of the non-leader
         # CTA will wait for that then arrive at the mbarrier on the leader CTA.
-        need_nonleader_cta = const_expr(self.gather_A and self.use_2cta_instrs)
+        need_nonleader_cta = const_expr(
+            self.gather_A and self.use_2cta_instrs and not self.use_tma_gather
+        )
         # Peek (try_wait) AB buffer full for k_tile = 0
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt and (is_leader_cta or need_nonleader_cta):
@@ -1851,7 +1935,7 @@ class GemmSm100(GemmSm90):
         # + 1 (from non-leader CTA).
         # The producer count for the non-leader CTA is num_cpasync_threads
         # (TMA doesn't arrive there).
-        if const_expr(not self.gather_A):
+        if const_expr(not self.gather_A or self.use_tma_gather):
             producer_cnt = 1
         else:
             producer_cnt = self.num_ab_load_warps * 32 + (
@@ -1866,6 +1950,16 @@ class GemmSm100(GemmSm90):
         )
         if const_expr(not self.gather_A):
             pipeline_ab = pipeline.PipelineTmaUmma.create(
+                barrier_storage=ab_pipeline_mbar_ptr,
+                num_stages=self.ab_stage,
+                producer_group=ab_pipeline_producer_group,
+                consumer_group=ab_pipeline_consumer_group,
+                tx_count=self.num_tma_load_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+        elif const_expr(self.use_tma_gather):
+            pipeline_ab = PipelineTmaUmma.create(
                 barrier_storage=ab_pipeline_mbar_ptr,
                 num_stages=self.ab_stage,
                 producer_group=ab_pipeline_producer_group,

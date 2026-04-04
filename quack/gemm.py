@@ -56,6 +56,7 @@ def _compile_gemm(
     varlen_m,
     varlen_k,
     gather_A,
+    use_tma_gather,
     has_batch_idx_permute,
     device_capacity,
     rounding_mode,
@@ -131,6 +132,7 @@ def _compile_gemm(
         scheduler_args,
         varlen_args,
         has_trace_ptr=has_trace_ptr,
+        use_tma_gather=use_tma_gather,
     )
 
 
@@ -160,6 +162,7 @@ def gemm(
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    use_tma_gather: bool = False,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -183,6 +186,11 @@ def gemm(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    if use_tma_gather:
+        assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
+        assert gather_A and varlen_m and not varlen_k, (
+            "TMA gather currently only supports varlen_m + gather_A"
+        )
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
     if is_dynamic_persistent and device_capacity[0] == 9:
@@ -224,6 +232,7 @@ def gemm(
         varlen_m,
         varlen_k,
         gather_A,
+        use_tma_gather,
         batch_idx_permute is not None,
         device_capacity,
         rounding_mode,

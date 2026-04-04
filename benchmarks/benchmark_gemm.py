@@ -13,7 +13,7 @@ Simplified GEMM benchmark using quack.gemm.gemm() directly.
 Usage:
     python benchmarks/benchmark_gemm.py --mnkl 512,7168,2048,256 \
         --tile_shape_mn 256,256 --cluster_shape_mn 2,1 --persistent \
-        --varlen_m --gather_A --skip_ref_check
+        --varlen_m --gather_A --use_tma_gather --skip_ref_check
 """
 
 
@@ -49,6 +49,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
+    parser.add_argument("--use_tma_gather", action="store_true", help="Use TMA gather4 for A")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
     args = parser.parse_args()
@@ -78,6 +79,7 @@ def run(args):
     print("Running Dense GEMM with:")
     print(f"mnkl: {args.mnkl}")
     print(f"Tile Shape: {args.tile_shape_mn}, Cluster Shape: {args.cluster_shape_mn}")
+    print(f"Use TMA gather: {args.use_tma_gather}")
     print(f"Warmup iterations: {warmup}")
     print(f"Iterations: {repeats}")
     print(f"Skip reference checking: {args.skip_ref_check}")
@@ -128,6 +130,7 @@ def run(args):
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
+            use_tma_gather=args.use_tma_gather,
         )
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
