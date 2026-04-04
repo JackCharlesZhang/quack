@@ -187,7 +187,7 @@ def gemm_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_dispatch(
@@ -263,7 +263,7 @@ def gemm_act_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_act_dispatch(
@@ -330,7 +330,7 @@ def gemm_dact_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_dact_dispatch(
@@ -1175,7 +1175,7 @@ def gemm_gated_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_act_dispatch(
@@ -1269,7 +1269,7 @@ def gemm_dgated_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_dact_dispatch(
@@ -1599,7 +1599,7 @@ def _gemm_rms_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_sq_reduce_dispatch(
@@ -1779,7 +1779,7 @@ def gemm_norm_act_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_norm_act_dispatch(
@@ -1841,7 +1841,7 @@ def gemm_norm_gated_tuned(
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
     gemm_norm_act_dispatch(
