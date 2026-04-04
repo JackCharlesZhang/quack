@@ -78,6 +78,7 @@ def _get_sm100_configs(
         + [(128, tile_n, (2, 2)) for tile_n in tile_n_vals]
         + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
         + [(256, tile_n, (2, 2)) for tile_n in tile_n_vals]
+        + [(256, 512, (2, 1))]
     )
     swap_ab_vals = [False, True]
     if epilogue in ["lse", "gated"]:

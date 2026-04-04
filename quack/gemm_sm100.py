@@ -201,9 +201,11 @@ class GemmSm100(GemmSm90):
         self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.occupancy = 1
         # Set specialized warp ids
-        self.epilog_warp_id = (0, 1, 2, 3)
-        self.mma_warp_id = 4
-        self.ab_load_warp_id = 5
+        self.epi_warps_per_accumulator = 4
+        num_epi_warps = self.epi_warps_per_accumulator
+        self.epilog_warp_id = tuple(range(num_epi_warps))
+        self.mma_warp_id = len(self.epilog_warp_id)
+        self.ab_load_warp_id = self.mma_warp_id + 1
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         # So that we have 12 warps in case of gather_A
@@ -250,9 +252,10 @@ class GemmSm100(GemmSm90):
         # Compute mma instruction shapes
         mma_inst_bits_k = 256
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
+        mma_inst_shape_n = self.mma_tiler[1] if self.mma_tiler[1] <= 256 else self.mma_tiler[1] // 2
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
-            self.mma_tiler[1],
+            mma_inst_shape_n,
             mma_inst_bits_k // self.a_dtype.width,
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
@@ -270,7 +273,7 @@ class GemmSm100(GemmSm90):
                 self.b_major_mode,
                 self.acc_dtype,
                 self.cta_group,
-                self.mma_tiler[:2],
+                self.mma_inst_shape_mnk[:2],
             )
             self.tiled_mma_sfb = None
         else:
@@ -296,8 +299,8 @@ class GemmSm100(GemmSm90):
         # Compute mma/cluster/tile shapes
         mma_inst_tile_k = 4
         self.mma_tiler = (
-            self.mma_inst_shape_mnk[0],
-            self.mma_inst_shape_mnk[1],
+            self.mma_tiler[0],
+            self.mma_tiler[1],
             self.mma_inst_shape_mnk[2] * mma_inst_tile_k,
         )
         if const_expr(self.blockscaled):
@@ -1998,7 +2001,7 @@ class GemmSm100(GemmSm90):
         blockscaled = sf_dtype is not None
         # Default ACC stages
         if const_expr(not blockscaled):
-            num_acc_stage = 2
+            num_acc_stage = 1 if mma_tiler_mnk[1] > 256 else 2
         else:
             num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
@@ -2257,8 +2260,9 @@ class GemmSm100(GemmSm90):
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in [64, 128, 256]:
             is_valid = False
+        mma_inst_n = mma_tiler_mn[1] if mma_tiler_mn[1] <= 256 else mma_tiler_mn[1] // 2
         if not blockscaled:
-            if mma_tiler_mn[1] not in range(32, 257, 32):
+            if mma_inst_n not in range(32, 257, 32):
                 is_valid = False
         else:
             if mma_tiler_mn[1] not in [128, 256]:
