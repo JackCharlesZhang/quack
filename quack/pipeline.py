@@ -311,6 +311,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
         self,
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
+        is_tma_warp: Optional[Boolean] = True,
         extra_tx_count: int = 0,
         *,
         loc=None,
@@ -325,9 +326,11 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
             loc=loc,
             ip=ip,
         )
+        # This is the difference between this and PipelineTmaAsync: we could have multiple
+        # warps calling this, but only 1 warp should do the arrive on the full barrier
         if const_expr(extra_tx_count == 0):
             if_generate(
-                self.is_leader_cta,
+                and_(self.is_leader_cta, is_tma_warp),
                 lambda: self.sync_object_full.arrive(
                     state.index, self.producer_mask, loc=loc, ip=ip
                 ),
@@ -337,7 +340,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
-                self.is_leader_cta,
+                and_(self.is_leader_cta, is_tma_warp),
                 lambda: self.sync_object_full.arrive_and_expect_tx(
                     state.index, tx_count, loc=loc, ip=ip
                 ),

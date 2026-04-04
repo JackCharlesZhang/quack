@@ -822,17 +822,17 @@ def gather_m_get_copy_fn(
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
-    tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
-    tAsA = thr_copy_A.partition_D(sA)
+    tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
+    tAsA = partition_D_position_independent(thr_copy_A, sA)
     # k-major
     assert tAsA.shape[2] == 1
     tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
 
-    is_even_m_smem = tile_shape_mk[0] % thr_copy_A.tiler_mn[0].shape == 0
+    is_even_m_smem = tile_M % thr_copy_A.tiler_mn[0].shape == 0
     if const_expr(not is_even_m_smem):
-        limit_m = min(limit_m, tile_shape_mk[0])
+        limit_m = min(limit_m, tile_M)
     elems_per_load = cute.size(tAsA.shape[0][0])
-    cA = cute.make_identity_tensor(tile_shape_mk)
+    cA = cute.make_identity_tensor((tile_M, tile_K))
     tAcA = thr_copy_A.partition_S(cA)
     t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
     # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
@@ -854,13 +854,13 @@ def gather_m_get_copy_fn(
         else:
             m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
 
-    mA_k = cute.logical_divide(mA, (None, tile_shape_mk[1]))
+    mA_k = cute.logical_divide(mA, (None, tile_K))
 
     def copy_fn(src_idx, dst_idx, pred: bool = False):
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
-            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            limit_k_cur = limit_k - src_idx * tile_K
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
         mA_cur = mA_k[None, (None, src_idx)]
