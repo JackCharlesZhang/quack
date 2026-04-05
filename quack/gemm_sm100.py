@@ -397,9 +397,14 @@ class GemmSm100(GemmSm90):
         )
         self.a_smem_load_layout_staged = self.a_smem_layout_staged
         if const_expr(self.gather_A):
-            if const_expr(self.use_tma_gather and varlen_args.mCuSeqlensM is not None):
+            if const_expr(self.use_tma_gather):
+                gather_dim = "m" if varlen_args.mCuSeqlensM is not None else "k"
                 self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_tma_gather_a(
-                    self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+                    self.tiled_mma,
+                    self.mma_tiler,
+                    self.a_dtype,
+                    self.ab_stage,
+                    gather_dim=gather_dim,
                 )
             else:
                 self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
@@ -505,20 +510,6 @@ class GemmSm100(GemmSm90):
         varlen_k = varlen_args.mCuSeqlensK is not None
         if const_expr(self.use_tma_gather):
             assert varlen_m and not varlen_k, "TMA gather currently only supports varlen_m"
-
-        # Assume all strides are divisible by 128 bits except the last stride
-        def new_stride(t: cute.Tensor):
-            return tuple(
-                cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
-                for s in t.stride
-            )
-
-        mA, mD = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (mA, mD)
-        ]
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
