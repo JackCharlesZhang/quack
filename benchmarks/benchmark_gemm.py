@@ -50,6 +50,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--use_tma_gather", action="store_true", help="Use TMA gather4 for A")
+    parser.add_argument("--max_swizzle_size", type=int, default=8, help="Max swizzle size")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
     args = parser.parse_args()
@@ -109,7 +110,12 @@ def run(args):
         total_k = k * l
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device=device) * k
         # m-major A, n-major B for varlen_k
-        A = torch.randn(total_k, m, dtype=torch.bfloat16, device=device).T
+        if gather_A:
+            larger_k = total_k * 2
+            A = torch.randn(larger_k, m, dtype=torch.bfloat16, device=device).T
+            A_idx = torch.randperm(larger_k, dtype=torch.int32, device=device)[:total_k]
+        else:
+            A = torch.randn(total_k, m, dtype=torch.bfloat16, device=device).T
         B = torch.randn(total_k, n, dtype=torch.bfloat16, device=device).T
         D = torch.empty(l, m, n, dtype=torch.bfloat16, device=device)
     else:
@@ -127,6 +133,7 @@ def run(args):
             pingpong=args.pingpong,
             persistent=persistent,
             is_dynamic_persistent=args.dynamic_persistent,
+            max_swizzle_size=args.max_swizzle_size,
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
@@ -146,7 +153,8 @@ def run(args):
             ])
         elif varlen_k:
             ref = torch.stack([
-                A[:, cu_seqlens_k[i]:cu_seqlens_k[i+1]] @
+                (A[:, A_idx[cu_seqlens_k[i]:cu_seqlens_k[i+1]]] if gather_A
+                 else A[:, cu_seqlens_k[i]:cu_seqlens_k[i+1]]) @
                 B[:, cu_seqlens_k[i]:cu_seqlens_k[i+1]].T
                 for i in range(l)
             ])
