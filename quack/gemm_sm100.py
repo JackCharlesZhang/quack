@@ -504,8 +504,6 @@ class GemmSm100(GemmSm90):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
-        if const_expr(self.use_tma_gather):
-            assert varlen_m and not varlen_k, "TMA gather currently only supports varlen_m"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -794,8 +792,6 @@ class GemmSm100(GemmSm90):
         assert not (varlen_m and varlen_k)
         if const_expr(self.gather_A):
             assert varlen_m or varlen_k
-        if const_expr(self.use_tma_gather):
-            assert varlen_m and not varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -1561,7 +1557,7 @@ class GemmSm100(GemmSm90):
                 )
             elif const_expr(varlen_k):
                 col_idx = Int32(tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0])
-                copy_A = copy_utils.gather_k_get_tma_copy_fn(
+                copy_A, prefetch_A = copy_utils.gather_k_get_tma_copy_fn(
                     tma_atom_a,
                     sA,
                     sAIdx,
@@ -1686,7 +1682,7 @@ class GemmSm100(GemmSm90):
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             if is_tma_warp:
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
-            copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr, *prefetch_out)
+            copy_A(k_tile, smem_idx, *prefetch_out, tma_bar_ptr=tma_bar_ptr)
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
             peek_ab_empty_status = Boolean(True)

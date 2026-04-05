@@ -3,12 +3,19 @@ import math
 import pytest
 import torch
 
+from quack.cute_dsl_utils import get_device_capacity
+from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
     gemm,
     gemm_ref,
     gemm_add,
     gemm_add_ref,
     gemm_add_inplace,
+)
+
+sm100_tma_gather_only = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] not in (10, 11),
+    reason="TMA gather tests require SM100/SM110",
 )
 
 
@@ -40,6 +47,105 @@ def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
         A = A.T.contiguous().T
         A_idx = None
     return A, A_idx
+
+
+def run_lowlevel_varlen_k_gemm(
+    A,
+    B,
+    out,
+    cu_seqlens_k,
+    A_idx,
+    *,
+    dynamic_persistent=False,
+    use_tma_gather=False,
+):
+    device_capacity = get_device_capacity(A.device)[0]
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_persistent and device_capacity == 9
+        else None
+    )
+    quack_gemm(
+        A,
+        B,
+        out,
+        C=None,
+        tile_count_semaphore=tile_count_semaphore,
+        tile_M=256,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
+        persistent=True,
+        is_dynamic_persistent=dynamic_persistent,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        use_tma_gather=use_tma_gather,
+    )
+
+
+@sm100_tma_gather_only
+@pytest.mark.parametrize("dynamic_persistent", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1024])
+@pytest.mark.parametrize("m", [2048])
+def test_gemm_varlen_k_tma_gather_matches_cpasync(
+    m,
+    n,
+    input_dtype,
+    dynamic_persistent,
+):
+    """Compare TMA gather vs cp.async gather for varlen_k."""
+    device = "cuda"
+    torch.random.manual_seed(42)
+    num_groups = 4
+    # Use K values divisible by tile_K (64 for bf16) to avoid partial-tile edge cases
+    seq_lens = torch.randint(2, 6, (num_groups,), device="cpu") * 64
+    total_k = seq_lens.sum().item()
+    cu_seqlens_k = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+    ).to(device)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A=True)
+    # B for quack_gemm varlen_k: 2D (n, total_k), n-major (stride(-2)==1)
+    B_ref = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(
+        total_k / num_groups
+    )
+    B = B_ref.T  # (n, total_k) with n contiguous — stride(-2)==1
+
+    out_cpasync = torch.empty((num_groups, m, n), device=device, dtype=input_dtype)
+    out_tma = torch.empty_like(out_cpasync)
+
+    run_lowlevel_varlen_k_gemm(
+        A,
+        B,
+        out_cpasync,
+        cu_seqlens_k,
+        A_idx,
+        dynamic_persistent=dynamic_persistent,
+        use_tma_gather=False,
+    )
+    run_lowlevel_varlen_k_gemm(
+        A,
+        B,
+        out_tma,
+        cu_seqlens_k,
+        A_idx,
+        dynamic_persistent=dynamic_persistent,
+        use_tma_gather=True,
+    )
+
+    # gemm_ref expects B as (total_K, N)
+    out_ref = gemm_ref(
+        A.float(),
+        B_ref.float(),
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+    )
+    out_pt = gemm_ref(A, B_ref, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx)
+
+    assert out_tma.shape == (num_groups, m, n)
+    assert (out_tma - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
+    assert (out_cpasync - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
+    torch.testing.assert_close(out_tma, out_cpasync, atol=3e-2, rtol=1e-3)
 
 
 @pytest.mark.parametrize("permute_batch", [False, True])

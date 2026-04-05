@@ -188,9 +188,6 @@ def gemm(
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
-        assert gather_A and varlen_m and not varlen_k, (
-            "TMA gather currently only supports varlen_m + gather_A"
-        )
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
     if is_dynamic_persistent and device_capacity[0] == 9:

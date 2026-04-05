@@ -13,9 +13,10 @@ from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
-
-from quack.utils import make_vector
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+
+from quack import layout_utils
+from quack.utils import make_vector
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
@@ -1023,14 +1024,81 @@ def gather_m_get_tma_copy_fn(
     tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
 
     def copy_fn(src_idx, dst_idx, tma_bar_ptr: cute.Pointer):
+        tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
         col_idx = tile_K * src_idx
         for m in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
             row_indices = [tSR_rAIdx[v, m] for v in range(4)]
-            smem_ptr = tSR_sA[None, m, None, dst_idx].iterator
+            smem_ptr = tSR_sA_cur[None, m, None].iterator
             with cute.arch.elect_one():
                 tma_gather4_load_fn(smem_ptr, tma_bar_ptr, col_idx, row_indices)
 
     return copy_fn
+
+
+@cute.jit
+def gather_k_get_tma_copy_fn(
+    tma_atom: cute.CopyAtom,
+    sA: cute.Tensor,  # ((4, tile_K/4), (tile_M,), STAGE) — K-grouped load layout
+    sAIdx: cute.Tensor,  # (tile_K, a_prefetch_stage) — K indices in smem
+    col_idx: Int32,  # M offset in global tensor (contiguous dim for M-major)
+    warp_idx: Int32,
+    num_warps: int,
+    num_cta: int = 1,
+) -> Tuple[Callable, Callable]:
+    """Build a copy function for TMA gather4 in K dimension (M-major A).
+
+    Each gather4 instruction loads 4 K-columns × tile_M contiguous M-elements.
+    col_idx is the absolute M position in the global tensor.
+    K indices come from sAIdx (prefetched to smem by the scheduler warp).
+
+    Returns copy_fn(src_idx, dst_idx, tma_bar_ptr) which:
+      Issues gather4 calls with those K indices as row_indices
+    """
+    tile_K = cute.size(sAIdx, mode=[0])
+    assert tile_K % 4 == 0
+    cta_group = num_cta
+
+    # Tiled copy for loading K indices from smem to registers (4 per vector, across warps)
+    copy_AIdx_s2r = cute.make_tiled_copy_tv(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128),
+        cute.make_layout(num_warps),  # thr_layout
+        cute.make_layout(4),  # val_layout — 4 K indices per gather4
+    )
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    warp_copy_AIdx_s2r = copy_AIdx_s2r.get_slice(warp_idx)
+    tSR_sAIdx = warp_copy_AIdx_s2r.partition_S(sAIdx)  # (((4,1),4,4))
+    # ((4,1),4,(64,2),(1,4)):((64,0),1024,(1,4096),(0,8192))
+    tSR_sA = warp_copy_AIdx_s2r.partition_S(layout_utils.transpose_view(sA))
+    tma_desc_ptr = get_tma_desc_addr(tma_atom)
+    tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
+
+    def prefetch_from_smem_fn(
+        a_prefetch_pipeline,
+        src_idx,
+        dst_idx,
+        a_prefetch_consumer_state,
+    ) -> cute.Tensor:
+        a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
+        tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        return tSR_rAIdx
+
+    def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):
+        # Issue gather4: col_idx = M position, row_indices = 4 K positions
+        tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
+        gather_dim = cute.size(tSR_sA_cur, mode=[2, 0])  # Typically 64
+        for k in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
+            row_indices = [tSR_rAIdx[v, k] for v in range(4)]
+            for m in cutlass.range(cute.size(tSR_sA_cur, mode=[2, 1]), unroll_full=True):
+                smem_ptr = tSR_sA_cur[None, k, (None, m)].iterator
+                with cute.arch.elect_one():
+                    tma_gather4_load_fn(
+                        smem_ptr, tma_bar_ptr, col_idx + m * gather_dim, row_indices
+                    )
+
+    return copy_fn, prefetch_from_smem_fn
 
 
 # ---------------------------------------------------------------------------
