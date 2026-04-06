@@ -321,6 +321,14 @@ class GemmSm100(GemmSm90):
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        if const_expr(self.blockscaled):
+            self.cta_tile_shape_mnk_sfb = (
+                self.mma_tiler_sfb[0] // cute.size(self.tiled_mma.thr_id.shape),
+                self.mma_tiler_sfb[1],
+                self.mma_tiler_sfb[2],
+            )
+        else:
+            self.cta_tile_shape_mnk_sfb = None
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -509,9 +517,14 @@ class GemmSm100(GemmSm90):
         self._setup_attributes(epilogue_args, varlen_args)
 
         if const_expr(self.blockscaled):
-            # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-            # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-            sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(mA.shape, self.sf_vec_size)
+            # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout.
+            # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL). mA may be rank-2 (total_m, k)
+            # in varlen_m mode; mB is always rank-3 (n, k, l).
+            if const_expr(cute.rank(mA) == 3):
+                sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(mA.shape, self.sf_vec_size)
+            else:
+                atom = blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout
+                sfa_layout = cute.tile_to_shape(atom, mA.shape, (2, 1))
             mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)
             # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
             sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(mB.shape, self.sf_vec_size)
@@ -596,6 +609,26 @@ class GemmSm100(GemmSm90):
                 self.cluster_layout_sfb_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
+            if const_expr(
+                self.cta_tile_shape_mnk[1] == 192 and self.sf_dtype is cutlass.Float8E8M0FNU
+            ):
+                x = tma_tensor_sfb.stride[0][1]
+                y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
+                tma_tensor_sfb = cute.make_tensor(
+                    tma_tensor_sfb.iterator,
+                    cute.make_layout(
+                        (
+                            (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
+                            tma_tensor_sfb.shape[1],
+                            tma_tensor_sfb.shape[2],
+                        ),
+                        stride=(
+                            (tma_tensor_sfb.stride[0][0], ((x, x), 3 * x)),
+                            tma_tensor_sfb.stride[1],
+                            tma_tensor_sfb.stride[2],
+                        ),
+                    ),
+                )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         if const_expr(not self.gather_A or self.use_tma_gather):
@@ -1008,8 +1041,15 @@ class GemmSm100(GemmSm90):
                     # (bN, bK)
                     gSFB_nkl = cute.local_tile(
                         varlen_manager.offset_batch_B(mSFB_nkl, batch_idx),
-                        cute.select(self.mma_tiler, [1, 2]),
-                        (mma_tile_coord_mnl[1], None),
+                        cute.select(self.mma_tiler_sfb, [1, 2]),
+                        (
+                            (
+                                mma_tile_coord_mnl[1] // 2
+                                if self.cta_tile_shape_mnk[1] == 64
+                                else mma_tile_coord_mnl[1]
+                            ),
+                            None,
+                        ),
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
@@ -1296,8 +1336,9 @@ class GemmSm100(GemmSm90):
 
             if const_expr(self.blockscaled):
                 # Make SFA tmem tensor
+                acc_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
                 sfa_tmem_ptr = cute.recast_ptr(
-                    acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                    acc_tmem_ptr + acc_tmem_col_offset,
                     dtype=self.sf_dtype,
                 )
                 # (MMA, MMA_M, MMA_K)
@@ -1309,10 +1350,11 @@ class GemmSm100(GemmSm90):
                 )
                 tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
                 # Make SFB tmem tensor
+                sfa_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                sfb_tmem_col_offset = acc_tmem_col_offset + sfa_tmem_col_offset
+                sfb_tmem_base_ptr = acc_tmem_ptr + sfb_tmem_col_offset
                 sfb_tmem_ptr = cute.recast_ptr(
-                    acc_tmem_ptr
-                    + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                    + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                    sfb_tmem_base_ptr,
                     dtype=self.sf_dtype,
                 )
                 # (MMA, MMA_N, MMA_K)
@@ -1357,6 +1399,15 @@ class GemmSm100(GemmSm90):
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
+                tCtSFB_mma = tCtSFB
+                if const_expr(self.blockscaled and self.mma_inst_shape_mnk[1] in (64, 192)):
+                    tCtSFB_mma = cute.make_tensor(
+                        cute.recast_ptr(
+                            sfb_tmem_base_ptr + Int32((tile_coord_mnkl[1] % 2) * 2),
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFB.layout,
+                    )
                 tctx.b("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
@@ -1371,7 +1422,7 @@ class GemmSm100(GemmSm90):
                     is_leader_cta,
                     cta_rank_in_cluster,
                     tCtSFA,
-                    tCtSFB,
+                    tCtSFB_mma,
                     tiled_copy_s2t_sfa,
                     tiled_copy_s2t_sfb,
                     tCsSFA_compact_s2t,
@@ -2138,7 +2189,7 @@ class GemmSm100(GemmSm90):
         if const_expr(not blockscaled):
             num_acc_stage = 1 if mma_tiler_mnk[1] > 256 else 2
         else:
-            num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
+            num_acc_stage = 1 if mma_tiler_mnk[1] >= 256 else 2
 
         # Default D stages
         epi_stage = 4 if cute.size(epi_tile[1]) <= 16 else 2
@@ -2393,15 +2444,22 @@ class GemmSm100(GemmSm90):
         """
         is_valid = True
         # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [64, 128, 256]:
-            is_valid = False
+        if not blockscaled:
+            if mma_tiler_mn[0] not in [64, 128, 256]:
+                is_valid = False
+        else:
+            if mma_tiler_mn[0] not in [128, 256]:
+                is_valid = False
         mma_inst_n = mma_tiler_mn[1] if mma_tiler_mn[1] <= 256 else mma_tiler_mn[1] // 2
         if not blockscaled:
             if mma_inst_n not in range(32, 257, 32):
                 is_valid = False
         else:
-            if mma_tiler_mn[1] not in [128, 256]:
+            # Blockscaled currently supports tile_n in {64, 128, 192, 256}.
+            if mma_tiler_mn[1] not in [64, 128, 192, 256]:
                 is_valid = False
+        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
+            is_valid = False
         # Skip invalid cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
@@ -2471,6 +2529,43 @@ class GemmSm100(GemmSm90):
         ):
             is_valid = False
         return is_valid
+
+    @staticmethod
+    def can_implement_blockscaled(
+        ab_dtype: Type[cutlass.Numeric],
+        sf_dtype: Type[cutlass.Numeric],
+        sf_vec_size: int,
+        d_dtype: Type[cutlass.Numeric],
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        d_major: str,
+    ) -> bool:
+        can_implement = True
+        if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
+            ab_dtype, sf_dtype, sf_vec_size, d_dtype
+        ):
+            can_implement = False
+        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
+            can_implement = False
+        if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, blockscaled=True
+        ):
+            can_implement = False
+        # Multi-tile N iteration with an asymmetric SFB atom size needs the same
+        # kind of special-case layout rewriting as tile_n==192.
+        if mma_tiler_mn[1] == 224 and n > 224:
+            can_implement = False
+        if not GemmSm100.is_valid_tensor_alignment(
+            m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major
+        ):
+            can_implement = False
+        return can_implement
 
     @staticmethod
     def can_implement(

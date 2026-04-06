@@ -266,8 +266,12 @@ class TileScheduler:
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
         else:  # tail part
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
@@ -374,6 +378,13 @@ class TileScheduler:
         num_persistent_clusters = Int32(cute.arch.grid_dim()[2])
         if const_expr(params.persistence_mode == PersistenceMode.STATIC):
             return self._current_work_idx + num_persistent_clusters
+            # Serpentine: alternate wave direction for a bit better load balancing
+            # But currently seems a tiny bit slower, disabling for now.
+            # c = Int32(cute.arch.cluster_idx()[2])
+            # next_work_idx = self._current_work_idx + 2 * c + 1
+            # if self.num_tiles_executed % 2 == 1:
+            #     next_work_idx = self._current_work_idx + 2 * (num_persistent_clusters - 1 - c) + 1
+            # return next_work_idx
         elif const_expr(params.persistence_mode == PersistenceMode.DYNAMIC):
             next_work_linear_idx = Int32(0)
             if cute.arch.lane_idx() == 0:
@@ -959,8 +970,12 @@ class VarlenMTileScheduler(TileScheduler):
             num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
             if (group_id + 1) * num_clusters_in_group <= num_clusters:
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
+                # if cid_slow % 2 == 1:  # inner serpentine
+                #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
             else:  # tail part
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
+                # if cid_slow % 2 == 1:  # inner serpentine
+                #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         else:
             assert params.raster_order == RasterOrder.AlongM
             group_size_actual = cutlass.min(
@@ -968,6 +983,8 @@ class VarlenMTileScheduler(TileScheduler):
             )
             cid_slow = id_in_group // group_size_actual
             cid_fast_in_group = id_in_group - cid_slow * group_size_actual
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = group_size_actual - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
