@@ -7,7 +7,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
-
+ 
 
 def assume_stride_divisibility(tensor):
     """Assume all strides are divisible by 32 bits (except static strides).
