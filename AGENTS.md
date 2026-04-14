@@ -67,10 +67,18 @@ Tests use pytest with parametrize across dtypes (`float32`, `float16`, `bfloat16
 
 When iterating on kernel code, run a small subset of tests (1-3 parametrizations) rather than the full test suite. Use `-k` or pass specific test IDs to pytest. Only run the full suite when finalizing changes.
 
+## Debugging Kernel Failures
+
+When debugging a kernel correctness failure, get to the bottom of the failure. Do not route around the bug just to make a test pass, for example by pruning a config, skipping a path, or switching to a different implementation, unless the root cause proves that the path is invalid.
+
+Start by reproducing the reported failure, then simplify it to the smallest setting that still fails: reduce batch, M/N/K, tile shape, scheduler options, `swap_ab`, beta/C, dtype, and epilogue features where possible. Keep the failing behavior intact while removing unrelated complexity.
+
+Use `cute.printf` inside `@cute.jit` / `@cute.kernel` code to print the relevant locations, tile coordinates, tensor coordinates, predicates, and values. Print at the boundaries between stages, for example TMA load, MMA accumulator, epilogue register values, register-to-smem, smem contents, and TMA store coordinates, until the first bad stage is identified.
+
+After finding a fix, verify that the minimized repro passes, the original repro passes, and that temporarily disabling the fix makes the regression test fail. Regression tests should encode the failure mode, not only the high-level symptom.
+
 ## Code Style
 
 - Favor concise, self-explanatory code
-- Avoid unnecessary line breaks
-- Empty lines should not have any space
 - Line length: 100 (ruff)
 - Ruff allows: lambda assignment (E731), single-char vars I/O/l (E741), unused locals (F841)
