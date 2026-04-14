@@ -117,6 +117,76 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("use_bias,use_residual", [(False, False), (True, True)])
+def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
+    device = "cuda"
+    B, S, H, D = 2, 16, 4, 64
+    eps = 1e-6
+    atol = TOLERANCES[input_dtype]
+    torch.random.manual_seed(0)
+
+    x = torch.randn(B, S, H, D, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(H, D, device=device, dtype=torch.float32, requires_grad=True)
+    bias = (
+        torch.randn(H, D, device=device, dtype=torch.float32, requires_grad=True)
+        if use_bias
+        else None
+    )
+    residual = (
+        torch.randn(B, S, H, D, device=device, dtype=input_dtype, requires_grad=True)
+        if use_residual
+        else None
+    )
+
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    bias_ref = bias.detach().clone().requires_grad_() if bias is not None else None
+    residual_ref = residual.detach().clone().requires_grad_() if residual is not None else None
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out = function(x, weight, bias=bias, residual=residual, eps=eps)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, bias=bias_ref, residual=residual_ref, eps=eps)
+    if residual is not None:
+        out_ref = out_ref[0]
+
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
+    if bias is not None:
+        torch.testing.assert_close(bias.grad, bias_ref.grad, atol=atol, rtol=1e-3)
+    if residual is not None:
+        torch.testing.assert_close(residual.grad, residual_ref.grad, atol=atol, rtol=1e-3)
+
+
+def test_rmsnorm_qk_many_heads():
+    device = "cuda"
+    B, S, H, D = 1, 1, 32, 128
+    torch.random.manual_seed(0)
+
+    x = torch.randn(B, S, H, D, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(H, D, device=device, dtype=torch.float32, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+
+    out = rmsnorm(x, weight)
+    out_ref = rmsnorm_ref(x_ref, weight_ref)
+    torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
+
+    grad_out = torch.randn_like(out)
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-1, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-1, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
 # @pytest.mark.parametrize("use_compile", [False])
 def test_rmsnorm_strided_tensor(use_compile):
     """Test RMSNorm with strided tensor input where shape is (8, 4096, 512) and stride is (sth, 576, 1)."""
