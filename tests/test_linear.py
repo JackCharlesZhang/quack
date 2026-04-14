@@ -11,6 +11,7 @@ from quack.gemm_interface import (
     gemm,
     gemm_add,
     gemm_add_inplace,
+    gemm_tuned,
     gemm_dact,
     gemm_gated,
     gemm_dgated,
@@ -168,6 +169,58 @@ def test_gemm_add_out_reuses_c_storage(m, k, n, input_dtype):
     C_pt = alpha_val * torch.mm(A, B) + C_og
     assert out is C
     assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize(
+    "tile_m, cluster_m, tile_n",
+    [
+        (128, 1, 160),
+        (128, 1, 192),
+        (128, 1, 224),
+        (128, 1, 240),
+        (256, 2, 160),
+        (256, 2, 224),
+    ],
+)
+def test_gemm_add_sm100_unaligned_epilogue_tile_n(tile_m, cluster_m, tile_n, swap_ab):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-specific TMA store regression")
+
+    # Bug repro: with source C present, SM100 may choose a 64-wide epilogue TMA store tile.
+    # For CTA-N sizes such as 160/224/240, later CTA-N tiles start at a non-64-aligned
+    # offset, and TMA store skipped the prefix before the next 64-element boundary.
+    device = "cuda"
+    dtype = torch.float16
+    k, tail_n = 8, tile_n + 8
+    base_cfg = dict(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        pingpong=False,
+        is_dynamic_persistent=True,
+        cluster_m=cluster_m,
+        cluster_n=1,
+        swap_ab=swap_ab,
+        max_swizzle_size=8,
+        device_capacity=10,
+    )
+
+    if not swap_ab:
+        A = torch.zeros((1, 1, k), device=device, dtype=dtype)
+        A[0, 0, 0] = 1
+        B = torch.zeros((1, k, tail_n), device=device, dtype=dtype)
+        B[0, 0] = torch.arange(tail_n, device=device, dtype=dtype) / 1000
+        C = torch.zeros((1, 1, tail_n), device=device, dtype=dtype)
+    else:
+        A = torch.zeros((1, tail_n, k), device=device, dtype=dtype)
+        A[0, :, 0] = torch.arange(tail_n, device=device, dtype=dtype) / 1000
+        B = torch.zeros((1, k, 1), device=device, dtype=dtype)
+        B[0, 0, 0] = 1
+        C = torch.zeros((1, tail_n, 1), device=device, dtype=dtype)
+    out = torch.empty_like(C)
+    gemm_tuned.fn(A, B, out, C, beta=0.0, config=GemmConfig(**base_cfg))
+    ref = torch.baddbmm(C.float(), A.float(), B.float(), beta=0.0)
+    torch.testing.assert_close(out.float(), ref, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("alpha_beta_type", ["float", "tensor"])

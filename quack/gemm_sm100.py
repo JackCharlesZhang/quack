@@ -4,6 +4,7 @@
 
 from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
+import math
 
 import cuda.bindings.driver as cuda
 
@@ -363,6 +364,16 @@ class GemmSm100(GemmSm90):
             layout_c=self.c_layout,
             elem_ty_c=self.c_dtype,
         )
+        # TMA store tile starts must stay aligned when advancing across CTA-N tiles.
+        # There's a bug w compute_epilogue_tile_shape (as of cutlass-dsl 4.4.2) where if
+        # tile_n = 224 and there's C, it will set epi_tile to (128, 64).
+        if const_expr(self.cta_tile_shape_mnk[1] % cute.size(self.epi_tile[1]) != 0):
+            warp_n = 2 if (self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs) else 1
+            epi_tile_n = math.gcd(self.cta_tile_shape_mnk[1], cute.size(self.epi_tile[1]))
+            epi_tile_n_layout = cute.make_layout(
+                (epi_tile_n // warp_n, warp_n), stride=(1, self.cta_tile_shape_mnk[1] // warp_n)
+            )
+            self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
