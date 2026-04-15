@@ -39,8 +39,9 @@ def run_cross_entropy(
     fn = lambda: cross_entropy_fwd(x, target, return_dx=return_dx)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # Memory bandwidth calculation: read x (M*N elements) + read target (M elements) + write loss (M elements)
-    mem_bytes = (M * N * (2 if return_dx else 1) + M + M) * dtype.width // 8
+    # I/O: read x (M*N*db) + read target (M*8) + write loss (M*4) [+ write dx (M*N*db) if return_dx]
+    db = dtype.width // 8
+    mem_bytes = M * N * db * (2 if return_dx else 1) + M * 8 + M * 4
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
@@ -49,7 +50,7 @@ def run_cross_entropy(
     for _ in range(5): fn_ref()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
-    mem_bytes = (M * N + M + M) * dtype.width // 8
+    mem_bytes = M * N * db + M * 8 + M * 4
     mem_bw_ref = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
@@ -99,14 +100,14 @@ def run_cross_entropy_backward(
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() +
-                        dloss.numel() * dloss.element_size()) / (avg_time_ref / 1000) / 1e9)
+                        dloss.numel() * dloss.element_size() + x.shape[0] * 4) / (avg_time_ref / 1000) / 1e9)
 
     time.sleep(0.5)
     fn = lambda: torch.autograd.grad(loss, x, grad_outputs=dloss, retain_graph=True)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # Memory bandwidth calculation: read x (M*N) + read target (M) + read dloss (M) + write grad (M*N)
-    mem_bw = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() + 
-                    dloss.numel() * dloss.element_size()) / (avg_time / 1000) / 1e9)
+    # I/O: read x (M*N*db) + read target (M*8) + read dloss (M*4) + read lse (M*4) + write dx (M*N*db)
+    mem_bw = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() +
+                    dloss.numel() * dloss.element_size() + x.shape[0] * 4) / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
     print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")

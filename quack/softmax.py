@@ -42,12 +42,17 @@ class Softmax(ReductionBase):
 
     def _set_cluster_n(self):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
-        if arch < Arch.sm_90 or arch.major == 12:
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
             self.cluster_n = 1
             return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
-        if const_expr(self.dtype.width == 16):
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 needs tighter clustering (same limits as fp16)
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
             thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
@@ -55,7 +60,7 @@ class Softmax(ReductionBase):
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     @cute.jit
     def __call__(
@@ -238,12 +243,17 @@ class SoftmaxBackward(ReductionBase):
 
     def _set_cluster_n(self):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
-        if arch < Arch.sm_90 or arch.major == 12:
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
             self.cluster_n = 1
             return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
-        if const_expr(self.dtype.width == 16):
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 bwd has 2 SMEM tensors, needs tighter clustering
+            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
+        elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
@@ -251,7 +261,7 @@ class SoftmaxBackward(ReductionBase):
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     def _num_threads(self):
         return 128 if self.N <= 8192 else 256

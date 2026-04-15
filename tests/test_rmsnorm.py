@@ -48,13 +48,12 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
-    # SM12x (consumer Blackwell) has 99 KB SMEM — skip dims that exceed capacity
     major, _ = torch.cuda.get_device_capability()
     if major == 12:
-        if input_dtype == torch.float32 and N > 4096:
-            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
-        if input_dtype != torch.float32 and N > 8192:
-            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
+        # SM12x 99 KB SMEM: bwd double-buffers 2 tensors; fp32 exceeds at N > 32K, fp16/bf16 at N > 64K
+        smem_n_limit = 32768 if input_dtype == torch.float32 else 65536
+        if N > smem_n_limit:
+            pytest.skip("SM12x: exceeds 99 KB SMEM")
     torch.cuda.empty_cache()
     device = "cuda"
     atol = TOLERANCES[input_dtype]
@@ -91,7 +90,9 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
             # orders, so the error grows with sqrt(M) (number of rows being reduced).
             weight_atol = 5e-6 * (M**0.5)
         else:
-            weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
+            # bf16/fp16: different reduction orders can land on different ULPs.
+            # Tolerance = 1 ULP at the magnitude of the largest gradient.
+            weight_atol = 2 * torch.finfo(weight_dtype).eps * weight_ref.grad.abs().max()
         torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
@@ -120,6 +121,10 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("use_bias,use_residual", [(False, False), (True, True)])
 def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
+    # Dynamo bug: after compiling rmsnorm with 1D weight (shape (N,)) from forward_backward
+    # tests, it incorrectly reuses the backward graph for 2D per-head weight (shape (H, D)),
+    # producing grad shape (M, N) instead of (H, D). Reset to force proper recompilation.
+    torch._dynamo.reset()
     device = "cuda"
     B, S, H, D = 2, 16, 4, 64
     eps = 1e-6
@@ -227,9 +232,10 @@ def test_rmsnorm_strided_tensor(use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     """Test RMSNorm forward pass against reference implementation."""
-    major, _ = torch.cuda.get_device_capability()
-    if major == 12:
-        pytest.skip("SM12x: large tensors exceed 16 GB VRAM on consumer cards")
+    vram_bytes = torch.cuda.get_device_properties(0).total_memory
+    peak_bytes = M * N * 2 * 3  # x + out + out_ref, bf16
+    if peak_bytes > vram_bytes * 0.85:
+        pytest.skip(f"Insufficient VRAM ({vram_bytes // 2**30} GB)")
     device = "cuda"
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
