@@ -1,6 +1,9 @@
 import argparse
+import os
 import time
 from typing import Type
+
+os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 
 import torch
 import torch.nn.functional as F

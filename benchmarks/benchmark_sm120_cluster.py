@@ -7,9 +7,14 @@ Usage:
 """
 
 import argparse
+import os
 import time
 
+os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
+
+
 import torch
+import torch.nn.functional as F
 from triton.testing import do_bench
 
 import cutlass
@@ -61,9 +66,32 @@ def bench_one(fn, io, warmup=5, rep=50):
     return t, bw
 
 
+def _compile_refs():
+    """Compile torch reference implementations (call once to warm up)."""
+    refs = {
+        "rmsnorm": torch.compile(
+            lambda x, w: x / (x.float().pow(2).mean(-1, keepdim=True) + 1e-6).sqrt() * w
+        ),
+        "softmax": torch.compile(lambda x: F.softmax(x, dim=-1)),
+        "ce": torch.compile(lambda x, t: F.cross_entropy(x, t, reduction="none")),
+    }
+    return refs
+
+
 def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
     db = dtype.itemsize
     results = []
+
+    # Warm up compiled references
+    refs = _compile_refs()
+    x_ = torch.randn(M, 4096, device="cuda", dtype=dtype)
+    w_ = torch.randn(4096, device="cuda", dtype=torch.float32)
+    t_ = torch.randint(0, 4096, (M,), device="cuda")
+    for _ in range(3):
+        refs["rmsnorm"](x_, w_)
+        refs["softmax"](x_)
+        refs["ce"](x_, t_)
+    del x_, w_, t_
 
     for N in N_vals:
         torch.cuda.empty_cache()
@@ -81,6 +109,11 @@ def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
             row["rmsnorm_fwd"] = bw
         except Exception:
             row["rmsnorm_fwd"] = "SMEM"
+
+        # rmsnorm fwd (torch.compile ref)
+        fn_ref = lambda x=x, w=w: refs["rmsnorm"](x, w)
+        _, bw_ref = bench_one(fn_ref, io_bytes("rmsnorm_fwd", M, N, db))
+        row["rmsnorm_fwd_ref"] = bw_ref
 
         # rmsnorm fwd+res
         try:
@@ -113,6 +146,11 @@ def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
         except Exception:
             row["softmax_fwd"] = "SMEM"
 
+        # softmax fwd (torch.compile ref)
+        fn_ref = lambda xs=xs: refs["softmax"](xs)
+        _, bw_ref = bench_one(fn_ref, io_bytes("softmax_fwd", M, N, db))
+        row["softmax_fwd_ref"] = bw_ref
+
         # softmax bwd
         try:
             ys = softmax(xs)
@@ -136,6 +174,11 @@ def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
         except Exception:
             row["ce_fwd"] = "SMEM"
 
+        # CE fwd (torch.compile ref)
+        fn_ref = lambda xce=xce, tgt=tgt: refs["ce"](xce, tgt)
+        _, bw_ref = bench_one(fn_ref, io_bytes("ce_fwd", M, N, db))
+        row["ce_fwd_ref"] = bw_ref
+
         # CE bwd
         xce2 = (0.1 * torch.randn(M, N, device="cuda", dtype=dtype)).requires_grad_(True)
         try:
@@ -158,20 +201,43 @@ def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
 
 
 def print_table(results, dtype_name):
-    cols = [
+    # Quack-only columns
+    q_cols = [
         "rmsnorm_fwd", "rmsnorm_fwd_res", "rmsnorm_bwd",
         "softmax_fwd", "softmax_bwd", "ce_fwd", "ce_bwd",
     ]
-    headers = [
+    q_headers = [
         "rmsnorm fwd", "rmsnorm fwd+res", "rmsnorm bwd",
         "softmax fwd", "softmax bwd", "CE fwd", "CE bwd",
     ]
-    print(f"\n=== {dtype_name} (GB/s) ===\n")
-    print("| N | " + " | ".join(headers) + " |")
-    print("|---" * (len(headers) + 1) + "|")
+    print(f"\n=== {dtype_name} — quack (GB/s) ===\n")
+    print("| N | " + " | ".join(q_headers) + " |")
+    print("|---" * (len(q_headers) + 1) + "|")
     for row in results:
-        vals = [str(row.get(c, "-")) for c in cols]
+        vals = [str(row.get(c, "-")) for c in q_cols]
         print(f"| {row['N']} | " + " | ".join(vals) + " |")
+
+    # Comparison table (quack vs torch.compile)
+    cmp = [
+        ("rmsnorm fwd", "rmsnorm_fwd", "rmsnorm_fwd_ref"),
+        ("softmax fwd", "softmax_fwd", "softmax_fwd_ref"),
+        ("CE fwd", "ce_fwd", "ce_fwd_ref"),
+    ]
+    print(f"\n=== {dtype_name} — quack vs torch.compile (GB/s) ===\n")
+    header = "| N |"
+    sep = "|---|"
+    for label, _, _ in cmp:
+        header += f" {label} quack | {label} compile |"
+        sep += "---|---|"
+    print(header)
+    print(sep)
+    for row in results:
+        line = f"| {row['N']} |"
+        for _, qk, rk in cmp:
+            qv = row.get(qk, "-")
+            rv = row.get(rk, "-")
+            line += f" {qv} | {rv} |"
+        print(line)
 
 
 if __name__ == "__main__":

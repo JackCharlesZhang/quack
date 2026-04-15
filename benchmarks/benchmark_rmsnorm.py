@@ -1,6 +1,9 @@
 import argparse
+import os
 import time
 from typing import Type, Optional
+
+os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 
 import torch
 from triton.testing import do_bench
