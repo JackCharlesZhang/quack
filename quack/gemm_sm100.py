@@ -91,11 +91,9 @@ Constraints are same as dense_gemm.py:
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
 * Mma tiler N must be 32-256, step 32
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 4, 8, and 16 for TFloat32,
   Float16/BFloat16, and Int8/Uint8/Float8, respectively.
-* OOB tiles are not allowed when TMA store is disabled
 """
 
 
@@ -469,6 +467,28 @@ class GemmSm100(GemmSm90):
             )
         else:
             self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+
+        # Overlapping accumulator and scaling factor in tmem, targetting the case tile_n == 256
+        # For iter 0, 2, ..., accum is in col 0...255 and SF are in col 256...256+SF_size.
+        # For iter 1, 3, ..., accum is in col 256...511 and SF are in col 0...0+SF_size.
+        # During the epilogue, we release acc_pipeline after being done with @SF_size columns.
+        # In the cute-dsl example,
+        # https://github.com/NVIDIA/cutlass/blob/08185b9c3e90510ee2b656662ed0d53b06d28157/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py#L369
+        # instead the 2 stages of accum are in col 0...255 and 256-SF_size...512-SF_size, and
+        # the SF are in 512-SF_size...511. The 2 accum stages overlap, so in the epilogue,
+        # they alternate the direction of epi tiles (from right to left, then from left to right)
+        # to release acc_pipeline early.
+        # The two approaches perform about the same.
+        self.overlap_accum_sf = self.blockscaled and self.num_acc_stage == 1
+        num_sf_tmem_cols = (
+            (
+                cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
+                + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
+            )
+            * 4  # 4 cols per stage
+            * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
+        )
+        self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
 
     @cute.jit
     def __call__(
@@ -959,7 +979,9 @@ class GemmSm100(GemmSm90):
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stage if not self.overlap_accum_sf else 2)
+        )
 
         varlen_manager = VarlenManager.create(
             varlen_params,
@@ -1355,10 +1377,15 @@ class GemmSm100(GemmSm90):
 
             if const_expr(self.blockscaled):
                 # Make SFA tmem tensor
-                acc_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
+                acc_tmem_col_offset = const_expr(
+                    tcgen05.find_tmem_tensor_col_offset(
+                        tCtAcc_base
+                        if const_expr(not self.overlap_accum_sf)
+                        else tCtAcc_base[None, None, None, 0]
+                    )
+                )
                 sfa_tmem_ptr = cute.recast_ptr(
-                    acc_tmem_ptr + acc_tmem_col_offset,
-                    dtype=self.sf_dtype,
+                    acc_tmem_ptr + acc_tmem_col_offset, dtype=self.sf_dtype
                 )
                 # (MMA, MMA_M, MMA_K)
                 tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -1372,10 +1399,7 @@ class GemmSm100(GemmSm90):
                 sfa_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
                 sfb_tmem_col_offset = acc_tmem_col_offset + sfa_tmem_col_offset
                 sfb_tmem_base_ptr = acc_tmem_ptr + sfb_tmem_col_offset
-                sfb_tmem_ptr = cute.recast_ptr(
-                    sfb_tmem_base_ptr,
-                    dtype=self.sf_dtype,
-                )
+                sfb_tmem_ptr = cute.recast_ptr(sfb_tmem_base_ptr, dtype=self.sf_dtype)
                 # (MMA, MMA_N, MMA_K)
                 tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                     tiled_mma,
@@ -1417,7 +1441,12 @@ class GemmSm100(GemmSm90):
                 k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
-                tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
+                acc_stage_idx = (
+                    acc_producer_state.phase ^ 1
+                    if const_expr(self.overlap_accum_sf)
+                    else acc_producer_state.index
+                )
+                tCtAcc = tCtAcc_base[None, None, None, acc_stage_idx]
                 tCtSFB_mma = tCtSFB
                 if const_expr(self.blockscaled and self.mma_inst_shape_mnk[1] in (64, 192)):
                     tCtSFB_mma = cute.make_tensor(
@@ -1449,6 +1478,24 @@ class GemmSm100(GemmSm90):
                     tCtSFA_compact_s2t,
                     tCtSFB_compact_s2t,
                 )
+                if const_expr(self.overlap_accum_sf):
+                    # After iter 0, 2, ..., shift tmem ptr by -256.
+                    # After iter 1, 3, ..., shift tmem ptr by 256.
+                    tCtSFA, tCtSFB, tCtSFA_compact_s2t, tCtSFB_compact_s2t = [
+                        cute.make_tensor(
+                            cute.recast_ptr(
+                                # Doing tmem ptr arithmetic requires 32-bit type, wrong otherwise
+                                cute.recast_ptr(mT.iterator, dtype=Float32)
+                                + cute.assume(
+                                    acc_tmem_col_offset * (acc_producer_state.phase * 2 - 1),
+                                    divby=acc_tmem_col_offset,
+                                ),
+                                dtype=self.sf_dtype,
+                            ),
+                            mT.layout,
+                        )
+                        for mT in [tCtSFA, tCtSFB, tCtSFA_compact_s2t, tCtSFB_compact_s2t]
+                    ]
                 tctx.e("mma")
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1508,7 +1555,12 @@ class GemmSm100(GemmSm90):
                 batch_idx = tile_coord_mnkl[3]
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, acc_consumer_state.index]
+                epi_acc_stage = (
+                    acc_consumer_state.index
+                    if const_expr(not self.overlap_accum_sf)
+                    else acc_consumer_state.phase
+                )
+                tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, epi_acc_stage]
                 # Wait for accumulator buffer full
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
@@ -1526,12 +1578,21 @@ class GemmSm100(GemmSm90):
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 k_len = varlen_manager.len_k(batch_idx)
+                epi_tile_num = cute.size(
+                    cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile),
+                    mode=[1],
+                )
                 load_acc_subtile = partial(
                     self.epi_load_acc_subtile,
                     tiled_copy_t2r,
                     tiled_copy_r2s,
                     tTR_tAcc,
                     tTR_rAcc,
+                    acc_pipeline=acc_pipeline,
+                    acc_consumer_state=acc_consumer_state,
+                    acc_release_idx=self.iter_acc_early_release
+                    if const_expr(self.overlap_accum_sf)
+                    else epi_tile_num - 1,
                     clear_acc=varlen_k and k_len == 0,
                 )
 
@@ -1562,12 +1623,9 @@ class GemmSm100(GemmSm90):
                     epi_tidx,
                     is_tma_warp,
                 )
-                tctx.e("epilogue")
-
-                # Async arrive accumulator buffer empty
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
+                # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
+                tctx.e("epilogue")
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1858,6 +1916,9 @@ class GemmSm100(GemmSm90):
         tTR_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
         epi_idx: int,
+        acc_pipeline: pipeline.PipelineAsync,
+        acc_consumer_state: pipeline.PipelineState,
+        acc_release_idx: int,
         clear_acc: Boolean = False,
     ):
         if not clear_acc:
@@ -1867,6 +1928,10 @@ class GemmSm100(GemmSm90):
             tRS_rD.store(tRS_rAcc.load())
         else:
             tRS_rD.fill(0.0)
+        if epi_idx == acc_release_idx:
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
 
     def mainloop_s2t_copy_and_partition(
         self,
