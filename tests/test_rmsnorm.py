@@ -117,14 +117,52 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
 
 
+def test_rmsnorm_compile_2d_then_4d():
+    """Regression test: torch.compile(rmsnorm) must work when called first with 2D input
+    (standard) then 4D input (per-head), without dynamo.reset() in between."""
+    torch._dynamo.reset()
+    f = torch.compile(rmsnorm, fullgraph=True)
+    device = "cuda"
+    atol = TOLERANCES[torch.bfloat16]
+
+    # Step 1: 2D input, 1D weight
+    x = torch.randn(32, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(256, device=device, dtype=torch.float32, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    w_ref = w.detach().clone().requires_grad_()
+    out = f(x, w, eps=1e-5)
+    out_ref = rmsnorm_ref(x_ref, w_ref, eps=1e-5)
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    out.sum().backward()
+    out_ref.sum().backward()
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+
+    # Step 2: 4D input, 2D per-head weight + bias + residual (different rank, different args)
+    x4 = torch.randn(2, 16, 4, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(4, 64, device=device, dtype=torch.float32, requires_grad=True)
+    b2 = torch.randn(4, 64, device=device, dtype=torch.float32, requires_grad=True)
+    r4 = torch.randn(2, 16, 4, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    x4_ref = x4.detach().clone().requires_grad_()
+    w2_ref = w2.detach().clone().requires_grad_()
+    b2_ref = b2.detach().clone().requires_grad_()
+    r4_ref = r4.detach().clone().requires_grad_()
+    out2 = f(x4, w2, bias=b2, residual=r4, eps=1e-6)
+    out2_ref = rmsnorm_ref(x4_ref, w2_ref, bias=b2_ref, residual=r4_ref, eps=1e-6)
+    if isinstance(out2_ref, tuple):
+        out2_ref = out2_ref[0]
+    torch.testing.assert_close(out2, out2_ref, atol=atol, rtol=1e-3)
+    out2.sum().backward()
+    out2_ref.sum().backward()
+    torch.testing.assert_close(x4.grad, x4_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(w2.grad, w2_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(b2.grad, b2_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(r4.grad, r4_ref.grad, atol=atol, rtol=1e-3)
+
+
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("use_bias,use_residual", [(False, False), (True, True)])
 def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
-    # Dynamo bug: after compiling rmsnorm with 1D weight (shape (N,)) from forward_backward
-    # tests, it incorrectly reuses the backward graph for 2D per-head weight (shape (H, D)),
-    # producing grad shape (M, N) instead of (H, D). Reset to force proper recompilation.
-    torch._dynamo.reset()
     device = "cuda"
     B, S, H, D = 2, 16, 4, 64
     eps = 1e-6

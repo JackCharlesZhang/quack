@@ -67,9 +67,11 @@ Tests use pytest with parametrize across dtypes (`float32`, `float16`, `bfloat16
 
 When iterating on kernel code, run a small subset of tests (1-3 parametrizations) rather than the full test suite. Use `-k` or pass specific test IDs to pytest. Only run the full suite when finalizing changes.
 
-## Debugging Kernel Failures
+## Debugging Failures
 
-When debugging a kernel correctness failure, get to the bottom of the failure. Do not route around the bug just to make a test pass, for example by pruning a config, skipping a path, or switching to a different implementation, unless the root cause proves that the path is invalid.
+When debugging any failure — kernel correctness, torch.compile interaction, test infrastructure — get to the bottom of it. The goal is not to make the test pass; it is to understand **why** it fails and fix the actual cause.
+
+Do not route around the bug just to make a test pass, for example by pruning a config, skipping a path, resetting state, increasing limits, or switching to a different implementation. A workaround that makes CI green but leaves the bug for users is worse than useless — it hides the problem and the deeper issue will eventually surface at greater cost. Only use workarounds after proving the root cause is external (e.g., upstream PyTorch bug) and documenting why.
 
 Start by reproducing the reported failure, then simplify it to the smallest setting that still fails: reduce batch, M/N/K, tile shape, scheduler options, `swap_ab`, beta/C, dtype, and epilogue features where possible. Keep the failing behavior intact while removing unrelated complexity.
 
