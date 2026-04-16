@@ -480,15 +480,18 @@ class GemmSm100(GemmSm90):
         # to release acc_pipeline early.
         # The two approaches perform about the same.
         self.overlap_accum_sf = self.blockscaled and self.num_acc_stage == 1
-        num_sf_tmem_cols = (
-            (
-                cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
-                + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
+        if const_expr(self.overlap_accum_sf):
+            num_sf_tmem_cols = (
+                (
+                    cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
+                    + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
+                )
+                * 4  # 4 cols per stage
+                * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
             )
-            * 4  # 4 cols per stage
-            * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
-        )
-        self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
+            self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
+        else:
+            self.iter_acc_early_release = -1
 
     @cute.jit
     def __call__(

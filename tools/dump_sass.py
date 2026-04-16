@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Dump PTX and SASS of cute-dsl kernels from any script.
 
-Sets CUTE_DSL_KEEP_CUBIN=1 and CUTE_DSL_KEEP_PTX=1, runs the target script,
-then disassembles all generated .cubin files with nvdisasm.
+Disables the QuACK persistent kernel cache, sets CUTE_DSL_KEEP_CUBIN=1 and
+CUTE_DSL_KEEP_PTX=1, runs the target script, then disassembles all generated
+.cubin files with nvdisasm.
 
 Usage::
 
@@ -45,6 +46,11 @@ def main():
     parser.add_argument("script", help="Python script to run")
     parser.add_argument("-o", "--output-dir", default="dump_sass_out", help="Output directory")
     parser.add_argument("--ptx-only", action="store_true", help="Skip SASS disassembly")
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="Allow QuACK to use its persistent .o cache instead of forcing recompilation",
+    )
     args = parser.parse_args(our_argv)
 
     script = Path(args.script)
@@ -59,6 +65,8 @@ def main():
             f.unlink()
 
     env = os.environ.copy()
+    if not args.use_cache:
+        env["QUACK_CACHE_ENABLED"] = "0"
     env["CUTE_DSL_KEEP_PTX"] = "1"
     env["CUTE_DSL_KEEP_CUBIN"] = "1"
     env["CUTE_DSL_DUMP_DIR"] = str(out_dir.resolve())
@@ -66,6 +74,8 @@ def main():
     cmd = [sys.executable, str(script)] + script_args
     print(f"Running: {' '.join(cmd)}")
     print(f"Dump dir: {out_dir.resolve()}\n")
+    if not args.use_cache:
+        print("QuACK cache: disabled via QUACK_CACHE_ENABLED=0\n")
     subprocess.run(cmd, env=env)
 
     ptx_files = sorted(out_dir.glob("*.ptx"))
