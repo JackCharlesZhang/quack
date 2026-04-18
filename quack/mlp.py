@@ -71,6 +71,26 @@ class _MLPGatedUntunedOps(_MLPUntunedOps):
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
+class _MLPGatedConcatOps(_MLPGatedOps):
+    matmul_fwd_act = partial(gemm_gated, concat_layout=("B",))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
+    matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
+    matmul_bwd_dw1_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, concat_layout=("C", "out")
+    )
+    recompute_fwd = partial(gemm, concat_layout=("B",))
+
+
+class _MLPGatedConcatUntunedOps(_MLPGatedUntunedOps):
+    matmul_fwd_act = partial(gemm_gated, tuned=False, concat_layout=("B",))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
+    matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
+    matmul_bwd_dw1_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("out",)
+    )
+    recompute_fwd = partial(gemm, tuned=False, concat_layout=("B",))
+
+
 class MLPRecomputeFunc(torch.autograd.Function):
     """MLP with activation recomputation: saves only x (not preact) to reduce memory.
 
@@ -123,15 +143,17 @@ class MLPRecomputeFunc(torch.autograd.Function):
             x_flat = x.reshape(-1, x.shape[-1]) if x is not None else None
             need_dact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
             any_grad = need_dact or ctx.needs_input_grad[2]
+            # concat ops override recompute_fwd to produce interleaved preact matching forward
+            recompute_fwd = getattr(ops, "recompute_fwd", ops.matmul_fwd)
             if need_dact:
-                preact = ops.matmul_fwd(x_flat, weight1.T)
+                preact = recompute_fwd(x_flat, weight1.T)
                 # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
                 dpreact, postact = ops.matmul_bwd_dact(
                     dout, weight2, preact, activation=ctx.activation
                 )
             elif any_grad:
                 # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
-                preact = ops.matmul_fwd(x_flat, weight1.T)
+                preact = recompute_fwd(x_flat, weight1.T)
                 postact = ops.recompute_postact(preact, ctx.activation)
                 dpreact = None
             else:
@@ -152,14 +174,16 @@ class MLPRecomputeFunc(torch.autograd.Function):
                 dx = dx.reshape(*batch_shape, dx.shape[-1])
             else:
                 dx = None
-            # dW1 = dpreact.T @ x
+            # dW1 = dpreact.T @ x (use dw1 ops if available, e.g. concat layout)
+            dw1_fn = getattr(ops, "matmul_bwd_dw1", ops.matmul_bwd_dw)
+            dw1_inplace_fn = getattr(ops, "matmul_bwd_dw1_inplace", ops.matmul_bwd_dw_inplace)
             dweight1 = _compute_weight_grad(
                 ctx,
                 dpreact,
                 x_flat,
                 weight1_og,
-                ops.matmul_bwd_dw,
-                ops.matmul_bwd_dw_inplace,
+                dw1_fn,
+                dw1_inplace_fn,
                 ctx.needs_input_grad[1],
             )
             return dx, dweight1, dweight2, None, None, None
@@ -179,16 +203,26 @@ def _compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn, 
 
 
 def mlp_func(
-    x, weight1, weight2, activation: str, fuse_grad_accum=False, tuned=True, recompute=False
+    x,
+    weight1,
+    weight2,
+    activation: str,
+    fuse_grad_accum=False,
+    tuned=True,
+    recompute=False,
+    concat_layout=False,
 ):
+    gated = activation in gate_fn_map
+    if concat_layout:
+        assert gated, "concat_layout is only supported for gated MLP"
     if recompute:
-        gated = activation in gate_fn_map
-        if gated:
+        if concat_layout:
+            ops = _MLPGatedConcatOps if tuned else _MLPGatedConcatUntunedOps
+        elif gated:
             ops = _MLPGatedOps if tuned else _MLPGatedUntunedOps
         else:
             ops = _MLPOps if tuned else _MLPUntunedOps
         return MLPRecomputeFunc.apply(x, weight1, weight2, activation, fuse_grad_accum, ops)
-    gated = activation in gate_fn_map
     fc1_fn = linear_gated_func if gated else linear_act_func
     fc2_fn = gated_linear_func if gated else act_linear_func
     preact, postact = fc1_fn(
@@ -198,6 +232,7 @@ def mlp_func(
         store_preact=torch.is_grad_enabled(),
         fuse_grad_accum=fuse_grad_accum,
         tuned=tuned,
+        **({"concat_layout": concat_layout} if concat_layout and gated else {}),
     )
     out = fc2_fn(
         preact,
@@ -225,12 +260,14 @@ class MLP(nn.Module):
         fuse_grad_accum: bool = False,
         tuned: bool = True,
         recompute: bool = False,
+        concat_layout: bool = False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features if out_features is not None else in_features
         self.activation = activation
         self.gated = activation in gate_fn_map
+        assert not concat_layout or self.gated, "concat_layout is only supported for gated MLP"
         if hidden_features is None:
             hidden_features = int(8 / 3 * in_features) if self.gated else 4 * in_features
         if multiple_of > 1:
@@ -238,14 +275,21 @@ class MLP(nn.Module):
         fc1_out = 2 * hidden_features if self.gated else hidden_features
         self.fc1 = nn.Linear(in_features, fc1_out, bias=bias1, **factory_kwargs)
         if self.gated:
-            self.fc1.weight._muon_reshape_functions = (
-                lambda w: rearrange(w, "(d two) e -> two d e", two=2),
-                lambda w: rearrange(w, "two d e -> (d two) e"),
-            )
+            if concat_layout:
+                self.fc1.weight._muon_reshape_functions = (
+                    lambda w: rearrange(w, "(two d) e -> two d e", two=2),
+                    lambda w: rearrange(w, "two d e -> (two d) e"),
+                )
+            else:
+                self.fc1.weight._muon_reshape_functions = (
+                    lambda w: rearrange(w, "(d two) e -> two d e", two=2),
+                    lambda w: rearrange(w, "two d e -> (d two) e"),
+                )
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
         self.fuse_grad_accum = fuse_grad_accum
         self.tuned = tuned
         self.recompute = recompute
+        self.concat_layout = concat_layout
 
     def forward(self, input: Tensor) -> Tensor:
         if (
@@ -265,11 +309,16 @@ class MLP(nn.Module):
                 fuse_grad_accum=self.fuse_grad_accum,
                 tuned=self.tuned,
                 recompute=self.recompute,
+                concat_layout=self.concat_layout,
             )
         else:
             y = self.fc1(input)
             if self.gated:
-                y = gated_to_pytorch_fn_map[self.activation](y[..., ::2], y[..., 1::2])
+                if self.concat_layout:
+                    gate, up = y.chunk(2, dim=-1)
+                    y = gated_to_pytorch_fn_map[self.activation](gate, up)
+                else:
+                    y = gated_to_pytorch_fn_map[self.activation](y[..., ::2], y[..., 1::2])
             else:
                 y = act_to_pytorch_fn_map[self.activation](y)
             return self.fc2(y)

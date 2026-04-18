@@ -53,6 +53,7 @@ def _compile_gemm(
     alpha_mode,
     beta_mode,
     add_to_output,
+    concat_layout,
     varlen_m,
     varlen_k,
     gather_A,
@@ -133,6 +134,7 @@ def _compile_gemm(
         varlen_args,
         has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
+        concat_layout=concat_layout or None,
     )
 
 
@@ -163,6 +165,7 @@ def gemm(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
+    concat_layout: dict | None = None,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -202,6 +205,7 @@ def gemm(
     alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
     beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
+    concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
 
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
@@ -226,6 +230,7 @@ def gemm(
         alpha_mode,
         beta_mode,
         add_to_output,
+        concat_layout,
         varlen_m,
         varlen_k,
         gather_A,

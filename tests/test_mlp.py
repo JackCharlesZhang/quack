@@ -2,9 +2,12 @@
 import pytest
 import torch
 import torch.nn.functional as F
+import torch._dynamo
 
 from quack.mlp import MLP
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+
+torch._dynamo.config.cache_size_limit = 64
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -189,3 +192,115 @@ def test_mlp_recompute_partial_grad(dtype, activation, freeze):
         assert dw2 is None and dw2_ref is None
     else:
         assert (dw2 - dw2_ref).abs().max() < 1e-2, "dW2 mismatch"
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_mlp_concat_layout(dtype, activation, recompute, use_compile):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch, dim, hidden = 256, 512, 512
+    mlp = MLP(
+        dim,
+        hidden,
+        activation=activation,
+        device=device,
+        dtype=dtype,
+        tuned=False,
+        recompute=recompute,
+        concat_layout=True,
+    )
+    # Reference uses concat weight directly. F.linear gives concat output [gate; up].
+    # The kernel interleaves, so we interleave the ref's preact before gated activation.
+    w1_ref = mlp.fc1.weight.detach().clone().float().requires_grad_(True)
+    w2_ref = mlp.fc2.weight.detach().clone().float().requires_grad_(True)
+    w1_pt = mlp.fc1.weight.detach().clone().requires_grad_(True)
+    w2_pt = mlp.fc2.weight.detach().clone().requires_grad_(True)
+    if use_compile:
+        mlp = torch.compile(mlp, fullgraph=True)
+    x = torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=True)
+    out = mlp(x)
+    x_ref = x.detach().clone().float().requires_grad_(True)
+    x_pt = x.detach().clone().requires_grad_(True)
+    # F.linear(x, w1_concat) gives [gate_cols, up_cols]. Interleave before gated activation.
+    y_ref = F.linear(x_ref, w1_ref)
+    y_ref = gated_to_pytorch_fn_map[activation](*y_ref.chunk(2, dim=-1))
+    out_ref = F.linear(y_ref, w2_ref)
+    y_pt = F.linear(x_pt, w1_pt)
+    y_pt = gated_to_pytorch_fn_map[activation](*y_pt.chunk(2, dim=-1))
+    out_pt = F.linear(y_pt, w2_pt)
+    assert (out.float() - out_ref).abs().max() < 1e-2
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    out_ref.backward(dout.float())
+    out_pt.backward(dout)
+    assert x.grad is not None
+    assert x_pt.grad is not None
+    assert (x.grad.float() - x_ref.grad).abs().max() < 2 * (
+        x_pt.grad.float() - x_ref.grad
+    ).abs().max() + 1e-2
+    assert mlp.fc1.weight.grad is not None and w1_ref.grad is not None and w1_pt.grad is not None
+    assert mlp.fc2.weight.grad is not None and w2_ref.grad is not None and w2_pt.grad is not None
+    assert (mlp.fc1.weight.grad.float() - w1_ref.grad).abs().max() < 2 * (
+        w1_pt.grad.float() - w1_ref.grad
+    ).abs().max() + 1e-2
+    assert (mlp.fc2.weight.grad.float() - w2_ref.grad).abs().max() < 2 * (
+        w2_pt.grad.float() - w2_ref.grad
+    ).abs().max() + 1e-2
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_mlp_concat_layout_fuse_grad_accum(dtype, activation, recompute):
+    """Test MLP concat layout with fused gradient accumulation (in-place dweight)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch, dim, hidden = 256, 512, 512
+    mlp = MLP(
+        dim,
+        hidden,
+        activation=activation,
+        device=device,
+        dtype=dtype,
+        tuned=False,
+        recompute=recompute,
+        concat_layout=True,
+        fuse_grad_accum=True,
+    )
+    # Pre-initialize grads with random values to test accumulation into existing grads
+    mlp.fc1.weight.grad = torch.randn_like(mlp.fc1.weight)
+    mlp.fc2.weight.grad = torch.randn_like(mlp.fc2.weight)
+    w1_grad_init = mlp.fc1.weight.grad.clone()
+    w2_grad_init = mlp.fc2.weight.grad.clone()
+    # Reference without fuse_grad_accum
+    mlp_ref = MLP(
+        dim,
+        hidden,
+        activation=activation,
+        device=device,
+        dtype=dtype,
+        tuned=False,
+        recompute=recompute,
+        concat_layout=True,
+        fuse_grad_accum=False,
+    )
+    mlp_ref.fc1.weight.data.copy_(mlp.fc1.weight.data)
+    mlp_ref.fc2.weight.data.copy_(mlp.fc2.weight.data)
+    x = torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    dout = torch.randn(batch, mlp.fc2.out_features, device=device, dtype=dtype)
+    out = mlp(x)
+    out.backward(dout)
+    out_ref = mlp_ref(x_ref)
+    out_ref.backward(dout)
+    # fuse_grad_accum adds to existing grad; non-fused replaces.
+    # Check that accumulated = init + new_grad, with tolerance relative to grad magnitude.
+    w1_expected = w1_grad_init + mlp_ref.fc1.weight.grad
+    w2_expected = w2_grad_init + mlp_ref.fc2.weight.grad
+    w1_atol = 1e-2 * w1_expected.abs().mean()
+    w2_atol = 1e-2 * w2_expected.abs().mean()
+    assert (mlp.fc1.weight.grad - w1_expected).abs().max() < w1_atol
+    assert (mlp.fc2.weight.grad - w2_expected).abs().max() < w2_atol

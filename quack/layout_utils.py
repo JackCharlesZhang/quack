@@ -18,6 +18,19 @@ def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
 
+def concat_to_interleave(a: cute.Tensor, dim: int) -> cute.Tensor:
+    """Reshape a concat [first_half; second_half] layout to interleaved along `dim`.
+
+    Splits dimension `dim` (size 2N) into hierarchical (2, N) so that elements
+    from the first half and second half alternate: [first_0, second_0, first_1, ...].
+    Used to convert gated MLP weight layout from concat [gate; up] to interleaved.
+    """
+    half = cute.size(a, mode=[dim]) // 2
+    shape = (*a.shape[:dim], (2, half), *a.shape[dim + 1 :])
+    stride = (*a.stride[:dim], (half * a.stride[dim], a.stride[dim]), *a.stride[dim + 1 :])
+    return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
+
+
 def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
     shape = (*a.shape[:dim], size, *a.shape[dim:])
     stride = (*a.layout.stride[:dim], 0, *a.layout.stride[dim:])

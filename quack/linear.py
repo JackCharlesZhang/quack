@@ -109,6 +109,24 @@ class _LinearGatedUntunedOps:
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
 
 
+class _LinearGatedConcatOps(_LinearGatedOps):
+    matmul_fwd_fn = partial(gemm_gated, concat_layout=("B",))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, concat_layout=("C", "out")
+    )
+
+
+class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
+    matmul_fwd_fn = partial(gemm_gated, tuned=False, concat_layout=("B",))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("C", "out")
+    )
+
+
 class _DActLinearOps(_LinearOps):
     matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
     recompute_postact = staticmethod(_recompute_act_postact)
@@ -238,9 +256,19 @@ def linear_act_func(
 
 
 def linear_gated_func(
-    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
+    x,
+    weight,
+    activation,
+    bias=None,
+    store_preact=True,
+    fuse_grad_accum=False,
+    tuned=True,
+    concat_layout=False,
 ):
-    ops = _LinearGatedOps if tuned else _LinearGatedUntunedOps
+    if concat_layout:
+        ops = _LinearGatedConcatOps if tuned else _LinearGatedConcatUntunedOps
+    else:
+        ops = _LinearGatedOps if tuned else _LinearGatedUntunedOps
     return LinearActFunc.apply(x, weight, activation, bias, store_preact, fuse_grad_accum, ops)
 
 

@@ -28,6 +28,7 @@ from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
+from quack import layout_utils
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
 
@@ -160,6 +161,7 @@ class GemmSm100(GemmSm90):
         gather_A: bool = False,
         use_tma_gather: bool = False,
         use_clc_persistence: bool = True,
+        concat_layout: tuple | None = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -198,6 +200,7 @@ class GemmSm100(GemmSm90):
         self.pingpong = False  # for compatibility with GemmSm90
         self.use_clc_persistence = use_clc_persistence
         self.gather_A = gather_A
+        self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
@@ -530,6 +533,13 @@ class GemmSm100(GemmSm90):
         """
         if const_expr(self.blockscaled):
             assert mSFA is not None and mSFB is not None
+        # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
+        mA, mB, mD, mC = [
+            layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)
+            if const_expr(name in self.concat_layout and mT is not None)
+            else mT
+            for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
+        ]
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
@@ -990,11 +1000,11 @@ class GemmSm100(GemmSm90):
             varlen_params,
             # Only used if not varlen_m
             len_m_static=Int32(
-                mA_mkl.shape[0]
+                cute.size(mA_mkl, mode=[0])
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(mA_mkl.shape[1]),
+            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
         )
 
         TileSchedulerCls = partial(

@@ -187,6 +187,7 @@ def compile_gemm_kernel(
     mSFB=None,
     has_trace_ptr=False,
     use_tma_gather=False,
+    concat_layout=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] in [9, 12]:
@@ -203,6 +204,7 @@ def compile_gemm_kernel(
         tile_shape_mn,
         cluster_shape_mnk,
         gather_A=gather_A,
+        concat_layout=concat_layout,
     )
     if post_init:
         post_init(gemm_obj)

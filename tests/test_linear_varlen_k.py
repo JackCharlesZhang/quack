@@ -416,3 +416,26 @@ def test_gemm_add_inplace_varlen_k(
         f"Output shape mismatch: {out.shape} vs expected ({num_groups}, {m}, {n})"
     )
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512])
+@pytest.mark.parametrize("m", [1024])
+@pytest.mark.parametrize("num_groups", [3])
+def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype):
+    """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    seq_lens = torch.randint(100, 200, (num_groups,), device=device)
+    total_k = seq_lens.sum().item()
+    cu_seqlens_k = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    # A must be m-major for varlen_k
+    A = torch.randn((total_k, m), device=device, dtype=input_dtype).T / math.sqrt(total_k)
+    B = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(total_k)
+    concat_layout = ("out",)
+    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False, concat_layout=concat_layout)
+    out_ref = gemm_ref(A.float(), B.float(), cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
+    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
