@@ -296,6 +296,11 @@ def test_mlp_concat_layout_fuse_grad_accum(dtype, activation, recompute):
     out.backward(dout)
     out_ref = mlp_ref(x_ref)
     out_ref.backward(dout)
-    # fuse_grad_accum adds to existing grad; non-fused replaces
-    assert (mlp.fc1.weight.grad - (w1_grad_init + mlp_ref.fc1.weight.grad)).abs().max() < 1e-2
-    assert (mlp.fc2.weight.grad - (w2_grad_init + mlp_ref.fc2.weight.grad)).abs().max() < 1e-2
+    # fuse_grad_accum adds to existing grad; non-fused replaces.
+    # Check that accumulated = init + new_grad, with tolerance relative to grad magnitude.
+    w1_expected = w1_grad_init + mlp_ref.fc1.weight.grad
+    w2_expected = w2_grad_init + mlp_ref.fc2.weight.grad
+    w1_atol = 1e-2 * w1_expected.abs().mean()
+    w2_atol = 1e-2 * w2_expected.abs().mean()
+    assert (mlp.fc1.weight.grad - w1_expected).abs().max() < w1_atol
+    assert (mlp.fc2.weight.grad - w2_expected).abs().max() < w2_atol
