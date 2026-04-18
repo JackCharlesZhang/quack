@@ -282,6 +282,7 @@ def _compile_gemm_act(
     colvec_ndim,
     varlen_m,
     gather_A,
+    concat_layout,
     device_capacity,
     gemm_cls_name,
     rounding_mode=RoundingMode.RN,
@@ -308,8 +309,8 @@ def _compile_gemm_act(
         varlen_m=varlen_m,
         gather_A=gather_A,
     )
-    div_pa = div_for_dtype(postact_dtype)
     pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
+    div_pa = div_for_dtype(postact_dtype)
     pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
     mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
@@ -362,6 +363,7 @@ def _compile_gemm_act(
         scheduler_args,
         varlen_args,
         use_tma_gather=use_tma_gather,
+        concat_layout=concat_layout or None,
     )
 
 
@@ -388,6 +390,7 @@ def gemm_act(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
+    concat_layout: tuple | None = None,
 ) -> None:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -439,6 +442,7 @@ def gemm_act(
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
+    concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
     compiled_fn = _compile_gemm_act(
         a_dtype,
         b_dtype,
@@ -461,6 +465,7 @@ def gemm_act(
         colvec_ndim,
         varlen_m,
         gather_A,
+        concat_layout,
         device_capacity,
         gemm_cls_name,
         rounding_mode=rounding_mode,

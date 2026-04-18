@@ -55,6 +55,12 @@ Activation = Literal[
 ]
 
 
+def _concat_interleave(t):
+    """Interleave halves along non-contiguous dim: [first; second] → [f0, s0, f1, ...]"""
+    dim = -2 if t.stride(-1) == 1 else -1
+    return t.unflatten(dim, (2, t.shape[dim] // 2)).transpose(dim - 1, dim).flatten(dim - 1, dim)
+
+
 def default_config(device):
     cap = get_device_capacity(device)[0]
     if cap in [10, 11]:
@@ -143,6 +149,7 @@ def gemm_tuned(
     config: Optional[GemmConfig] = None,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
     if config is None:
         # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
@@ -193,6 +200,14 @@ def gemm_tuned(
         if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
+    # When swap_ab, A↔B (out/C stay, but .mT flips their strides so the kernel
+    # auto-detects the correct non-contiguous dim).
+    _swap_map = {"A": "B", "B": "A", "out": "out", "C": "C"}
+    swapped_concat = (
+        tuple(_swap_map.get(k, k) for k in concat_layout)
+        if config.swap_ab and concat_layout
+        else concat_layout
+    )
     gemm_dispatch(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -219,6 +234,7 @@ def gemm_tuned(
         rounding_mode=rounding_mode,
         sr_seed=sr_seed,
         use_tma_gather=config.use_tma_gather,
+        concat_layout=swapped_concat,
     )
 
 
@@ -376,6 +392,7 @@ def gemm(
     tuned: bool = True,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
@@ -398,6 +415,7 @@ def gemm(
     alpha = alpha if isinstance(alpha, float) else 1.0
     sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
     sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
+    concat_str = ",".join(concat_layout) if concat_layout else None
     gemm_out(
         A,
         B,
@@ -414,6 +432,7 @@ def gemm(
         rounding_mode=rounding_mode,
         sr_seed=sr_seed_int,
         sr_seed_tensor=sr_seed_tensor,
+        concat_layout=concat_str,
     )
     return out
 
@@ -443,6 +462,7 @@ def gemm_out(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int = 0,
     sr_seed_tensor: Optional[Tensor] = None,
+    concat_layout: Optional[str] = None,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -462,6 +482,7 @@ def gemm_out(
         dynamic_scheduler=dynamic_scheduler,
         rounding_mode=rounding_mode,
         sr_seed=sr_seed_arg,
+        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
     )
 
 
@@ -476,10 +497,16 @@ def gemm_ref(
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     out_dtype: Optional[torch.dtype] = None,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tensor:
     """Reference implementation for GEMM with pre-allocated output."""
     # The out_dtype argument requires torch >= 2.8
     out_dtype = A.dtype if out_dtype is None else out_dtype
+    if concat_layout:
+        if "A" in concat_layout:
+            A = _concat_interleave(A)
+        if "B" in concat_layout:
+            B = _concat_interleave(B)
     if cu_seqlens_m is None and cu_seqlens_k is None:
         fn = torch.bmm if A.ndim == 3 else torch.mm
         out = fn(A, B, out_dtype=out_dtype, out=out)
@@ -520,6 +547,9 @@ def gemm_ref(
             out *= alpha
         if bias is not None:
             out += bias
+    if concat_layout and "out" in concat_layout:
+        # out is n-major (ref allocates contiguous). Split rows (non-contiguous dim).
+        out = torch.cat([out[..., ::2, :], out[..., 1::2, :]], dim=-2)
     return out
 
 
@@ -538,6 +568,7 @@ def gemm_add(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tensor:
     """GEMM with addition and optional output tensor."""
     if out is None:
@@ -564,6 +595,7 @@ def gemm_add(
     beta = beta if isinstance(beta, float) else 1.0
     alpha_arg = alpha_tensor if alpha_tensor is not None else alpha
     beta_arg = beta_tensor if beta_tensor is not None else beta
+    concat_str = ",".join(concat_layout) if concat_layout else None
     if add_to_output:
         gemm_add_inplace(
             A,
@@ -577,6 +609,7 @@ def gemm_add(
             batch_idx_permute=batch_idx_permute,
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
+            concat_layout=concat_str,
         )
     else:
         gemm_add_out(
@@ -595,6 +628,7 @@ def gemm_add(
             add_to_output=add_to_output,
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
+            concat_layout=concat_str,
         )
     return out
 
@@ -624,6 +658,7 @@ def gemm_add_out(
     add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: Optional[str] = None,
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -642,6 +677,7 @@ def gemm_add_out(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
+        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
     )
 
 
@@ -658,8 +694,16 @@ def gemm_add_ref(
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
     out_dtype: Optional[torch.dtype] = None,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tensor:
     """Reference implementation for GEMM with addition and pre-allocated output."""
+    if concat_layout:
+        if "A" in concat_layout:
+            A = _concat_interleave(A)
+        if "B" in concat_layout:
+            B = _concat_interleave(B)
+        if "C" in concat_layout:
+            C = _concat_interleave(C)
     if cu_seqlens_m is None and cu_seqlens_k is None:
         if isinstance(alpha, float) and isinstance(beta, float):
             out = torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
@@ -670,6 +714,8 @@ def gemm_add_ref(
             result = (alpha * (A @ B) + beta * C).to(out_dtype)
             if out is not None:
                 out.copy_(result)
+            else:
+                out = result
         if bias is not None:
             bias = bias if A.ndim == 2 else bias.unsqueeze(1)
             out += bias
@@ -709,6 +755,8 @@ def gemm_add_ref(
             out[i].copy_(result)
         if bias is not None:
             out += bias
+    if concat_layout and "out" in concat_layout:
+        out = torch.cat([out[..., ::2, :], out[..., 1::2, :]], dim=-2)
     return out
 
 
@@ -725,6 +773,7 @@ def gemm_add_inplace(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
     """In-place GEMM with addition: out = alpha * A @ B + beta * out.
     Args:
@@ -756,6 +805,9 @@ def gemm_add_inplace(
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        concat_layout=",".join(concat_layout)
+        if isinstance(concat_layout, tuple)
+        else concat_layout,
     )
 
 
@@ -782,6 +834,7 @@ def gemm_add_inplace_op(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: Optional[str] = None,
 ) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
@@ -801,6 +854,7 @@ def gemm_add_inplace_op(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
+        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
     )
 
 
@@ -819,6 +873,7 @@ def gemm_act(
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     is_gated = activation in gated_to_pytorch_fn_map
@@ -838,6 +893,7 @@ def gemm_act(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
+    concat_str = ",".join(concat_layout) if concat_layout else None
     if is_gated:
         gemm_gated_out(
             A,
@@ -851,6 +907,7 @@ def gemm_act(
             A_idx,
             dynamic_scheduler,
             tuned,
+            concat_layout=concat_str,
         )
     else:
         gemm_act_out(
@@ -907,15 +964,22 @@ def gemm_act_ref(
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> Tuple[Optional[Tensor], Tensor]:
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
-        preact = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        preact = gemm_ref(
+            A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+        )
     else:
-        preact = gemm_add_ref(A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        preact = gemm_add_ref(
+            A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+        )
     if is_gated:
+        # With concat=("B",), gemm_ref already interleaves the output columns,
+        # so we always use the interleaved gate/up split.
         gate = preact[..., ::2]
         up = preact[..., 1::2]
         postact = gated_to_pytorch_fn_map[activation](gate, up).to(postact_dtype)
@@ -1172,6 +1236,7 @@ def gemm_gated_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
+    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -1222,6 +1287,7 @@ def gemm_gated_tuned(
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
+        concat_layout=concat_layout,
     )
 
 
@@ -1331,7 +1397,7 @@ def gemm_dgated_tuned(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1345,10 +1411,23 @@ def gemm_gated_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: Optional[str] = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     fn = gemm_gated_tuned if tuned else partial(gemm_gated_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    fn(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias,
+        activation,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+    )
 
 
 @torch.library.custom_op(

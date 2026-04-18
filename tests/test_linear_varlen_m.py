@@ -674,3 +674,100 @@ def test_gemm_dgated_varlen_m(
         assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
             colvec_reduce_pt - colvec_reduce_ref
         ).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504])
+@pytest.mark.parametrize("k", [736])
+@pytest.mark.parametrize("num_groups", [3])
+def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_scheduler, gather_A):
+    """Test GEMM varlen_m with concat_layout=("B",) for MoE forward/backward."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    seq_lens = torch.randint(100, 200, (num_groups,), device=device)
+    total_m = seq_lens.sum().item()
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
+    B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
+    bias = torch.randn(num_groups, n, device=device) if has_bias else None
+    concat = ("B",)
+    out = gemm(
+        A,
+        B,
+        bias=bias,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=False,
+        concat_layout=concat,
+    )
+    out_ref = gemm_ref(
+        A.float(),
+        B.float(),
+        bias=bias,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        concat_layout=concat,
+    )
+    out_pt = gemm_ref(A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat)
+    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("dynamic_scheduler", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504])
+@pytest.mark.parametrize("k", [736])
+@pytest.mark.parametrize("num_groups", [3])
+def test_gemm_gated_varlen_m_concat(
+    num_groups, k, n, input_dtype, has_bias, dynamic_scheduler, gather_A
+):
+    """Test gated GEMM varlen_m with concat_layout=("B",) for MoE forward."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    seq_lens = torch.randint(100, 200, (num_groups,), device=device)
+    total_m = seq_lens.sum().item()
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
+    B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
+    bias = torch.randn(num_groups, n, device=device) if has_bias else None
+    concat = ("B",)
+    preact, postact = gemm_gated(
+        A,
+        B,
+        bias=bias,
+        activation="swiglu",
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=False,
+        concat_layout=concat,
+    )
+    preact_ref, postact_ref = gemm_gated_ref(
+        A.float(),
+        B.float(),
+        bias=bias,
+        activation="swiglu",
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        concat_layout=concat,
+    )
+    preact_pt, postact_pt = gemm_gated_ref(
+        A,
+        B,
+        bias=bias,
+        activation="swiglu",
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        concat_layout=concat,
+    )
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5

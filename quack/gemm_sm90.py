@@ -23,6 +23,7 @@ from cutlass.utils import LayoutEnum
 from dataclasses import dataclass
 
 from quack.cute_dsl_utils import ParamsBase
+from quack import layout_utils
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
@@ -145,6 +146,7 @@ class GemmSm90:
         fp8_fast_accum: bool = False,
         gather_A: bool = False,
         use_clc_persistence: bool = False,
+        concat_layout: tuple | None = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -170,6 +172,7 @@ class GemmSm90:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
         self.gather_A = gather_A
+        self.concat_layout = concat_layout or ()
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
 
@@ -393,6 +396,14 @@ class GemmSm90:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
+
+        # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
+        mA, mB, mD, mC = [
+            layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)
+            if const_expr(name in self.concat_layout and mT is not None)
+            else mT
+            for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
+        ]
 
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
@@ -653,11 +664,11 @@ class GemmSm90:
             varlen_params,
             # Only used if not varlen_m
             len_m_static=Int32(
-                mA_mkl.shape[0]
+                cute.size(mA_mkl, mode=[0])
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(mA_mkl.shape[1]),
+            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
         )
 
         TileSchedulerCls = partial(
@@ -804,7 +815,9 @@ class GemmSm90:
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
-            k_tile_cnt_static = cute.ceil_div(mA_mkl.shape[1], self.cta_tile_shape_mnk[2])
+            k_tile_cnt_static = cute.ceil_div(
+                cute.size(mA_mkl, mode=[1]), self.cta_tile_shape_mnk[2]
+            )
             c_tile_cnt = cute.size(cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile))
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
@@ -1364,8 +1377,8 @@ class GemmSm90:
                 )
             )
             problem_shape_ntile_mnl = (
-                cute.ceil_div(mA.shape[0], self.cta_tile_shape_mnk[0]),
-                cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
+                cute.ceil_div(cute.size(mA, mode=[0]), self.cta_tile_shape_mnk[0]),
+                cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
                 num_problems,
             )
             tile_sched_args = TileSchedulerArguments(
@@ -1381,7 +1394,7 @@ class GemmSm90:
             assert (mD is not None) or (epilogue_args.mPostAct is not None) or (not self.gather_A)
             problem_shape_ntile_mnl = (
                 None,
-                cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
+                cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
                 varlen_args.mCuSeqlensM.shape[0] - 1,
             )
             tile_sched_args = VarlenMTileSchedulerArguments(
