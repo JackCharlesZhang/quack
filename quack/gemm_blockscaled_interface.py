@@ -71,8 +71,8 @@ def _compile_cached(
     fake_mB = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
     # N-major: (l, m, n) contiguous, viewed as (m, n, l) strides (n, 1, m*n)
     fake_mD = torch.empty(l, m, n, dtype=out_torch_dtype, device=dev).permute(1, 2, 0)
-    fake_sc_A = torch.empty(l, rm, rk, 32, 4, 4, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_sc_B = torch.empty(l, rn, rk, 32, 4, 4, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
     fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
     fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
     return compile_blockscaled_gemm_tvm_ffi(

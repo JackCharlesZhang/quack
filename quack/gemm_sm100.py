@@ -31,6 +31,7 @@ from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack import layout_utils
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
+from quack.layout_utils import tile_atom_to_shape_SF_strided
 
 # return PipelineStateWAdvance instead of PipelineState
 
@@ -569,17 +570,25 @@ class GemmSm100(GemmSm90):
         self._setup_attributes(epilogue_args, varlen_args)
 
         if const_expr(self.blockscaled):
-            # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout.
-            # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL). mA may be rank-2 (total_m, k)
-            # in varlen_m mode; mB is always rank-3 (n, k, l).
+            # Rebuild the SFA/SFB layouts from mSFA/mSFB's actual strides
+            # so non-packed buffers work (e.g. a slice of a larger scale tensor).
+            # Only the innermost 512-B tile must be contiguous.
+            # For varlen_m, mSFA is sized for per-expert 128-row-padded storage
+            # (dQaccum format), so use its own M dim (= total_padded_rm * 128)
+            # instead of mA.shape[0] (= total_m, unpadded).
             if const_expr(cute.rank(mA) == 3):
-                sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(mA.shape, self.sf_vec_size)
-            else:
-                atom = blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout
-                sfa_layout = cute.tile_to_shape(atom, mA.shape, (2, 1))
+                sfa_shape = mA.shape
+            elif const_expr(varlen_m):
+                sfa_shape = (mSFA.shape[1] * 128, mA.shape[1])
+            else:  # varlen_k
+                sfa_shape = (mA.shape[0], mSFA.shape[2] * 128)
+            sfa_layout = tile_atom_to_shape_SF_strided(sfa_shape, self.sf_vec_size, mSFA.stride)
             mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)
-            # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-            sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(mB.shape, self.sf_vec_size)
+            if const_expr(cute.rank(mB) == 3):
+                sfb_shape = mB.shape
+            else:  # varlen_k: mB is (n, total_k)
+                sfb_shape = (mB.shape[0], mSFB.shape[2] * 128)
+            sfb_layout = tile_atom_to_shape_SF_strided(sfb_shape, self.sf_vec_size, mSFB.stride)
             mSFB = cute.make_tensor(mSFB.iterator, sfb_layout)
 
         atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
@@ -1087,14 +1096,18 @@ class GemmSm100(GemmSm90):
                 )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
+                    # SFA uses padded per-expert offset (dQaccum format), not
+                    # the A-data offset — allows varlen_m seqlens that aren't
+                    # multiples of 128.
                     gSFA_mkl = cute.local_tile(
-                        varlen_manager.offset_batch_A(mSFA_mkl, batch_idx),
+                        varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
                         cute.select(self.mma_tiler, [0, 2]),
                         (mma_tile_coord_mnl[0], None),
                     )
                     # (bN, bK)
+                    # SFB uses padded per-expert K offset in varlen_k (dQaccum format).
                     gSFB_nkl = cute.local_tile(
-                        varlen_manager.offset_batch_B(mSFB_nkl, batch_idx),
+                        varlen_manager.offset_batch_SFB(mSFB_nkl, batch_idx),
                         cute.select(self.mma_tiler_sfb, [1, 2]),
                         (
                             (

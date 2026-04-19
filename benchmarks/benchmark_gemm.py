@@ -112,6 +112,14 @@ def parse_arguments() -> argparse.Namespace:
                         help="Output dtype: BFloat16/Float16/Float32 (applies to both dense and blockscaled).")
     parser.add_argument("--c_dtype", type=str, default=None,
                         help="Optional C-tensor dtype (for alpha*A@B + beta*C). Default: no C tensor.")
+    parser.add_argument("--a_major", type=str, default=None, choices=["k", "m"],
+                        help="A operand major mode. Blockscaled: MXFP8 supports k/m, "
+                             "MXFP4/NVFP4 must be k. Dense: varlen_k forces m, others default "
+                             "to k if omitted.")
+    parser.add_argument("--b_major", type=str, default=None, choices=["k", "n"],
+                        help="B operand major mode. Blockscaled: MXFP8 supports k/n, "
+                             "MXFP4/NVFP4 must be k. Dense: varlen_k forces n, others default "
+                             "to k if omitted.")
 
     args = parser.parse_args()
     if len(args.mnkl) != 4:
@@ -133,7 +141,6 @@ def _run_blockscaled(args):
         create_blockscaled_operand_tensor,
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
-        scale_view_for_kernel,
         torch_dtype_for_cutlass,
     )
     from quack.cute_dsl_utils import get_device_capacity
@@ -180,11 +187,23 @@ def _run_blockscaled(args):
     else:
         ab_dtype = cutlass.dtype(args.ab_dtype)
 
+    # MXFP4/NVFP4 require K-major for both operands. Only MXFP8 supports m/n-major.
+    a_major = args.a_major if args.a_major is not None else "k"
+    b_major = args.b_major if args.b_major is not None else "k"
+    is_fp4 = ab_dtype == cutlass.Float4E2M1FN
+    if is_fp4 and (a_major != "k" or b_major != "k"):
+        raise ValueError(
+            f"MXFP4/NVFP4 require K-major for both A and B; got a_major={a_major}, b_major={b_major}"
+        )
     if not GemmDefaultSm100.can_implement_blockscaled(
         ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn,
-        m, n, k, l, "k", "k", "n",
+        m, n, k, l, a_major, b_major, "n",
     ):
-        raise TypeError(f"Unsupported blockscaled config: ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}, d={d_dtype}, tiler={mma_tiler_mn}, cluster={cluster_shape_mn}")
+        raise TypeError(
+            f"Unsupported blockscaled config: ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}, "
+            f"d={d_dtype}, tiler={mma_tiler_mn}, cluster={cluster_shape_mn}, "
+            f"a_major={a_major}, b_major={b_major}"
+        )
 
     assert k % sf_vec_size == 0, f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size})"
     if args.varlen_m:
@@ -193,12 +212,19 @@ def _run_blockscaled(args):
         assert ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32, (
             "blockscaled varlen_m currently only supports MXFP8"
         )
+        # A must stay k-major in varlen_m (the per-expert padded SF offset
+        # targets the M axis); B can be k- or n-major (MXFP8 only).
+        assert a_major == "k", (
+            f"varlen_m currently requires a_major=k; got a={a_major}"
+        )
         total_m = m * l
         a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
-            create_blockscaled_varlen_m_operands(l, m, n, k, sf_vec_size)
+            create_blockscaled_varlen_m_operands(
+                l, m, n, k, sf_vec_size, b_major=b_major,
+            )
         )
-        mSFA = scale_view_for_kernel(a_sc_contig, total_m, k // sf_vec_size, 1)
-        mSFB = scale_view_for_kernel(b_sc_contig, n, k // sf_vec_size, l)
+        # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
+        mSFA, mSFB = a_sc_contig, b_sc_contig
         mD = torch.empty(total_m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda")
         runner = compile_blockscaled_gemm_tvm_ffi(
             ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn,
@@ -208,13 +234,13 @@ def _run_blockscaled(args):
             runner(mA, mB, mD, mSFA, mSFB, cu_seqlens_m)
     else:
         a_ref, mA, a_sc_contig = create_blockscaled_operand_quantized(
-            l, m, k, False, sf_vec_size, ab_dtype, sf_dtype,
+            l, m, k, a_major == "m", sf_vec_size, ab_dtype, sf_dtype,
         )
         b_ref, mB, b_sc_contig = create_blockscaled_operand_quantized(
-            l, n, k, False, sf_vec_size, ab_dtype, sf_dtype,
+            l, n, k, b_major == "n", sf_vec_size, ab_dtype, sf_dtype,
         )
-        mSFA = scale_view_for_kernel(a_sc_contig, m, k // sf_vec_size, l)
-        mSFB = scale_view_for_kernel(b_sc_contig, n, k // sf_vec_size, l)
+        # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
+        mSFA, mSFB = a_sc_contig, b_sc_contig
         sfa_ref = torch.ones_like(a_ref)
         sfb_ref = torch.ones_like(b_ref)
         _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
@@ -245,6 +271,7 @@ def _run_blockscaled(args):
     print(f"mnkl: {args.mnkl}")
     print(f"tile_shape_mn: {mma_tiler_mn}, cluster_shape_mn: {cluster_shape_mn}")
     print(f"ab_dtype: {ab_dtype}, sf_dtype: {sf_dtype}, sf_vec_size: {sf_vec_size}, d_dtype: {args.d_dtype}")
+    print(f"a_major: {a_major}, b_major: {b_major}")
 
     flops = 2 * m * n * k * l
     timing = _bench_and_report("quack ", fn, flops, args.warmup_iterations, args.iterations)
@@ -257,6 +284,12 @@ def _run_blockscaled(args):
         # with per-group swizzled scales we don't build here. Looping F.scaled_mm per
         # batch would be an unfair comparison (hides batching potential), so skip.
         print("(skipping cuBLAS: batched blockscaled mm not supported via a single call)")
+        return
+    if a_major != "k" or b_major != "k":
+        # F.scaled_mm requires A (M,K) row-major and B (K,N) col-major —
+        # i.e. both operands K-contiguous. Skip for m/n-major to avoid an
+        # apples-vs-oranges copy+transpose.
+        print(f"(skipping cuBLAS: F.scaled_mm needs a_major=k, b_major=k; got a={a_major}, b={b_major})")
         return
     from torch.nn.functional import scaled_mm, ScalingType, SwizzleType
     scaling_recipe_map = {32: ScalingType.BlockWise1x32, 16: ScalingType.BlockWise1x16}
@@ -308,9 +341,26 @@ def run(args):
     if device_capacity[0] in [10, 11]:
         persistent = True
 
+    # a_major / b_major control the memory order. Defaults: varlen_k -> m/n
+    # (kernel requirement), everything else -> k.
+    if varlen_k:
+        a_major = args.a_major if args.a_major is not None else "m"
+        b_major = args.b_major if args.b_major is not None else "n"
+        assert a_major == "m" and b_major == "n", (
+            f"dense varlen_k requires a_major=m, b_major=n; got a={a_major}, b={b_major}"
+        )
+    else:
+        a_major = args.a_major if args.a_major is not None else "k"
+        b_major = args.b_major if args.b_major is not None else "k"
+        if varlen_m:
+            assert a_major == "k", (
+                f"dense varlen_m requires a_major=k; got a={a_major}"
+            )
+
     print("Running Dense GEMM with:")
     print(f"mnkl: {args.mnkl}")
     print(f"Tile Shape: {args.tile_shape_mn}, Cluster Shape: {args.cluster_shape_mn}")
+    print(f"a_major: {a_major}, b_major: {b_major}")
     print(f"Use TMA gather: {args.use_tma_gather}")
     print(f"Warmup iterations: {warmup}")
     print(f"Iterations: {repeats}")
@@ -321,13 +371,33 @@ def run(args):
 
     # ── Tensor creation ───────────────────────────────────────────────────────
     # quack.gemm.gemm() conventions:
-    #   A: (l, m, k) or (total_m, k) if varlen_m — k-major
-    #   B: (l, n, k) — k-major
+    #   A: (l, m, k) or (total_m, k) if varlen_m
+    #   B: (l, n, k)
     #   D: (l, m, n) or (total_m, n) if varlen_m — n-major
     cu_seqlens_m, cu_seqlens_k, A_idx = None, None, None
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=device) if args.dynamic_persistent else None
     )
+
+    def _make_a_non_varlen(l_, m_, k_, major):
+        """(l, m, k) with requested major. k-major: contig; m-major: transposed."""
+        if major == "k":
+            return torch.randn(l_, m_, k_, dtype=ab_dtype, device=device) / (k_**0.5)
+        else:  # m-major: stride (m*k, 1, m)
+            return (
+                torch.randn(l_, k_, m_, dtype=ab_dtype, device=device).transpose(1, 2)
+                / (k_**0.5)
+            )
+
+    def _make_b_non_varlen(l_, n_, k_, major):
+        """(l, n, k) with requested major. k-major: contig; n-major: transposed."""
+        if major == "k":
+            return torch.randn(l_, n_, k_, dtype=ab_dtype, device=device) / (k_**0.5)
+        else:  # n-major: stride (n*k, 1, n)
+            return (
+                torch.randn(l_, k_, n_, dtype=ab_dtype, device=device).transpose(1, 2)
+                / (k_**0.5)
+            )
 
     if varlen_m:
         total_m = m * l
@@ -335,12 +405,12 @@ def run(args):
         A = torch.randn(total_m, k, dtype=ab_dtype, device=device) / (k**0.5)
         if gather_A:
             A_idx = torch.randperm(total_m, dtype=torch.int32, device=device)
-        B = torch.randn(l, n, k, dtype=ab_dtype, device=device) / (k**0.5)
+        B = _make_b_non_varlen(l, n, k, b_major)
         D = torch.empty(total_m, n, dtype=d_dtype, device=device)
     elif varlen_k:
         total_k = k * l
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device=device) * k
-        # m-major A, n-major B for varlen_k
+        # m-major A, n-major B for varlen_k (enforced above).
         if gather_A:
             larger_k = total_k * 2
             A = torch.randn(larger_k, m, dtype=ab_dtype, device=device).T
@@ -350,8 +420,8 @@ def run(args):
         B = torch.randn(total_k, n, dtype=ab_dtype, device=device).T
         D = torch.empty(l, m, n, dtype=d_dtype, device=device)
     else:
-        A = torch.randn(l, m, k, dtype=ab_dtype, device=device) / (k**0.5)
-        B = torch.randn(l, n, k, dtype=ab_dtype, device=device) / (k**0.5)
+        A = _make_a_non_varlen(l, m, k, a_major)
+        B = _make_b_non_varlen(l, n, k, b_major)
         D = torch.empty(l, m, n, dtype=d_dtype, device=device)
 
     C = None

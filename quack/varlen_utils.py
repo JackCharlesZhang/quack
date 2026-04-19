@@ -122,6 +122,37 @@ class VarlenManager:
             mAIdx_mk = params.mAIdx[None, batch_idx]
         return mAIdx_mk
 
+    def offset_batch_SFA(self, mSFA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        """Offset SFA by padded per-expert offset (dQaccum-style).
+
+        The padded offset, in tile units (128 source-M or source-K per tile),
+        is simply `cu_seqlens[b] // 128 + b`. (Algebraically identical to
+        `(cu_seqlens[b] + b*128) // 128 * 128` / 128.) We pass it as a
+        compound coord `(0, offset_tile)` to `domain_offset` so the outer
+        rm/rk mode is shifted in tile units — no `* 128` needed, and the
+        compiler sees the tile alignment natively.
+        """
+        params = self.params
+        tile = 128
+        if const_expr(self.varlen_m):
+            offset_tile = params.cu_seqlens_m[batch_idx] // tile + batch_idx
+            return cute.domain_offset(((0, offset_tile), None), mSFA_mkl)
+        elif const_expr(self.varlen_k):
+            offset_tile = params.cu_seqlens_k[batch_idx] // tile + batch_idx
+            return cute.domain_offset((None, (0, offset_tile)), mSFA_mkl)
+        else:
+            return mSFA_mkl[None, None, batch_idx]
+
+    def offset_batch_SFB(self, mSFB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        """Offset SFB by padded per-expert K offset (varlen_k only)."""
+        params = self.params
+        tile = 128
+        if const_expr(self.varlen_k):
+            offset_tile = params.cu_seqlens_k[batch_idx] // tile + batch_idx
+            return cute.domain_offset((None, (0, offset_tile)), mSFB_nkl)
+        else:
+            return mSFB_nkl[None, None, batch_idx]
+
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
         if const_expr(self.varlen_k):
