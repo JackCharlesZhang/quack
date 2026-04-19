@@ -163,6 +163,7 @@ class GemmSm100(GemmSm90):
         use_tma_gather: bool = False,
         use_clc_persistence: bool = True,
         concat_layout: tuple | None = None,
+        use_pdl: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -203,6 +204,7 @@ class GemmSm100(GemmSm90):
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
+        self.use_pdl = use_pdl
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
@@ -836,6 +838,7 @@ class GemmSm100(GemmSm90):
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -1034,6 +1037,9 @@ class GemmSm100(GemmSm90):
             warp_idx >= self.ab_load_warp_id
             and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
         ):
+            # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ main_load)
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Compute multicast mask for A/B buffer full
@@ -1255,6 +1261,9 @@ class GemmSm100(GemmSm90):
         # Specialized scheduler warp
         if const_expr(self.is_persistent or self.gather_A):
             if warp_idx == self.scheduler_warp_id:
+                # PDL: wait for prior kernel before reading CLC state (matches cutlass C++ sched)
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 if const_expr(self.gather_A):
                     cute.arch.setmaxregister_decrease(self.num_regs_other)
                 is_scheduler_warp = True
@@ -1349,6 +1358,9 @@ class GemmSm100(GemmSm90):
         if warp_idx == self.epi_load_warp_id:
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+            # PDL: wait for prior kernel before any C TMA loads (matches cutlass C++ epi_load)
+            if const_expr(self.use_pdl and mC_mnl is not None):
+                cute.arch.griddepcontrol_wait()
             if const_expr(mC_mnl is not None):
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
@@ -1526,6 +1538,10 @@ class GemmSm100(GemmSm90):
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
+
+            # PDL: hint the next kernel to launch early now that all MMAs are issued
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
             tmem_alloc_barrier.arrive()
             # Wait for accumulator buffer empty

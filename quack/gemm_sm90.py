@@ -147,6 +147,7 @@ class GemmSm90:
         gather_A: bool = False,
         use_clc_persistence: bool = False,
         concat_layout: tuple | None = None,
+        use_pdl: bool = True,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -168,6 +169,7 @@ class GemmSm90:
         self.use_clc_persistence = use_clc_persistence
         if self.use_clc_persistence:
             assert self.arch == 100
+        self.use_pdl = use_pdl
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
@@ -547,6 +549,7 @@ class GemmSm90:
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -684,6 +687,9 @@ class GemmSm90:
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
+                # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ sm90 mainloop producer)
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 # Get mcast mask
                 cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
@@ -961,6 +967,10 @@ class GemmSm90:
                             tile_scheduler.advance_to_next_work()
                             work_tile = tile_scheduler.get_current_work()
                 # End of persistent scheduler loop
+
+            # PDL: hint next kernel to launch (matches cutlass C++ sm90 consumer)
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
             # Wait for D store complete
             if const_expr(not self.pingpong):

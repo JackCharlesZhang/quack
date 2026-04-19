@@ -47,12 +47,14 @@ class GemmSm120(GemmSm90):
         pingpong: bool = False,
         is_persistent: bool = True,
         gather_A: bool = False,
+        use_pdl: bool = True,
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
         self.is_persistent = is_persistent
         self.use_clc_persistence = False
+        self.use_pdl = use_pdl
         self.fp8_slow_accum = False
         self.gather_A = gather_A
         if self.pingpong:
