@@ -251,6 +251,51 @@ def test_mlp_concat_layout(dtype, activation, recompute, use_compile):
     ).abs().max() + 1e-2
 
 
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_bias2", [False, True])
+@pytest.mark.parametrize("has_bias1", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu", "reglu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_mlp_concat_layout_bias_fwd(dtype, activation, has_bias1, has_bias2, bias_dtype):
+    """Test MLP concat layout with bias in forward-only (inference) mode."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch, dim, hidden = 256, 512, 512
+    mlp = MLP(
+        dim,
+        hidden,
+        activation=activation,
+        bias1=has_bias1,
+        bias2=has_bias2,
+        device=device,
+        dtype=dtype,
+        tuned=False,
+        concat_layout=True,
+    )
+    # Override bias dtype to test both bf16 (Python permute) and fp32 (kernel layout permute)
+    if has_bias1:
+        mlp.fc1.bias = torch.nn.Parameter(mlp.fc1.bias.to(bias_dtype))
+    if has_bias2:
+        mlp.fc2.bias = torch.nn.Parameter(mlp.fc2.bias.to(bias_dtype))
+    x = torch.randn(batch, dim, device=device, dtype=dtype)
+    with torch.no_grad():
+        out = mlp(x)
+    # fp32 reference
+    w1, w2 = mlp.fc1.weight.float(), mlp.fc2.weight.float()
+    b1 = mlp.fc1.bias.float() if has_bias1 else None
+    b2 = mlp.fc2.bias.float() if has_bias2 else None
+    y_ref = F.linear(x.float(), w1, b1)
+    y_ref = gated_to_pytorch_fn_map[activation](*y_ref.chunk(2, dim=-1))
+    out_ref = F.linear(y_ref, w2, b2)
+    # bf16 baseline (cast bias to input dtype for F.linear compatibility)
+    b1_pt = mlp.fc1.bias.to(dtype) if has_bias1 else None
+    b2_pt = mlp.fc2.bias.to(dtype) if has_bias2 else None
+    y_pt = F.linear(x, mlp.fc1.weight, b1_pt)
+    y_pt = gated_to_pytorch_fn_map[activation](*y_pt.chunk(2, dim=-1))
+    out_pt = F.linear(y_pt, mlp.fc2.weight, b2_pt)
+    assert (out.float() - out_ref).abs().max() < 2 * (out_pt.float() - out_ref).abs().max() + 1e-5
+
+
 @pytest.mark.parametrize("recompute", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

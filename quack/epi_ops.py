@@ -283,7 +283,7 @@ class VecLoad(EpiOp):
             tVgV = thr_copy.partition_S(gVec)
             tVsV = thr_copy.partition_D(smem_tensor)
             tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
-            limit = min(mVec.shape[0] - coord_idx * tile_dim, tile_dim)
+            limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
             pred = cute.make_rmem_tensor((1, cute.size(tVsV.shape[1])), Boolean)
             for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
                 pred[0, m] = tVcV[0, m] < limit

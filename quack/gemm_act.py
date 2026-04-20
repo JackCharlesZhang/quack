@@ -37,6 +37,7 @@ from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
 )
 from quack.cache_utils import jit_cache
+import quack.layout_utils as layout_utils
 from quack.layout_utils import permute_gated_Cregs_b16
 from quack.activation import act_fn_map, gate_fn_map
 from quack.rounding import RoundingMode
@@ -67,6 +68,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
     # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
@@ -210,6 +214,9 @@ class GemmGatedMixin(GemmActMixin):
         )
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
     @cute.jit

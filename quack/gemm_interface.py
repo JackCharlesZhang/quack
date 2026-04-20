@@ -60,10 +60,12 @@ def _concat_interleave(t):
     dim = -2 if t.stride(-1) == 1 else -1
     return t.unflatten(dim, (2, t.shape[dim] // 2)).transpose(dim - 1, dim).flatten(dim - 1, dim)
 
+
 def _concat_interleave_bias(t):
     """Interleave [gate; up] along last dim for bias vectors."""
     half = t.shape[-1] // 2
     return t.unflatten(-1, (2, half)).transpose(-2, -1).flatten(-2, -1)
+
 
 def default_config(device):
     cap = get_device_capacity(device)[0]
@@ -204,16 +206,24 @@ def gemm_tuned(
         if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
+    # Handle bias concat layout: transform "bias" key to kernel-level key or permute data.
+    if concat_layout and "bias" in concat_layout:
+        if bias is not None and bias.dtype.itemsize >= 4:
+            # fp32: kernel permutes via layout; replace "bias" with the kernel-level key
+            concat_layout = tuple("mRowVecBroadcast" if k == "bias" else k for k in concat_layout)
+        else:
+            # No bias or sub-fp32: strip "bias" from concat_layout; permute data if needed
+            concat_layout = tuple(k for k in concat_layout if k != "bias")
+            if bias is not None:
+                bias = _concat_interleave_bias(bias)
     # When swap_ab, A↔B (out/C stay, but .mT flips their strides so the kernel
     # auto-detects the correct non-contiguous dim).
-    _swap_map = {"A": "B", "B": "A", "out": "out", "C": "C"}
+    _swap_map = {"A": "B", "B": "A", "out": "out", "C": "C", "mRowVecBroadcast": "mColVecBroadcast"}
     swapped_concat = (
         tuple(_swap_map.get(k, k) for k in concat_layout)
         if config.swap_ab and concat_layout
         else concat_layout
     )
-    if concat_layout and "B" in concat_layout and bias is not None:
-        bias = _concat_interleave_bias(bias)
     gemm_dispatch(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -513,8 +523,8 @@ def gemm_ref(
             A = _concat_interleave(A)
         if "B" in concat_layout:
             B = _concat_interleave(B)
-            if bias is not None:
-                bias = _concat_interleave_bias(bias)
+        if "bias" in concat_layout and bias is not None:
+            bias = _concat_interleave_bias(bias)
     if cu_seqlens_m is None and cu_seqlens_k is None:
         fn = torch.bmm if A.ndim == 3 else torch.mm
         out = fn(A, B, out_dtype=out_dtype, out=out)
@@ -710,8 +720,8 @@ def gemm_add_ref(
             A = _concat_interleave(A)
         if "B" in concat_layout:
             B = _concat_interleave(B)
-            if bias is not None:
-                bias = _concat_interleave_bias(bias)
+        if "bias" in concat_layout and bias is not None:
+            bias = _concat_interleave_bias(bias)
         if "C" in concat_layout:
             C = _concat_interleave(C)
     if cu_seqlens_m is None and cu_seqlens_k is None:
@@ -1270,8 +1280,14 @@ def gemm_gated_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    if concat_layout and "B" in concat_layout and bias is not None:
-        bias = _concat_interleave_bias(bias)
+    if concat_layout and "bias" in concat_layout:
+        if bias is not None and bias.dtype.itemsize >= 4:
+            bias_key = "mColVecBroadcast" if config.swap_ab else "mRowVecBroadcast"
+            concat_layout = tuple(bias_key if k == "bias" else k for k in concat_layout)
+        else:
+            concat_layout = tuple(k for k in concat_layout if k != "bias")
+            if bias is not None:
+                bias = _concat_interleave_bias(bias)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)

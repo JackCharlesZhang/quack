@@ -110,7 +110,7 @@ class _LinearGatedUntunedOps:
 
 
 class _LinearGatedConcatOps(_LinearGatedOps):
-    matmul_fwd_fn = partial(gemm_gated, concat_layout=("B",))
+    matmul_fwd_fn = partial(gemm_gated, concat_layout=("B", "bias"))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
     matmul_bwd_dw_inplace = partial(
@@ -119,7 +119,7 @@ class _LinearGatedConcatOps(_LinearGatedOps):
 
 
 class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
-    matmul_fwd_fn = partial(gemm_gated, tuned=False, concat_layout=("B",))
+    matmul_fwd_fn = partial(gemm_gated, tuned=False, concat_layout=("B", "bias"))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
     matmul_bwd_dw_inplace = partial(
@@ -274,10 +274,11 @@ def linear_gated_func(
 
 class DActLinearFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, preact, weight, x, activation, fuse_grad_accum, ops):
+    def forward(ctx, preact, weight, x, activation, bias, fuse_grad_accum, ops):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
+        bias: (out_features,) or None
         out: (..., out_features)
         Takes in an extra preact argument which is the pre-activation, to be used in the backward pass.
         """
@@ -289,7 +290,7 @@ class DActLinearFunc(torch.autograd.Function):
             weight_og = weight
             batch_shape = x.shape[:-1]
             x = x.reshape(-1, x.shape[-1])
-            out = ops.matmul_fwd_fn(x, weight.T)
+            out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
             # Store preact instead of x, we will recompute x (postact) in backward.
             # dpreact needs gemm_dact(dout, weight, preact) → needs both weight and preact.
             # dweight needs postact: if dpreact is also needed, postact comes from gemm_dact;
@@ -300,6 +301,8 @@ class DActLinearFunc(torch.autograd.Function):
                 ctx, preact, weight, weight_og, needs_x_w_grad=(need_weight, need_preact)
             )
             ctx.activation = activation
+            ctx.bias_dtype = bias.dtype if bias is not None else None
+            ctx.compute_dbias = bias is not None and ctx.needs_input_grad[4]
             return out.reshape(*batch_shape, out.shape[-1])
 
     @staticmethod
@@ -313,6 +316,7 @@ class DActLinearFunc(torch.autograd.Function):
             preact, weight, weight_og = ctx.saved_tensors
             batch_shape = dout.shape[:-1]
             dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
+            dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
             if ctx.needs_input_grad[0]:
                 # Need dpreact: gemm_dact(dout, weight, preact) → (dpreact, postact)
                 preact = preact.reshape(-1, preact.shape[-1])
@@ -331,17 +335,17 @@ class DActLinearFunc(torch.autograd.Function):
             dweight = linear_bwd_compute_weight_grad(
                 ctx, dout, x, weight_og, ops.matmul_bwd_dw, ops.matmul_bwd_dw_inplace
             )
-            return dpreact, dweight, None, None, None, None
+            return dpreact, dweight, None, None, dbias, None, None
 
 
-def act_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
+def act_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
     ops = _DActLinearOps if tuned else _DActLinearUntunedOps
-    return DActLinearFunc.apply(preact, weight, x, activation, fuse_grad_accum, ops)
+    return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
-def gated_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
+def gated_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
     ops = _DGatedLinearOps if tuned else _DGatedLinearUntunedOps
-    return DActLinearFunc.apply(preact, weight, x, activation, fuse_grad_accum, ops)
+    return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
 class Linear(nn.Linear):

@@ -109,18 +109,23 @@ def test_gemm(m, k, n, input_dtype, A_major, B_major, out_major, swap_ab):
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("A_major", ["k", "m"])
 @pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("concat_tensor", ["A", "B", "out"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1504, 2048])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960])
 def test_gemm_concat_layout(
-    m, k, n, input_dtype, concat_tensor, batched, A_major, B_major, out_major, swap_ab
+    m, k, n, input_dtype, concat_tensor, bias_dtype, batched, A_major, B_major, out_major, swap_ab
 ):
     """Test concat_layout on each tensor with all major/stride combinations."""
+    if bias_dtype is not None and batched:
+        pytest.skip("batched + bias not supported")
     device = "cuda"
     torch.random.manual_seed(0)
     concat = (concat_tensor,)
+    if bias_dtype is not None and concat_tensor == "B":
+        concat = ("B", "bias")
     batch_shape = (3,) if batched else ()
     A = torch.randn((*batch_shape, m, k), device=device, dtype=input_dtype) / math.sqrt(k)
     if A_major == "m":
@@ -131,20 +136,21 @@ def test_gemm_concat_layout(
     out = torch.empty((*batch_shape, m, n), device=device, dtype=input_dtype)
     if out_major == "m":
         out = out.mT.contiguous().mT
+    bias = torch.randn(n, device=device, dtype=bias_dtype) if bias_dtype is not None else None
     config = replace(default_config(torch.device(device)), swap_ab=swap_ab)
-    gemm_tuned.fn(A, B, out, config=config, concat_layout=concat)
+    gemm_tuned.fn(A, B, out, config=config, bias=bias, concat_layout=concat)
     # For ref: gemm_ref always produces n-major output and interleaves rows for concat="out".
     # When the kernel's out is m-major, the kernel interleaves columns instead.
     # Match by creating the ref with matching out major.
     if concat_tensor == "out" and out_major == "m":
         # Kernel interleaves columns. Ref: compute flat, then interleave columns.
-        out_ref_flat = gemm_ref(A.float(), B.float())
+        out_ref_flat = gemm_ref(A.float(), B.float(), bias=bias)
         out_ref = torch.cat([out_ref_flat[..., ::2], out_ref_flat[..., 1::2]], dim=-1)
-        out_pt_flat = gemm_ref(A, B)
+        out_pt_flat = gemm_ref(A, B, bias=bias)
         out_pt = torch.cat([out_pt_flat[..., ::2], out_pt_flat[..., 1::2]], dim=-1)
     else:
-        out_ref = gemm_ref(A.float(), B.float(), concat_layout=concat)
-        out_pt = gemm_ref(A, B, concat_layout=concat)
+        out_ref = gemm_ref(A.float(), B.float(), bias=bias, concat_layout=concat)
+        out_pt = gemm_ref(A, B, bias=bias, concat_layout=concat)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
@@ -362,12 +368,12 @@ def test_gemm_add_inplace_alpha_beta(
 @pytest.mark.parametrize("store_preact", [True, False])
 @pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "reglu", "geglu", "glu"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("out_features", [1504, 2048])
 @pytest.mark.parametrize("in_features", [736, 4096])
 @pytest.mark.parametrize("is_concat_layout_B", [False, True])
 def test_gemm_gated(
-    in_features, out_features, has_bias, input_dtype, activation, store_preact, is_concat_layout_B
+    in_features, out_features, bias_dtype, input_dtype, activation, store_preact, is_concat_layout_B
 ):
     """Test GEMM with gated activation forward computation."""
     device = "cuda"
@@ -381,8 +387,18 @@ def test_gemm_gated(
         / math.sqrt(in_features)
     ).requires_grad_()
     B = w.T
-    concat = ("B",) if is_concat_layout_B else None
-    bias = torch.randn(2 * out_features, device=device) if has_bias else None
+    bias = (
+        torch.randn(2 * out_features, device=device, dtype=bias_dtype)
+        if bias_dtype is not None
+        else None
+    )
+    concat = (
+        ("B", "bias")
+        if is_concat_layout_B and bias_dtype is not None
+        else ("B",)
+        if is_concat_layout_B
+        else None
+    )
     preact, postact = gemm_gated(
         x,
         B,

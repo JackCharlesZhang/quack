@@ -12,6 +12,7 @@ from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.rounding import RoundingMode
+import quack.layout_utils as layout_utils
 import quack.utils as utils
 
 
@@ -39,6 +40,9 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
         d = self._epi_ops_to_params_dict(args)
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
     @cute.jit

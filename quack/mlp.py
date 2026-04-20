@@ -207,6 +207,8 @@ def mlp_func(
     weight1,
     weight2,
     activation: str,
+    bias1=None,
+    bias2=None,
     fuse_grad_accum=False,
     tuned=True,
     recompute=False,
@@ -229,6 +231,7 @@ def mlp_func(
         x,
         weight1,
         activation,
+        bias=bias1,
         store_preact=torch.is_grad_enabled(),
         fuse_grad_accum=fuse_grad_accum,
         tuned=tuned,
@@ -239,6 +242,7 @@ def mlp_func(
         weight2,
         postact,
         activation=activation,
+        bias=bias2,
         fuse_grad_accum=fuse_grad_accum,
         tuned=tuned,
     )
@@ -292,9 +296,10 @@ class MLP(nn.Module):
         self.concat_layout = concat_layout
 
     def forward(self, input: Tensor) -> Tensor:
+        # Allow bias in the fused path during inference (fwd-only, no bwd).
+        bias_ok = not torch.is_grad_enabled() or (self.fc1.bias is None and self.fc2.bias is None)
         if (
-            self.fc1.bias is None
-            and self.fc2.bias is None
+            bias_ok
             and input.is_cuda
             and input.stride(-1) == 1
             and self.fc1.in_features % 8 == 0
@@ -306,6 +311,8 @@ class MLP(nn.Module):
                 self.fc1.weight,
                 self.fc2.weight,
                 activation=self.activation,
+                bias1=self.fc1.bias,
+                bias2=self.fc2.bias,
                 fuse_grad_accum=self.fuse_grad_accum,
                 tuned=self.tuned,
                 recompute=self.recompute,
