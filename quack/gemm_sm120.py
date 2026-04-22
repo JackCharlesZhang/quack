@@ -47,6 +47,7 @@ class GemmSm120(GemmSm90):
         pingpong: bool = False,
         is_persistent: bool = True,
         gather_A: bool = False,
+        concat_layout: tuple | None = None,
         use_pdl: bool = True,
     ):
         # Don't call super().__init__ — we set up our own config
@@ -57,6 +58,7 @@ class GemmSm120(GemmSm90):
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
         self.gather_A = gather_A
+        self.concat_layout = concat_layout or ()
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         if gather_A:
