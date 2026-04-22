@@ -40,7 +40,8 @@ class RotaryVectorized:
         self.conjugate = conjugate
         self.num_threads = 128
         self.tile_h = 2 if self.dim <= 64 else 1
-        self.tile_d = (dim + 32 - 1) // 32 * 32
+        multiple = 32 if dim <= 32 else 64
+        self.tile_d = (dim + multiple - 1) // multiple * multiple
 
     @cute.jit
     def __call__(
@@ -63,14 +64,25 @@ class RotaryVectorized:
 
         self.is_varlen = const_expr(mCuSeqlens is not None)
 
+        # If not self.interleaved, we use cp.async for copying X from gmem -> smem, sync, then
+        # smem -> rmem with a different thread layout.
+        # If self.interleaved, then we directly copy X from gmem -> rmem, so the layout for X
+        # has to be compatible w the layout for cos/sin.
         vecsize = math.gcd(128 // mX.element_type.width, self.dim)
-        vecsize_cs = math.gcd(128 // mCos.element_type.width, self.dim // 2)
+        if const_expr(not self.interleaved):
+            vecsize_cs = math.gcd(128 // mCos.element_type.width, self.dim // 2)
+        else:
+            vecsize_cs = vecsize // 2
+            assert (128 // mCos.element_type.width) % vecsize_cs == 0
         vecs_per_row = self.tile_d // vecsize
         vecs_per_row_cs = self.tile_d // 2 // vecsize_cs
         threads_per_row = math.gcd(32, vecs_per_row)
         threads_per_row_cs = math.gcd(32, vecs_per_row_cs)
-        # Multiply so that all threads can fetch 1 cos and 1 sin.
-        multiple = max(mX.element_type.width * 2 // mCos.element_type.width, 1)
+        if const_expr(not self.interleaved):
+            # Multiply so that all threads can fetch 1 cos and 1 sin.
+            multiple = max(mX.element_type.width * 2 // mCos.element_type.width, 1)
+        else:
+            multiple = 1
         tiler_mn = (self.num_threads // threads_per_row * multiple, self.tile_d)
         tiled_copy = copy_utils.tiled_copy_2d(
             mX.element_type, threads_per_row, self.num_threads, vecsize
@@ -139,17 +151,13 @@ class RotaryVectorized:
         tiler_cossin = (tiler_mn[0], tiler_mn[1] // 2)
 
         smem = cutlass.utils.SmemAllocator()
-        sX = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mnh, order=(1, 0, 2)),
-            byte_alignment=16,
-        )
-        # 2 stages, one for cos and one for sin
-        sCosSin = smem.allocate_tensor(
-            mCos.element_type,
-            cute.make_ordered_layout(cute.append(tiler_cossin, 2), order=(1, 0, 2)),
-            byte_alignment=16,
-        )
+        sX = None
+        if const_expr(not self.interleaved):
+            sX = smem.allocate_tensor(
+                mX.element_type,
+                cute.make_ordered_layout(tiler_mnh, order=(1, 0, 2)),
+                byte_alignment=16,
+            )
 
         offset = seqlen_offsets
         if const_expr(mSeqlenOffsets is not None):
@@ -188,11 +196,13 @@ class RotaryVectorized:
         tScCosSin_full = thr_copy_cs.partition_S(cCosSin)
         tXcX = tXcX_full[(0, None), None, None]
         tXgX = thr_copy.partition_S(gX)
-        tXsX = thr_copy.partition_D(sX)
+        tXsX = thr_copy.partition_D(sX) if const_expr(sX is not None) else None
         tXgO = thr_copy.partition_D(gO)
         tCSgCos = thr_copy_cs.partition_S(gCos)
         tCSgSin = thr_copy_cs.partition_S(gSin)
-        tCSsCosSin = thr_copy_cs.partition_D(sCosSin)
+        tCSrCos = cute.make_rmem_tensor_like(tCSgCos)
+        tCSrSin = cute.make_rmem_tensor_like(tCSgSin)
+        tXrX_g2r = cute.make_rmem_tensor_like(tXgX)
 
         is_even_dim = const_expr(tiler_mn[1] == self.dim)
         pred, pred_cs = None, None
@@ -209,27 +219,28 @@ class RotaryVectorized:
             if const_expr(mSeqlenOffsets is not None):
                 sincos_is_valid = sincos_is_valid and row_cs + offset < mCos.shape[0]
             if sincos_is_valid:
-                copy_cs(tCSgCos[None, m, None], tCSsCosSin[None, m, None, 0], is_async=True)
-                copy_cs(tCSgSin[None, m, None], tCSsCosSin[None, m, None, 1], is_async=True)
-        cute.arch.cp_async_commit_group()
+                copy_cs(tCSgCos[None, m, None], tCSrCos[None, m, None])
+                copy_cs(tCSgSin[None, m, None], tCSrSin[None, m, None])
 
         for h in cutlass.range_constexpr(self.tile_h):
             if self.tile_h == 1 or h < nheads - head_idx * self.tile_h:
                 for m in cutlass.range(cute.size(tXgX, mode=[1]), unroll_full=True):
                     if tXcX[0, m, 0][0] < seq_len:
-                        copy(tXgX[None, m, None, h], tXsX[None, m, None, h], is_async=True)
-            cute.arch.cp_async_commit_group()
+                        if const_expr(not self.interleaved):
+                            copy(tXgX[None, m, None, h], tXsX[None, m, None, h], is_async=True)
+                        else:
+                            copy(tXgX[None, m, None, h], tXrX_g2r[None, m, None, h])
+            if const_expr(not self.interleaved):
+                cute.arch.cp_async_commit_group()
 
-        cute.arch.cp_async_wait_group(self.tile_h)
-        # Don't need cute.arch.sync_threads() since each thread is reading that it loaded
-        tCSrCosSin = copy_utils.load_s2r(tCSsCosSin)
-        cos_vals = tCSrCosSin[None, None, None, 0].load().to(Float32)
-        sin_vals = tCSrCosSin[None, None, None, 1].load().to(Float32)
+        cos_vals = tCSrCos.load().to(Float32)
+        sin_vals = tCSrSin.load().to(Float32)
         if const_expr(self.conjugate):
             sin_vals = -sin_vals
-        rCosSin_f32 = cute.make_rmem_tensor(tCSrCosSin.shape, Float32)
-        rCosSin_f32[None, None, None, 0].store(cos_vals)
-        rCosSin_f32[None, None, None, 1].store(sin_vals)
+        rCos = cute.make_rmem_tensor(tCSrCos.shape, Float32)
+        rCos.store(cos_vals)
+        rSin = cute.make_rmem_tensor(tCSrSin.shape, Float32)
+        rSin.store(sin_vals)
         if const_expr(not self.interleaved):
             sX0 = cute.composition(sX, (tiler_mn[0], tiler_mn[1] // 2, self.tile_h))
             sX1 = cute.domain_offset((None, self.dim // 2, None), sX0)
@@ -251,34 +262,23 @@ class RotaryVectorized:
                         if pred_cs[0, 0, k]:  # Need predication to avoid overwriting tCsX1
                             cute.autovec_copy(tCrX0[None, None, k], tCsX0[None, None, k, h])
                 cute.autovec_copy(tCrX1, tCsX1[None, None, None, h])
+            cute.arch.sync_threads()
         else:
-            # Recast to another type that's 2x wider, partition, then recast back, to have
-            # the same layout as tCSsCosSin.
-            dtype_x2 = Int32.recast_width(sX.element_type.width * 2)
-            tCsX = cute.recast_tensor(
-                thr_copy_cs.partition_D(cute.recast_tensor(sX, dtype_x2)), sX.element_type
-            )
-            rCos = rCosSin_f32[None, None, None, 0]
-            rSin = rCosSin_f32[None, None, None, 1]
             for h in cutlass.range_constexpr(self.tile_h):
-                cute.arch.cp_async_wait_group(self.tile_h - h - 1)
-                cute.arch.sync_threads()
-                tCrX = cute.make_rmem_tensor_like(tCsX[None, None, None, h])
-                # This could have size 16, and autovec_copy would result in LDS.U16
-                copy_utils.copy(tCsX[None, None, None, h], tCrX)
-                tCrX_f32 = cute.make_rmem_tensor(tCrX.shape, Float32)
-                tCrX_f32.store(tCrX.load().to(Float32))
-                assert cute.size(tCrX.shape) == cute.size(tCSrCosSin)
-                for i in cutlass.range(cute.size(tCrX.shape) // 2, unroll_full=True):
+                tCrX_f32 = cute.make_rmem_tensor(tXrX_g2r[None, None, None, 0].shape, Float32)
+                tCrX_f32.store(tXrX_g2r[None, None, None, h].load().to(Float32))
+                assert cute.size(tCrX_f32.shape) == cute.size(rCos) * 2
+                for i in cutlass.range(cute.size(tCrX_f32.shape) // 2, unroll_full=True):
                     x0, x1 = tCrX_f32[2 * i], tCrX_f32[2 * i + 1]
                     tCrX_f32[2 * i] = x0 * rCos[i] - x1 * rSin[i]
                     tCrX_f32[2 * i + 1] = x0 * rSin[i] + x1 * rCos[i]
-                tCrX.store(tCrX_f32.load().to(sX.element_type))
-                cute.autovec_copy(tCrX, tCsX[None, None, None, h])
+                tXrX_g2r[None, None, None, h].store(tCrX_f32.load().to(tXrX_g2r.element_type))
 
-        cute.arch.sync_threads()
         for h in cutlass.range_constexpr(self.tile_h):
-            tXrX = copy_utils.load_s2r(tXsX[None, None, None, h])
+            if const_expr(not self.interleaved):
+                tXrX = copy_utils.load_s2r(tXsX[None, None, None, h])
+            else:
+                tXrX = tXrX_g2r[None, None, None, h]
             if self.tile_h == 1 or h < nheads - head_idx * self.tile_h:
                 for m in cutlass.range(cute.size(tXgO, mode=[1]), unroll_full=True):
                     if tXcX[0, m, 0][0] < seq_len:

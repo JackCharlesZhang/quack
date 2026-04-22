@@ -433,6 +433,7 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
         interleaved=interleaved,
         num_heads_q=None if not gqa else nheads,
     )
+    assert out.data_ptr() == qkv.data_ptr()
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
     if not gqa:
         q_pt, k_pt, v_pt = qkv_pt.unbind(2)
@@ -509,6 +510,7 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
             interleaved=False,
             num_heads_q=None if not gqa else nheads,
         )
+        assert out.data_ptr() == qkv.data_ptr()
         cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
         if not gqa:
             q_pt, k_pt, v_pt = qkv_pt.unbind(2)
