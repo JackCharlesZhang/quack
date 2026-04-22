@@ -7,7 +7,7 @@ runs:
     - name: Compile and run tests
       shell: bash
       run: |
-        apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
+        apptainer exec --nv --writable-tmpfs ~/attention_26.03.26.sif bash -c "
           export PYTHONPATH=\$PWD:\$PYTHONPATH &&
           export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
           pytest tests/ --compile-only -n 24 &&
