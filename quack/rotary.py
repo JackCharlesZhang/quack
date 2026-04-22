@@ -39,8 +39,8 @@ class RotaryVectorized:
         self.interleaved = interleaved
         self.conjugate = conjugate
         self.num_threads = 128
-        self.tile_h = 2 if self.dim <= 64 else 1
-        multiple = 32 if dim <= 32 else 64
+        self.tile_h = 2 if self.dim <= 96 else 1
+        multiple = 32 if dim <= 128 else 64
         self.tile_d = (dim + multiple - 1) // multiple * multiple
 
     @cute.jit
