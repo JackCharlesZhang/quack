@@ -15,6 +15,12 @@ from quack.rmsnorm import layernorm_fwd, layernorm_ref, layernorm_rstd_ref, laye
 def test_layernorm_forward(M, N, input_dtype, eps):
     """Test LayerNorm forward pass against reference implementation."""
     device = "cuda"
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        # SM12x 99 KB SMEM: fwd holds input tile in smem; fp32 exceeds when N/cluster_n > ~25K
+        smem_n_limit = 131072 if input_dtype == torch.float32 else 262144
+        if N > smem_n_limit:
+            pytest.skip("SM12x: exceeds 99 KB SMEM")
 
     # tolerance depends on precision
     if input_dtype == torch.bfloat16:
