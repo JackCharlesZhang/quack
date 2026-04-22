@@ -28,23 +28,21 @@ def generate_cos_sin(seqlen, rotary_dim, device, dtype):
 
 
 def generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device):
-    if seqlen_offsets_type == 0:
-        return 0
-    if seqlen_offsets_type is int:
-        return torch.randint(0, seqlen + 1, (1,)).item()
+    if seqlen_offsets_type is None:
+        return None
     if seqlen_offsets_type is torch.Tensor:
         return torch.randint(0, seqlen + 1, (batch_size,), dtype=torch.int32, device=device)
     raise ValueError(f"Unsupported seqlen_offsets_type: {seqlen_offsets_type}")
 
 
 def index_cos_sin(cos, sin, seqlen_offsets, seqlen):
+    if seqlen_offsets is None:
+        return cos[:seqlen], sin[:seqlen]
     if isinstance(seqlen_offsets, torch.Tensor):
         arange = torch.arange(seqlen, device=cos.device).view(1, seqlen)
         idx = seqlen_offsets.view(-1, 1) + arange
         return cos[idx], sin[idx]
-    return cos[seqlen_offsets : seqlen_offsets + seqlen], sin[
-        seqlen_offsets : seqlen_offsets + seqlen
-    ]
+    raise TypeError("seqlen_offsets must be None or a tensor")
 
 
 def rotate_half(x, interleaved=False):
@@ -96,9 +94,33 @@ def pad_input(x_unpad, indices, batch, seqlen):
     return out.reshape(batch, seqlen, *x_unpad.shape[1:])
 
 
+def cuda_event_names(prof):
+    return [
+        event.name
+        for event in prof.events()
+        if str(getattr(event, "device_type", "")).endswith("CUDA")
+    ]
+
+
+def assert_one_cuda_kernel_no_memcpy(prof):
+    names = cuda_event_names(prof)
+    kernels = [name for name in names if not name.startswith("Memcpy")]
+    memcpys = [name for name in names if name.startswith("Memcpy")]
+    assert len(kernels) == 1, names
+    assert memcpys == [], names
+
+
+def assert_packed_qkv_reshape_is_view(qkv):
+    batch_size, seqlen, three, nheads, headdim = qkv.shape
+    assert three == 3
+    qk = qkv[:, :, :2].reshape(batch_size, seqlen, 2 * nheads, headdim)
+    assert qk.untyped_storage().data_ptr() == qkv.untyped_storage().data_ptr()
+    assert qk.storage_offset() == qkv.storage_offset()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
-# @pytest.mark.parametrize("seqlen_offsets_type", [0])
+@pytest.mark.parametrize("seqlen_offsets_type", [None, torch.Tensor])
+# @pytest.mark.parametrize("seqlen_offsets_type", [None])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 # @pytest.mark.parametrize("rotary_fraction", [1.0])
 @pytest.mark.parametrize("interleaved", [False, True])
@@ -129,8 +151,9 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -144,7 +167,11 @@ def test_rotary_emb_compile():
     )
     x_pt = x.detach().clone().requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
-    seqlen_offsets = torch.randint(0, seqlen + 1, (batch_size,), dtype=torch.int32, device=device)
+    seqlen_offsets_storage = torch.randint(
+        0, seqlen + 1, (batch_size * 2,), dtype=torch.int32, device=device
+    )
+    seqlen_offsets = seqlen_offsets_storage[::2]
+    assert seqlen_offsets.stride(0) != 1
 
     fn = torch.compile(apply_rotary_emb, fullgraph=True)
     out = fn(x, cos, sin, interleaved=True, seqlen_offsets=seqlen_offsets)
@@ -155,9 +182,57 @@ def test_rotary_emb_compile():
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rotary_emb_inplace_backward_no_copy(use_compile):
+    torch._dynamo.reset()
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim, rotary_dim = 4, 64, 4, 128, 64
+    fn = torch.compile(apply_rotary_emb, fullgraph=True) if use_compile else apply_rotary_emb
+
+    def make_case():
+        x = torch.randn(
+            batch_size, seqlen, nheads, headdim, dtype=dtype, device=device, requires_grad=True
+        )
+        x_pt = x.detach().clone().requires_grad_()
+        cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+        return x, x_pt, cos, sin
+
+    def reference(x_pt, cos, sin):
+        cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
+        return apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
+
+    # Warm both the CuTe JIT and the torch.compile forward/backward graphs.
+    x, _, cos, sin = make_case()
+    out = fn(x, cos, sin, inplace=True)
+    torch.autograd.grad(out, x, torch.randn_like(out))
+    torch.cuda.synchronize()
+
+    x, x_pt, cos, sin = make_case()
+    out = fn(x, cos, sin, inplace=True)
+    out_pt = reference(x_pt, cos, sin)
+    assert out.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
+
+    grad = torch.randn_like(out)
+    grad_pt = grad.clone()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        (dx,) = torch.autograd.grad(out, x, grad)
+        torch.cuda.synchronize()
+    assert_one_cuda_kernel_no_memcpy(prof)
+    assert dx.data_ptr() == grad.data_ptr()
+    out_pt.backward(grad_pt)
+    torch.testing.assert_close(dx, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -180,13 +255,14 @@ def test_rotary_emb_vector_width_selection(headdim, rotary_dim, x_offset, dtype)
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
 
     out = apply_rotary_emb(x, cos, sin)
-    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -212,7 +288,7 @@ def test_rotary_emb_dim_dtype_grid(
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, cossin_dtype)
 
     out = apply_rotary(x, cos, sin, interleaved=interleaved, conjugate=conjugate)
-    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     if conjugate:
         sin_pt = -sin_pt
     out_pt = apply_rotary_emb_torch(
@@ -264,7 +340,7 @@ def test_rotary_emb_strided_x_qkv_view(interleaved, inplace, dtype):
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
 
     out = apply_rotary_emb(x, cos, sin, interleaved=interleaved, inplace=inplace)
-    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(
         x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
     ).to(dtype=dtype)
@@ -277,8 +353,9 @@ def test_rotary_emb_strided_x_qkv_view(interleaved, inplace, dtype):
     else:
         assert torch.equal(qkv, qkv_pt)
         grad = torch.randn_like(out)
+        grad_pt = grad.clone()
         out.backward(grad)
-        out_pt.backward(grad.clone())
+        out_pt.backward(grad_pt)
         torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -301,15 +378,16 @@ def test_rotary_emb_strided_cos_sin(interleaved, dtype):
     assert sin.stride(-1) == 1
 
     out = apply_rotary_emb(x, cos, sin, interleaved=interleaved)
-    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(
         x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
     ).to(dtype=dtype)
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -325,18 +403,19 @@ def test_rotary_emb_odd_nheads_block_h(dtype):
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
 
     out = apply_rotary_emb(x, cos, sin)
-    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("seqlen_offsets_type", [0, torch.Tensor])
+@pytest.mark.parametrize("seqlen_offsets_type", [None, torch.Tensor])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
@@ -377,8 +456,9 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     x_grad = pad_input(x_unpad.grad, indices, batch_size, seqlen)
     torch.testing.assert_close(x_grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
@@ -386,7 +466,7 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("gqa", [False, True])
-@pytest.mark.parametrize("seqlen_offsets_type", [0, torch.Tensor])
+@pytest.mark.parametrize("seqlen_offsets_type", [None, torch.Tensor])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, use_compile, dtype):
@@ -433,7 +513,7 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
         interleaved=interleaved,
         num_heads_q=None if not gqa else nheads,
     )
-    # assert out.data_ptr() == qkv.data_ptr()  # TODO: reenable
+    assert out.data_ptr() == qkv.data_ptr()
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
     if not gqa:
         q_pt, k_pt, v_pt = qkv_pt.unbind(2)
@@ -457,8 +537,9 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
 
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     grad = torch.randn_like(out)
+    grad_pt = grad.clone()
     out.backward(grad)
-    out_pt.backward(grad.clone())
+    out_pt.backward(grad_pt)
     torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -506,12 +587,12 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
             qkv,
             cos,
             sin,
-            seqlen_offsets=0,
+            seqlen_offsets=None,
             interleaved=False,
             num_heads_q=None if not gqa else nheads,
         )
-        # assert out.data_ptr() == qkv.data_ptr()  # TODO: reenable
-        cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+        assert out.data_ptr() == qkv.data_ptr()
+        cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
         if not gqa:
             q_pt, k_pt, v_pt = qkv_pt.unbind(2)
             q_pt = apply_rotary_emb_torch(q_pt.float(), cos_pt.float(), sin_pt.float()).to(
@@ -534,16 +615,147 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
 
         torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
         grad = torch.randn_like(out)
+        grad_pt = grad.clone()
         out.backward(grad)
-        out_pt.backward(grad.clone())
+        out_pt.backward(grad_pt)
         torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
     run_case(gqa=False)
     run_case(gqa=True)
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
+    torch._dynamo.reset()
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, nheads, seqlen, headdim, rotary_dim = 4, 4, 64, 128, 128
+    fn = (
+        torch.compile(apply_rotary_emb_qkv_, fullgraph=True)
+        if use_compile
+        else apply_rotary_emb_qkv_
+    )
+
+    def make_case():
+        qkv = torch.randn(
+            batch_size,
+            seqlen,
+            3,
+            nheads,
+            headdim,
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+        qkv_pt = qkv.detach().clone().requires_grad_()
+        cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+        return qkv, qkv_pt, cos, sin
+
+    def reference(qkv_pt, cos, sin):
+        q_pt, k_pt, v_pt = qkv_pt.unbind(2)
+        cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
+        q_pt = apply_rotary_emb_torch(q_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
+        k_pt = apply_rotary_emb_torch(k_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
+        return torch.stack([q_pt, k_pt, v_pt], dim=2)
+
+    # Warm both the CuTe JIT and the torch.compile forward/backward graphs.
+    qkv, _, cos, sin = make_case()
+    out = fn(qkv, cos, sin, seqlen_offsets=None, interleaved=False)
+    torch.autograd.grad(out, qkv, torch.randn_like(out))
+    torch.cuda.synchronize()
+
+    qkv, qkv_pt, cos, sin = make_case()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        out = fn(qkv, cos, sin, seqlen_offsets=None, interleaved=False)
+        torch.cuda.synchronize()
+    assert_one_cuda_kernel_no_memcpy(prof)
+    assert out.data_ptr() == qkv.data_ptr()
+    torch.testing.assert_close(out, reference(qkv_pt, cos, sin), atol=1e-2, rtol=1e-3)
+
+    qkv, qkv_pt, cos, sin = make_case()
+    out = fn(qkv, cos, sin, seqlen_offsets=None, interleaved=False)
+    out_pt = reference(qkv_pt, cos, sin)
+    grad = torch.randn_like(out)
+    grad_pt = grad.clone()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        (dqkv,) = torch.autograd.grad(out, qkv, grad)
+        torch.cuda.synchronize()
+    assert_one_cuda_kernel_no_memcpy(prof)
+    assert dqkv.data_ptr() == grad.data_ptr()
+    out_pt.backward(grad_pt)
+    torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rotary_emb_qkv_packed_reshape_backward_no_copy(use_compile):
+    torch._dynamo.reset()
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, nheads, seqlen, headdim, rotary_dim = 4, 4, 64, 128, 128
+    fn = (
+        torch.compile(apply_rotary_emb_qkv_, fullgraph=True)
+        if use_compile
+        else apply_rotary_emb_qkv_
+    )
+
+    def make_case():
+        qkv = torch.randn(
+            batch_size,
+            seqlen,
+            3,
+            nheads,
+            headdim,
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+        qkv_pt = qkv.detach().clone().requires_grad_()
+        cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+        return qkv, qkv_pt, cos, sin
+
+    def reference(qkv_pt, cos, sin):
+        q_pt, k_pt, v_pt = qkv_pt.unbind(2)
+        cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
+        q_pt = apply_rotary_emb_torch(q_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
+        k_pt = apply_rotary_emb_torch(k_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
+        return torch.stack([q_pt, k_pt, v_pt], dim=2)
+
+    # This is the exact packed-QKV reshape used by rotary.py.
+    # It must stay a view; otherwise backward would need an extra copy.
+    qkv, _, cos, sin = make_case()
+    assert_packed_qkv_reshape_is_view(qkv)
+
+    # Warm both the CuTe JIT and the torch.compile forward/backward graphs.
+    out = fn(qkv, cos, sin, seqlen_offsets=None, interleaved=False)
+    torch.autograd.grad(out, qkv, torch.randn_like(out))
+    torch.cuda.synchronize()
+
+    qkv, qkv_pt, cos, sin = make_case()
+    out = fn(qkv, cos, sin, seqlen_offsets=None, interleaved=False)
+    out_pt = reference(qkv_pt, cos, sin)
+    grad = torch.randn_like(out)
+    grad_pt = grad.clone()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        (dqkv,) = torch.autograd.grad(out, qkv, grad)
+        torch.cuda.synchronize()
+    assert_one_cuda_kernel_no_memcpy(prof)
+    assert dqkv.data_ptr() == grad.data_ptr()
+    out_pt.backward(grad_pt)
+    torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
+@pytest.mark.parametrize("seqlen_offsets_type", [None, torch.Tensor])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_rotary_emb_kv(interleaved, rotary_fraction, seqlen_offsets_type, dtype):
