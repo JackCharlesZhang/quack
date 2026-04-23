@@ -20,9 +20,21 @@ from quack.rms_final_reduce import rms_final_reduce
 from quack.rounding import RoundingMode
 
 
+def _silu_tanh(x: Tensor) -> Tensor:
+    x_half = 0.5 * x
+    return x_half * torch.tanh(x_half) + x_half
+
+
+def _swiglu_oai_tanh(gate: Tensor, up: Tensor, alpha: float = 1.702) -> Tensor:
+    gate_half = 0.5 * gate
+    return (gate_half * torch.tanh(alpha * gate_half) + gate_half) * (up + 1)
+
+
 # Dictionary mapping activation names to PyTorch functions
 act_to_pytorch_fn_map = {
     None: lambda x: x,
+    "silu": F.silu,
+    "silu-tanh": _silu_tanh,
     "relu": F.relu,
     "relu_sq": lambda x: F.relu(x).square(),
     "gelu_tanh_approx": partial(F.gelu, approximate="tanh"),
@@ -33,22 +45,36 @@ act_to_pytorch_fn_map = {
 # Each function takes (gate, up) and returns postact
 gated_to_pytorch_fn_map = {
     "swiglu": lambda gate, up: F.silu(gate) * up,
+    "swiglu-tanh": lambda gate, up: _silu_tanh(gate) * up,
     "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.702 * gate) * (up + 1),
+    "swiglu_oai-tanh": _swiglu_oai_tanh,
     "reglu": lambda gate, up: F.relu(gate) * up,
     "geglu": lambda gate, up: F.gelu(gate, approximate="tanh") * up,
     "glu": lambda gate, up: torch.sigmoid(gate) * up,
 }
 
 
-ActActivation = Literal[None, "relu", "relu_sq", "gelu_tanh_approx"]
-GatedActivation = Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"]
+ActActivation = Literal[None, "silu", "silu-tanh", "relu", "relu_sq", "gelu_tanh_approx"]
+GatedActivation = Literal[
+    "swiglu",
+    "swiglu-tanh",
+    "swiglu_oai",
+    "swiglu_oai-tanh",
+    "reglu",
+    "geglu",
+    "glu",
+]
 Activation = Literal[
     None,
+    "silu",
+    "silu-tanh",
     "relu",
     "relu_sq",
     "gelu_tanh_approx",
     "swiglu",
+    "swiglu-tanh",
     "swiglu_oai",
+    "swiglu_oai-tanh",
     "reglu",
     "geglu",
     "glu",
@@ -2151,13 +2177,12 @@ def gemm_norm_act_ref(
     if rstd is not None:
         D = D * rstd.unsqueeze(-1)
     preact = D.to(out_dtype) if store_preact else None
-    _act_map = {**act_to_pytorch_fn_map, "silu": F.silu}
     if is_gated:
         gate = D[..., ::2]
         up = D[..., 1::2]
         postact = gated_to_pytorch_fn_map[activation](gate, up).to(postact_dtype)
     else:
-        postact = _act_map[activation](D).to(postact_dtype)
+        postact = act_to_pytorch_fn_map[activation](D).to(postact_dtype)
     return preact, postact
 
 

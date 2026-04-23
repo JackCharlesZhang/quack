@@ -26,10 +26,14 @@ from quack.gemm_interface import (
 
 Activation = Literal[
     "gelu_tanh_approx",
+    "silu",
+    "silu-tanh",
     "relu",
     "relu_sq",
     "swiglu",
+    "swiglu-tanh",
     "swiglu_oai",
+    "swiglu_oai-tanh",
     "reglu",
     "geglu",
     "glu",
