@@ -88,6 +88,7 @@ class _LinearUntunedOps(_LinearOps):
     matmul_fwd_fn = partial(gemm, tuned=False)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
 
 
 class _LinearActOps(_LinearOps):
