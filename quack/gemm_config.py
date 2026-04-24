@@ -14,6 +14,7 @@ class GemmConfig:
     is_dynamic_persistent: bool = True
     cluster_m: int = 2
     cluster_n: int = 1
+    cluster_k: int = 1
     swap_ab: bool = False
     # raster_order: int = 1
     max_swizzle_size: int = 8

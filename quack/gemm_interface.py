@@ -260,6 +260,7 @@ def gemm_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        config.cluster_k,
         config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,

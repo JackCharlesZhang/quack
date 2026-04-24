@@ -149,6 +149,7 @@ def gemm(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    cluster_K: int = 1,
     pingpong: bool = False,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -220,7 +221,7 @@ def gemm(
         d_major,
         c_major,
         (tile_M, tile_N),
-        (cluster_M, cluster_N, 1),
+        (cluster_M, cluster_N, cluster_K),
         pingpong,
         persistent,
         is_dynamic_persistent,
@@ -255,7 +256,9 @@ def gemm(
         else:
             return scalar.data_ptr()
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = (
+        get_max_active_clusters(cluster_M * cluster_N * cluster_K) if persistent else 0
+    )
 
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
         alpha=scalar_arg(alpha, alpha_mode),
