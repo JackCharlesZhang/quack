@@ -1253,19 +1253,19 @@ class GemmSm90:
 
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
+                epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    copy_C(src_idx=epi_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # The global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -1276,10 +1276,10 @@ class GemmSm90:
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
             if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if is_tma_warp:
                     epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    copy_C(src_idx=epi_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
@@ -1335,9 +1335,9 @@ class GemmSm90:
             # Copy from shared memory to global memory
             if is_tma_warp:
                 if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
                 if const_expr(postact_ctx is not None):
-                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
+                    copy_postact(src_idx=epi_buffer, dst_idx=epi_coord)
                 epi_store_pipeline.producer_commit()
 
         self.epi_end(
