@@ -164,8 +164,6 @@ def test_gemm_concat_layout(
 # @pytest.mark.parametrize("in_features", [4096])
 def test_linear_act(in_features, out_features, has_bias, input_dtype, activation, store_preact):
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 non-gated activation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 1920
     x = torch.randn((m, in_features), device=device, dtype=input_dtype)
@@ -198,8 +196,6 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
 def test_gemm_dact(n, k, input_dtype, activation):
     """Test GEMM with activation gradient computation."""
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 non-gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 960
     dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -791,8 +787,6 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
     D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
     """
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 GEMM sq reduce epilogue is not yet supported")
     torch.random.manual_seed(0)
     eps = 1e-6
     A = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -932,8 +926,6 @@ def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
       postact = gemm_norm_act(D, W1_fused, rstd=rstd, activation=act)
     """
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 GEMM sq reduce epilogue is not yet supported")
     torch.random.manual_seed(0)
     m, k, n = 1024, 4096, 2048
     eps = 1e-6
