@@ -475,9 +475,9 @@ class TileStore(EpiOp):
 
 @cute.jit
 def vec_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
-    """Multiply tRS_rD by colvec and/or rowvec in-place. Uses packed f32x2 on SM100+."""
+    """Multiply tRS_rD by colvec and/or rowvec in-place. Uses packed f32x2 on SM100."""
     if const_expr(tDrColVec is not None):
-        if const_expr(gemm.arch < 100):
+        if const_expr(gemm.arch != 100):
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] *= tDrColVec[i]
         else:
@@ -487,7 +487,7 @@ def vec_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
                     (tDrColVec[2 * i], tDrColVec[2 * i + 1]),
                 )
     if const_expr(tDrRowVec is not None):
-        if const_expr(gemm.arch < 100):
+        if const_expr(gemm.arch != 100):
             for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
                 tRS_rD[i] *= tDrRowVec[i]
         else:
@@ -503,13 +503,13 @@ def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
     """Accumulate transform_fn(input) or input * rScale into a ColVecReduce buffer.
 
     If transform_fn is provided, accumulates transform_fn(input[i]).
-    If rScale is provided, accumulates input[i] * rScale[i] (uses mul/fma for SM100).
+    If rScale is provided, accumulates input[i] * rScale[i] (uses packed mul/fma for SM100).
     If neither, accumulates input directly (identity).
     """
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
             transform_fn = lambda x: x
-        if const_expr(gemm.arch < 100):
+        if const_expr(gemm.arch != 100):
             for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
                 val = transform_fn(tRS_rInput[i])
                 tDrReduce[i] += val * rScale[i] if const_expr(rScale is not None) else val

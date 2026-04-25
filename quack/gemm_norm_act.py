@@ -74,7 +74,7 @@ class GemmNormActMixin(GemmActMixin):
         # Apply activation
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch < 100):
+            if const_expr(self.arch != 100):
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                     tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
             else:
@@ -129,7 +129,7 @@ class GemmNormGatedMixin(GemmGatedMixin):
         # Gated activation on normalized D
         tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
-        if const_expr(self.arch < 100):
+        if const_expr(self.arch != 100):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                 tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
         else:

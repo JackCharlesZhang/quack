@@ -60,7 +60,7 @@ class GemmDActMixin(GemmActMixin):
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch < 100):
+            if const_expr(self.arch != 100):
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                     tRS_rD[i], tRS_rPostAct[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
             else:
@@ -150,7 +150,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rOut = cute.make_rmem_tensor_like(tRS_rD, Float32)
         tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
         if const_expr(tDrColVec is not None):  # Scale D by colvec
-            if const_expr(self.arch < 100):
+            if const_expr(self.arch != 100):
                 tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
             else:
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
@@ -171,7 +171,7 @@ class GemmDGatedMixin(GemmActMixin):
                         )
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch < 100):
+        if const_expr(self.arch != 100):
             for i in cutlass.range(cute.size(tRS_rD)):
                 (
                     tRS_rdXY_f32x2[2 * i],
@@ -196,7 +196,7 @@ class GemmDGatedMixin(GemmActMixin):
             colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rOut, rScale=tRS_rD)
 
         if const_expr(tDrColVec is not None):  # Scale Out by colvec
-            if const_expr(self.arch < 100):
+            if const_expr(self.arch != 100):
                 tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
             else:
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
