@@ -137,6 +137,10 @@ class EpiOp:
         Returns dict of {param_name: value}. Like EVT's to_underlying_arguments."""
         return {}
 
+    def epi_m_major_score(self, arg_tensor, gemm):
+        """Preference for epilogue subtile order. Positive prefers M-major, negative N-major."""
+        return 0
+
     # --- Host-side: smem allocation ---
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
         """Bytes of smem needed per stage. arg_tensor is the EpilogueArguments field."""
@@ -263,6 +267,12 @@ class VecLoad(EpiOp):
     def needs_async_fence(self):
         return True
 
+    def epi_m_major_score(self, arg_tensor, gemm):
+        if arg_tensor is None:
+            return 0
+        # It costs more registers (say 4x) to keep rowvec in register vs keeping colvec in register
+        return 4 if self.dim == 1 else -1
+
     def _get_gmem_vec(self, param, ctx):
         """Get the global memory vector for this tile. Override for varlen."""
         return param[ctx.batch_idx, None]
@@ -270,6 +280,7 @@ class VecLoad(EpiOp):
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
         tDsV = None
+        tDrV_cvt = None
         if const_expr(param is not None):
             dtype = param.element_type
             num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
@@ -296,17 +307,27 @@ class VecLoad(EpiOp):
             )
             if const_expr(ctx.tiled_copy_t2r is not None):
                 tDsV = ctx.tiled_copy_r2s.retile(tDsV)
-        return tDsV
+            # Pre-allocate register tensor reused across begin_loop calls
+            tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
+            tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
+        return [tDsV, tDrV_cvt]
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        tDrV_cvt = None
-        if const_expr(state is not None):
-            tDsV_cur = cute.group_modes(state, 3, cute.rank(state))[None, None, None, epi_coord]
-            tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
-            cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
-            tDrV_cvt = cute.make_rmem_tensor_like(tDrV, gemm.acc_dtype)
-            tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
+        tDsV, tDrV_cvt = state[0], state[1]
+        if const_expr(tDsV is not None):
+            should_load = Boolean(True)
+            if const_expr(self.dim == 1):
+                if const_expr(gemm.epi_m_major):
+                    should_load = epi_coord[0] == 0
+            else:
+                if const_expr(not gemm.epi_m_major):
+                    should_load = epi_coord[1] == 0
+            if should_load:
+                tDsV_cur = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, epi_coord]
+                tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
+                cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
+                tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
         return tDrV_cvt
 
 
@@ -374,20 +395,6 @@ class ColVecLoad(VecLoad):
             tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
             tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
         return [tDsV, tDrV_cvt]
-
-    @cute.jit
-    def begin_loop(self, gemm, state, epi_coord):
-        tDsV, tDrV_cvt = state[0], state[1]
-        if const_expr(tDsV is not None):
-            # Col vector is constant across N subtiles — only copy on first N subtile.
-            # Assumes N-major epi subtile order: epi_tile_layout = ordered_layout(..., order=(1,0))
-            epi_n = epi_coord[1]
-            if epi_n == 0:
-                tDsV_cur = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, epi_coord]
-                tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
-                cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
-                tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
-        return tDrV_cvt
 
 
 class TileStore(EpiOp):

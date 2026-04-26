@@ -248,7 +248,7 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
             self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
-        if const_expr(self.arch == 90):
+        if const_expr(self.arch != 100):
             # Only need this if we're using STSM
             permute_gated_Cregs_b16(tRS_rPostAct_out)
         return tRS_rPostAct_out

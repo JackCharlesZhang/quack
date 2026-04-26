@@ -71,10 +71,7 @@ class GemmSm120(GemmSm90):
         # Pingpong: 2 warp groups each with (2,2,1) atom layout
         # Non-pingpong: 1 group of 8 warps with (4,2,1) atom layout
         self.mma_inst_mnk = (16, 8, 16)
-        if not self.pingpong:
-            self.atom_layout_mnk = (4, 2, 1)
-        else:
-            self.atom_layout_mnk = (2, 2, 1)
+        self.atom_layout_mnk = (4, 2, 1) if not self.pingpong else (2, 2, 1)
         # num_mma_warps = total warps doing MMA (both warp groups in pingpong)
         self.num_mma_warps = math.prod(self.atom_layout_mnk) * (1 if not self.pingpong else 2)
         # For compatibility with SM90 code that uses warp groups
@@ -115,6 +112,7 @@ class GemmSm120(GemmSm90):
 
         self.ab_stage = None
         self.epi_stage = None
+        self.epi_m_major = True
         self.a_smem_layout_staged = None
         self.b_smem_layout_staged = None
         self.epi_smem_layout_staged = None
@@ -474,7 +472,8 @@ class GemmSm120(GemmSm90):
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
-                tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s, tidx)
+                # (R2S, R2S_M, R2S_N, (epi_M, epi_N))
+                tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
                 load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
@@ -612,17 +611,28 @@ class GemmSm120(GemmSm90):
 
         return ab_read_state
 
-    def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s, tidx=None):
-        """Retile accumulator for epilogue. Warp-level MMA uses tiled_copy_r2s.retile."""
-        if tidx is None:
-            tidx = cute.arch.thread_idx()[0]
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-        self._epi_size_tRS_rD = cute.size(tRS_rD)
-        return thr_copy_r2s.retile(acc)
+    @staticmethod
+    def _compute_tile_shape_or_override(
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        atom_layout_mnk: Tuple[int, int, int],
+        element_type: Optional[Type[cutlass.Numeric]] = None,
+        epi_tile_override: Tuple[int, int] | None = None,
+    ) -> Tuple[int, int]:
+        """Compute the epilogue tile shape or use override if provided.
 
-    @cute.jit
-    def epi_load_acc_subtile(self, tRS_rAcc, tRS_rD, epi_idx):
-        """Load acc subtile using retile-based flat indexing (warp-level MMA layout)."""
-        size_rD = self._epi_size_tRS_rD
-        for i in cutlass.range_constexpr(size_rD):
-            tRS_rD[i] = tRS_rAcc[epi_idx * size_rD + i]
+        :param cta_tile_shape_mnk: CTA tile shape (M,N,K)
+        :type cta_tile_shape_mnk: Tuple[int, int, int]
+        :param element_type: Data type of elements
+        :type element_type: type[cutlass.Numeric]
+        :param epi_tile_override: Optional override for epilogue tile shape
+        :type epi_tile_override: Tuple[int, int] or None
+
+        :return: Computed epilogue tile shape
+        :rtype: Tuple[int, int]
+        """
+        if epi_tile_override is not None:
+            return epi_tile_override
+        n_perf = 64 if element_type is not None and element_type.width == 8 else 32
+        tile_m = math.gcd(64, cute.size(cta_tile_shape_mnk, mode=[0]))
+        tile_n = math.gcd(n_perf, cute.size(cta_tile_shape_mnk, mode=[1]))
+        return (tile_m, tile_n)

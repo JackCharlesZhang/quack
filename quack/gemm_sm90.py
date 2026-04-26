@@ -268,6 +268,7 @@ class GemmSm90:
 
         self.ab_stage = None
         self.epi_stage = None
+        self.epi_m_major = True
 
         self.a_smem_layout_staged = None
         self.b_smem_layout_staged = None
@@ -325,14 +326,16 @@ class GemmSm90:
         - Computing A/B/C shared memory layout
         """
         self._setup_tiled_mma()
+        self.epi_m_major = self.resolve_epi_m_major(epilogue_args)
 
         self.cluster_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
-        self.epi_tile = self._sm90_compute_tile_shape_or_override(
+        self.epi_tile = self._compute_tile_shape_or_override(
             self.cta_tile_shape_mnk,
             self.atom_layout_mnk,
             self.d_dtype,
         )
+        self.epi_tile_shape = cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile)
 
         # Compute stage before compute smem layout
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
@@ -824,7 +827,7 @@ class GemmSm90:
             k_tile_cnt_static = cute.ceil_div(
                 cute.size(mA_mkl, mode=[1]), self.cta_tile_shape_mnk[2]
             )
-            c_tile_cnt = cute.size(cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile))
+            c_tile_cnt = cute.size(self.epi_tile_shape)
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
             epi_store_pipeline = self.make_epi_store_pipeline()
@@ -897,7 +900,7 @@ class GemmSm90:
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
-                # (R2S, R2S_M, R2S_N, num_epi)
+                # (R2S, R2S_M, R2S_N, (epi_M, epi_N))
                 tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
                 load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
@@ -1234,8 +1237,10 @@ class GemmSm90:
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
+        if const_expr(self.epi_m_major):
+            epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
+        else:
+            epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
@@ -1264,7 +1269,7 @@ class GemmSm90:
             # The global memory coordinate for the current epi tile
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
-            load_acc_subtile(tRS_rD, epi_idx)
+            load_acc_subtile(tRS_rD, epi_coord)
             epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
@@ -1357,6 +1362,9 @@ class GemmSm90:
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
         return TileScheduler if not varlen_m else VarlenMTileScheduler
 
+    def resolve_epi_m_major(self, epilogue_args: EpilogueArguments):
+        return True
+
     def get_scheduler_arguments(
         self,
         mA: cute.Tensor,
@@ -1421,12 +1429,29 @@ class GemmSm90:
         return tile_sched_args
 
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
-        """Retile accumulator for epilogue subtile access. SM90 uses flat_divide."""
-        return cute.flat_divide(acc, tRS_rD.layout)
+        """Retile accumulator for epilogue subtile access."""
+        acc_reshaped = layout_utils.reshape_acc_to_frgA(acc)  # ((2, 2, 2), MMA_M, MMA_N)
+        # ((2, 2, 2), MMA_M / epi_M, MMA_N / epi_N)
+        epi_acc_shape = (
+            acc_reshaped.shape[0],
+            *cute.ceil_div(acc_reshaped.shape[1:], self.epi_tile_shape),
+        )
+        # ((2, 2, 2), MMA_M / epi_M, MMA_N / epi_N, (1, 1, 1), epi_M, epi_N)
+        acc_divide = cute.flat_divide(acc_reshaped, epi_acc_shape)
+        assert cute.size(acc_divide, mode=[3]) == 1
+        # ((2, 2, 2), MMA_M / epi_M, MMA_N / epi_N, (epi_M, epi_N))
+        tRS_rAcc = cute.group_modes(acc_divide[None, None, None, 0, None, None], 3, 5)
+        # (((2,2,2),1), MMA_M / epi_M, MMA_N / epi_N, (epi_M, epi_N))
+        return tiled_copy_r2s.retile(tRS_rAcc)
 
     @cute.jit
-    def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
-        cute.autovec_copy(tRS_rAcc[None, None, None, epi_idx], tRS_rD)
+    def epi_load_acc_subtile(
+        self,
+        tRS_rAcc: cute.Tensor,
+        tRS_rD: cute.Tensor,
+        epi_coord,  # int or (int, int)
+    ):
+        cute.autovec_copy(tRS_rAcc[None, None, None, epi_coord], tRS_rD)
 
     @cute.jit
     def epi_begin(
@@ -1741,7 +1766,7 @@ class GemmSm90:
         return ab_stage, epi_stage, epi_c_stage
 
     @staticmethod
-    def _sm90_compute_tile_shape_or_override(
+    def _compute_tile_shape_or_override(
         cta_tile_shape_mnk: Tuple[int, int, int],
         atom_layout_mnk: Tuple[int, int, int],
         element_type: Optional[Type[cutlass.Numeric]] = None,

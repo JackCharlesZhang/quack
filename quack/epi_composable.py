@@ -77,6 +77,12 @@ class ComposableEpiMixin:
             d.update(op.to_params(self, args))
         return d
 
+    def resolve_epi_m_major(self, args):
+        score = sum(
+            op.epi_m_major_score(getattr(args, op.name, None), self) for op in self._epi_ops
+        )
+        return score >= 0
+
     # --- Host-side: smem allocation (queried from ops) ---
 
     @classmethod

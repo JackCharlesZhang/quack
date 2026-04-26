@@ -201,6 +201,7 @@ class GemmSm100(GemmSm90):
         self.is_persistent = True
         self.pingpong = False  # for compatibility with GemmSm90
         self.use_clc_persistence = use_clc_persistence
+        self.epi_m_major = True
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
@@ -264,6 +265,8 @@ class GemmSm100(GemmSm90):
         - Computing A/B/C shared memory layout
         - Computing tensor memory allocation columns
         """
+        self.epi_m_major = self.resolve_epi_m_major(epilogue_args)
+
         # Compute mma instruction shapes
         mma_inst_bits_k = 256
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
@@ -1635,7 +1638,7 @@ class GemmSm100(GemmSm90):
                     acc_release_idx=self.iter_acc_early_release
                     if const_expr(self.overlap_accum_sf)
                     else epi_tile_num - 1,
-                    clear_acc=varlen_k and k_len == 0,
+                    clear_acc=(varlen_k and k_len == 0),
                 )
 
                 tctx.b("epilogue")
@@ -1957,7 +1960,7 @@ class GemmSm100(GemmSm90):
         tTR_tAcc: cute.Tensor,
         tTR_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
-        epi_idx: int,
+        epi_coord: [int, int],
         acc_pipeline: pipeline.PipelineAsync,
         acc_consumer_state: pipeline.PipelineState,
         acc_release_idx: int,
@@ -1965,12 +1968,13 @@ class GemmSm100(GemmSm90):
     ):
         if not clear_acc:
             # Load accumulator from tensor memory buffer to register
-            cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_idx], tTR_rAcc)
+            cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_coord], tTR_rAcc)
             tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
             tRS_rD.store(tRS_rAcc.load())
         else:
             tRS_rD.fill(0.0)
-        if epi_idx == acc_release_idx:
+        assert epi_coord[0] == 0  # For Sm100, we assume epi_M = 1
+        if epi_coord[1] == acc_release_idx:
             cute.arch.fence_view_async_tmem_load()
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(acc_consumer_state)
@@ -2682,10 +2686,6 @@ class GemmSm100(GemmSm90):
         if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler_mn, cluster_shape_mn, blockscaled=True
         ):
-            can_implement = False
-        # Multi-tile N iteration with an asymmetric SFB atom size needs the same
-        # kind of special-case layout rewriting as tile_n==192.
-        if mma_tiler_mn[1] == 224 and n > 224:
             can_implement = False
         if not GemmSm100.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major

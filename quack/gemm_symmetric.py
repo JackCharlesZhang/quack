@@ -108,7 +108,7 @@ class GemmSymmetricMixin(GemmActMixin):
             # The global memory coordinate for the current epi tile
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
-            load_acc_subtile(tRS_rD, epi_idx)
+            load_acc_subtile(tRS_rD, epi_coord)
             epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
