@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Int32, Int16, Boolean, const_expr
+from cutlass.base_dsl import Arch
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
@@ -373,12 +374,12 @@ def sm90_get_smem_load_op(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int],
     element_type: Type[cute.Numeric],
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
@@ -397,12 +398,12 @@ def get_smem_store_atom(
 
 
 def get_smem_load_atom(
-    arch: cutlass.Constexpr[int],
     element_type: Type[cute.Numeric],
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
@@ -424,13 +425,12 @@ def get_smem_store_C(
     tiled_mma: cute.TiledMma,
     sC: cute.Tensor,
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
     major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_store_atom(arch, dtype, transpose, major_mode_size=major_mode_size)
+    copy_atom = get_smem_store_atom(dtype, transpose, major_mode_size=major_mode_size)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
@@ -449,19 +449,18 @@ def get_smem_load_C(
     tiled_mma: cute.TiledMma,
     sC: cute.Tensor,
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_load_atom(arch, dtype, transpose)
+    copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
         tSR_sC = thr_copy.partition_S(sC)
     else:
         tSR_sC = partition_S_position_independent(thr_copy, sC)
-    copy_atom_RS = get_smem_store_atom(arch, dtype, transpose)
+    copy_atom_RS = get_smem_store_atom(dtype, transpose)
     thr_copy_RS = cute.make_tiled_copy_C(copy_atom_RS, tiled_mma).get_slice(tidx)
     tRS_shape = thr_copy_RS.partition_S(cute.make_identity_tensor(sC.shape[:2])).shape
 
@@ -475,10 +474,18 @@ def get_smem_load_C(
 def epilog_smem_copy_atom(
     tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False
 ) -> cute.TiledCopy:
-    copy_atom_C = cute.make_copy_atom(
-        warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
-        cutlass.Float16,  # this is just to get the right source layout
-    )
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90):
+        copy_atom_C = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float16,  # this is just to get the right source layout
+            num_bits_per_copy=(2 if not transpose else 1) * cutlass.Float16.width,
+        )
+    else:
+        copy_atom_C = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
+            cutlass.Float16,  # this is just to get the right source layout
+        )
     tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
     return tiled_copy_C_atom
 
@@ -488,13 +495,12 @@ def get_smem_store_epi(
     epi_tile: cute.Shape,
     sC: Optional[cute.Tensor],
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor, cute.Tensor]:
     dtype = sC.element_type if const_expr(sC is not None) else cutlass.Float16
+    copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy_C_atom = epilog_smem_copy_atom(tiled_mma, epi_tile)
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
     tiled_copy = cute.make_tiled_copy_S(copy_atom, tiled_copy_C_atom)
     thr_copy = tiled_copy.get_slice(tidx)
     tRS_sC = None
@@ -515,11 +521,11 @@ def get_smem_store_epi(
 
 
 def get_smem_store_A(
-    tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, arch: int, position_independent=False
+    tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, position_independent=False
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
     transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
@@ -537,13 +543,12 @@ def get_smem_load_A(
     tiled_mma: cute.TiledMma,
     sA: cute.Tensor,
     tidx: Int32,
-    arch: int,
     with_dst_tensor: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
     transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
-    copy_atom = get_smem_load_atom(arch, dtype, transpose)
+    copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
