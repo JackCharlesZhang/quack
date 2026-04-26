@@ -381,6 +381,8 @@ def test_gemm_gated(
 ):
     """Test GEMM with gated activation forward computation."""
     device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 12:
+        pytest.skip("SM120 gated GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 1920
     x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)

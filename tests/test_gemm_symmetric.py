@@ -8,13 +8,9 @@ from quack.gemm_interface import gemm_symmetric
 @pytest.mark.parametrize("L", [1, 3, 10])
 @pytest.mark.parametrize("M", [128, 512, 1024, 4096])
 @pytest.mark.parametrize("K", [128, 512, 2048])
-@pytest.mark.parametrize("has_C", [False, True])
+@pytest.mark.parametrize(("has_C", "beta"), [(False, 1.0), (True, 1.0), (True, 0.5)])
 @pytest.mark.parametrize("alpha", [1.0, 2.5])
-@pytest.mark.parametrize("beta", [1.0, 0.5])
 def test_symmetric_gemm(dtype, L, M, K, has_C, alpha, beta):
-    if not has_C and beta != 1.0:
-        pytest.skip("beta only relevant with C")
-
     device = "cuda"
     torch.manual_seed(42)
 
