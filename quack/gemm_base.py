@@ -417,6 +417,7 @@ class GemmBase:
         """Convert postact from acc_dtype to output dtype. Override for custom postprocessing."""
         return tRS_rPostAct
 
+
 class GemmTmaBase(GemmBase):
     """Common TMA descriptor and pipeline helpers for SM90+ GEMM paths."""
 
