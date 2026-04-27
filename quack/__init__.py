@@ -2,12 +2,16 @@ __version__ = "0.3.11"
 
 import os
 
-# NVIDIA/cutlass#3161: fix duplicate .text section flags in CuTeDSL-emitted .o
-# files before anything else imports / compiles. Must run before the first
-# cute.compile call; see quack.cute_dsl_elf_fix for details.
+# Two CuTeDSL workarounds, both must run before the first cute.compile call:
+#   - cutlass#3161: duplicate .text section flags break MCJIT in multi-process
+#     loads (see quack.cute_dsl_elf_fix).
+#   - cutlass#3062: ir.Context spawns LLVM thread pools that leak across
+#     compiles, eventually exhausting pthreads (see quack.cute_dsl_mlir_threading).
 import quack.cute_dsl_elf_fix
+import quack.cute_dsl_mlir_threading
 
 quack.cute_dsl_elf_fix.patch()
+quack.cute_dsl_mlir_threading.patch()
 
 from quack.rmsnorm import rmsnorm  # noqa: E402
 from quack.softmax import softmax  # noqa: E402
