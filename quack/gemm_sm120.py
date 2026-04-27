@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, Tri Dao.
+# Copyright (c) 2025-2026, QuACK team.
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py
 # SM120-style GEMM using warp-level MMA (MmaF16BF16Op) + ldmatrix.
@@ -314,8 +314,8 @@ class GemmSm120(GemmSm90):
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
-                        ab_producer_state = self.load_AB(
-                            ab_pipeline, ab_producer_state, copy_A, copy_B, k_tile_cnt
+                        ab_producer_state = self.load_tma(
+                            ab_pipeline, ab_producer_state, [copy_A, copy_B], k_tile_cnt
                         )
                     else:
                         ab_producer_state = self.load_AB_gather_A(

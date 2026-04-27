@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# Copyright (c) 2025-2026, QuACK team.
 
 from typing import Optional, Type, Tuple, Callable, Sequence
 from functools import partial
@@ -8,7 +8,7 @@ import cutlass.cute as cute
 
 from cutlass import Int32, Int16, Boolean, const_expr
 from cutlass.base_dsl import Arch
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, tcgen05, warp, warpgroup
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
@@ -72,6 +72,13 @@ def sr_cvt_copy(
 @dsl_user_op
 def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     dst = cute.make_rmem_tensor_like(src, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
+
+
+@dsl_user_op
+def contiguous(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    dst = cute.make_rmem_tensor(src.shape, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)
     return dst
 
@@ -805,6 +812,42 @@ def tma_get_copy_fn(
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
 
 
+def s2t_get_copy_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    cta_group: tcgen05.CtaGroup,
+) -> Callable:
+    """
+    Make tiledCopy for smem to tmem load, then return a copy function over stages.
+
+    :param src_tensor: The source tensor in smem
+    :param dst_tensor: The destination tensor in tmem
+    """
+    assert src_tensor.element_type == dst_tensor.element_type
+    # (MMA, MMA_MN, MMA_K, STAGE)
+    src_compact = cute.filter_zeros(src_tensor)
+    # (MMA, MMA_MN, MMA_K)
+    dst_compact = cute.filter_zeros(dst_tensor)
+    # Make S2T CopyAtom and tiledCopy.
+    copy_atom = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(cta_group), dst_tensor.element_type)
+    tiled_copy = tcgen05.make_s2t_copy(copy_atom, dst_compact)
+    thr_copy = tiled_copy.get_slice(0)
+    # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+    src_partition = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, thr_copy.partition_S(src_compact))
+    # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+    dst_partition = thr_copy.partition_D(dst_compact)
+
+    @dsl_user_op
+    def copy_s2t(stage_idx, *, loc=None, ip=None, **new_kwargs):
+        # Stage slice of partitioned source tensor: ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+        stage_coord = (None, None, None, None, stage_idx)
+        cute.copy(
+            tiled_copy, src_partition[stage_coord], dst_partition, loc=loc, ip=ip, **new_kwargs
+        )
+
+    return copy_s2t
+
+
 def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
     def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
         copy(
@@ -860,7 +903,7 @@ def gather_m_get_copy_fn(
 
     mA_k = cute.logical_divide(mA, (None, tile_K))
 
-    def copy_fn(src_idx, dst_idx, pred: bool = False):
+    def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)

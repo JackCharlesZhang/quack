@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, Tri Dao.
+# Copyright (c) 2025-2026, QuACK team.
 # GEMM compilation via TVM-FFI with fake tensors and NamedTuple args.
 
 from typing import Optional
@@ -214,6 +214,7 @@ def gemm(
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
+    tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -223,7 +224,7 @@ def gemm(
         b_major,
         d_major,
         c_major,
-        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
+        tile_shape_mnk,
         (cluster_M, cluster_N, cluster_K),
         pingpong,
         persistent,

@@ -79,25 +79,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
                 tRS_rD[i] += tDrColVec[i]
         return None
 
-    def epi_setup_postact(
-        self,
-        params,
-        epi_smem_tensors,
-        tiled_copy_r2s,
-        tiled_copy_t2r,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        """Returns None — default epilogue has no postact output."""
-        return None
 
-    @cute.jit
-    def epi_convert_postact(
-        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
-    ):
-        """Convert postact from acc_dtype to output dtype. Override for custom postprocessing."""
-        return tRS_rPostAct
 
 
 class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):
