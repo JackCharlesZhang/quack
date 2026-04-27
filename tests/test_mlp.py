@@ -6,13 +6,8 @@ import torch._dynamo
 
 from quack.mlp import MLP
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
-from quack.cute_dsl_utils import get_device_capacity
 
 torch._dynamo.config.cache_size_limit = 64
-
-
-def _is_sm120(device="cuda"):
-    return torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 12
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -23,8 +18,6 @@ def _is_sm120(device="cuda"):
 def test_mlp(in_features, hidden_features, dtype, activation, use_compile):
     device = "cuda"
     gated = activation in gated_to_pytorch_fn_map
-    if _is_sm120(device) and gated:
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     batch = 256
     mlp = MLP(
@@ -64,8 +57,6 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     """out.sum().backward() produces expanded gradient with zero strides."""
     device = "cuda"
     gated = activation in gated_to_pytorch_fn_map
-    if _is_sm120(device) and gated:
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     mlp = MLP(512, 512, activation=activation, device=device, dtype=dtype, tuned=False)
     w1_ref = mlp.fc1.weight.detach().clone().float()
@@ -95,8 +86,6 @@ def test_mlp_recompute(dtype, activation, use_compile):
     """recompute=True should match normal mode and float32 reference."""
     device = "cuda"
     gated = activation in gated_to_pytorch_fn_map
-    if _is_sm120(device) and gated:
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
     mlp = MLP(dim, hidden, activation=activation, device=device, dtype=dtype, tuned=False)
@@ -152,8 +141,6 @@ def test_mlp_recompute_partial_grad(dtype, activation, freeze):
     """
     device = "cuda"
     gated = activation in gated_to_pytorch_fn_map
-    if _is_sm120(device) and gated:
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
     mlp = MLP(
@@ -213,8 +200,6 @@ def test_mlp_recompute_partial_grad(dtype, activation, freeze):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mlp_concat_layout(dtype, activation, recompute, use_compile):
     device = "cuda"
-    if _is_sm120(device):
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
     mlp = MLP(
@@ -317,8 +302,6 @@ def test_mlp_concat_layout_bias_fwd(dtype, activation, has_bias1, has_bias2, bia
 def test_mlp_concat_layout_fuse_grad_accum(dtype, activation, recompute):
     """Test MLP concat layout with fused gradient accumulation (in-place dweight)."""
     device = "cuda"
-    if _is_sm120(device):
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
     mlp = MLP(

@@ -1,16 +1,16 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
 from __future__ import annotations
-from typing import NamedTuple, Tuple, Optional, Callable
-from functools import partial
+import math
+from typing import NamedTuple, Tuple, Optional, Callable, Type
 
 from torch import Tensor
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, const_expr
 from cutlass.cute.runtime import make_ptr
+from cutlass.cute.nvgpu import warp
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
@@ -38,6 +38,7 @@ from quack.gemm_tvm_ffi_utils import (
 )
 from quack.cache_utils import jit_cache
 import quack.layout_utils as layout_utils
+import quack.copy_utils as copy_utils
 from quack.layout_utils import permute_gated_Cregs_b16
 from quack.activation import act_fn_map, gate_fn_map
 from quack.rounding import RoundingMode, convert_f32_to_bf16_sr, epilogue_postact_sr_seed
@@ -76,6 +77,25 @@ class GemmActMixin(GemmDefaultEpiMixin):
     # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
     # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
+    def epi_make_postact_copy_atom_r2s(self, params, tiled_copy_t2r):
+        """Build the register-to-shared copy atom used by postact outputs."""
+        if self.arch == 100:
+            return sm100_utils.get_smem_store_op(
+                self.postact_layout, self.postact_dtype, self.acc_dtype, tiled_copy_t2r
+            )
+        else:
+            return copy_utils.get_smem_store_atom(
+                self.postact_dtype,
+                transpose=self.postact_layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
+                major_mode_size=cute.size(params.epi_tile_mPostAct, mode=[1])
+                // self.atom_layout_mnk[1],
+            )
+
+    def epi_make_postact_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        """Build the register-to-shared tiled copy used by postact outputs."""
+        copy_atom_postact_r2s = self.epi_make_postact_copy_atom_r2s(params, tiled_copy_t2r)
+        return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
+
     def epi_setup_postact(
         self,
         params,
@@ -88,15 +108,9 @@ class GemmActMixin(GemmDefaultEpiMixin):
     ):
         """Setup postact TMA copies and partitions before the epilogue loop."""
         sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
-        get_smem_store_op = (
-            partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
-            if self.arch == 100
-            else sm90_utils_og.sm90_get_smem_store_op
+        tiled_copy_postact_r2s = self.epi_make_postact_tiled_copy_r2s(
+            params, tiled_copy_r2s, tiled_copy_t2r
         )
-        copy_atom_postact_r2s = get_smem_store_op(
-            self.postact_layout, self.postact_dtype, self.acc_dtype
-        )
-        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
         batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
@@ -237,7 +251,7 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
             self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
-        if const_expr(self.arch != 100):
+        if const_expr(self.arch in (90, 120)):
             # Only need this if we're using STSM
             permute_gated_Cregs_b16(tRS_rPostAct_out)
         return tRS_rPostAct_out
@@ -252,7 +266,40 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
 
 
 class GemmGatedSm120(GemmGatedMixin, GemmSm120):
-    pass
+    @staticmethod
+    def _compute_tile_shape_or_override(
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        atom_layout_mnk: Tuple[int, int, int],
+        element_type: Optional[Type[cutlass.Numeric]] = None,
+        epi_tile_override: Tuple[int, int] | None = None,
+    ) -> Tuple[int, int]:
+        if epi_tile_override is not None:
+            return epi_tile_override
+        # Typically epi_tile is (64, 32) but since we want tile_n = 64 (see below), we might set
+        # tile_m = 32 if there's only 2 warps along the M direction.
+        tile_m = math.gcd(atom_layout_mnk[0] * 16, cute.size(cta_tile_shape_mnk, mode=[0]))
+        atom_n = atom_layout_mnk[1]
+        # E.g. if we have 2 warps along N direction, we want each warp to have 32 elems so that
+        # postact has 16 elements, which means tile_n should be 64.
+        tile_n = math.gcd(atom_n * 8 * 4, cute.size(cta_tile_shape_mnk, mode=[1]))
+        return (tile_m, tile_n)
+
+    def epi_make_postact_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        copy_atom_postact_r2s = self.epi_make_postact_copy_atom_r2s(params, tiled_copy_t2r)
+        copy_atom_postact_c = self.epi_make_postact_copy_atom_r2s(params, cutlass.Float16)
+        op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
+        tC = cute.make_layout(self.atom_layout_mnk)
+        atom_m, atom_n, atom_k = self.atom_layout_mnk
+        permutation_mnk = (
+            self.mma_inst_mnk[0] * atom_m,
+            self.mma_inst_mnk[1] * atom_n * 2,
+            self.mma_inst_mnk[2] * atom_k,
+        )
+        tiled_mma_gated_postact = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+        tiled_copy_postact_c_atom = cute.make_tiled_copy_C_atom(
+            copy_atom_postact_c, tiled_mma_gated_postact
+        )
+        return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_postact_c_atom)
 
 
 @jit_cache

@@ -611,8 +611,6 @@ def test_gemm_dgated_varlen_m(
 ):
     """Test GEMM with gated activation gradient and variable length M dimension."""
     device = "cuda"
-    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 12:
-        pytest.skip("SM120 gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(42)
     seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
     total_m = seq_lens.sum().item()

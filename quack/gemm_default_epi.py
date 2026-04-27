@@ -80,8 +80,6 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         return None
 
 
-
-
 class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):
     pass
 
