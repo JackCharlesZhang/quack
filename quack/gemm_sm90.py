@@ -75,8 +75,9 @@ class GemmSm90(GemmTmaBase):
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
-    :param tile_shape_mn: Shape of the CTA tile (M,N)
-    :type tile_shape_mn: Tuple[int, int, int]
+    :param tile_shape_mnk: Shape of the CTA tile. Pass (M, N) to default K to
+        4 MMA instructions, or (M, N, K) to set K explicitly.
+    :type tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int]
     :param cluster_shape_mnk: Cluster dimensions (M,N,K) for parallel processing
     :type cluster_shape_mnk: Tuple[int, int, int]
 
@@ -99,7 +100,7 @@ class GemmSm90(GemmTmaBase):
     Example:
         >>> gemm = GemmSm90(
         ...     acc_dtype=Float32,
-        ...     tile_shape_mn=(128, 256),
+        ...     tile_shape_mnk=(128, 256),
         ...     cluster_shape_mnk=(1, 1, 1)
         ... )
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
@@ -113,7 +114,7 @@ class GemmSm90(GemmTmaBase):
         self,
         acc_dtype: Type[cutlass.Numeric],
         a_dtype: Type[cutlass.Numeric],
-        tile_shape_mn: Tuple[int, int],
+        tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         pingpong: bool = False,
         is_persistent: bool = True,
@@ -131,8 +132,8 @@ class GemmSm90(GemmTmaBase):
 
         :param acc_dtype: Data type for accumulation during computation
         :type acc_dtype: type[cutlass.Numeric]
-        :param tile_shape_mn: Shape of the CTA tile (M,N)
-        :type tile_shape_mn: Tuple[int, int]
+        :param tile_shape_mnk: Shape of the CTA tile (M,N) or (M,N,K)
+        :type tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int]
         :param cluster_shape_mnk: Cluster dimensions (M,N,K) for parallel processing
         :type cluster_shape_mnk: Tuple[int, int, int]
         """
@@ -153,8 +154,11 @@ class GemmSm90(GemmTmaBase):
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
 
         self.cluster_shape_mnk = cluster_shape_mnk
-        # K dimension is deferred in _setup_attributes
-        self.cta_tile_shape_mnk = (*tile_shape_mn, 1)
+        assert len(tile_shape_mnk) in [2, 3], "CTA tile shape must be (M, N) or (M, N, K)"
+        # K dimension: if user provides 3 values, use their K; otherwise default in _setup_tiled_mma.
+        self.cta_tile_shape_mnk = (
+            tuple(tile_shape_mnk) if len(tile_shape_mnk) == 3 else (*tile_shape_mnk, 0)
+        )
         tile_M, tile_N = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
         # check the cta tile shape
         if not self.pingpong:
@@ -279,11 +283,17 @@ class GemmSm90(GemmTmaBase):
                 permutation_mnk=(None, permutation_n, None),
             )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
+        tile_k = (
+            self.cta_tile_shape_mnk[2] if self.cta_tile_shape_mnk[2] > 0 else mma_inst_shape_k * 4
+        )
+        assert tile_k > 0, "CTA tile K must be positive"
+        assert tile_k % mma_inst_shape_k == 0, (
+            f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({mma_inst_shape_k})"
+        )
         self.cta_tile_shape_mnk = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            tile_k,
         )
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):

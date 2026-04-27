@@ -64,29 +64,7 @@ SM100 tcgen05.mma instructions operate as follows:
 - Write accumulator to TMEM
 The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
 
-Input arguments to this example is same as dense_gemm.py.
-
-.. code-block:: bash
-
-    python examples/blackwell/dense_gemm_persistent.py                          \
-      --ab_dtype Float16 --d_dtype Float16 --acc_dtype Float32                  \
-      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-      --mnkl 8192,8192,8192,1                                                   \
-      --use_2cta_instrs
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/dense_gemm_persistent.py                     \
-      --ab_dtype Float16 --d_dtype Float16 --acc_dtype Float32                 \
-      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
-      --mnkl 8192,8192,8192,1                                                  \
-      --use_2cta_instrs                                        \
-      --warmup_iterations 1 --iterations 10 --skip_ref_check
-
-
-Constraints are same as dense_gemm.py:
+Constraints:
 * Supported input data types: fp16, bf16, tf32, int8, uint8, fp8 (e4m3fn, e5m2),
   see detailed valid dtype combinations in below GemmSm100 class documentation
 * A/B tensor must have the same data type
@@ -105,9 +83,9 @@ class GemmSm100(GemmTmaBase):
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
-    :param mma_tiler_mn: Shape of the MMA tile. Pass (M, N) to default K to
+    :param mma_tiler_mnk: Shape of the MMA tile. Pass (M, N) to default K to
         4 MMA instructions, or (M, N, K) to set the K tile size explicitly.
-    :type mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]]
+    :type mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
 
@@ -141,7 +119,7 @@ class GemmSm100(GemmTmaBase):
     Example:
         >>> gemm = GemmSm100(
         ...     acc_dtype=Float32,
-        ...     mma_tiler_mn=(128, 128),
+        ...     mma_tiler_mnk=(128, 128),
         ...     cluster_shape_mn=(2, 2)
         ... )
         >>> gemm(mA, mB, mD, max_active_clusters, stream)
@@ -156,7 +134,7 @@ class GemmSm100(GemmTmaBase):
         self,
         acc_dtype: Type[cutlass.Numeric],
         a_dtype: Type[cutlass.Numeric],  # ignored for now
-        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
+        mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
@@ -171,7 +149,7 @@ class GemmSm100(GemmTmaBase):
 
         1.  MMA Instruction Settings (tcgen05):
             - acc_dtype: Data types for MMA accumulator.
-            - mma_tiler_mn: The (M, N) shape of the MMA instruction tiler.
+            - mma_tiler_mnk: The (M, N) or (M, N, K) shape of the MMA instruction tiler.
             - use_2cta_instrs: Boolean indicating if the tcgen05 MMA variant
               with cta_group=2 should be used.
 
@@ -180,9 +158,9 @@ class GemmSm100(GemmTmaBase):
 
         :param acc_dtype: Data type of the accumulator.
         :type acc_dtype: type[cutlass.Numeric]
-        :param mma_tiler_mn: (M, N) or (M, N, K) shape of the MMA tile.
+        :param mma_tiler_mnk: (M, N) or (M, N, K) shape of the MMA tile.
             If only (M, N) is given, K defaults to 4 * instruction K.
-        :type mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]]
+        :type mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]]
         :param cluster_shape_mnk: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mnk: Tuple[int, int]
         """
@@ -190,15 +168,16 @@ class GemmSm100(GemmTmaBase):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
+        assert len(mma_tiler_mnk) in [2, 3], "MMA tiler must be (M, N) or (M, N, K)"
         valid_2cta_m = (128, 256) if not self.blockscaled else (256,)
-        self.use_2cta_instrs = cluster_shape_mnk[0] % 2 == 0 and mma_tiler_mn[0] in valid_2cta_m
+        self.use_2cta_instrs = cluster_shape_mnk[0] % 2 == 0 and mma_tiler_mnk[0] in valid_2cta_m
         self.cluster_shape_mnk = cluster_shape_mnk
         assert cluster_shape_mnk[2] == 1, "Cluster shape K must be 1"
         # K dimension: if user provides 3 values, use their K; otherwise default in _setup_attributes
-        if len(mma_tiler_mn) == 3:
-            self.mma_tiler = tuple(mma_tiler_mn)
+        if len(mma_tiler_mnk) == 3:
+            self.mma_tiler = tuple(mma_tiler_mnk)
         else:
-            self.mma_tiler = (*mma_tiler_mn, 0)
+            self.mma_tiler = (*mma_tiler_mnk, 0)
         self.is_persistent = True
         self.use_clc_persistence = use_clc_persistence
         self.epi_m_major = True
@@ -316,6 +295,10 @@ class GemmSm100(GemmTmaBase):
 
         # Compute mma/cluster/tile shapes
         if self.mma_tiler[2] > 0:
+            assert self.mma_tiler[2] % self.mma_inst_shape_mnk[2] == 0, (
+                f"MMA tiler K ({self.mma_tiler[2]}) must be divisible by "
+                f"MMA instruction K ({self.mma_inst_shape_mnk[2]})"
+            )
             mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
         else:
             mma_inst_tile_k = 4
@@ -2483,15 +2466,15 @@ class GemmSm100(GemmTmaBase):
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
+        mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mn: Tuple[int, int],
         blockscaled: bool,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
 
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
+        :param mma_tiler_mnk: The (M, N) or (M, N, K) shape of the MMA instruction tiler
+        :type mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
 
@@ -2501,20 +2484,20 @@ class GemmSm100(GemmTmaBase):
         is_valid = True
         # Skip invalid mma tile shape
         if not blockscaled:
-            if mma_tiler_mn[0] not in [64, 128, 256]:
+            if mma_tiler_mnk[0] not in [64, 128, 256]:
                 is_valid = False
         else:
-            if mma_tiler_mn[0] not in [128, 256]:
+            if mma_tiler_mnk[0] not in [128, 256]:
                 is_valid = False
-        mma_inst_n = mma_tiler_mn[1] if mma_tiler_mn[1] <= 256 else mma_tiler_mn[1] // 2
+        mma_inst_n = mma_tiler_mnk[1] if mma_tiler_mnk[1] <= 256 else mma_tiler_mnk[1] // 2
         if not blockscaled:
             if mma_inst_n not in range(32, 257, 32):
                 is_valid = False
         else:
             # Blockscaled currently supports tile_n in {64, 128, 192, 256}.
-            if mma_tiler_mn[1] not in [64, 128, 192, 256]:
+            if mma_tiler_mnk[1] not in [64, 128, 192, 256]:
                 is_valid = False
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
+        if cluster_shape_mn[0] % (2 if mma_tiler_mnk[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
@@ -2592,7 +2575,7 @@ class GemmSm100(GemmTmaBase):
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         d_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
+        mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mn: Tuple[int, int],
         m: int,
         n: int,
@@ -2610,7 +2593,7 @@ class GemmSm100(GemmTmaBase):
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             can_implement = False
         if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mn, cluster_shape_mn, blockscaled=True
+            mma_tiler_mnk, cluster_shape_mn, blockscaled=True
         ):
             can_implement = False
         if not GemmSm100.is_valid_tensor_alignment(
@@ -2624,7 +2607,7 @@ class GemmSm100(GemmTmaBase):
         ab_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
+        mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mn: Tuple[int, int],
         m: int,
         n: int,
@@ -2643,8 +2626,8 @@ class GemmSm100(GemmTmaBase):
         :type acc_dtype: Type[cutlass.Numeric]
         :param d_dtype: The data type of the output tensor
         :type d_dtype: Type[cutlass.Numeric]
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
+        :param mma_tiler_mnk: The (M, N) or (M, N, K) shape of the MMA instruction tiler
+        :type mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
         :param m: The number of rows in the A tensor
@@ -2671,7 +2654,7 @@ class GemmSm100(GemmTmaBase):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
         if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mn, cluster_shape_mn, blockscaled=False
+            mma_tiler_mnk, cluster_shape_mn, blockscaled=False
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment

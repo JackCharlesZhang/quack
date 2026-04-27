@@ -42,7 +42,7 @@ class GemmSm120(GemmSm90):
         self,
         acc_dtype: Type[cutlass.Numeric],
         a_dtype: Type[cutlass.Numeric],
-        tile_shape_mn: Tuple[int, int],
+        tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         pingpong: bool = False,
         is_persistent: bool = True,
@@ -65,8 +65,12 @@ class GemmSm120(GemmSm90):
             assert cluster_shape_mnk[1] == 1
 
         self.cluster_shape_mnk = cluster_shape_mnk
-        tile_M, tile_N = tile_shape_mn
-        self.cta_tile_shape_mnk = (tile_M, tile_N, 1)
+        assert len(tile_shape_mnk) in [2, 3], "CTA tile shape must be (M, N) or (M, N, K)"
+        # K dimension: if user provides 3 values, use their K; otherwise default in _setup_tiled_mma.
+        self.cta_tile_shape_mnk = (
+            tuple(tile_shape_mnk) if len(tile_shape_mnk) == 3 else (*tile_shape_mnk, 0)
+        )
+        tile_M, tile_N = self.cta_tile_shape_mnk[:2]
 
         # Pingpong: 2 warp groups each with (2,2,1) atom layout
         # Non-pingpong: 1 group of 8 warps with (4,2,1) atom layout
@@ -124,18 +128,26 @@ class GemmSm120(GemmSm90):
         """Set up warp-level MMA (MmaF16BF16Op) and tile K dimension."""
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
+        atom_m, atom_n, atom_k = self.atom_layout_mnk
+        # We want each warp to have 16 consecutive elements in the N direction, for STSM
+        # and for gated epilogue.
+        permutation_n = cute.make_ordered_layout((self.mma_inst_mnk[1], atom_n, 2), order=(0, 2, 1))
         permutation_mnk = (
-            self.atom_layout_mnk[0] * self.mma_inst_mnk[0],
-            self.atom_layout_mnk[1] * self.mma_inst_mnk[1] * 2,
-            self.atom_layout_mnk[2] * self.mma_inst_mnk[2],
+            atom_m * self.mma_inst_mnk[0],
+            permutation_n,
+            atom_k * self.mma_inst_mnk[2],
         )
         self.tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
-        tile_k = self.mma_inst_mnk[2] * 4
-        self.cta_tile_shape_mnk = (
-            self.cta_tile_shape_mnk[0],
-            self.cta_tile_shape_mnk[1],
-            tile_k,
+        tile_k = (
+            self.cta_tile_shape_mnk[2]
+            if self.cta_tile_shape_mnk[2] > 0
+            else self.mma_inst_mnk[2] * 4
         )
+        assert tile_k > 0, "CTA tile K must be positive"
+        assert tile_k % self.mma_inst_mnk[2] == 0, (
+            f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({self.mma_inst_mnk[2]})"
+        )
+        self.cta_tile_shape_mnk = (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], tile_k)
 
     # __call__, _setup_attributes, make_ab_pipeline, make_epi_store_pipeline,
     # make_sched_pipeline, epilogue are all inherited from GemmSm90.
