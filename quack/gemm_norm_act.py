@@ -21,7 +21,7 @@ from quack.cute_dsl_utils import (
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
-from quack.gemm_act import GemmActMixin, GemmGatedMixin
+from quack.gemm_act import GemmActMixin, GemmGatedMixin, GemmGatedSm120Mixin
 from quack.epi_ops import vec_multiply
 from quack.activation import act_fn_map, gate_fn_map
 from quack.cache_utils import jit_cache
@@ -149,7 +149,7 @@ class GemmNormGatedSm100(GemmNormGatedMixin, GemmSm100):
     pass
 
 
-class GemmNormGatedSm120(GemmNormGatedMixin, GemmSm120):
+class GemmNormGatedSm120(GemmGatedSm120Mixin, GemmNormGatedMixin, GemmSm120):
     pass
 
 

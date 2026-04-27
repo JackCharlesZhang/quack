@@ -265,7 +265,7 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
 
-class GemmGatedSm120(GemmGatedMixin, GemmSm120):
+class GemmGatedSm120Mixin:
     @staticmethod
     def _compute_tile_shape_or_override(
         cta_tile_shape_mnk: Tuple[int, int, int],
@@ -300,6 +300,10 @@ class GemmGatedSm120(GemmGatedMixin, GemmSm120):
             copy_atom_postact_c, tiled_mma_gated_postact
         )
         return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_postact_c_atom)
+
+
+class GemmGatedSm120(GemmGatedSm120Mixin, GemmGatedMixin, GemmSm120):
+    pass
 
 
 @jit_cache
