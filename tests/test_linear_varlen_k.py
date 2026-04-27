@@ -418,12 +418,18 @@ def test_gemm_add_inplace_varlen_k(
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-4
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
+@pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("m", [1024])
 @pytest.mark.parametrize("num_groups", [3])
-def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype):
-    """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward)."""
+def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre_allocate_out):
+    """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward).
+
+    Covers sonic-moe's down_projection_backward_weight call: cu_seqlens_k + A_idx
+    (gather) + concat_layout=("out",) + pre-allocated out= buffer.
+    """
     device = "cuda"
     torch.random.manual_seed(0)
     seq_lens = torch.randint(100, 200, (num_groups,), device=device)
@@ -431,11 +437,32 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype):
     cu_seqlens_k = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
     )
-    # A must be m-major for varlen_k
-    A = torch.randn((total_k, m), device=device, dtype=input_dtype).T / math.sqrt(total_k)
+    A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A)
+    A = A / math.sqrt(total_k)
     B = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(total_k)
     concat_layout = ("out",)
-    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False, concat_layout=concat_layout)
-    out_ref = gemm_ref(A.float(), B.float(), cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
-    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, concat_layout=concat_layout)
+    out_buf = (
+        torch.empty((num_groups, m, n), device=device, dtype=input_dtype)
+        if pre_allocate_out
+        else None
+    )
+    out = gemm(
+        A,
+        B,
+        out=out_buf,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        tuned=False,
+        concat_layout=concat_layout,
+    )
+    out_ref = gemm_ref(
+        A.float(),
+        B.float(),
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        concat_layout=concat_layout,
+    )
+    out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, concat_layout=concat_layout)
+    if pre_allocate_out:
+        assert out.data_ptr() == out_buf.data_ptr()
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5

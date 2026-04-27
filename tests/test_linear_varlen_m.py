@@ -151,6 +151,7 @@ def test_gemm_varlen_m_tma_gather_matches_cpasync(
     torch.testing.assert_close(out_tma, out_cpasync, atol=3e-2, rtol=1e-3)
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
 # @pytest.mark.parametrize("gather_A", [True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -180,6 +181,7 @@ def test_gemm_varlen_m(
     alpha_is_tensor,
     has_bias,
     gather_A,
+    pre_allocate_out,
 ):
     """Test GEMM with variable length M dimension using cu_seqlens_m."""
     device = "cuda"
@@ -197,9 +199,13 @@ def test_gemm_varlen_m(
     if alpha_is_tensor:
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
     bias = torch.randn(num_groups, n, device=device) if has_bias else None
+    out_buf = (
+        torch.empty((total_m, n), device=device, dtype=input_dtype) if pre_allocate_out else None
+    )
     out = gemm(
         A,
         B,
+        out=out_buf,
         bias=bias,
         alpha=alpha,
         cu_seqlens_m=cu_seqlens_m,
@@ -207,6 +213,8 @@ def test_gemm_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
+    if pre_allocate_out:
+        assert out.data_ptr() == out_buf.data_ptr()
     A_f, B_f = A.float(), B.float()
     out_ref = gemm_ref(A_f, B_f, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     del A_f, B_f
@@ -512,8 +520,9 @@ def test_gemm_dact_varlen_m(
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
-@pytest.mark.parametrize("activation", ["swiglu"])
+@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -531,6 +540,7 @@ def test_gemm_gated_varlen_m(
     dynamic_scheduler,
     activation,
     gather_A,
+    pre_allocate_out,
 ):
     """Test GEMM with gated activation and variable length M dimension."""
     device = "cuda"
@@ -547,6 +557,11 @@ def test_gemm_gated_varlen_m(
     bias = torch.randn(num_groups, n, device=device) if has_bias else None
     if B_major == "k":
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    if pre_allocate_out:
+        preact_buf = torch.empty((total_m, n), device=device, dtype=input_dtype)
+        postact_buf = torch.empty((total_m, n // 2), device=device, dtype=input_dtype)
+    else:
+        preact_buf, postact_buf = None, None
     # Test with kernel
     preact, postact = gemm_gated(
         A,
@@ -554,11 +569,16 @@ def test_gemm_gated_varlen_m(
         C,
         bias=bias,
         activation=activation,
+        preact_out=preact_buf,
+        postact_out=postact_buf,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
+    if pre_allocate_out:
+        assert preact.data_ptr() == preact_buf.data_ptr()
+        assert postact.data_ptr() == postact_buf.data_ptr()
     assert preact.shape == (total_m, n)
     assert postact.shape == (total_m, n // 2)
     # Compare with reference
@@ -580,9 +600,10 @@ def test_gemm_gated_varlen_m(
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
 # @pytest.mark.parametrize("gather_A", [False])
-@pytest.mark.parametrize("activation", ["swiglu"])
+@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 # @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
@@ -608,6 +629,7 @@ def test_gemm_dgated_varlen_m(
     dynamic_scheduler,
     activation,
     gather_A,
+    pre_allocate_out,
 ):
     """Test GEMM with gated activation gradient and variable length M dimension."""
     device = "cuda"
@@ -624,6 +646,11 @@ def test_gemm_dgated_varlen_m(
     if B_major == "k":
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     colvec_scale = torch.randn(total_m, device=device) if has_colvec_scale else None
+    if pre_allocate_out:
+        dx_buf = torch.empty((total_m, 2 * n), device=device, dtype=input_dtype)
+        postact_buf = torch.empty((total_m, n), device=device, dtype=input_dtype)
+    else:
+        dx_buf, postact_buf = None, None
     # Test with kernel
     dx, postact, *rest = gemm_dgated(
         A,
@@ -631,12 +658,17 @@ def test_gemm_dgated_varlen_m(
         PreAct,
         colvec_scale=colvec_scale,
         activation=activation,
+        dx_out=dx_buf,
+        postact_out=postact_buf,
         colvec_reduce=colvec_reduce,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
+    if pre_allocate_out:
+        assert dx.data_ptr() == dx_buf.data_ptr()
+        assert postact.data_ptr() == postact_buf.data_ptr()
     if colvec_reduce:
         colvec_reduce_out = rest[0]
     assert dx.shape == (total_m, 2 * n)
@@ -676,6 +708,7 @@ def test_gemm_dgated_varlen_m(
         ).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -683,7 +716,9 @@ def test_gemm_dgated_varlen_m(
 @pytest.mark.parametrize("n", [1504])
 @pytest.mark.parametrize("k", [736])
 @pytest.mark.parametrize("num_groups", [3])
-def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_scheduler, gather_A):
+def test_gemm_varlen_m_concat(
+    num_groups, k, n, input_dtype, has_bias, dynamic_scheduler, gather_A, pre_allocate_out
+):
     """Test GEMM varlen_m with concat_layout=("B",) for MoE forward/backward."""
     device = "cuda"
     torch.random.manual_seed(0)
@@ -696,9 +731,13 @@ def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_s
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     bias = torch.randn(num_groups, n, device=device) if has_bias else None
     concat = ("B",)
+    out_buf = (
+        torch.empty((total_m, n), device=device, dtype=input_dtype) if pre_allocate_out else None
+    )
     out = gemm(
         A,
         B,
+        out=out_buf,
         bias=bias,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
@@ -706,6 +745,8 @@ def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_s
         tuned=False,
         concat_layout=concat,
     )
+    if pre_allocate_out:
+        assert out.data_ptr() == out_buf.data_ptr()
     out_ref = gemm_ref(
         A.float(),
         B.float(),
@@ -718,7 +759,9 @@ def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_s
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize("dynamic_scheduler", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -726,7 +769,15 @@ def test_gemm_varlen_m_concat(num_groups, k, n, input_dtype, has_bias, dynamic_s
 @pytest.mark.parametrize("k", [736])
 @pytest.mark.parametrize("num_groups", [3])
 def test_gemm_gated_varlen_m_concat(
-    num_groups, k, n, input_dtype, has_bias, dynamic_scheduler, gather_A
+    num_groups,
+    k,
+    n,
+    input_dtype,
+    has_bias,
+    dynamic_scheduler,
+    activation,
+    gather_A,
+    pre_allocate_out,
 ):
     """Test gated GEMM varlen_m with concat_layout=("B",) for MoE forward."""
     device = "cuda"
@@ -740,22 +791,32 @@ def test_gemm_gated_varlen_m_concat(
     B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
     bias = torch.randn(num_groups, n, device=device) if has_bias else None
     concat = ("B",)
+    if pre_allocate_out:
+        preact_buf = torch.empty((total_m, n), device=device, dtype=input_dtype)
+        postact_buf = torch.empty((total_m, n // 2), device=device, dtype=input_dtype)
+    else:
+        preact_buf, postact_buf = None, None
     preact, postact = gemm_gated(
         A,
         B,
         bias=bias,
-        activation="swiglu",
+        activation=activation,
+        preact_out=preact_buf,
+        postact_out=postact_buf,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
         concat_layout=concat,
     )
+    if pre_allocate_out:
+        assert preact.data_ptr() == preact_buf.data_ptr()
+        assert postact.data_ptr() == postact_buf.data_ptr()
     preact_ref, postact_ref = gemm_gated_ref(
         A.float(),
         B.float(),
         bias=bias,
-        activation="swiglu",
+        activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         concat_layout=concat,
@@ -764,7 +825,7 @@ def test_gemm_gated_varlen_m_concat(
         A,
         B,
         bias=bias,
-        activation="swiglu",
+        activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         concat_layout=concat,
