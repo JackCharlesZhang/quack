@@ -9,6 +9,7 @@ from dataclasses import dataclass
 class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192
+    tile_k: int | None = None
     pingpong: bool = True
     # by default, we use dynamic persistent tile scheduler on SM100 but not on SM90
     is_dynamic_persistent: bool = True
@@ -142,7 +143,7 @@ def get_all_configs(
     epilogue: Optional[str] = None,
     tune_coop: bool = True,
 ) -> List[GemmConfig]:
-    """Return autotuning configs for all supported device capabilities (sm90 + sm100 + sm120).
+    """Return autotuning configs for all supported device capabilities.
 
     Each GemmConfig is tagged with its target device_capacity, so the caller can
     filter at runtime based on the actual device. This avoids querying the device

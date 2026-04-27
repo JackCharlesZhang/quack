@@ -442,8 +442,6 @@ def test_gemm_gated(
 def test_gemm_gated_pingpong_configs(pingpong):
     """Exercise tuned gated dispatch with configs that bypass the public wrapper."""
     device = "cuda"
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
     device_capacity = get_device_capacity(torch.device(device))[0]
     if device_capacity not in (9, 12):
         pytest.skip("pingpong config regression only covers SM90 and SM120")
