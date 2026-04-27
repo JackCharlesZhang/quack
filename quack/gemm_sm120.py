@@ -598,7 +598,11 @@ class GemmSm120(GemmSm90):
             for k in cutlass.range_constexpr(num_k_blocks):
                 k_next = 0 if k + 1 == num_k_blocks else k + 1
                 if const_expr(k == num_k_blocks - 1):
-                    # Don't need to sync_warp: the previous instruction was mma.sync from cute.gemm
+                    # TMA writes smem through the async proxy; ldmatrix reads it through the
+                    # generic proxy. Fence before releasing the smem stage for reuse, then
+                    # sync the warp because only one lane signals the mbarrier.
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
                     ab_pipeline.consumer_release(ab_read_state)
                     ab_read_state.advance()
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
@@ -614,6 +618,11 @@ class GemmSm120(GemmSm90):
             for k in cutlass.range_constexpr(num_k_blocks):
                 k_next = 0 if k + 1 == num_k_blocks else k + 1
                 if const_expr(k == num_k_blocks - 1):
+                    # TMA writes smem through the async proxy; ldmatrix reads it through the
+                    # generic proxy. Fence before releasing the smem stage for reuse, then
+                    # sync the warp because only one lane signals the mbarrier.
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
                     ab_pipeline.consumer_release(ab_read_state)
                     ab_read_state.advance()
                 if const_expr(k_next > 0):
