@@ -19,13 +19,20 @@ import torch
 
 from quack.autotuner import _gpu_warmup
 from quack.gemm_config import GemmConfig
-from quack.gemm_interface import _gemm_rms_tuned, gemm_act, gemm_act_tuned, gemm_norm_act, gemm_norm_act_tuned
+from quack.gemm_interface import (
+    _gemm_rms_tuned,
+    gemm_act,
+    gemm_act_tuned,
+    gemm_norm_act,
+    gemm_norm_act_tuned,
+)
 
 
 def make_config(args) -> GemmConfig:
     return GemmConfig(
         tile_m=args.tile_m,
         tile_n=args.tile_n,
+        tile_k=args.tile_k,
         pingpong=args.pingpong,
         cluster_m=1,
         cluster_n=1,
@@ -220,11 +227,14 @@ def main():
     parser.add_argument("--activation", default="gelu_tanh_approx")
     parser.add_argument("--tile-m", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=64)
+    parser.add_argument("--tile-k", type=int, default=None)
     parser.add_argument("--pingpong", action="store_true")
     parser.add_argument("--swap-ab", action="store_true")
     parser.add_argument("--dynamic-scheduler", action="store_true")
     parser.add_argument("--use-selected-config", action="store_true")
-    parser.add_argument("--tuned", action="store_true", help="When using selected config mode, call the tuned path")
+    parser.add_argument(
+        "--tuned", action="store_true", help="When using selected config mode, call the tuned path"
+    )
     parser.add_argument("--no-dynamic-persistent", action="store_true")
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--no-norm-weight", action="store_true")
@@ -237,7 +247,9 @@ def main():
         default="second-min",
         help="Statistic to report from repeated CUDA-event timings",
     )
-    parser.add_argument("--profile", action="store_true", help="Run one profiled launch after a small warmup")
+    parser.add_argument(
+        "--profile", action="store_true", help="Run one profiled launch after a small warmup"
+    )
     parser.add_argument("--profile-warmup", type=int, default=1)
     parser.add_argument(
         "--preheat-ms",
