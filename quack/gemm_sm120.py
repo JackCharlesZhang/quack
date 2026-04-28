@@ -124,6 +124,9 @@ class GemmSm120(GemmSm90):
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
+    def epi_smem_warp_shape_mnk(self):
+        return self.atom_layout_mnk
+
     def _setup_tiled_mma(self):
         """Set up warp-level MMA (MmaF16BF16Op) and tile K dimension."""
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)

@@ -401,6 +401,8 @@ class GemmSm100(GemmTmaBase):
             prefetch_A_idx,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
+            # TODO: this is wrong when tile_m=64 or when tile_m=128 and use 2cta instructions
+            self.epi_smem_warp_shape_mnk(),
         )
         self.sched_stage = 1
         self.a_prefetch_stage = (
@@ -2197,6 +2199,7 @@ class GemmSm100(GemmTmaBase):
         prefetch_A_idx: Literal[None, "varlen_m", "varlen_k"],
         smem_capacity: int,
         occupancy: int,
+        warp_shape_mnk: Tuple[int, int, int] | None = None,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2287,7 +2290,7 @@ class GemmSm100(GemmTmaBase):
             cute.size_in_bytes(d_dtype, d_smem_layout_staged_one) if d_dtype is not None else 0
         )
         epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
-            epilogue_args, cta_tile_shape_mnk, epi_tile
+            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
         )
         epi_bytes = epi_bytes_per_stage * epi_stage
         if const_expr(c_dtype is not None):

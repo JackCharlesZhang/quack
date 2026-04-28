@@ -49,6 +49,9 @@ class GemmBase:
 
     EpilogueParams = ParamsBase
 
+    def epi_smem_warp_shape_mnk(self):
+        return (self.num_epi_warps, 1, 1)
+
     @cute.jit
     def epilogue(
         self,
@@ -416,6 +419,7 @@ class GemmBase:
         args: Optional[EpilogueArguments],
         cta_tile_shape_mnk: Tuple[int, int, int],
         epi_tile: cute.Tile,
+        warp_shape_mnk: Tuple[int, int, int] | None = None,
     ) -> int:
         return 0
 
