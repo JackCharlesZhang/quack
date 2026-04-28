@@ -560,29 +560,30 @@ class ColVecReduce(EpiOp):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
     @staticmethod
-    def _max_warps_in_n(atom_layout_mnk):
-        return atom_layout_mnk[1] if atom_layout_mnk is not None else 1
+    def _smem_warps_in_n(atom_layout_mnk):
+        warps_in_n = atom_layout_mnk[1] if atom_layout_mnk is not None else 1
+        return max(warps_in_n - 1, 0)
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
-        max_warps_in_n = self._max_warps_in_n(atom_layout_mnk)
-        if arg_tensor is None or max_warps_in_n <= 1:
+        smem_warps_in_n = self._smem_warps_in_n(atom_layout_mnk)
+        if arg_tensor is None or smem_warps_in_n == 0:
             return 0
-        return cta_tile_shape_mnk[0] * max_warps_in_n * (Float32.width // 8)
+        return cta_tile_shape_mnk[0] * smem_warps_in_n * (Float32.width // 8)
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name, None)
-        max_warps_in_n = self._max_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
-        if tensor is None or max_warps_in_n <= 1:
+        smem_warps_in_n = self._smem_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
+        if tensor is None or smem_warps_in_n == 0:
             return None
-        size = gemm.cta_tile_shape_mnk[0] * max_warps_in_n
+        size = gemm.cta_tile_shape_mnk[0] * smem_warps_in_n
         return (f"s_{self.name}", cute.struct.Align[cute.struct.MemRange[Float32, size], 16])
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        max_warps_in_n = self._max_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
-        if getattr(params, self.name, None) is None or max_warps_in_n == 1:
+        smem_warps_in_n = self._smem_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
+        if getattr(params, self.name, None) is None or smem_warps_in_n == 0:
             return None
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
-            cute.make_layout((gemm.cta_tile_shape_mnk[0], max_warps_in_n))
+            cute.make_layout((gemm.cta_tile_shape_mnk[0], smem_warps_in_n))
         )
 
     @cute.jit
@@ -637,7 +638,7 @@ class ColVecReduce(EpiOp):
                 "lanes_in_N must be a power of 2 for butterfly reduction"
             )
 
-            # ── Intra-warp shuffle reduction across N lanes ──
+            # Intra-warp shuffle reduction across N lanes
             if const_expr(lanes_in_N > 1):
                 assert lane_layout_MN.stride[1] == 1
                 tDrReduce_flt = cute.filter_zeros(tDrReduce)
@@ -648,7 +649,6 @@ class ColVecReduce(EpiOp):
 
             warp_N = warp_layout_MN[1]
             warps_in_N = const_expr(cute.size(warp_N))
-
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
                 epi_tile=epi_tile,
@@ -657,7 +657,28 @@ class ColVecReduce(EpiOp):
                 reference_src=tiled_copy_t2r is None,
             )
             tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
-            epilogue_barrier = gemm.epilogue_barrier
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDrReduce_m = layout_utils.convert_layout_zero_stride(tDrReduce, tDrReduce.layout)[
+                None, 0
+            ]
+            tDcD_m = layout_utils.convert_layout_zero_stride(tDcD, tDrReduce.layout)[None, 0]
+
+            # Inter-warp reduction through smem
+            warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
+            warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
+            if const_expr(warps_in_N > 1):
+                if warp_n_idx > 0 and is_lane_n_leader:
+                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                        row_idx = tDcD_m[m][0]
+                        sDrReduce[row_idx, warp_n_idx - 1] = tDrReduce_m[m]
+                gemm.epilogue_barrier.arrive_and_wait()
+                if warp_n_idx == 0 and is_lane_n_leader:
+                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                        row_idx = tDcD_m[m][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            tDrReduce_m[m] += sDrReduce[row_idx, warp_n - 1]
+
+            # Write to gmem
             batch_idx = tile_coord_mnkl[3]
             limit_n = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
             if tile_coord_mnkl[1] < limit_n:
@@ -673,31 +694,13 @@ class ColVecReduce(EpiOp):
                     varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M,
                     tile_M,
                 )
-                tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDrReduce_m = layout_utils.convert_layout_zero_stride(tDrReduce, tDrReduce.layout)[
-                    None, 0
-                ]
-                tDcD_m = layout_utils.convert_layout_zero_stride(tDcD, tDrReduce.layout)[None, 0]
-                if const_expr(warps_in_N == 1):
-                    if is_lane_n_leader:
-                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                            row_idx = tDcD_m[m][0]
-                            if row_idx < limit_m:
-                                gColVec[row_idx] = tDrReduce_m[m]
-                else:
-                    warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
-                    warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
-                    if is_lane_n_leader:
-                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                            row_idx = tDcD_m[m][0]
-                            if row_idx < limit_m:
-                                sDrReduce[row_idx, warp_n_idx] = tDrReduce_m[m]
-                    epilogue_barrier.arrive_and_wait()
-                    if warp_n_idx == 0 and is_lane_n_leader:
-                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                            row_idx = tDcD_m[m][0]
-                            if row_idx < limit_m:
-                                row_sum = Float32(0.0)
-                                for warp_n in cutlass.range_constexpr(warps_in_N):
-                                    row_sum += sDrReduce[row_idx, warp_n]
-                                gColVec[row_idx] = row_sum
+                should_write_gmem = (
+                    is_lane_n_leader
+                    if const_expr(warps_in_N == 1)
+                    else warp_n_idx == 0 and is_lane_n_leader
+                )
+                if should_write_gmem:
+                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                        row_idx = tDcD_m[m][0]
+                        if row_idx < limit_m:
+                            gColVec[row_idx] = tDrReduce_m[m]
