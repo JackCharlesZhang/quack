@@ -11,6 +11,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.activation import act_fn_map
 from quack.gemm_act import GemmActMixin
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -238,6 +239,10 @@ class GemmSymmetricMixin(GemmActMixin):
         return epi_read_state, epi_producer_state
 
 
+class GemmSymmetricSm80(GemmSymmetricMixin, GemmSm80):
+    pass
+
+
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
     pass
 
@@ -272,6 +277,7 @@ def _compile_gemm_symmetric(
     device_capacity,
 ):
     sm_to_cls = {
+        8: GemmSymmetricSm80,
         9: GemmSymmetricSm90,
         10: GemmSymmetricSm100,
         11: GemmSymmetricSm100,
@@ -367,11 +373,11 @@ def gemm_symmetric(
     postact_major = "n" if PostAct_p.stride(1) == 1 else "m"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
 
-    if is_dynamic_persistent and device_capacity[0] == 9:
+    if is_dynamic_persistent and device_capacity[0] <= 9:
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
@@ -407,7 +413,10 @@ def gemm_symmetric(
     if COMPILE_ONLY:
         return
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    cluster_size = cluster_M * cluster_N
+    max_active_clusters = (
+        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
+    )
 
     def scalar_arg(scalar, mode):
         if mode == 0:

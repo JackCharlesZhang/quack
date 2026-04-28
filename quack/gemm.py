@@ -14,6 +14,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
+    GemmDefaultSm80,
     GemmDefaultSm90,
     GemmDefaultSm100,
     GemmDefaultSm120,
@@ -63,8 +64,10 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     has_trace_ptr,
+    num_warps,
 ):
     sm_to_cls = {
+        8: GemmDefaultSm80,
         9: GemmDefaultSm90,
         10: GemmDefaultSm100,
         11: GemmDefaultSm100,
@@ -111,7 +114,7 @@ def _compile_gemm(
         sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), has_batch_idx_permute, l
+        (is_dynamic_persistent and device_capacity[0] <= 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -135,6 +138,7 @@ def _compile_gemm(
         has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
+        num_warps=num_warps,
     )
 
 
@@ -169,6 +173,7 @@ def gemm(
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
+    num_warps: Optional[int] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -178,8 +183,6 @@ def gemm(
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    if varlen:
-        assert persistent, "varlen requires persistent=True"
     if add_to_output:
         assert not varlen_m, "Add to output not supported with varlen_m"
     if varlen_m:
@@ -190,17 +193,21 @@ def gemm(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
-    if is_dynamic_persistent and device_capacity[0] == 9:
+    if is_dynamic_persistent and device_capacity[0] <= 9:
         assert tile_count_semaphore is not None, (
-            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+            "Dynamic persistent tile scheduler for SM8x and SM90 requires a semaphore in GMEM"
         )
+    if device_capacity[0] == 8:
+        if add_to_output:
+            C = D
+            add_to_output = False
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -245,6 +252,7 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         trace_ptr is not None,
+        num_warps,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -260,8 +268,9 @@ def gemm(
         else:
             return scalar.data_ptr()
 
+    cluster_size = cluster_M * cluster_N * cluster_K
     max_active_clusters = (
-        get_max_active_clusters(cluster_M * cluster_N * cluster_K) if persistent else 0
+        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
     )
 
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(

@@ -8,6 +8,7 @@ from torch import Tensor
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -77,6 +78,10 @@ class GemmDActMixin(GemmActMixin):
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
+    pass
+
+
+class GemmDActSm80(GemmDActMixin, GemmSm80):
     pass
 
 
@@ -220,6 +225,10 @@ class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
     pass
 
 
+class GemmDGatedSm80(GemmDGatedMixin, GemmSm80):
+    pass
+
+
 class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
     pass
 
@@ -259,8 +268,15 @@ def _compile_gemm_dact(
 ):
     is_dgated = gemm_cls_name == "dgated"
     sm_to_cls = {
-        "dact": {9: GemmDActSm90, 10: GemmDActSm100, 11: GemmDActSm100, 12: GemmDActSm120},
+        "dact": {
+            8: GemmDActSm80,
+            9: GemmDActSm90,
+            10: GemmDActSm100,
+            11: GemmDActSm100,
+            12: GemmDActSm120,
+        },
         "dgated": {
+            8: GemmDGatedSm80,
             9: GemmDGatedSm90,
             10: GemmDGatedSm100,
             11: GemmDGatedSm100,
@@ -427,9 +443,9 @@ def gemm_dact(
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (

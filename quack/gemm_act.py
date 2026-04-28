@@ -21,6 +21,7 @@ from quack.cute_dsl_utils import (
 )
 from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import ColVecLoad, RowVecLoad, Scalar, TileStore
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -186,6 +187,10 @@ class GemmActSm90(GemmActMixin, GemmSm90):
     pass
 
 
+class GemmActSm80(GemmActMixin, GemmSm80):
+    pass
+
+
 class GemmActSm100(GemmActMixin, GemmSm100):
     pass
 
@@ -276,6 +281,10 @@ class GemmGatedSm90(GemmGatedMixin, GemmSm90):
     pass
 
 
+class GemmGatedSm80(GemmGatedMixin, GemmSm80):
+    pass
+
+
 class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
@@ -352,8 +361,20 @@ def _compile_gemm_act(
     use_tma_gather=False,
 ):
     sm_to_cls = {
-        "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
-        "gated": {9: GemmGatedSm90, 10: GemmGatedSm100, 11: GemmGatedSm100, 12: GemmGatedSm120},
+        "act": {
+            8: GemmActSm80,
+            9: GemmActSm90,
+            10: GemmActSm100,
+            11: GemmActSm100,
+            12: GemmActSm120,
+        },
+        "gated": {
+            8: GemmGatedSm80,
+            9: GemmGatedSm90,
+            10: GemmGatedSm100,
+            11: GemmGatedSm100,
+            12: GemmGatedSm120,
+        },
     }
     GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     pa_leading = 1 if postact_major == "n" else 0
@@ -491,9 +512,9 @@ def gemm_act(
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
 

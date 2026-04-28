@@ -8,6 +8,7 @@ from cutlass import Int32, Float32, const_expr
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import Scalar, RowVecLoad, ColVecLoad
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -78,6 +79,10 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] += tDrColVec[i]
         return None
+
+
+class GemmDefaultSm80(GemmDefaultEpiMixin, GemmSm80):
+    pass
 
 
 class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):

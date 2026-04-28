@@ -95,7 +95,19 @@ def _concat_interleave_bias(t):
 
 def default_config(device):
     cap = get_device_capacity(device)[0]
-    if cap in [10, 11]:
+    if cap == 8:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            tile_k=32,
+            num_warps=4,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=False,
+            device_capacity=8,
+        )
+    elif cap in [10, 11]:
         return GemmConfig(
             tile_m=256,
             tile_n=256,
@@ -278,6 +290,8 @@ def gemm_tuned(
         sr_seed=sr_seed,
         use_tma_gather=config.use_tma_gather,
         concat_layout=swapped_concat,
+        num_warps=config.num_warps,
+        tile_K=config.tile_k,
     )
 
 
@@ -341,6 +355,7 @@ def gemm_act_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -409,6 +424,7 @@ def gemm_dact_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -1178,6 +1194,21 @@ def gemm_dact_ref(
 gemm_dgated_ref = gemm_dact_ref
 
 
+def _symmetric_gemm_config(sm: int) -> tuple[int, int, int, bool]:
+    configs = {
+        8: (128, 128, 1, False),
+        9: (128, 256, 2, False),
+        10: (256, 256, 2, False),
+        11: (256, 256, 2, False),
+        12: (128, 128, 1, True),
+    }
+    if sm not in configs:
+        raise NotImplementedError(
+            "gemm_symmetric is only supported on SM8x, SM90, SM100, SM110, and SM120"
+        )
+    return configs[sm]
+
+
 @torch.library.custom_op(
     "quack::gemm_symmetric_out",
     mutates_args=("out",),
@@ -1210,12 +1241,7 @@ def gemm_symmetric_out(
     )
     sm = get_device_capacity(A.device)[0]
     # We want square tile per cluster
-    tile_m, tile_n, cluster_m, pingpong = {
-        9: (128, 256, 2, False),
-        10: (256, 256, 2, False),
-        11: (256, 256, 2, False),
-        12: (128, 128, 1, True),
-    }[sm]
+    tile_m, tile_n, cluster_m, pingpong = _symmetric_gemm_config(sm)
     gemm_symmetric_dispatch(
         A,
         B,
@@ -1333,6 +1359,7 @@ def gemm_gated_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -1429,6 +1456,7 @@ def gemm_dgated_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -1686,9 +1714,10 @@ def gemm_symmetric_out_fake(
         return
     # gemm_symmetric is not autotuned, compile the single fixed config directly
     sm = get_device_capacity(A.device)[0]
-    tile_m = 256 if sm == 10 else 128
-    tile_n = 128 if sm == 12 else 256
-    cluster_m = 1 if sm == 12 else 2
+    try:
+        tile_m, tile_n, cluster_m, pingpong = _symmetric_gemm_config(sm)
+    except NotImplementedError:
+        return
     try:
         gemm_symmetric_dispatch(
             A.unsqueeze(0) if A.ndim == 2 else A,
@@ -1700,7 +1729,7 @@ def gemm_symmetric_out_fake(
             tile_N=tile_n,
             cluster_M=cluster_m,
             cluster_N=1,
-            pingpong=False,
+            pingpong=pingpong,
             persistent=True,
             max_swizzle_size=8,
             alpha=alpha,
@@ -1775,6 +1804,7 @@ def _gemm_rms_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -1965,6 +1995,7 @@ def gemm_norm_act_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
@@ -2027,6 +2058,7 @@ def gemm_norm_gated_tuned(
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
+        tile_K=config.tile_k,
         pingpong=config.pingpong,
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,

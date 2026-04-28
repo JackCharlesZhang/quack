@@ -25,6 +25,7 @@ from quack.epi_ops import (
     vec_multiply,
 )
 from quack.gemm_act import GemmActMixin
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -121,6 +122,10 @@ class GemmSqReduceSm90(GemmSqReduceMixin, GemmSm90):
     pass
 
 
+class GemmSqReduceSm80(GemmSqReduceMixin, GemmSm80):
+    pass
+
+
 class GemmSqReduceSm100(GemmSqReduceMixin, GemmSm100):
     pass
 
@@ -152,6 +157,7 @@ def _compile_gemm_sq_reduce(
     device_capacity,
 ):
     sm_to_cls = {
+        8: GemmSqReduceSm80,
         9: GemmSqReduceSm90,
         10: GemmSqReduceSm100,
         11: GemmSqReduceSm100,
@@ -249,9 +255,9 @@ def gemm_sq_reduce(
     written to it.
     """
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)

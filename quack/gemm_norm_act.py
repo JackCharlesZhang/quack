@@ -18,6 +18,7 @@ from quack.cute_dsl_utils import (
     get_device_capacity,
     get_max_active_clusters,
 )
+from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -91,6 +92,10 @@ class GemmNormActSm90(GemmNormActMixin, GemmSm90):
     pass
 
 
+class GemmNormActSm80(GemmNormActMixin, GemmSm80):
+    pass
+
+
 class GemmNormActSm100(GemmNormActMixin, GemmSm100):
     pass
 
@@ -145,6 +150,10 @@ class GemmNormGatedSm90(GemmNormGatedMixin, GemmSm90):
     pass
 
 
+class GemmNormGatedSm80(GemmNormGatedMixin, GemmSm80):
+    pass
+
+
 class GemmNormGatedSm100(GemmNormGatedMixin, GemmSm100):
     pass
 
@@ -183,12 +192,14 @@ def _compile_gemm_norm_act(
 ):
     sm_to_cls = {
         "norm_act": {
+            8: GemmNormActSm80,
             9: GemmNormActSm90,
             10: GemmNormActSm100,
             11: GemmNormActSm100,
             12: GemmNormActSm120,
         },
         "norm_gated": {
+            8: GemmNormGatedSm80,
             9: GemmNormGatedSm90,
             10: GemmNormGatedSm100,
             11: GemmNormGatedSm100,
@@ -327,9 +338,9 @@ def gemm_norm_act_fn(
     colvec_ndim = colvec.ndim if colvec is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if tile_K is not None:
-        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding requires SM100"
 
