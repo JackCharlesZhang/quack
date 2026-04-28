@@ -58,22 +58,22 @@ class GemmDActMixin(GemmActMixin):
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
+            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                    tRS_rD[i], tRS_rPostAct[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
+                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                    tRS_rD[i], tRS_rAuxOut[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
             else:
-                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
+                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
                     (
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
-                        (tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1]),
+                        (tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1]),
                     ) = params.act_fn(
                         (tRS_rC_acc[2 * i], tRS_rC_acc[2 * i + 1]),
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
                     )
         else:
-            tRS_rPostAct = tRS_rC_acc
-        return tRS_rPostAct
+            tRS_rAuxOut = tRS_rC_acc
+        return tRS_rAuxOut
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -94,14 +94,14 @@ class GemmDGatedMixin(GemmActMixin):
     _epi_ops = (
         ColVecLoad("mColVecBroadcast"),
         Scalar("sr_seed", dtype=Int32),
-        TileStore("mPostAct"),
+        TileStore("mAuxOut"),
         ColVecReduce("mColVecReduce"),
     )
     _extra_param_fields = (("act_bwd_fn", cutlass.Constexpr, None),)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
-        mPostAct: cute.Tensor
+        mAuxOut: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
@@ -117,9 +117,9 @@ class GemmDGatedMixin(GemmActMixin):
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
         self.rounding_mode = args.rounding_mode
-        self.postact_dtype = args.mPostAct.element_type
-        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        self.aux_out_dtype = args.mAuxOut.element_type
+        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.cta_tile_shape_aux_out_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
         return self.EpilogueParams(**d)
@@ -283,7 +283,7 @@ def _compile_gemm_dact(
     div_pa = div_for_dtype(postact_dtype)
     pa_leading = 1 if postact_major == "n" else 0
     pa_shape = (m, n) if varlen_m else (m, n, l)
-    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading, divisibility=div_pa)
+    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading, divisibility=div_pa)
 
     if is_dgated:
         act_fn = dgate_fn_map[activation]
@@ -310,7 +310,7 @@ def _compile_gemm_dact(
                 divisibility=1,
             )
         epi_args = GemmCls.EpilogueArguments(
-            mPostAct,
+            mAuxOut,
             act_fn,
             mColVecBroadcast=mColVec,
             mColVecReduce=mColVecReduce,
@@ -322,7 +322,7 @@ def _compile_gemm_dact(
         post_init = _set_implicit_dtype
     else:
         act_fn = dact_fn_map[activation]
-        epi_args = GemmCls.EpilogueArguments(mPostAct, act_fn)
+        epi_args = GemmCls.EpilogueArguments(mAuxOut, act_fn)
         post_init = None
 
     scheduler_args = make_fake_scheduler_args(

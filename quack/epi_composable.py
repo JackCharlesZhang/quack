@@ -6,7 +6,7 @@ epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
 epi_begin_loop, epi_end_loop, epi_end, and EpilogueParams by querying each op.
 
 epi_get_smem_tensors, epi_begin, and epi_begin_loop all return dicts keyed by op
-name, so consumers access values by name (e.g. epi_smem_tensors["mPostAct"],
+name, so consumers access values by name (e.g. epi_smem_tensors["mAuxOut"],
 epi_loop_tensors["alpha"]).
 
 EpilogueParams is auto-generated from _epi_ops (via param_fields()) plus any

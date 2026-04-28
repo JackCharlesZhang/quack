@@ -401,7 +401,7 @@ class TileStore(EpiOp):
     """Tile-sized output tensor stored via TMA (e.g. postact).
 
     Args:
-        name: field name in EpilogueArguments/Params (e.g. "mPostAct")
+        name: field name in EpilogueArguments/Params (e.g. "mAuxOut")
         epi_tile_fn: optional (gemm, epi_tile) -> epi_tile for half-tile (GemmGated)
     """
 
@@ -456,7 +456,7 @@ class TileStore(EpiOp):
             f"s_{self.name}",
             cute.struct.Align[
                 cute.struct.MemRange[
-                    gemm.postact_dtype,
+                    gemm.aux_out_dtype,
                     cute.cosize(getattr(params, smem_layout_key)),
                 ],
                 gemm.buffer_align_bytes,

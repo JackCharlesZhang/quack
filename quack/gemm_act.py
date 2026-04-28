@@ -41,7 +41,7 @@ import quack.layout_utils as layout_utils
 import quack.copy_utils as copy_utils
 from quack.layout_utils import permute_gated_Cregs_b16
 from quack.activation import act_fn_map, gate_fn_map
-from quack.rounding import RoundingMode, convert_f32_to_bf16_sr, epilogue_postact_sr_seed
+from quack.rounding import RoundingMode, convert_f32_to_bf16_sr, epilogue_aux_out_sr_seed
 
 
 class GemmActMixin(ComposableEpiMixin):
@@ -51,13 +51,13 @@ class GemmActMixin(ComposableEpiMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
-        TileStore("mPostAct"),
+        TileStore("mAuxOut"),
     )
     _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
-        mPostAct: cute.Tensor
+        mAuxOut: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -70,9 +70,9 @@ class GemmActMixin(ComposableEpiMixin):
 
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
-        self.postact_dtype = args.mPostAct.element_type
-        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        self.aux_out_dtype = args.mAuxOut.element_type
+        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.cta_tile_shape_aux_out_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
@@ -83,26 +83,26 @@ class GemmActMixin(ComposableEpiMixin):
     # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
     # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
-    def epi_make_postact_copy_atom_r2s(self, params, tiled_copy_t2r):
-        """Build the register-to-shared copy atom used by postact outputs."""
+    def epi_make_aux_out_copy_atom_r2s(self, params, tiled_copy_t2r):
+        """Build the register-to-shared copy atom used by aux outputs."""
         if self.arch == 100:
             return sm100_utils.get_smem_store_op(
-                self.postact_layout, self.postact_dtype, self.acc_dtype, tiled_copy_t2r
+                self.aux_out_layout, self.aux_out_dtype, self.acc_dtype, tiled_copy_t2r
             )
         else:
             return copy_utils.get_smem_store_atom(
-                self.postact_dtype,
-                transpose=self.postact_layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
-                major_mode_size=cute.size(params.epi_tile_mPostAct, mode=[1])
+                self.aux_out_dtype,
+                transpose=self.aux_out_layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
+                major_mode_size=cute.size(params.epi_tile_mAuxOut, mode=[1])
                 // self.atom_layout_mnk[1],
             )
 
-    def epi_make_postact_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
-        """Build the register-to-shared tiled copy used by postact outputs."""
-        copy_atom_postact_r2s = self.epi_make_postact_copy_atom_r2s(params, tiled_copy_t2r)
-        return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
+    def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        """Build the register-to-shared tiled copy used by aux outputs."""
+        copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
+        return cute.make_tiled_copy_S(copy_atom_aux_out_r2s, tiled_copy_r2s)
 
-    def epi_setup_postact(
+    def epi_setup_aux_out(
         self,
         params,
         epi_smem_tensors,
@@ -112,44 +112,44 @@ class GemmActMixin(ComposableEpiMixin):
         varlen_manager,
         tidx,
     ):
-        """Setup postact TMA copies and partitions before the epilogue loop."""
-        sPostAct = epi_smem_tensors["mPostAct"]
-        tiled_copy_postact_r2s = self.epi_make_postact_tiled_copy_r2s(
+        """Setup aux output TMA copies and partitions before the epilogue loop."""
+        sAuxOut = epi_smem_tensors["mAuxOut"]
+        tiled_copy_aux_out_r2s = self.epi_make_aux_out_tiled_copy_r2s(
             params, tiled_copy_r2s, tiled_copy_t2r
         )
-        tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
+        tRS_sAuxOut = tiled_copy_aux_out_r2s.get_slice(tidx).partition_D(sAuxOut)
         batch_idx = tile_coord_mnkl[3]
-        copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
-            params.tma_atom_mPostAct,
-            varlen_manager.offset_batch_epi(params.mPostAct, batch_idx),
-            self.cta_tile_shape_postact_mn,
-            params.epi_tile_mPostAct,
-            sPostAct,
+        copy_aux_out, _, _ = self.epilog_gmem_copy_and_partition(
+            params.tma_atom_mAuxOut,
+            varlen_manager.offset_batch_epi(params.mAuxOut, batch_idx),
+            self.cta_tile_shape_aux_out_mn,
+            params.epi_tile_mAuxOut,
+            sAuxOut,
             tile_coord_mnkl,
         )
-        return tiled_copy_postact_r2s, tRS_sPostAct, copy_postact
+        return tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out
 
     @cute.jit
-    def epi_convert_postact(
-        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    def epi_convert_aux_out(
+        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
-        """Convert postact from acc_dtype to postact_dtype. Override for custom postprocessing."""
+        """Convert aux output from acc_dtype to aux_out_dtype. Override for custom postprocessing."""
         if const_expr(
             self.rounding_mode == RoundingMode.RS
-            and tRS_rPostAct.element_type == cutlass.Float32
-            and self.postact_dtype == cutlass.BFloat16
+            and tRS_rAuxOut.element_type == cutlass.Float32
+            and self.aux_out_dtype == cutlass.BFloat16
         ):
             from cutlass.cute.tensor import TensorSSA
 
-            seed = epilogue_postact_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
-            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
-            src_vec = tRS_rPostAct.load()
+            seed = epilogue_aux_out_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
+            tRS_rAuxOut_out = cute.make_rmem_tensor_like(tRS_rAuxOut, self.aux_out_dtype)
+            src_vec = tRS_rAuxOut.load()
             raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
-            tRS_rPostAct_out.store(TensorSSA(raw_vec, src_vec.shape, self.postact_dtype))
+            tRS_rAuxOut_out.store(TensorSSA(raw_vec, src_vec.shape, self.aux_out_dtype))
         else:
-            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
-            tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+            tRS_rAuxOut_out = cute.make_rmem_tensor_like(tRS_rAuxOut, self.aux_out_dtype)
+            tRS_rAuxOut_out.store(tRS_rAuxOut.load().to(self.aux_out_dtype))
+        return tRS_rAuxOut_out
 
     @cute.jit
     def epi_visit_subtile(
@@ -163,18 +163,18 @@ class GemmActMixin(ComposableEpiMixin):
         # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
+            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                    tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
+                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                    tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
             else:
-                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                    tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1])
                     )
         else:
-            tRS_rPostAct = tRS_rD
-        return tRS_rPostAct
+            tRS_rAuxOut = tRS_rD
+        return tRS_rAuxOut
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
@@ -198,26 +198,30 @@ def _gated_epi_tile_fn(gemm, epi_tile):
 
 class GemmGatedMixin(GemmActMixin):
     _epi_ops = (
-        *GemmDefaultEpiMixin._epi_ops,
-        TileStore("mPostAct", epi_tile_fn=_gated_epi_tile_fn),
+        Scalar("alpha"),
+        Scalar("beta"),
+        Scalar("sr_seed", dtype=Int32),
+        RowVecLoad("mRowVecBroadcast"),
+        ColVecLoad("mColVecBroadcast"),
+        TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
-        assert args.mPostAct.element_type.width == 16, (
+        assert args.mAuxOut.element_type.width == 16, (
             "GemmGated only supports 16bit postact for now"
         )
         assert self.d_layout is None or self.d_layout.is_n_major_c()
-        assert cutlass.utils.LayoutEnum.from_tensor(args.mPostAct).is_n_major_c()
+        assert cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut).is_n_major_c()
         if self.arch == 90:
             assert self.cta_tile_shape_mnk[1] % 32 == 0, (
                 "GemmGatedSm90 requires tileN to be divisible by 32"
             )
         self.rounding_mode = args.rounding_mode
-        self.postact_dtype = args.mPostAct.element_type
-        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        self.cta_tile_shape_postact_mn = (
+        self.aux_out_dtype = args.mAuxOut.element_type
+        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.cta_tile_shape_aux_out_mn = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1] // 2,
         )
@@ -237,30 +241,30 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
-        tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
-        tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
+        tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
         if const_expr(self.arch != 100):
-            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                tRS_rAuxOut[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
         else:
-            for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+            for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
-        return tRS_rPostAct
+        return tRS_rAuxOut
 
     @cute.jit
-    def epi_convert_postact(
-        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    def epi_convert_aux_out(
+        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
-        tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
-            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        tRS_rAuxOut_out = GemmActMixin.epi_convert_aux_out(
+            self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
         if const_expr(self.arch in (90, 120)):
             # Only need this if we're using STSM
-            permute_gated_Cregs_b16(tRS_rPostAct_out)
-        return tRS_rPostAct_out
+            permute_gated_Cregs_b16(tRS_rAuxOut_out)
+        return tRS_rAuxOut_out
 
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
@@ -290,9 +294,9 @@ class GemmGatedSm120Mixin:
         tile_n = math.gcd(atom_n * 8 * 4, cute.size(cta_tile_shape_mnk, mode=[1]))
         return (tile_m, tile_n)
 
-    def epi_make_postact_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
-        copy_atom_postact_r2s = self.epi_make_postact_copy_atom_r2s(params, tiled_copy_t2r)
-        copy_atom_postact_c = self.epi_make_postact_copy_atom_r2s(params, cutlass.Float16)
+    def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
+        copy_atom_postact_c = self.epi_make_aux_out_copy_atom_r2s(params, cutlass.Float16)
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
         atom_m, atom_n, atom_k = self.atom_layout_mnk
@@ -302,10 +306,10 @@ class GemmGatedSm120Mixin:
             self.mma_inst_mnk[2] * atom_k,
         )
         tiled_mma_gated_postact = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
-        tiled_copy_postact_c_atom = cute.make_tiled_copy_C_atom(
+        tiled_copy_aux_out_c_atom = cute.make_tiled_copy_C_atom(
             copy_atom_postact_c, tiled_mma_gated_postact
         )
-        return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_postact_c_atom)
+        return cute.make_tiled_copy_S(copy_atom_aux_out_r2s, tiled_copy_aux_out_c_atom)
 
 
 class GemmGatedSm120(GemmGatedSm120Mixin, GemmGatedMixin, GemmSm120):
@@ -364,7 +368,7 @@ def _compile_gemm_act(
     div_pa = div_for_dtype(postact_dtype)
     pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
-    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -385,7 +389,7 @@ def _compile_gemm_act(
             return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
 
     epi_args = GemmCls.EpilogueArguments(
-        mPostAct,
+        mAuxOut,
         act_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,

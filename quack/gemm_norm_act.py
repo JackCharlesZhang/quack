@@ -73,18 +73,18 @@ class GemmNormActMixin(GemmActMixin):
         vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Apply activation
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
+            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                    tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
+                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                    tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
             else:
-                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                    tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1])
                     )
         else:
-            tRS_rPostAct = tRS_rD
-        return tRS_rPostAct
+            tRS_rAuxOut = tRS_rD
+        return tRS_rAuxOut
 
 
 class GemmNormActSm90(GemmNormActMixin, GemmSm90):
@@ -127,18 +127,18 @@ class GemmNormGatedMixin(GemmGatedMixin):
         # Multiply by colvec (rstd) and rowvec (norm_weight)
         vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Gated activation on normalized D
-        tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
-        tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
+        tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
         if const_expr(self.arch != 100):
-            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                tRS_rAuxOut[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
         else:
-            for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+            for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]),
                     (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3]),
                 )
-        return tRS_rPostAct
+        return tRS_rAuxOut
 
 
 class GemmNormGatedSm90(GemmNormGatedMixin, GemmSm90):
@@ -213,7 +213,7 @@ def _compile_gemm_norm_act(
     pa_n = cute.sym_int() if gemm_cls_name == "norm_gated" else n
     pa_leading_dim = 1 if gemm_cls_name == "norm_gated" else pa_leading
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
-    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -234,7 +234,7 @@ def _compile_gemm_norm_act(
             return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
 
     epi_args = GemmCls.EpilogueArguments(
-        mPostAct,
+        mAuxOut,
         act_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,

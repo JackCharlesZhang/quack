@@ -33,7 +33,7 @@ EPILOGUE_SR_SEED_M_STRIDE = 65537
 EPILOGUE_SR_SEED_N_STRIDE = 257
 EPILOGUE_SR_SEED_BATCH_STRIDE = 17
 EPILOGUE_SR_SEED_SUBTILE_STRIDE = 7
-EPILOGUE_SR_SEED_POSTACT_SALT = 0x9E3779B1
+EPILOGUE_SR_SEED_AUX_OUT_SALT = 0x9E3779B1
 
 PHILOX_N_ROUNDS_DEFAULT = 7
 
@@ -61,7 +61,7 @@ def epilogue_sr_seed(
 
 
 @dsl_user_op
-def epilogue_postact_sr_seed(
+def epilogue_aux_out_sr_seed(
     base_seed: Int32,
     tile_coord_mnkl: cute.Coord,
     subtile_idx,
@@ -70,7 +70,7 @@ def epilogue_postact_sr_seed(
     ip=None,
 ) -> Int32:
     return epilogue_sr_seed(
-        base_seed + EPILOGUE_SR_SEED_POSTACT_SALT,
+        base_seed + EPILOGUE_SR_SEED_AUX_OUT_SALT,
         tile_coord_mnkl,
         subtile_idx,
         loc=loc,

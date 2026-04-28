@@ -87,8 +87,8 @@ class GemmBase:
             and self.d_dtype == cutlass.BFloat16
         )
 
-        # Setup postact output (returns None for default epilogue, context tuple for Act)
-        postact_ctx = self.epi_setup_postact(
+        # Setup aux output (returns None for default epilogue, context tuple for Act)
+        aux_out_ctx = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
             tiled_copy_r2s,
@@ -169,10 +169,10 @@ class GemmBase:
                         src_idx=epi_coord_C,
                         dst_idx=(epi_idx + self.epi_c_stage) % self.epi_c_stage,
                     )
-            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            if const_expr(postact_ctx is not None):
-                tRS_rPostAct_out = self.epi_convert_postact(
-                    tRS_rPostAct,
+            tRS_rAuxOut = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            if const_expr(aux_out_ctx is not None):
+                tRS_rAuxOut_out = self.epi_convert_aux_out(
+                    tRS_rAuxOut,
                     epi_loop_tensors["sr_seed"],
                     tidx,
                     tile_coord_mnkl,
@@ -196,13 +196,13 @@ class GemmBase:
                     copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
                 else:
                     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
-            if const_expr(postact_ctx is not None):
-                tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = postact_ctx
+            if const_expr(aux_out_ctx is not None):
+                tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
                 cute.copy(
-                    tiled_copy_postact_r2s,
+                    tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_postact_r2s.retile(tRS_rPostAct_out)),
-                    tRS_sPostAct[None, None, None, epi_buffer],
+                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
+                    tRS_sAuxOut[None, None, None, epi_buffer],
                 )
             if const_expr(use_tma_epi):
                 cute.arch.fence_view_async_shared()
@@ -210,15 +210,15 @@ class GemmBase:
                 if is_tma_warp:
                     if const_expr(has_D):
                         copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                    if const_expr(postact_ctx is not None):
-                        copy_postact(src_idx=epi_buffer, dst_idx=epi_coord)
+                    if const_expr(aux_out_ctx is not None):
+                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
             else:
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
                     copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                if const_expr(postact_ctx is not None):
-                    copy_postact(src_idx=epi_buffer, dst_idx=epi_coord)
+                if const_expr(aux_out_ctx is not None):
+                    copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
 
         self.epi_end(
@@ -285,7 +285,7 @@ class GemmBase:
                 persistence_mode=persistence_mode,
             )
         else:
-            assert (mD is not None) or (epilogue_args.mPostAct is not None) or (not self.gather_A)
+            assert (mD is not None) or (epilogue_args.mAuxOut is not None) or (not self.gather_A)
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
@@ -399,7 +399,7 @@ class GemmBase:
     def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Dict[str, cute.Tensor]:
         return {}
 
-    def epi_setup_postact(
+    def epi_setup_aux_out(
         self,
         params,
         epi_smem_tensors,
@@ -409,15 +409,15 @@ class GemmBase:
         varlen_manager,
         tidx,
     ):
-        """Default epilogue has no postact output."""
+        """Default epilogue has no aux output."""
         return None
 
     @cute.jit
-    def epi_convert_postact(
-        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    def epi_convert_aux_out(
+        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
-        """Convert postact from acc_dtype to output dtype. Override for custom postprocessing."""
-        return tRS_rPostAct
+        """Convert aux output from acc_dtype to output dtype. Override for custom postprocessing."""
+        return tRS_rAuxOut
 
 
 class GemmTmaBase(GemmBase):
