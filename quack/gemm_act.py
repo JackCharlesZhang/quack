@@ -14,13 +14,13 @@ from cutlass.cute.nvgpu import warp
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
-    ParamsBase,
     mlir_namedtuple,
     get_device_capacity,
     get_max_active_clusters,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import TileStore
+from quack.epi_composable import ComposableEpiMixin
+from quack.epi_ops import ColVecLoad, RowVecLoad, Scalar, TileStore
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -44,10 +44,16 @@ from quack.activation import act_fn_map, gate_fn_map
 from quack.rounding import RoundingMode, convert_f32_to_bf16_sr, epilogue_postact_sr_seed
 
 
-class GemmActMixin(GemmDefaultEpiMixin):
-    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"))
+class GemmActMixin(ComposableEpiMixin):
+    _epi_ops = (
+        Scalar("alpha"),
+        Scalar("beta"),
+        Scalar("sr_seed", dtype=Int32),
+        RowVecLoad("mRowVecBroadcast"),
+        ColVecLoad("mColVecBroadcast"),
+        TileStore("mPostAct"),
+    )
     _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
-    _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):

@@ -8,7 +8,7 @@ from torch import Tensor
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, const_expr
+from cutlass import Int32, Float32, const_expr
 
 from quack.cute_dsl_utils import (
     mlir_namedtuple,
@@ -16,11 +16,17 @@ from quack.cute_dsl_utils import (
     get_device_capacity,
     get_max_active_clusters,
 )
-from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate, vec_multiply
+from quack.epi_composable import ComposableEpiMixin
+from quack.epi_ops import (
+    ColVecReduce,
+    RowVecLoad,
+    Scalar,
+    colvec_reduce_accumulate,
+    vec_multiply,
+)
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
-from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.rounding import RoundingMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cache_utils import jit_cache
@@ -38,25 +44,30 @@ from quack.gemm_tvm_ffi_utils import (
 import quack.utils as utils
 
 
-class GemmSqReduceMixin(GemmDefaultEpiMixin):
+class GemmSqReduceMixin(ComposableEpiMixin):
     """GEMM + sq_reduce + optional rowvec scaling.
 
     D_raw = A @ B (+ C), reduce[m] = sum_n(D_raw[m,n]^2), D_out = D_raw * rowvec.
     The sq_sum is computed BEFORE the rowvec scaling.
     """
 
-    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, ColVecReduce("mColVecReduce"))
+    _epi_ops = (
+        Scalar("alpha"),
+        Scalar("beta"),
+        Scalar("sr_seed", dtype=Int32),
+        RowVecLoad("mRowVecBroadcast"),
+        ColVecReduce("mColVecReduce"),
+    )
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
         add_to_output: cutlass.Constexpr[bool] = False
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
-        sr_seed: None = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops
 

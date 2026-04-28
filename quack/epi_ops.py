@@ -559,6 +559,9 @@ class ColVecReduce(EpiOp):
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
+    def epi_m_major_score(self, arg_tensor, gemm):
+        return 1 if arg_tensor is not None else 0
+
     @staticmethod
     def _smem_warps_in_n(atom_layout_mnk):
         warps_in_n = atom_layout_mnk[1] if atom_layout_mnk is not None else 1

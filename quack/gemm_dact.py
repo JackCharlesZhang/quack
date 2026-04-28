@@ -13,10 +13,9 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_act import GemmActMixin
-from quack.epi_ops import ColVecReduce, colvec_reduce_accumulate
+from quack.epi_ops import ColVecLoad, ColVecReduce, Scalar, TileStore, colvec_reduce_accumulate
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
-    ParamsBase,
     mlir_namedtuple,
     torch2cute_dtype_map,
     get_device_capacity,
@@ -92,17 +91,18 @@ class GemmDActSm120(GemmDActMixin, GemmSm120):
 class GemmDGatedMixin(GemmActMixin):
     # Different from GemmActMixin, here act_bwd_fn must take in 3 arguments (x, y, dout)
     # and return 3 arguments (dx, dy, out)
-    _epi_ops = (*GemmActMixin._epi_ops, ColVecReduce("mColVecReduce"))
+    _epi_ops = (
+        ColVecLoad("mColVecBroadcast"),
+        Scalar("sr_seed", dtype=Int32),
+        TileStore("mPostAct"),
+        ColVecReduce("mColVecReduce"),
+    )
     _extra_param_fields = (("act_bwd_fn", cutlass.Constexpr, None),)
-    _epi_param_bases = (ParamsBase,)
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
@@ -134,12 +134,8 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        alpha = epi_loop_tensors["alpha"]
-        beta = epi_loop_tensors["beta"]
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
-        assert alpha is None and beta is None and tDrRowVec is None  # We don't use these for now
         assert tRS_rC is not None
         implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"

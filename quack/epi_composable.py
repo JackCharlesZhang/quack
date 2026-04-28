@@ -19,6 +19,7 @@ from dataclasses import make_dataclass, MISSING
 import cutlass.cute as cute
 from cutlass import const_expr
 
+from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiContext, Scalar
 
 
@@ -42,7 +43,7 @@ class ComposableEpiMixin:
 
     _epi_ops = ()
     _extra_param_fields = ()  # [(name, type, default), ...] for non-op params (e.g. act_fn)
-    _epi_param_bases = ()  # Base classes for EpilogueParams (e.g. (ParamsBase,))
+    _epi_param_bases = (ParamsBase,)  # Base classes for the auto-generated EpilogueParams
     _epi_has_async_ops = False
 
     def __init_subclass__(cls, **kwargs):
