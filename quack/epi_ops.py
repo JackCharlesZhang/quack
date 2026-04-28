@@ -685,7 +685,7 @@ class ColVecReduce(EpiOp):
                             if row_idx < limit_m:
                                 gColVec[row_idx] = tDrReduce_m[m]
                 else:
-                    warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WAPR_SIZE)
+                    warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
                     warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
                     if is_lane_n_leader:
                         for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
