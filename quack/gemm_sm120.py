@@ -598,9 +598,10 @@ class GemmSm120(GemmSm90):
             for k in cutlass.range_constexpr(num_k_blocks):
                 k_next = 0 if k + 1 == num_k_blocks else k + 1
                 if const_expr(k == num_k_blocks - 1):
-                    # TMA writes smem through the async proxy; ldmatrix reads it through the
-                    # generic proxy. Fence before releasing the smem stage for reuse, then
-                    # sync the warp because only one lane signals the mbarrier.
+                    # TMA writes this smem stage through the async proxy, while ldmatrix
+                    # reads it through the generic proxy. Fence before release so the
+                    # producer's next async-proxy write cannot race those reads; sync the
+                    # warp because only one lane signals the empty mbarrier.
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     ab_pipeline.consumer_release(ab_read_state)
@@ -618,9 +619,10 @@ class GemmSm120(GemmSm90):
             for k in cutlass.range_constexpr(num_k_blocks):
                 k_next = 0 if k + 1 == num_k_blocks else k + 1
                 if const_expr(k == num_k_blocks - 1):
-                    # TMA writes smem through the async proxy; ldmatrix reads it through the
-                    # generic proxy. Fence before releasing the smem stage for reuse, then
-                    # sync the warp because only one lane signals the mbarrier.
+                    # TMA writes this smem stage through the async proxy, while ldmatrix
+                    # reads it through the generic proxy. Fence before release so the
+                    # producer's next async-proxy write cannot race those reads; sync the
+                    # warp because only one lane signals the empty mbarrier.
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     ab_pipeline.consumer_release(ab_read_state)
