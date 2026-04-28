@@ -20,10 +20,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu: [h100, b300]
+        include:
+          - gpu: h100
+          - gpu: b300
+          - gpu: h100
+            arch: '120'
     runs-on: [self-hosted, '${{ matrix.gpu }}']
-    name: test (${{ matrix.gpu }})
+    name: test (${{ matrix.gpu }}${{ matrix.arch && format(' / sm{0}', matrix.arch) || '' }})
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/gpu-test
+        with:
+          arch: ${{ matrix.arch }}
