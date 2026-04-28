@@ -814,16 +814,18 @@ def test_rms_final_reduce(M, N, input_dtype):
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("premult_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("has_norm_weight", [False, True])
 @pytest.mark.parametrize("has_C", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("n", [1504, 2048])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960, 1920])
-def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
-    """Test GEMM + RMS + optional rowvec scaling.
+def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, premult_dtype, use_compile):
+    """Test GEMM + RMS + optional rowvec scaling, optionally writing a pre-norm_weight snapshot.
 
     D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    If premult_out is provided, D_raw is also written there (cast to premult_dtype).
     """
     device = "cuda"
     torch.random.manual_seed(0)
@@ -832,8 +834,11 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
     B = torch.randn((k, n), device=device, dtype=input_dtype)
     C = torch.randn((m, n), device=device, dtype=input_dtype) if has_C else None
     norm_weight = torch.randn(n, device=device, dtype=input_dtype) if has_norm_weight else None
+    premult_out = (
+        torch.empty(m, n, device=device, dtype=premult_dtype) if premult_dtype is not None else None
+    )
     fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, eps=eps, tuned=False)
+    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tuned=False)
     D_ref, rstd_ref = gemm_rms_ref(
         A.float(),
         B.float(),
@@ -844,6 +849,18 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
     D_pt, rstd_pt = gemm_rms_ref(A, B, C=C, norm_weight=norm_weight, eps=eps)
     assert (D - D_ref).abs().max() < 2 * (D_pt - D_ref).abs().max() + 1e-5
     assert (rstd - rstd_ref).abs().max() < 2 * (rstd_pt - rstd_ref).abs().max() + 1e-3
+
+    if premult_out is not None:
+        # premult_out holds (A@B + C) (pre-norm_weight), cast to premult_dtype.
+        ab = A.float() @ B.float()
+        if C is not None:
+            ab = ab + C.float()
+        expected_premult = ab.to(premult_dtype).float()
+        # Tolerance is gated by the wider of input/premult eps: input eps bounds matmul-accumulation
+        # divergence, premult eps bounds the storage cast.
+        eff_eps = max(torch.finfo(input_dtype).eps, torch.finfo(premult_dtype).eps)
+        tol = 2 * (expected_premult.abs().max() * eff_eps + torch.finfo(premult_dtype).tiny)
+        assert (premult_out.float() - expected_premult).abs().max() <= tol
 
 
 @pytest.mark.parametrize("swap_ab", [False, True])

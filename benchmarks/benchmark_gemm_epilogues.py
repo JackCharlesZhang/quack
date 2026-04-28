@@ -26,6 +26,7 @@ from quack.gemm_interface import (
     gemm_norm_act,
     gemm_norm_act_tuned,
 )
+from quack.gemm_sq_reduce import gemm_sq_reduce
 
 
 def make_config(args) -> GemmConfig:
@@ -176,6 +177,64 @@ def run_norm_act(args, config: GemmConfig):
     return {"ms": ms, "samples": samples}
 
 
+def run_sq_reduce(args, config: GemmConfig):
+    a = torch.randn(args.m, args.k, device="cuda", dtype=args.dtype)
+    b = torch.randn(args.k, args.n, device="cuda", dtype=args.dtype) / math.sqrt(args.k)
+    c = (
+        torch.randn(args.m, args.n, device="cuda", dtype=args.dtype)
+        if not args.no_residual
+        else None
+    )
+    rowvec = (
+        torch.randn(args.n, device="cuda", dtype=torch.float32) if not args.no_norm_weight else None
+    )
+    out = torch.empty(args.m, args.n, device="cuda", dtype=args.dtype)
+    aux_out = (
+        torch.empty(args.m, args.n, device="cuda", dtype=args.dtype) if args.with_aux else None
+    )
+    tile_m = config.tile_m if config is not None else args.tile_m
+    tile_n = config.tile_n if config is not None else args.tile_n
+    tile_k = config.tile_k if config is not None else args.tile_k
+    cluster_m = config.cluster_m if config is not None else 1
+    cluster_n = config.cluster_n if config is not None else 1
+    pingpong = config.pingpong if config is not None else args.pingpong
+    n_tiles = math.ceil(args.n / tile_n)
+    colvec = torch.zeros(args.m, n_tiles, device="cuda", dtype=torch.float32)
+
+    # gemm_sq_reduce wants (l, m, k)/(l, n, k) inputs; expand the leading batch dim of 1.
+    A = a.unsqueeze(0)
+    B = b.transpose(-1, -2).unsqueeze(0).contiguous()  # (1, n, k)
+    D = out.unsqueeze(0)
+    C = c.unsqueeze(0) if c is not None else None
+    rowvec_3d = rowvec.unsqueeze(0) if rowvec is not None else None
+    colvec_3d = colvec.unsqueeze(0)
+    AuxOut = aux_out.unsqueeze(0) if aux_out is not None else None
+
+    fn = lambda: gemm_sq_reduce(
+        A,
+        B,
+        D,
+        C,
+        colvec_3d,
+        None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
+        cluster_N=cluster_n,
+        tile_K=tile_k,
+        pingpong=pingpong,
+        persistent=False,
+        rowvec=rowvec_3d,
+        aux_out=AuxOut,
+    )
+    if args.profile:
+        profile_once(fn, args.profile_warmup)
+        return {"ms": None}
+    fn()
+    ms, samples = benchmark(fn, args.repeats, args.warmup, args.stat)
+    return {"ms": ms, "samples": samples}
+
+
 def run_act(args, config: GemmConfig):
     a = torch.randn(args.m, args.k, device="cuda", dtype=args.dtype)
     b = torch.randn(args.k, args.n, device="cuda", dtype=args.dtype) / math.sqrt(args.k)
@@ -219,7 +278,7 @@ def run_act(args, config: GemmConfig):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark GEMM epilogue kernels")
-    parser.add_argument("--kernel", choices=["rms", "norm_act", "act"], default="rms")
+    parser.add_argument("--kernel", choices=["rms", "norm_act", "act", "sq_reduce"], default="rms")
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
@@ -238,6 +297,11 @@ def main():
     parser.add_argument("--no-dynamic-persistent", action="store_true")
     parser.add_argument("--no-residual", action="store_true")
     parser.add_argument("--no-norm-weight", action="store_true")
+    parser.add_argument(
+        "--with-aux",
+        action="store_true",
+        help="(sq_reduce) also write the pre-rowvec output to mAuxOut",
+    )
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
@@ -278,6 +342,8 @@ def main():
         result = run_rms(args, config)
     elif args.kernel == "norm_act":
         result = run_norm_act(args, config)
+    elif args.kernel == "sq_reduce":
+        result = run_sq_reduce(args, config)
     else:
         result = run_act(args, config)
 

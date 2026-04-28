@@ -445,7 +445,14 @@ class TileStore(EpiOp):
         ]
 
     def to_params(self, gemm, args):
-        tensor = getattr(args, self.name)
+        tensor = getattr(args, self.name, None)
+        if tensor is None:
+            return {
+                self._tma_atom_key(): None,
+                self.name: None,
+                self._smem_layout_key(): None,
+                self._epi_tile_key(): None,
+            }
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm, tensor, epi_tile=epi_tile
@@ -466,34 +473,32 @@ class TileStore(EpiOp):
 
     def smem_struct_field(self, gemm, params):
         smem_layout_key = self._smem_layout_key()
-        if not hasattr(params, smem_layout_key):
+        smem_layout = getattr(params, smem_layout_key, None)
+        if smem_layout is None:
             return (f"s_{self.name}", cute.struct.MemRange[Float32, 0])
         return (
             f"s_{self.name}",
             cute.struct.Align[
                 cute.struct.MemRange[
                     gemm.aux_out_dtype,
-                    cute.cosize(getattr(params, smem_layout_key)),
+                    cute.cosize(smem_layout),
                 ],
                 gemm.buffer_align_bytes,
             ],
         )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        smem_layout_key = self._smem_layout_key()
-        if not hasattr(params, smem_layout_key):
+        smem_layout = getattr(params, self._smem_layout_key(), None)
+        if smem_layout is None:
             return None
-        smem_layout = getattr(params, smem_layout_key)
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             smem_layout.outer,
             swizzle=smem_layout.inner,
         )
 
     def tma_atoms(self, gemm, params):
-        tma_key = self._tma_atom_key()
-        if hasattr(params, tma_key):
-            atom = getattr(params, tma_key)
-            return [] if atom is None else [atom]
+        atom = getattr(params, self._tma_atom_key(), None)
+        return [] if atom is None else [atom]
         return []
 
 

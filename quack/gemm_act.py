@@ -112,7 +112,12 @@ class GemmActMixin(ComposableEpiMixin):
         varlen_manager,
         tidx,
     ):
-        """Setup aux output TMA copies and partitions before the epilogue loop."""
+        """Setup aux output TMA copies and partitions before the epilogue loop.
+
+        Returns None when mAuxOut wasn't supplied so the framework skips the aux-out path.
+        """
+        if getattr(params, "mAuxOut", None) is None:
+            return None
         sAuxOut = epi_smem_tensors["mAuxOut"]
         tiled_copy_aux_out_r2s = self.epi_make_aux_out_tiled_copy_r2s(
             params, tiled_copy_r2s, tiled_copy_t2r

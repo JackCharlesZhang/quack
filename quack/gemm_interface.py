@@ -1730,6 +1730,7 @@ def _gemm_rms_tuned(
     out: Tensor,  # (M, N) or (L, M, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
+    premult_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) — pre-norm_weight snapshot
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
@@ -1749,6 +1750,8 @@ def _gemm_rms_tuned(
         C = C.unsqueeze(0)
     if norm_weight is not None and norm_weight.ndim == 1:
         norm_weight = norm_weight.unsqueeze(0)  # (L, N)
+    if premult_out is not None and premult_out.ndim == 2:
+        premult_out = premult_out.unsqueeze(0)
     # Allocate partial reduction buffer
     tile_n = config.tile_n
     n_tiles = (N + tile_n - 1) // tile_n
@@ -1790,9 +1793,9 @@ def _gemm_rms_tuned(
 
 @torch.library.custom_op(
     "quack::gemm_rms_out",
-    mutates_args=("out",),
+    mutates_args=("out", "premult_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, Tensor(a2!)? premult_out=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
 )
 def _gemm_rms_out(
     A: Tensor,
@@ -1800,6 +1803,7 @@ def _gemm_rms_out(
     out: Tensor,
     C: Optional[Tensor] = None,
     norm_weight: Optional[Tensor] = None,
+    premult_out: Optional[Tensor] = None,
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -1807,6 +1811,7 @@ def _gemm_rms_out(
     """GEMM + RMS + optional rowvec scaling.
 
     D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     """
     fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
     return fn(
@@ -1815,6 +1820,7 @@ def _gemm_rms_out(
         out,
         C=C,
         norm_weight=norm_weight,
+        premult_out=premult_out,
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
     )
@@ -1827,6 +1833,7 @@ def _gemm_rms_out_fake(
     out: Tensor,
     C: Optional[Tensor] = None,
     norm_weight: Optional[Tensor] = None,
+    premult_out: Optional[Tensor] = None,
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -1838,6 +1845,7 @@ def _gemm_rms_out_fake(
         out,
         C=C,
         norm_weight=norm_weight,
+        premult_out=premult_out,
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
     )
@@ -1870,6 +1878,7 @@ def gemm_rms(
     norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     out_dtype: Optional[torch.dtype] = None,
+    premult_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) — pre-norm_weight snapshot
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -1877,6 +1886,7 @@ def gemm_rms(
     """GEMM + RMS statistics + optional rowvec scaling.
 
     D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     Returns (D_out, rstd).
     """
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -1890,6 +1900,7 @@ def gemm_rms(
         out,
         C=C,
         norm_weight=norm_weight,
+        premult_out=premult_out,
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
