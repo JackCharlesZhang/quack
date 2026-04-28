@@ -1780,6 +1780,7 @@ def _gemm_rms_tuned(
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         rowvec=norm_weight,
+        aux_out=premult_out,
     )
     # Final reduction: rstd = rsqrt(sum(partials) / N + eps)
     scale = 1.0 / N
