@@ -107,7 +107,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         tidx,
     ):
         """Setup postact TMA copies and partitions before the epilogue loop."""
-        sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
+        sPostAct = epi_smem_tensors["mPostAct"]
         tiled_copy_postact_r2s = self.epi_make_postact_tiled_copy_r2s(
             params, tiled_copy_r2s, tiled_copy_t2r
         )

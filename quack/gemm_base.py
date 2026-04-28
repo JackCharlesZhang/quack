@@ -3,7 +3,7 @@
 import enum
 import math
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, Literal, Optional, Sequence, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -53,7 +53,7 @@ class GemmBase:
     def epilogue(
         self,
         params: EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
+        epi_smem_tensors: Dict[str, cute.Tensor],
         epi_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         epi_read_state: Optional[cutlass.pipeline.PipelineState],
@@ -325,7 +325,7 @@ class GemmBase:
     def epi_begin(
         self,
         params: EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
+        epi_smem_tensors: Dict[str, cute.Tensor],
         epi_tile: cute.Tile,
         tiled_copy_t2r: Optional[cute.TiledCopy],
         tiled_copy_r2s: cute.TiledCopy,
@@ -396,8 +396,8 @@ class GemmBase:
     def epi_get_smem_struct(self, params: EpilogueParams):
         return cute.struct.MemRange[Int32, 0]  # Dummy struct
 
-    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
-        return tuple()
+    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Dict[str, cute.Tensor]:
+        return {}
 
     def epi_setup_postact(
         self,

@@ -3,10 +3,11 @@
 
 Subclasses declare _epi_ops as a tuple of EpiOp instances. The mixin auto-generates
 epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
-epi_begin_loop, epi_end, and EpilogueParams by querying each op.
+epi_begin_loop, epi_end_loop, epi_end, and EpilogueParams by querying each op.
 
-epi_begin and epi_begin_loop return dicts keyed by op name, so epi_visit_subtile
-can access values by name (e.g. epi_loop_tensors["alpha"]).
+epi_get_smem_tensors, epi_begin, and epi_begin_loop all return dicts keyed by op
+name, so consumers access values by name (e.g. epi_smem_tensors["mPostAct"],
+epi_loop_tensors["alpha"]).
 
 EpilogueParams is auto-generated from _epi_ops (via param_fields()) plus any
 _extra_param_fields declared on the subclass. Subclasses still define
@@ -19,17 +20,6 @@ import cutlass.cute as cute
 from cutlass import const_expr
 
 from quack.epi_ops import EpiContext, Scalar
-
-
-def _compute_smem_map(ops):
-    """Pre-compute name → smem tensor index for each non-Scalar op."""
-    smem_map = {}
-    idx = 0
-    for op in ops:
-        if not isinstance(op, Scalar):
-            smem_map[op.name] = idx
-            idx += 1
-    return smem_map
 
 
 def _make_epi_params(epi_ops, extra_fields, bases):
@@ -53,13 +43,11 @@ class ComposableEpiMixin:
     _epi_ops = ()
     _extra_param_fields = ()  # [(name, type, default), ...] for non-op params (e.g. act_fn)
     _epi_param_bases = ()  # Base classes for EpilogueParams (e.g. (ParamsBase,))
-    _epi_smem_map = {}
     _epi_has_async_ops = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls._epi_ops:
-            cls._epi_smem_map = _compute_smem_map(cls._epi_ops)
             cls._epi_has_async_ops = any(op.needs_async_fence() for op in cls._epi_ops)
             # Auto-generate EpilogueParams if not explicitly defined on this class
             if "EpilogueParams" not in cls.__dict__:
@@ -95,21 +83,29 @@ class ComposableEpiMixin:
         )
 
     def epi_get_smem_struct(self, params):
-        fields = {}
+        fields = []
         for op in self._epi_ops:
             result = op.smem_struct_field(self, params)
             if result is not None:
-                name, ftype = result
-                fields[name] = ftype
-        EpiSharedStorage = type("EpiSharedStorage", (), {"__annotations__": fields})
+                fields.append(result)
+
+        # Sort smallest-to-largest so smaller fields pack ahead of larger
+        # higher-aligned fields, reducing smem wasted to alignment padding.
+        def _field_bytes(name_ftype):
+            wrapper = type("_F", (), {"__annotations__": {name_ftype[0]: name_ftype[1]}})
+            return cute.struct(wrapper).size_in_bytes()
+
+        fields.sort(key=_field_bytes)
+        annotations = {name: ftype for name, ftype in fields}
+        EpiSharedStorage = type("EpiSharedStorage", (), {"__annotations__": annotations})
         return cute.struct(EpiSharedStorage)
 
     def epi_get_smem_tensors(self, params, storage):
-        return tuple(
-            op.get_smem_tensor(self, params, storage.epi)
+        return {
+            op.name: op.get_smem_tensor(self, params, storage.epi)
             for op in self._epi_ops
             if not isinstance(op, Scalar)
-        )
+        }
 
     def epi_get_tma_atoms(self, params, *, loc=None, ip=None):
         atoms = []
@@ -142,12 +138,11 @@ class ComposableEpiMixin:
             epilogue_barrier,
             tidx,
         )
-        smem_map = self._epi_smem_map
         results = {
             op.name: op.begin(
                 self,
                 getattr(params, op.name, None),
-                epi_smem_tensors[smem_map[op.name]] if op.name in smem_map else None,
+                epi_smem_tensors.get(op.name),
                 ctx,
             )
             for op in self._epi_ops

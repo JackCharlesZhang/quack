@@ -1,4 +1,4 @@
-from typing import Tuple, Optional, Callable
+from typing import Dict, Tuple, Optional, Callable
 
 from torch import Tensor
 
@@ -38,7 +38,7 @@ class GemmSymmetricMixin(GemmActMixin):
     def epilogue(
         self,
         params: GemmActMixin.EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
+        epi_smem_tensors: Dict[str, cute.Tensor],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
@@ -153,11 +153,7 @@ class GemmSymmetricMixin(GemmActMixin):
                         + (num_prev_subtiles + epi_idx) * 7
                     )
                     copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s,
-                        tRS_rD,
-                        tRS_sD[None, None, None, epi_buffer],
-                        seed,
-                        tidx,
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer], seed, tidx
                     )
                 else:
                     copy_utils.cvt_copy(
