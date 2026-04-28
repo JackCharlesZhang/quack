@@ -166,6 +166,33 @@ class ComposableEpiMixin:
         }
 
     @cute.jit
+    def epi_end_loop(
+        self,
+        params,
+        epi_tensors,
+        epi_coord,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        for op in self._epi_ops:
+            op.end_loop(
+                self,
+                getattr(params, op.name, None),
+                epi_tensors[op.name],
+                epi_coord,
+                epi_tile,
+                tiled_copy_t2r,
+                tiled_copy_r2s,
+                tile_coord_mnkl,
+                varlen_manager,
+                tidx,
+            )
+
+    @cute.jit
     def epi_end(
         self,
         params,

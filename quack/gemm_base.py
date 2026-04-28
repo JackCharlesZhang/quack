@@ -170,6 +170,17 @@ class GemmBase:
                         dst_idx=(epi_idx + self.epi_c_stage) % self.epi_c_stage,
                     )
             tRS_rAuxOut = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            self.epi_end_loop(
+                params,
+                epi_tensors,
+                epi_coord,
+                epi_tile,
+                tiled_copy_t2r,
+                tiled_copy_r2s,
+                tile_coord_mnkl,
+                varlen_manager,
+                tidx,
+            )
             if const_expr(aux_out_ctx is not None):
                 tRS_rAuxOut_out = self.epi_convert_aux_out(
                     tRS_rAuxOut,
@@ -357,6 +368,21 @@ class GemmBase:
         tiled_mma: cute.TiledMma,
         tile_coord_mnkl: cute.Coord,
         tidx: Int32,
+    ) -> None:
+        pass
+
+    @cute.jit
+    def epi_end_loop(
+        self,
+        params: EpilogueParams,
+        epi_tensors: Tuple[cute.Tensor, ...],
+        epi_coord: cute.Coord,
+        epi_tile: cute.Tile,
+        tiled_copy_t2r: Optional[cute.TiledCopy],
+        tiled_copy_r2s: cute.TiledCopy,
+        tile_coord_mnkl: cute.Coord,
+        varlen_manager,
+        tidx,
     ) -> None:
         pass
 
