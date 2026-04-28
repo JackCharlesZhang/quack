@@ -142,7 +142,7 @@ class EpiOp:
         return 0
 
     # --- Host-side: smem allocation ---
-    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
         """Bytes of smem needed per stage. arg_tensor is the EpilogueArguments field."""
         return 0
 
@@ -243,7 +243,7 @@ class VecLoad(EpiOp):
     def _coord_idx(self):
         return 1 if self.dim == 1 else 0
 
-    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
         if arg_tensor is None:
             return 0
         return self._tile_size(cta_tile_shape_mnk) * (arg_tensor.element_type.width // 8)
@@ -441,7 +441,7 @@ class TileStore(EpiOp):
             self._epi_tile_key(): epi_tile_out,
         }
 
-    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
         if arg_tensor is None:
             return 0
         if self.epi_tile_fn is not None:
@@ -476,7 +476,8 @@ class TileStore(EpiOp):
     def tma_atoms(self, gemm, params):
         tma_key = self._tma_atom_key()
         if hasattr(params, tma_key):
-            return [getattr(params, tma_key)]
+            atom = getattr(params, tma_key)
+            return [] if atom is None else [atom]
         return []
 
 
@@ -552,33 +553,36 @@ class ColVecReduce(EpiOp):
     and final reduction + gmem write (end).
     """
 
-    def __init__(self, name, max_warps_in_n=1):
-        super().__init__(name)
-        self.max_warps_in_n = max_warps_in_n
-
     def param_fields(self):
         return [(self.name, object, None)]
 
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
-    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
-        if arg_tensor is None or self.max_warps_in_n <= 1:
+    @staticmethod
+    def _max_warps_in_n(atom_layout_mnk):
+        return atom_layout_mnk[1] if atom_layout_mnk is not None else 1
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
+        max_warps_in_n = self._max_warps_in_n(atom_layout_mnk)
+        if arg_tensor is None or max_warps_in_n <= 1:
             return 0
-        return cta_tile_shape_mnk[0] * self.max_warps_in_n * (Float32.width // 8)
+        return cta_tile_shape_mnk[0] * max_warps_in_n * (Float32.width // 8)
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name, None)
-        if tensor is None or self.max_warps_in_n <= 1:
+        max_warps_in_n = self._max_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
+        if tensor is None or max_warps_in_n <= 1:
             return None
-        size = gemm.cta_tile_shape_mnk[0] * self.max_warps_in_n
+        size = gemm.cta_tile_shape_mnk[0] * max_warps_in_n
         return (f"s_{self.name}", cute.struct.Align[cute.struct.MemRange[Float32, size], 16])
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        if getattr(params, self.name, None) is None or self.max_warps_in_n == 1:
+        max_warps_in_n = self._max_warps_in_n(getattr(gemm, "atom_layout_mnk", None))
+        if getattr(params, self.name, None) is None or max_warps_in_n == 1:
             return None
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
-            cute.make_layout((gemm.cta_tile_shape_mnk[0], self.max_warps_in_n))
+            cute.make_layout((gemm.cta_tile_shape_mnk[0], max_warps_in_n))
         )
 
     @cute.jit
@@ -644,11 +648,6 @@ class ColVecReduce(EpiOp):
 
             warp_N = warp_layout_MN[1]
             warps_in_N = const_expr(cute.size(warp_N))
-            max_warps_in_n = const_expr(self.max_warps_in_n)
-            if const_expr(max_warps_in_n <= 1):
-                assert warps_in_N == 1, "ColVecReduce has no inter-warp-N smem staging"
-            else:
-                assert warps_in_N <= max_warps_in_n, "ColVecReduce warp_N exceeds smem staging"
 
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
@@ -686,7 +685,7 @@ class ColVecReduce(EpiOp):
                             if row_idx < limit_m:
                                 gColVec[row_idx] = tDrReduce_m[m]
                 else:
-                    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+                    warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WAPR_SIZE)
                     warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
                     if is_lane_n_leader:
                         for m in cutlass.range(cute.size(tDcD_m, mode=[0])):

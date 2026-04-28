@@ -229,7 +229,7 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
 
 
 class GemmDGatedSm120(GemmDGatedMixin, GemmSm120):
-    _epi_ops = (*GemmActMixin._epi_ops, ColVecReduce("mColVecReduce", max_warps_in_n=2))
+    pass
 
 
 @jit_cache

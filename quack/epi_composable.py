@@ -86,9 +86,11 @@ class ComposableEpiMixin:
     # --- Host-side: smem allocation (queried from ops) ---
 
     @classmethod
-    def epi_smem_bytes_per_stage(cls, args, cta_tile_shape_mnk, epi_tile):
+    def epi_smem_bytes_per_stage(cls, args, cta_tile_shape_mnk, epi_tile, atom_layout_mnk=None):
         return sum(
-            op.smem_bytes(getattr(args, op.name, None), cta_tile_shape_mnk, epi_tile)
+            op.smem_bytes(
+                getattr(args, op.name, None), cta_tile_shape_mnk, epi_tile, atom_layout_mnk
+            )
             for op in cls._epi_ops
         )
 

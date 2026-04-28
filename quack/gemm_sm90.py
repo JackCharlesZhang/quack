@@ -332,6 +332,7 @@ class GemmSm90(GemmTmaBase):
             epilogue_args,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
+            self.atom_layout_mnk,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -1228,6 +1229,7 @@ class GemmSm90(GemmTmaBase):
         epilogue_args: EpilogueArguments,
         smem_capacity: int,
         occupancy: int,
+        atom_layout_mnk: Tuple[int, int, int] | None = None,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1250,7 +1252,7 @@ class GemmSm90(GemmTmaBase):
         epi_stage = 4 if epi_tile[1] <= 16 else 2
         d_bytes_per_stage = cute.size(epi_tile) * d_dtype.width // 8 if d_dtype is not None else 0
         epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
-            epilogue_args, cta_tile_shape_mnk, epi_tile
+            epilogue_args, cta_tile_shape_mnk, epi_tile, atom_layout_mnk
         )
         epi_bytes = epi_bytes_per_stage * epi_stage
         epi_c_stage = 0 if c_dtype is None else (4 if epi_tile[1] <= 16 else 2)
