@@ -515,3 +515,40 @@ def test_rmsnorm_prenorm_false(use_compile):
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_residual_dtype_override(use_compile):
+    """Regression test: user-supplied residual_dtype must not be overwritten by residual.dtype.
+
+    Passing a bf16 residual together with residual_dtype=torch.float32 should produce an fp32
+    residual_out holding the full-precision (x + residual) sum (the kernel accumulates in fp32
+    and casts only at the final store).
+    """
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    input_dtype = torch.bfloat16
+    weight_dtype = torch.float32
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype)
+    weight = torch.randn(N, device=device, dtype=weight_dtype)
+    residual = torch.randn(M, N, device=device, dtype=input_dtype)
+
+    out, residual_out, _ = rmsnorm_fwd(
+        x, weight, residual=residual, residual_dtype=torch.float32, eps=eps
+    )
+    assert residual_out.dtype == torch.float32, (
+        f"residual_out dtype overridden: got {residual_out.dtype}, expected float32"
+    )
+    expected_residual_f32 = x.float() + residual.float()
+    torch.testing.assert_close(residual_out, expected_residual_f32, atol=0.0, rtol=0.0)
+    assert out.dtype == input_dtype
+
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    out_hl, residual_out_hl = function(
+        x, weight, residual=residual, residual_dtype=torch.float32, eps=eps, prenorm=True
+    )
+    assert residual_out_hl.dtype == torch.float32
+    torch.testing.assert_close(residual_out_hl, expected_residual_f32, atol=0.0, rtol=0.0)

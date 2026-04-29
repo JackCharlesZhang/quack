@@ -486,7 +486,7 @@ def rmsnorm_fwd(
     out_dtype = x.dtype if out_dtype is None else out_dtype
     out = torch.empty_like(x, dtype=out_dtype)
     rstd = torch.empty(*x.shape[:-1], device=x.device, dtype=torch.float32) if store_rstd else None
-    if residual is not None:
+    if residual is not None and residual_dtype is None:
         residual_dtype = residual.dtype
     if residual is not None or (residual_dtype is not None and residual_dtype != x.dtype):
         residual_out = torch.empty_like(
