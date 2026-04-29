@@ -102,7 +102,38 @@ def cuda_event_names(prof):
     ]
 
 
+_profiler_cuda_kernels_visible = None
+
+
+def _profiler_can_see_cuda_kernels():
+    # Some CI environments (e.g. CUPTI mismatched with the device, or no
+    # CAP_SYS_ADMIN) load kineto fine but never report CUDA activity events.
+    # Probe once and cache so we can skip kernel-count tests there.
+    global _profiler_cuda_kernels_visible
+    if _profiler_cuda_kernels_visible is None:
+        try:
+            a = torch.randn(8, device="cuda")
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            ) as prof:
+                (a + 1).sum()
+                torch.cuda.synchronize()
+            _profiler_cuda_kernels_visible = bool(cuda_event_names(prof))
+        except Exception:
+            _profiler_cuda_kernels_visible = False
+    return _profiler_cuda_kernels_visible
+
+
 def assert_one_cuda_kernel_no_memcpy(prof):
+    if not _profiler_can_see_cuda_kernels():
+        pytest.skip(
+            "torch.profiler reports no CUDA kernels in this environment "
+            "(CUPTI unavailable); cannot verify kernel-count / no-memcpy."
+        )
     names = cuda_event_names(prof)
     kernels = [name for name in names if not name.startswith("Memcpy")]
     memcpys = [name for name in names if name.startswith("Memcpy")]
