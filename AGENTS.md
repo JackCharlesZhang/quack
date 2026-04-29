@@ -38,6 +38,8 @@ Key rules:
 - Types must be determinable at compile time (no dependent types)
 - Variables defined inside control flow bodies are not accessible outside
 
+**Note:** CuTe DSL relies on Python source inspection `inspect.getsourcelines()` to parse kernel definitions. Defining `@cute.kernel` / `@cute.jit` functions directly in plain Python REPL will cause source inspection to fail with errors like `OSError: could not get source code`. One should write to a temporary file.
+
 ## Architecture
 
 ### Kernel patterns
