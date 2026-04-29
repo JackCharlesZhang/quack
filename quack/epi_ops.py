@@ -550,6 +550,7 @@ def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
             for m in cutlass.range(cute.size(tDrReduce_mn, mode=[0]), unroll_full=True):
                 inp = lambda n: (tRS_rInput_mn[m, 2 * n], tRS_rInput_mn[m, 2 * n + 1])
                 val0 = transform_fn(inp(0))
+                assert cute.size(tDrReduce_mn, mode=[1]) % 2 == 0
                 if const_expr(rScale is not None):
                     row_sum = cute.arch.mul_packed_f32x2(val0, (rScale_mn[m, 0], rScale_mn[m, 1]))
                 else:
@@ -580,28 +581,26 @@ def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
                 val = transform_fn(tRS_rInput[i])
                 tDrReduce[i] += val * rScale[i] if const_expr(rScale is not None) else val
         else:
-            # Explicitly reduce the zero-stride M mode on SM100. Elementwise += through
-            # the aliased zero-stride view is not reliable for this layout there.
-            tDrReduce_mn = layout_utils.convert_layout_zero_stride(tDrReduce, tDrReduce.layout)
-            tRS_rInput_mn = layout_utils.convert_layout_zero_stride(tRS_rInput, tDrReduce.layout)
-            if const_expr(rScale is not None):
-                rScale_mn = layout_utils.convert_layout_zero_stride(rScale, tDrReduce.layout)
-            for n in cutlass.range(cute.size(tDrReduce_mn, mode=[0]), unroll_full=True):
-                inp = lambda m: (tRS_rInput_mn[n, 2 * m], tRS_rInput_mn[n, 2 * m + 1])
-                val0 = transform_fn(inp(0))
+            # Keep CUTLASS's linear fragment indexing, but use packed f32x2 arithmetic
+            # for any transform that accepts and returns an f32x2 tuple.
+            # We have to be careful to avoid tDrReduce[2 * i] and tDrReduce[2 * i + 1] aliasing
+            # each other. For SM100, tDrReduce has layout ((32,1),1,1):((1,0),0,0) or
+            # (((2,2,4),1),2,1):(((1,0,8),0),0,0), so this works. But it's error-prone.
+            for i in cutlass.range(cute.size(tRS_rInput) // 2, unroll_full=True):
+                acc = (tDrReduce[2 * i], tDrReduce[2 * i + 1])
+                val = (tRS_rInput[2 * i], tRS_rInput[2 * i + 1])
+                val = transform_fn(val)
                 if const_expr(rScale is not None):
-                    col_sum = cute.arch.mul_packed_f32x2(val0, (rScale_mn[n, 0], rScale_mn[n, 1]))
+                    scale = (rScale[2 * i], rScale[2 * i + 1])
+                    tDrReduce[2 * i], tDrReduce[2 * i + 1] = cute.arch.fma_packed_f32x2(
+                        val, scale, acc
+                    )
                 else:
-                    col_sum = val0
-                for m in cutlass.range(1, cute.size(tDrReduce_mn, mode=[1]) // 2, unroll_full=True):
-                    val = transform_fn(inp(m))
-                    if const_expr(rScale is not None):
-                        col_sum = cute.arch.fma_packed_f32x2(
-                            val, (rScale_mn[n, 2 * m], rScale_mn[n, 2 * m + 1]), col_sum
-                        )
-                    else:
-                        col_sum = cute.arch.add_packed_f32x2(val, col_sum)
-                tDrReduce_mn[n, 0] += col_sum[0] + col_sum[1]
+                    tDrReduce[2 * i], tDrReduce[2 * i + 1] = cute.arch.add_packed_f32x2(val, acc)
+            if const_expr(cute.size(tRS_rInput) % 2 != 0):
+                i = cute.size(tRS_rInput) - 1
+                val = transform_fn(tRS_rInput[i])
+                tDrReduce[i] += val * rScale[i] if const_expr(rScale is not None) else val
 
 
 class VecReduce(EpiOp):
@@ -841,9 +840,13 @@ class RowVecReduce(VecReduce):
                 assert lanes_in_M == 1 << int(math.log2(lanes_in_M)), (
                     "lanes_in_M must be a power of 2 for butterfly reduction"
                 )
+                if const_expr(lanes_in_N > 1):
+                    assert lane_layout_MN.stride[1] == 1, (
+                        "RowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
+                    )
 
-                # Intra-warp shuffle reduction across M lanes. M lanes are strided by N lanes.
-                assert lane_layout_MN.stride[1] == 1
+                # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
+                # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
                 tDrReduce_n = layout_utils.convert_layout_zero_stride(
                     tDrReduce_cur, tDrReduce_cur.layout
                 )[None, 0]

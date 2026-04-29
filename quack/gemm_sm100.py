@@ -230,6 +230,15 @@ class GemmSm100(GemmTmaBase):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
+    def epi_smem_warp_shape_mnk(self):
+        # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
+        # the epilogue tmem layout uses two M warps and two N warps when the
+        # per-CTA M tile is 64 and the kernel uses 2-CTA instructions.
+        warp_m, warp_n = (
+            (2, 2) if self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs else (4, 1)
+        )
+        return (warp_m, warp_n, 1)
+
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -401,7 +410,6 @@ class GemmSm100(GemmTmaBase):
             prefetch_A_idx,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
-            # TODO: this is wrong when tile_m=64 or when tile_m=128 and use 2cta instructions
             self.epi_smem_warp_shape_mnk(),
         )
         self.sched_stage = 1
