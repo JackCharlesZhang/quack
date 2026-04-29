@@ -285,7 +285,8 @@ def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
     M = x.size(0)
     values = torch.empty((M, k), dtype=x.dtype, device=x.device)
     indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
-    _topk_fwd(x, k, softmax, values, indices)
+    if x.numel() > 0:
+        _topk_fwd(x, k, softmax, values, indices)
     return values, indices
 
 
@@ -549,7 +550,8 @@ def topk_bwd(
     """
     M, k = dvalues.shape
     dx = torch.zeros((M, N), dtype=dvalues.dtype, device=dvalues.device)
-    _topk_bwd(dvalues, values, indices, k, softmax, dx)
+    if dvalues.numel() > 0:
+        _topk_bwd(dvalues, values, indices, k, softmax, dx)
     return dx
 
 

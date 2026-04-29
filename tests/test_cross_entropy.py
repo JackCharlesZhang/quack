@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.cross_entropy import cross_entropy_fwd, cross_entropy
+from quack.cross_entropy import cross_entropy_fwd, cross_entropy_bwd, cross_entropy
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -334,3 +334,23 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
             loss_ig[~ignore_mask], loss_ref_ig[~ignore_mask], atol=atol, rtol=rtol
         )
     torch.testing.assert_close(dx_ig, dx_ref_ig.to(input_dtype), atol=atol, rtol=rtol)
+
+
+def test_cross_entropy_fwd_empty():
+    """cross_entropy_fwd must handle zero-batch inputs without launching a kernel."""
+    N = 4096
+    x = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    target = torch.empty(0, dtype=torch.int64, device="cuda")
+    loss, lse = cross_entropy_fwd(x, target, return_lse=True)
+    assert loss.shape == (0,) and lse.shape == (0,)
+
+
+def test_cross_entropy_bwd_empty():
+    """cross_entropy_bwd must handle zero-batch inputs without launching a kernel."""
+    N = 4096
+    x = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    target = torch.empty(0, dtype=torch.int64, device="cuda")
+    dloss = torch.empty(0, device="cuda", dtype=torch.float32)
+    lse = torch.empty(0, device="cuda", dtype=torch.float32)
+    dx = cross_entropy_bwd(x, target, dloss, lse)
+    assert dx.shape == x.shape and dx.numel() == 0

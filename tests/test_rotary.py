@@ -782,3 +782,30 @@ def test_rotary_emb_kv(interleaved, rotary_fraction, seqlen_offsets_type, dtype)
     out.backward(grad)
     out_pt.backward(grad.clone())
     torch.testing.assert_close(kv.grad, kv_pt.grad, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_apply_rotary_empty(inplace):
+    """apply_rotary must handle zero-batch inputs without launching a kernel."""
+    dtype = torch.bfloat16
+    seqlen, nheads, headdim = 64, 4, 64
+    rotary_dim = 32
+    x = torch.empty(0, seqlen, nheads, headdim, device="cuda", dtype=dtype)
+    cos = torch.randn(seqlen, rotary_dim // 2, device="cuda", dtype=dtype)
+    sin = torch.randn(seqlen, rotary_dim // 2, device="cuda", dtype=dtype)
+    out = apply_rotary(x, cos, sin, inplace=inplace)
+    assert out.shape == x.shape and out.numel() == 0
+
+
+def test_apply_rotary_bwd_empty():
+    """Backward path of apply_rotary_emb (autograd) on zero-batch inputs."""
+    dtype = torch.bfloat16
+    seqlen, nheads, headdim = 64, 4, 64
+    rotary_dim = 32
+    x = torch.empty(0, seqlen, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True)
+    cos = torch.randn(seqlen, rotary_dim // 2, device="cuda", dtype=dtype)
+    sin = torch.randn(seqlen, rotary_dim // 2, device="cuda", dtype=dtype)
+    out = apply_rotary_emb(x, cos, sin)
+    grad = torch.empty_like(out)
+    out.backward(grad)
+    assert x.grad.shape == x.shape and x.grad.numel() == 0

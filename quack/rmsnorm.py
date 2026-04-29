@@ -494,7 +494,8 @@ def rmsnorm_fwd(
         )
     else:
         residual_out = None
-    _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
+    if x.numel() > 0:
+        _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
@@ -1107,13 +1108,16 @@ def rmsnorm_bwd(
     db_shape = (sm_count, H, N) if per_head else (sm_count, N)
     db_partial = torch.empty(db_shape, device=device, dtype=torch.float32) if has_bias else None
 
-    _rmsnorm_bwd(
-        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
-    )
-
-    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
-    db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+    if x.numel() > 0:
+        _rmsnorm_bwd(
+            x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+        )
+        # we have summed the partial gradients in fp32, now we convert back to the weight dtype
+        dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
+        db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+    else:
+        dw = torch.zeros_like(weight) if weight is not None else None
+        db = torch.zeros_like(weight) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
         dresidual = dx

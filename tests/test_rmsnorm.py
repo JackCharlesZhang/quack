@@ -552,3 +552,43 @@ def test_rmsnorm_residual_dtype_override(use_compile):
     )
     assert residual_out_hl.dtype == torch.float32
     torch.testing.assert_close(residual_out_hl, expected_residual_f32, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("store_rstd", [False, True])
+def test_rmsnorm_fwd_empty(store_rstd):
+    """rmsnorm_fwd must not launch a kernel when the input has zero elements
+    (e.g. uneven FSDP shards), and must return correctly-shaped empty outputs."""
+    dtype = torch.bfloat16
+    N = 4096
+    x = torch.empty(0, N, device="cuda", dtype=dtype)
+    weight = torch.randn(N, device="cuda", dtype=dtype)
+    out, residual_out, rstd = rmsnorm_fwd(x, weight, store_rstd=store_rstd)
+    assert out.shape == x.shape and out.numel() == 0
+    # No residual passed in: residual_out aliases x (and is empty).
+    assert residual_out.shape == x.shape and residual_out.numel() == 0
+    if store_rstd:
+        assert rstd.shape == x.shape[:-1] and rstd.numel() == 0
+    else:
+        assert rstd is None
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_rmsnorm_bwd_empty(has_bias):
+    """rmsnorm_bwd must not launch a kernel when inputs have zero elements,
+    and dw / db must reduce to zero (the gradient over an empty batch)."""
+    dtype = torch.bfloat16
+    N = 4096
+    x = torch.empty(0, N, device="cuda", dtype=dtype)
+    weight = torch.randn(N, device="cuda", dtype=dtype)
+    dout = torch.empty(0, N, device="cuda", dtype=dtype)
+    rstd = torch.empty(0, device="cuda", dtype=torch.float32)
+    dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, has_bias=has_bias)
+    assert dx.shape == x.shape and dx.numel() == 0
+    assert dw is not None and dw.shape == weight.shape
+    assert torch.all(dw == 0)
+    if has_bias:
+        assert db is not None and db.shape == weight.shape
+        assert torch.all(db == 0)
+    else:
+        assert db is None
+    assert dresidual is None

@@ -352,6 +352,8 @@ def _launch_rotary(
         "Rotary vectorized path requires last-dim stride 1"
     )
     assert cos.dtype == sin.dtype and cos.shape == sin.shape
+    if x.numel() == 0:
+        return
     dtype = torch2cute_dtype_map[x.dtype]
     cossin_dtype = torch2cute_dtype_map[cos.dtype]
     dim_half = cos.size(1)

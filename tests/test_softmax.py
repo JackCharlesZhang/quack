@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 
-from quack.softmax import softmax
+from quack.softmax import softmax, softmax_fwd, softmax_bwd
 
 
 torch._dynamo.config.cache_size_limit = 1024
@@ -105,3 +105,20 @@ def test_softmax_numerical_stability(use_compile):
     out = function(x)
     out_shifted = function(x_shifted)
     torch.testing.assert_close(out, out_shifted, atol=1e-6, rtol=1e-6)
+
+
+def test_softmax_fwd_empty():
+    """softmax_fwd must handle zero-batch inputs without launching a kernel."""
+    N = 4096
+    x = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    out = softmax_fwd(x)
+    assert out.shape == x.shape and out.numel() == 0
+
+
+def test_softmax_bwd_empty():
+    """softmax_bwd must handle zero-batch inputs without launching a kernel."""
+    N = 4096
+    dy = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(0, N, device="cuda", dtype=torch.bfloat16)
+    dx = softmax_bwd(dy, y)
+    assert dx.shape == dy.shape and dx.numel() == 0
