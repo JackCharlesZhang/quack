@@ -832,3 +832,90 @@ def test_gemm_gated_varlen_m_concat(
     )
     assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+
+
+# ---- Empty-input tests for varlen_m. total_m=0 is the FSDP-style empty shard:
+# the cu_seqlens are all zero, so the (total_m, N) output has zero rows.
+def _zero_cu_seqlens(L, device="cuda"):
+    return torch.zeros(L + 1, dtype=torch.int32, device=device)
+
+
+def _make_cu_seqlens(L, total_m, device="cuda"):
+    cu = _zero_cu_seqlens(L, device)
+    if total_m > 0:
+        per = total_m // L
+        cu[1:] = torch.arange(per, total_m + 1, per, dtype=torch.int32, device=device)
+    return cu
+
+
+@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
+def test_gemm_varlen_m_empty(zero_dim):
+    L, total_m, K, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_m":
+        total_m = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    cu_seqlens_m = _make_cu_seqlens(L, total_m)
+    A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm(A, B, cu_seqlens_m=cu_seqlens_m, tuned=False)
+    assert out.shape == (total_m, N)
+    if K == 0:
+        assert torch.all(out == 0)
+
+
+@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
+def test_gemm_add_varlen_m_empty(zero_dim):
+    L, total_m, K, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_m":
+        total_m = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    cu_seqlens_m = _make_cu_seqlens(L, total_m)
+    A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(total_m, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, cu_seqlens_m=cu_seqlens_m, tuned=False)
+    assert out.shape == (total_m, N)
+    if K == 0:
+        assert torch.equal(out, C)
+
+
+@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
+def test_gemm_act_varlen_m_empty(zero_dim):
+    L, total_m, K, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_m":
+        total_m = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    cu_seqlens_m = _make_cu_seqlens(L, total_m)
+    A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
+    preact, postact = gemm_act(A, B, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False)
+    assert preact.shape == (total_m, N)
+    assert postact.shape == (total_m, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
+def test_gemm_dact_varlen_m_empty(zero_dim):
+    L, total_m, K, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_m":
+        total_m = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    cu_seqlens_m = _make_cu_seqlens(L, total_m)
+    A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
+    PreAct = torch.randn(total_m, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_dact(A, B, PreAct, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False)
+    dx, postact = out[0], out[1]
+    assert dx.shape == (total_m, N)
+    assert postact.shape == (total_m, N)

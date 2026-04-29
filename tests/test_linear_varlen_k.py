@@ -466,3 +466,56 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre
     if pre_allocate_out:
         assert out.data_ptr() == out_buf.data_ptr()
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
+
+
+# ---- Empty-input tests for varlen_k. total_k=0 means each batch's contraction
+# dim is empty (mathematically, output is per-batch zero matrix, then summed).
+def _zero_cu_seqlens_k(L, device="cuda"):
+    return torch.zeros(L + 1, dtype=torch.int32, device=device)
+
+
+def _make_cu_seqlens_k(L, total_k, device="cuda"):
+    cu = _zero_cu_seqlens_k(L, device)
+    if total_k > 0:
+        per = total_k // L
+        cu[1:] = torch.arange(per, total_k + 1, per, dtype=torch.int32, device=device)
+    return cu
+
+
+@pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
+def test_gemm_varlen_k_empty(zero_dim):
+    L, M, total_k, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_k":
+        total_k = 0
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    cu_seqlens_k = _make_cu_seqlens_k(L, total_k)
+    A = torch.randn(M, total_k, device="cuda", dtype=torch.bfloat16)
+    A = A.T.contiguous().T  # m-major as required by varlen_k
+    B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert out.shape == (L, M, N)
+    if total_k == 0:
+        assert torch.all(out == 0)
+
+
+@pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
+def test_gemm_add_varlen_k_empty(zero_dim):
+    L, M, total_k, N = 4, 4096, 4096, 4096
+    if zero_dim == "total_k":
+        total_k = 0
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    cu_seqlens_k = _make_cu_seqlens_k(L, total_k)
+    A = torch.randn(M, total_k, device="cuda", dtype=torch.bfloat16)
+    A = A.T.contiguous().T
+    B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(L, M, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert out.shape == (L, M, N)
+    if total_k == 0:
+        assert torch.equal(out, C)

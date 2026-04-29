@@ -10,6 +10,7 @@ from quack.linear import linear_gated_func
 from quack.mlp import mlp_func
 from quack.gemm_interface import (
     gemm,
+    gemm_act,
     gemm_add,
     gemm_add_inplace,
     gemm_tuned,
@@ -1027,3 +1028,199 @@ def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
         f"act={activation}: err={err:.4f}, err_pt={err_pt:.4f}, ratio={err / (err_pt + 1e-10):.2f}"
     )
     assert err < 2 * err_pt + 1e-4
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm(A, B)
+    assert out.shape == (M, N)
+    if K == 0:
+        # 0 @ K x K @ N is mathematically an M x N matrix of zeros (empty sum).
+        assert torch.all(out == 0)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_add_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C)
+    assert out.shape == (M, N)
+    if K == 0:
+        # D = A@B + C reduces to D = C when K = 0.
+        assert torch.equal(out, C)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    out = linear_func(x, w)
+    assert out.shape == (M, N)
+    if K == 0:
+        assert torch.all(out == 0)
+    if with_backward and out.numel() > 0:
+        out.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_act_empty(zero_dim, activation):
+    is_gated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    # Gated: output preact has 2*N cols (gate || up); postact has N cols.
+    B_n = N * 2 if is_gated else N
+    B = torch.randn(K, B_n, device="cuda", dtype=torch.bfloat16)
+    preact, postact = gemm_act(A, B, activation=activation)
+    assert preact.shape == (M, B_n)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_dact_empty(zero_dim, activation):
+    is_dgated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    preact_n = N * 2 if is_dgated else N
+    PreAct = torch.randn(M, preact_n, device="cuda", dtype=torch.bfloat16)
+    out = gemm_dact(A, B, PreAct, activation=activation)
+    dx, postact = out[0], out[1]
+    assert dx.shape == (M, preact_n)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_add_inplace_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    out = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    out_orig = out.clone()
+    gemm_add_inplace(A, B, out)
+    assert out.shape == (M, N)
+    if K == 0:
+        # K=0: A@B is zero matrix; out = 1.0 * 0 + 1.0 * out = out (unchanged).
+        assert torch.equal(out, out_orig)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+def test_gemm_rms_empty(zero_dim):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    out, rstd = gemm_rms(A, B, norm_weight=norm_weight)
+    assert out.shape == (M, N)
+    assert rstd.shape == (M,)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_norm_act_empty(zero_dim, activation):
+    is_gated = activation in ("swiglu",)
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    B_n = N * 2 if is_gated else N
+    B = torch.randn(K, B_n, device="cuda", dtype=torch.bfloat16)
+    rstd = torch.randn(M, device="cuda", dtype=torch.float32)
+    _preact, postact = gemm_norm_act(A, B, rstd=rstd, activation=activation)
+    assert postact.shape == (M, N)
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_act_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    preact, postact = linear_act_func(x, w, activation="relu")
+    assert preact.shape == (M, N)
+    assert postact.shape == (M, N)
+    if with_backward and postact.numel() > 0:
+        preact.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape
+
+
+@pytest.mark.parametrize("zero_dim", ["M", "N", "K"])
+@pytest.mark.parametrize("with_backward", [False, True])
+def test_linear_gated_func_empty(zero_dim, with_backward):
+    M, K, N = 4096, 4096, 4096
+    if zero_dim == "M":
+        M = 0
+    if zero_dim == "N":
+        N = 0
+    if zero_dim == "K":
+        K = 0
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    # gated: weight has 2*N rows for (gate || up); postact has N cols.
+    w = torch.randn(N * 2, K, device="cuda", dtype=torch.bfloat16, requires_grad=with_backward)
+    preact, postact = linear_gated_func(x, w, activation="swiglu")
+    assert preact.shape == (M, N * 2)
+    assert postact.shape == (M, N)
+    if with_backward and postact.numel() > 0:
+        preact.sum().backward()
+        assert x.grad.shape == x.shape and w.grad.shape == w.shape
