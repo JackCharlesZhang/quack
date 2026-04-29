@@ -1,11 +1,21 @@
 name: GPU Test
-description: Compile and run tests inside apptainer
+description: Pull SIF from Docker Hub (cached by tag), compile and run tests
 inputs:
+  cuda:
+    description: cu129 or cu132 — selects which image to run for this job
+    required: true
+  image_cu129:
+    description: Docker image for the cu129 variant (e.g. tridao/quack-kernels:cu12.9-DATE)
+    required: true
+  image_cu132:
+    description: Docker image for the cu132 variant (e.g. tridao/quack-kernels:cu13.2-DATE)
+    required: true
   arch:
     description: >-
       Optional QUACK_ARCH override (e.g. "120"). When set, quack dispatches to
       that arch's kernel implementations while still compiling/running on the
-      host GPU. Each arch uses its own QUACK_CACHE_DIR so different arches
+      host GPU. QUACK_CACHE_DIR is suffixed with both the cuda variant and the
+      arch (e.g. .quack_cache_cu132_sm120), so different (cuda, arch) pairs
       don't share a cache directory on the same self-hosted runner.
     required: false
     default: ''
@@ -13,19 +23,67 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Pull SIF (cached) and prune stale variants
+      shell: bash
+      env:
+        CUDA: ${{ inputs.cuda }}
+        IMAGE_CU129: ${{ inputs.image_cu129 }}
+        IMAGE_CU132: ${{ inputs.image_cu132 }}
+      run: |
+        WORK_DIR="${CI_WORK_DIR:-$HOME}"
+        mkdir -p "$WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
+
+        sif_path() { echo "$WORK_DIR/$(echo "$1" | tr '/: ' '---').sif"; }
+        SIF_CU129=$(sif_path "$IMAGE_CU129")
+        SIF_CU132=$(sif_path "$IMAGE_CU132")
+
+        if [ "$CUDA" = "cu129" ]; then
+          ACTIVE_IMAGE="$IMAGE_CU129"; ACTIVE_SIF="$SIF_CU129"
+        else
+          ACTIVE_IMAGE="$IMAGE_CU132"; ACTIVE_SIF="$SIF_CU132"
+        fi
+
+        if [ ! -f "$ACTIVE_SIF" ]; then
+          echo "Pulling docker://$ACTIVE_IMAGE → $ACTIVE_SIF"
+          # Pull to .tmp and rename atomically so an interrupted pull doesn't
+          # leave a partial SIF that the next run would silently reuse.
+          APPTAINER_TMPDIR="/tmp/apptainer_tmp" \
+          APPTAINER_CACHEDIR="$WORK_DIR/apptainer_cache" \
+            apptainer pull "$ACTIVE_SIF.tmp" "docker://$ACTIVE_IMAGE"
+          mv "$ACTIVE_SIF.tmp" "$ACTIVE_SIF"
+        else
+          echo "Using cached SIF: $ACTIVE_SIF"
+        fi
+
+        # Whitelist both currently-pinned variants; delete any other *.sif left
+        # over from a previous image bump.
+        find "$WORK_DIR" -maxdepth 1 -name "*.sif" \
+          ! -name "$(basename "$SIF_CU129")" \
+          ! -name "$(basename "$SIF_CU132")" \
+          -delete
+
+        echo "QUACK_SIF=$ACTIVE_SIF" >> "$GITHUB_ENV"
+
     - name: Compile and run tests
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
+        CUDA: ${{ inputs.cuda }}
       run: |
-        apptainer exec --nv --writable-tmpfs ~/attention_26.03.26.sif bash -c "
-          export PYTHONPATH=\$PWD:\$PYTHONPATH &&
+        # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
+        # this Python inside the SIF picks up packages from the runner user's
+        # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
+        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 "$QUACK_SIF" bash -c "
+          # Editable-install over the container's baked-in quack so any code
+          # that reads install metadata (importlib.metadata.version, etc.) sees
+          # the PR's version, not the image's snapshot.
+          uv pip install --system --break-system-packages --no-deps -q -e . &&
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache_sm$ARCH &&
+            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
             echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR\"
           else
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache
+            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}
           fi &&
           pytest tests/ --compile-only -n 24 &&
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
