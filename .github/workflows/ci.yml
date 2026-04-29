@@ -16,7 +16,28 @@ jobs:
       - name: Ruff format
         run: ruff format --check quack/ tests/
 
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'quack/**'
+              - 'tests/**'
+              - '.github/**'
+              - 'pyproject.toml'
+              - 'setup.py'
+
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:

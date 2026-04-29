@@ -22,10 +22,28 @@ jobs:
       - name: Ruff format
         run: ruff format --check quack/ tests/
 
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'quack/**'
+              - 'tests/**'
+              - '.github/**'
+              - 'pyproject.toml'
+              - 'setup.py'
+
   test:
+    needs: changes
     if: >
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
-      github.event_name == 'pull_request_target'
+      needs.changes.outputs.code == 'true' &&
+      ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'pull_request_target')
     environment: gpu-ci
     strategy:
       fail-fast: false
