@@ -55,9 +55,11 @@ runs:
           echo "Using cached SIF: $ACTIVE_SIF"
         fi
 
-        # Whitelist both currently-pinned variants; delete any other *.sif left
-        # over from a previous image bump.
-        find "$WORK_DIR" -maxdepth 1 -name "*.sif" \
+        # Cleanup: delete *only* old quack-kernels SIFs left from previous image
+        # bumps. Match a strict prefix so unrelated SIFs sharing $WORK_DIR (when
+        # CI_WORK_DIR is unset and $WORK_DIR == $HOME, the runner user's personal
+        # SIFs) are never touched.
+        find "$WORK_DIR" -maxdepth 1 -name "*quack-kernels*.sif" \
           ! -name "$(basename "$SIF_CU129")" \
           ! -name "$(basename "$SIF_CU132")" \
           -delete
