@@ -13,7 +13,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from quack import copy_utils
+from quack import copy_utils, layout_utils
 from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -25,7 +25,7 @@ def _next_power_of_2(n: int) -> int:
 
 def _num_threads_for_log_n(log_n: int) -> int:
     # Same schedule as fast-hadamard-transform / TileLang for power-of-two sizes.
-    return [0, 1, 1, 1, 2, 4, 8, 16, 32, 32, 128, 256, 256, 256, 256, 256][log_n]
+    return [0, 1, 1, 1, 2, 4, 8, 16, 32, 32, 32, 32, 32, 256, 256, 1024][log_n]
 
 
 def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
@@ -50,24 +50,6 @@ def _hadamard_thread(
                 b = vals[idx + stride, c]
                 vals[idx, c] = a + b
                 vals[idx + stride, c] = a - b
-
-
-@cute.jit
-def _hadamard_chunks(
-    vals: cute.Tensor,
-    vecsize: cutlass.Constexpr[int],
-    log_n: cutlass.Constexpr[int],
-) -> None:
-    for step in cutlass.range_constexpr(log_n):
-        stride = const_expr(1 << step)
-        for j in cutlass.range_constexpr(1 << (log_n - 1)):
-            lo = const_expr(j & (stride - 1))
-            idx = const_expr((j - lo) * 2 + lo)
-            for i in cutlass.range_constexpr(vecsize):
-                a = vals[i, idx]
-                b = vals[i, idx + stride]
-                vals[i, idx] = a + b
-                vals[i, idx + stride] = a - b
 
 
 @cute.jit
@@ -271,7 +253,10 @@ class HadamardTransform:
                     copy_exch(s_exchange[None, (lane_id, warp_id), c], x_vals[None, chunk])
 
         if const_expr(self.num_chunks > 1):
-            _hadamard_chunks(x_vals, self.vecsize, self.log_chunks)
+            # x_vals is laid out as (vec, chunk), while _hadamard_thread transforms its
+            # first mode and iterates over its second. Select modes [1, 0] to get a
+            # metadata-only (chunk, vec) view and reuse the same butterfly loop nest.
+            _hadamard_thread(layout_utils.select(x_vals, [1, 0]), self.vecsize, self.log_chunks)
 
         for c in cutlass.range_constexpr(self.num_chunks):
             for i in cutlass.range_constexpr(self.vecsize):
