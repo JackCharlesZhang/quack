@@ -21,6 +21,17 @@ from quack.complex import (
 )
 
 
+def _skip_tvm_ffi_launch_under_compile_only():
+    import quack.cache_utils as cache_utils
+
+    # These tests call cute.compile directly, so compile-only still reaches the
+    # raw TVM-FFI launch. Under FakeTensorMode that launch would use fake CUDA
+    # pointers and can illegal-access/poison CUDA state. Call this after compile
+    # but before launch so compile coverage is preserved without executing it.
+    if cache_utils.COMPILE_ONLY:
+        pytest.skip("compiled under --compile-only; skipping FakeTensor tvm-ffi launch")
+
+
 class _ScaleByComplex:
     """out[i, j] = scale_complex * in[i, j], one thread per element."""
 
@@ -76,15 +87,13 @@ def _compile_scale_by_complex(n: int):
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("batch", [1, 4])
 def test_complex_scale_tvm_ffi(batch: int, n: int):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
     torch.manual_seed(0)
     x = torch.randn(batch, n, dtype=torch.complex64, device="cuda")
     out = torch.empty_like(x)
     scale = complex(2.0, 1.0)
 
     fn = _compile_scale_by_complex(n)
+    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(x), complex_storage(out), Complex64(scale))
     torch.cuda.synchronize()
 
@@ -165,13 +174,11 @@ def _compile_smem_roundtrip():
 
 @pytest.mark.parametrize("batch", [1, 4])
 def test_smem_roundtrip_complex64(batch: int):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
     torch.manual_seed(0)
     x = torch.randn(batch, _SMEM_BLOCK_ELEMS, dtype=torch.complex64, device="cuda")
     out = torch.empty_like(x)
     fn = _compile_smem_roundtrip()
+    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(x), complex_storage(out))
     torch.cuda.synchronize()
     torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
@@ -235,8 +242,6 @@ class _OneShot:
 
 def _run_oneshot(body_fn, n_outputs: int) -> list[complex]:
     """Compile a kernel that writes n_outputs Complex64 values, run it, return them."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
     out = torch.zeros(n_outputs, dtype=torch.complex64, device="cuda")
     out_fake = cute.runtime.make_fake_tensor(Complex64, (n_outputs,), stride=(1,), assumed_align=8)
     fn = cute.compile(
@@ -245,6 +250,7 @@ def _run_oneshot(body_fn, n_outputs: int) -> list[complex]:
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(out))
     torch.cuda.synchronize()
     return out.tolist()
@@ -535,8 +541,6 @@ def test_complex_storage_passthrough_for_float64():
 
 def test_complex_storage_view_for_complex64():
     """Tier 5.24b -- complex_storage(complex64) returns a float64 view sharing memory."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required for view alignment")
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64

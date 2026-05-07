@@ -15,6 +15,7 @@ from cutlass import Int64, Float32, const_expr
 import quack.utils as utils
 import quack.copy_utils as copy_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.dsl import cute_op
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
@@ -190,7 +191,7 @@ def _compile_softmax_fwd(dtype, out_dtype, N):
     )
 
 
-@torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
+@cute_op("quack::_softmax_fwd", mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
     Args:
@@ -205,23 +206,6 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
     _compile_softmax_fwd(dtype, out_dtype, N)(x, out)
-
-
-@_softmax_fwd.register_fake
-def _softmax_fwd_fake(x: torch.Tensor, out: torch.Tensor) -> None:
-    # This register_fake serves two purposes:
-    # 1. torch.compile: When dynamo traces with symbolic shapes (SymInt), we must be a no-op.
-    #    Without register_fake, dynamo would trace the real impl which calls _compile_softmax_fwd
-    #    with a SymInt N — crashing @lru_cache since SymInt isn't hashable.
-    # 2. --compile-only mode: We enter FakeTensorMode with *concrete* shapes to pre-compile
-    #    kernels without GPU memory. Here we trigger both fwd and bwd compilation.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-        _compile_softmax_fwd(dtype, out_dtype, N)
-        _compile_softmax_backward(dtype, out_dtype, out_dtype, N)
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
@@ -388,7 +372,7 @@ def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
     )
 
 
-@torch.library.custom_op("quack::_softmax_backward", mutates_args={"dx"})
+@cute_op("quack::_softmax_backward", mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
     Args:
@@ -407,17 +391,6 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     N = dy.size(1)
     dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
     _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
-
-
-@_softmax_backward.register_fake
-def _softmax_backward_fake(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
-    # See _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(dy.size(1), torch.SymInt):
-        N = dy.size(1)
-        dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-        _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

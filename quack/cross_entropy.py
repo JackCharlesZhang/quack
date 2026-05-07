@@ -17,6 +17,7 @@ import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.dsl import cute_op
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
@@ -308,7 +309,7 @@ def _compile_cross_entropy_fwd(
     )
 
 
-@torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
+@cute_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
 def cross_entropy_fwd_out(
     x: Tensor,
     target: Tensor,
@@ -361,42 +362,6 @@ def cross_entropy_fwd_out(
         weight_dtype,
         target_logit_ndim,
     )(x, target, target_logit, loss, lse, dx, weight, Int32(ignore_index))
-
-
-@cross_entropy_fwd_out.register_fake
-def _cross_entropy_fwd_out_fake(
-    x: Tensor,
-    target: Tensor,
-    target_logit: Optional[Tensor],
-    loss: Tensor,
-    lse: Optional[Tensor],
-    dx: Optional[Tensor],
-    weight: Optional[Tensor],
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        target_logit_dtype = (
-            torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
-        )
-        target_logit_ndim = target_logit.ndim if target_logit is not None else None
-        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-        _compile_cross_entropy_fwd(
-            dtype,
-            target_dtype,
-            target_logit_dtype,
-            N,
-            lse is not None,
-            dx is not None,
-            weight_dtype,
-            target_logit_ndim,
-        )
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_fwd(
@@ -649,7 +614,7 @@ def _cross_entropy_backward(
     )
 
 
-@torch.library.custom_op("quack::cross_entropy_bwd_out", mutates_args={"dx"})
+@cute_op("quack::cross_entropy_bwd_out", mutates_args={"dx"})
 def cross_entropy_bwd_out(
     x: torch.Tensor,
     target: torch.Tensor,
@@ -660,27 +625,6 @@ def cross_entropy_bwd_out(
     ignore_index: int = -100,
 ) -> None:
     _cross_entropy_backward(x, target, dloss, lse, dx, weight, ignore_index)
-
-
-@cross_entropy_bwd_out.register_fake
-def _cross_entropy_bwd_out_fake(
-    x: torch.Tensor,
-    target: torch.Tensor,
-    dloss: torch.Tensor,
-    lse: torch.Tensor,
-    dx: torch.Tensor,
-    weight: Optional[torch.Tensor] = None,
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_bwd(

@@ -183,14 +183,14 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
         x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
     ).to(dtype=dtype)
 
-    if not inplace:
-        assert torch.equal(x, x_pt)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    if not inplace:
+        assert torch.equal(x, x_pt)
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -216,12 +216,12 @@ def test_rotary_emb_compile():
     out_pt = apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float(), True).to(
         dtype=dtype
     )
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -255,9 +255,6 @@ def test_rotary_emb_inplace_backward_no_copy(use_compile):
     x, x_pt, cos, sin = make_case()
     out = fn(x, cos, sin, inplace=True)
     out_pt = reference(x_pt, cos, sin)
-    assert out.data_ptr() == x.data_ptr()
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     torch.cuda.synchronize()
@@ -266,9 +263,12 @@ def test_rotary_emb_inplace_backward_no_copy(use_compile):
     ) as prof:
         (dx,) = torch.autograd.grad(out, x, grad)
         torch.cuda.synchronize()
+    out_pt.backward(grad_pt)
+
+    assert out.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     assert_one_cuda_kernel_no_memcpy(prof)
     assert dx.data_ptr() == grad.data_ptr()
-    out_pt.backward(grad_pt)
     torch.testing.assert_close(dx, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -294,12 +294,13 @@ def test_rotary_emb_vector_width_selection(headdim, rotary_dim, x_offset, dtype)
     out = apply_rotary_emb(x, cos, sin)
     cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -381,18 +382,19 @@ def test_rotary_emb_strided_x_qkv_view(interleaved, inplace, dtype):
     out_pt = apply_rotary_emb_torch(
         x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
     ).to(dtype=dtype)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-
     if inplace:
         qkv_expected = qkv_pt.clone()
         qkv_expected[:, :, 0] = out_pt
+        torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
         torch.testing.assert_close(qkv, qkv_expected, atol=1e-2, rtol=1e-3)
     else:
-        assert torch.equal(qkv, qkv_pt)
         grad = torch.randn_like(out)
         grad_pt = grad.clone()
         out.backward(grad)
         out_pt.backward(grad_pt)
+
+        torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
+        assert torch.equal(qkv, qkv_pt)
         torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -419,12 +421,13 @@ def test_rotary_emb_strided_cos_sin(interleaved, dtype):
     out_pt = apply_rotary_emb_torch(
         x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
     ).to(dtype=dtype)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -442,12 +445,13 @@ def test_rotary_emb_odd_nheads_block_h(dtype):
     out = apply_rotary_emb(x, cos, sin)
     cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
     out_pt = apply_rotary_emb_torch(x_pt.float(), cos_pt.float(), sin_pt.float()).to(dtype=dtype)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
 
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -488,15 +492,15 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     ).to(dtype=dtype)
     out_pt = out_pt.masked_fill(~padding_mask[:, :, None, None], 0.0)
 
-    if not inplace:
-        assert torch.equal(x_unpad, x_unpad_clone)
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
     x_grad = pad_input(x_unpad.grad, indices, batch_size, seqlen)
+
+    if not inplace:
+        assert torch.equal(x_unpad, x_unpad_clone)
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x_grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -550,7 +554,6 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
         interleaved=interleaved,
         num_heads_q=None if not gqa else nheads,
     )
-    assert out.data_ptr() == qkv.data_ptr()
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
     if not gqa:
         q_pt, k_pt, v_pt = qkv_pt.unbind(2)
@@ -572,11 +575,13 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
         ).to(dtype=dtype)
         out_pt = torch.cat([q_pt, k_pt, v_pt], dim=2)
 
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     grad = torch.randn_like(out)
     grad_pt = grad.clone()
     out.backward(grad)
     out_pt.backward(grad_pt)
+
+    assert out.data_ptr() == qkv.data_ptr()
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -628,7 +633,6 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
             interleaved=False,
             num_heads_q=None if not gqa else nheads,
         )
-        assert out.data_ptr() == qkv.data_ptr()
         cos_pt, sin_pt = index_cos_sin(cos, sin, None, seqlen)
         if not gqa:
             q_pt, k_pt, v_pt = qkv_pt.unbind(2)
@@ -650,11 +654,13 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
             )
             out_pt = torch.cat([q_pt, k_pt, v_pt], dim=2)
 
-        torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
         grad = torch.randn_like(out)
         grad_pt = grad.clone()
         out.backward(grad)
         out_pt.backward(grad_pt)
+
+        assert out.data_ptr() == qkv.data_ptr()
+        torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
         torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
     run_case(gqa=False)
@@ -814,10 +820,11 @@ def test_rotary_emb_kv(interleaved, rotary_fraction, seqlen_offsets_type, dtype)
     ).to(dtype=dtype)
     out_pt = torch.stack([k_pt, kv_pt[:, :, 1]], dim=2)
 
-    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     grad = torch.randn_like(out)
     out.backward(grad)
     out_pt.backward(grad.clone())
+
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(kv.grad, kv_pt.grad, atol=1e-2, rtol=1e-3)
 
 

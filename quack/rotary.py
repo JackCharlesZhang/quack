@@ -17,6 +17,7 @@ from quack import copy_utils
 from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.dsl import cute_op
 
 
 def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
@@ -373,7 +374,7 @@ def _launch_rotary(
     )(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen)
 
 
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_fwd_out",
     mutates_args=("out",),
     device_types="cuda",
@@ -393,27 +394,7 @@ def _rotary_fwd_out(
     _launch_rotary(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen, interleaved, conjugate)
 
 
-@_rotary_fwd_out.register_fake
-def _rotary_fwd_out_fake(
-    x: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    out: Tensor,
-    max_seqlen: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        _launch_rotary(
-            x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen, interleaved, conjugate
-        )
-
-
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_fwd_inplace",
     mutates_args=("x",),
     device_types="cuda",
@@ -432,25 +413,6 @@ def _rotary_fwd_inplace(
     _launch_rotary(x, cos, sin, seqlen_offsets, cu_seqlens, x, max_seqlen, interleaved, conjugate)
 
 
-@_rotary_fwd_inplace.register_fake
-def _rotary_fwd_inplace_fake(
-    x: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    max_seqlen: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        _launch_rotary(
-            x, cos, sin, seqlen_offsets, cu_seqlens, x, max_seqlen, interleaved, conjugate
-        )
-
-
 # CustomOpDef.register_effect() is only public in PyTorch 2.10+ (pytorch#163284).
 # On 2.8 / 2.9 fall back to the private torch._higher_order_ops.effects API,
 # which takes the underlying OpOverload. Collapse this once 2.10 is the floor.
@@ -465,7 +427,7 @@ def _register_ordered_effect(op) -> None:
         _register_effectful_op(op._opoverload, _EffectType.ORDERED)
 
 
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_inplace_bwd",
     mutates_args=(),
     device_types="cuda",
@@ -499,34 +461,6 @@ def _rotary_inplace_bwd(
 
 
 _register_ordered_effect(_rotary_inplace_bwd)
-
-
-@_rotary_inplace_bwd.register_fake
-def _rotary_inplace_bwd_fake(
-    dout: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    max_seqlen: Optional[int],
-    interleaved: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        max_seqlen = dout.shape[1] if cu_seqlens is None else max_seqlen
-        assert max_seqlen is not None
-        _launch_rotary(
-            dout,
-            cos,
-            sin,
-            seqlen_offsets,
-            cu_seqlens,
-            dout,
-            max_seqlen,
-            interleaved,
-            conjugate=True,
-        )
 
 
 def apply_rotary(
@@ -742,7 +676,7 @@ def _apply_rotary_qkv_inplace(
 
 # Keep the QKV view/reshape work behind this mutating custom op. Dynamo's
 # custom-autograd tracing still fails when the packed-QK GQA path is inlined.
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_qkv_inplace",
     mutates_args=("qkv",),
     device_types="cuda",
@@ -760,26 +694,7 @@ def _rotary_qkv_inplace(
     _apply_rotary_qkv_inplace(qkv, cos, sin, seqlen_offsets, num_heads_q, interleaved, conjugate)
 
 
-@_rotary_qkv_inplace.register_fake
-def _rotary_qkv_inplace_fake(
-    qkv: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    num_heads_q: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    has_symint = isinstance(cos.size(1), torch.SymInt) or isinstance(qkv.size(0), torch.SymInt)
-    if COMPILE_ONLY and not has_symint:
-        _apply_rotary_qkv_inplace(
-            qkv, cos, sin, seqlen_offsets, num_heads_q, interleaved, conjugate
-        )
-
-
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_qkv_inplace_bwd",
     mutates_args=(),
     device_types="cuda",
@@ -809,30 +724,6 @@ def _rotary_qkv_inplace_bwd(
 # first. Mark it as an ordered effect instead so Dynamo keeps the call without
 # inserting that clone; the returned grad input is the same mutated dqkv tensor.
 _register_ordered_effect(_rotary_qkv_inplace_bwd)
-
-
-@_rotary_qkv_inplace_bwd.register_fake
-def _rotary_qkv_inplace_bwd_fake(
-    dqkv: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    num_heads_q: int,
-    interleaved: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    has_symint = isinstance(cos.size(1), torch.SymInt) or isinstance(dqkv.size(0), torch.SymInt)
-    if COMPILE_ONLY and not has_symint:
-        _apply_rotary_qkv_inplace(
-            dqkv,
-            cos,
-            sin,
-            seqlen_offsets,
-            num_heads_q,
-            interleaved,
-            conjugate=True,
-        )
 
 
 class ApplyRotaryEmbQKV_(torch.autograd.Function):

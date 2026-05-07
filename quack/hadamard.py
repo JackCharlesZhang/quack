@@ -17,6 +17,7 @@ from quack import copy_utils, layout_utils
 from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.dsl import cute_op
 
 
 def _next_power_of_2(n: int) -> int:
@@ -280,7 +281,7 @@ def _compile_hadamard_transform_fwd(dtype, N):
     )
 
 
-@torch.library.custom_op(
+@cute_op(
     "quack::_hadamard_transform_fwd",
     mutates_args={"out"},
     device_types="cuda",
@@ -296,16 +297,6 @@ def _hadamard_transform_fwd(x: Tensor, out: Tensor, scale: float) -> None:
     assert 2 <= N <= 32768, "Hadamard transform supports last dimension in [2, 32768]"
     dtype = torch2cute_dtype_map[x.dtype]
     _compile_hadamard_transform_fwd(dtype, N)(x, out, scale)
-
-
-@_hadamard_transform_fwd.register_fake
-def _hadamard_transform_fwd_fake(x: Tensor, out: Tensor, scale: float) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        _compile_hadamard_transform_fwd(dtype, N)
 
 
 def hadamard_transform_fwd(x: Tensor, scale: float = 1.0) -> Tensor:

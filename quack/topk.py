@@ -19,6 +19,7 @@ from quack.reduction_base import ReductionBase
 from quack.reduce import row_reduce
 from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.dsl import cute_op
 from quack.sort.bitonic_sort import bitonic_topk
 
 
@@ -215,7 +216,7 @@ class TopK:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
 
 
-@torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
+@cute_op("quack::_topk_fwd", mutates_args={"values", "indices"})
 def _topk_fwd(
     x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -236,22 +237,6 @@ def _topk_fwd(
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     _compile_topk_fwd(dtype, N, k, softmax)(x, values, indices)
-
-
-@_topk_fwd.register_fake
-def _topk_fwd_fake(
-    x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    has_symint = isinstance(x.size(1), torch.SymInt) or isinstance(k, torch.SymInt)
-    if COMPILE_ONLY and not has_symint:
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        dx_dtype = torch2cute_dtype_map[x.dtype]
-        _compile_topk_fwd(dtype, N, k, softmax)
-        _compile_topk_bwd(dtype, dtype, dx_dtype, N, k, softmax)
 
 
 @jit_cache
@@ -457,7 +442,7 @@ class TopKBackward(ReductionBase):
             copy_dx(tXrdX, tXgdX)
 
 
-@torch.library.custom_op("quack::_topk_bwd", mutates_args={"dx"})
+@cute_op("quack::_topk_bwd", mutates_args={"dx"})
 def _topk_bwd(
     dvalues: torch.Tensor,
     values: Optional[torch.Tensor],
@@ -488,26 +473,6 @@ def _topk_bwd(
     val_dtype = torch2cute_dtype_map[values.dtype] if values is not None else None
     dx_dtype = torch2cute_dtype_map[dx.dtype]
     _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax)(dvalues, values, indices, dx)
-
-
-@_topk_bwd.register_fake
-def _topk_bwd_fake(
-    dvalues: torch.Tensor,
-    values: Optional[torch.Tensor],
-    indices: torch.Tensor,
-    k: int,
-    softmax: bool,
-    dx: torch.Tensor,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(dx.size(1), torch.SymInt):
-        N = dx.size(1)
-        dtype = torch2cute_dtype_map[dvalues.dtype]
-        val_dtype = torch2cute_dtype_map[values.dtype] if values is not None else None
-        dx_dtype = torch2cute_dtype_map[dx.dtype]
-        _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax)
 
 
 @jit_cache

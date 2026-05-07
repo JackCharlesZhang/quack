@@ -69,20 +69,23 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     # Compile ref for large inputs to avoid OOMs.
     compile_ref = N >= 256 * 1024 and M >= 8 * 1024
     ref_function = torch.compile(rmsnorm_ref) if compile_ref else rmsnorm_ref
+    # Order matters under `pytest --compile-only` (FakeTensorMode): we want both fwd
+    # and bwd kernels to be dispatched (and therefore compiled). `assert_close` raises
+    # on fake tensors, so run all kernel calls FIRST, then do numerical assertions.
     out = function(x, weight, eps=eps)
     out_ref = ref_function(x_ref, weight_ref, eps=eps)
+    skip_bwd = N > 128 * 1024 and input_dtype == torch.float32  # Not enough smem for bwd
+    if not skip_bwd:
+        grad_out = torch.randn_like(out)
+        torch.cuda.synchronize()
+        out.backward(grad_out)
+        out_ref.backward(grad_out)
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
-    # Backward pass
-    if N > 128 * 1024 and input_dtype == torch.float32:
-        # Skip backward pass due to not enough smem
+    if skip_bwd:
         return
-    grad_out = torch.randn_like(out)
-    torch.cuda.synchronize()
-    out.backward(grad_out)
-    out_ref.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
@@ -111,9 +114,9 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out = function(x, w, eps=1e-6)
     out_ref = rmsnorm_ref(x_ref, w_ref, eps=1e-6)
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     out.sum().backward()
     out_ref.sum().backward()
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
 
 
@@ -132,9 +135,9 @@ def test_rmsnorm_compile_2d_then_4d():
     w_ref = w.detach().clone().requires_grad_()
     out = f(x, w, eps=1e-5)
     out_ref = rmsnorm_ref(x_ref, w_ref, eps=1e-5)
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     out.sum().backward()
     out_ref.sum().backward()
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
 
     # Step 2: 4D input, 2D per-head weight + bias + residual (different rank, different args)
@@ -150,9 +153,9 @@ def test_rmsnorm_compile_2d_then_4d():
     out2_ref = rmsnorm_ref(x4_ref, w2_ref, bias=b2_ref, residual=r4_ref, eps=1e-6)
     if isinstance(out2_ref, tuple):
         out2_ref = out2_ref[0]
-    torch.testing.assert_close(out2, out2_ref, atol=atol, rtol=1e-3)
     out2.sum().backward()
     out2_ref.sum().backward()
+    torch.testing.assert_close(out2, out2_ref, atol=atol, rtol=1e-3)
     torch.testing.assert_close(x4.grad, x4_ref.grad, atol=atol, rtol=1e-3)
     torch.testing.assert_close(w2.grad, w2_ref.grad, atol=atol, rtol=1e-3)
     torch.testing.assert_close(b2.grad, b2_ref.grad, atol=atol, rtol=1e-3)
@@ -193,13 +196,12 @@ def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
     if residual is not None:
         out_ref = out_ref[0]
 
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
-
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out_ref.backward(grad_out)
     out.backward(grad_out)
+    out_ref.backward(grad_out)
 
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
     if bias is not None:
@@ -220,11 +222,11 @@ def test_rmsnorm_qk_many_heads():
 
     out = rmsnorm(x, weight)
     out_ref = rmsnorm_ref(x_ref, weight_ref)
-    torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
 
     grad_out = torch.randn_like(out)
-    out_ref.backward(grad_out)
     out.backward(grad_out)
+    out_ref.backward(grad_out)
+    torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-1, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-1, rtol=1e-3)
 
@@ -249,12 +251,12 @@ def test_rmsnorm_strided_tensor(use_compile):
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
-    assert out.shape == x.shape
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out_ref.backward(grad_out)
     out.backward(grad_out)
+    out_ref.backward(grad_out)
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
 
@@ -294,8 +296,12 @@ def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     )
 
 
-def test_rmsnorm_input_validation():
+def test_rmsnorm_input_validation(request):
     """Test input validation and error handling."""
+    # Validation runs eagerly in the op body and raises *before* dispatch under
+    # FakeTensorMode, so `with pytest.raises(...)` cannot fire under --compile-only.
+    if request.config.getoption("--compile-only", default=False):
+        pytest.skip("validation paths are not exercised under --compile-only / FakeTensorMode")
     device = "cuda"
 
     # Test 3D input (should now work since rmsnorm was updated to accept 3D inputs)
@@ -405,14 +411,14 @@ def test_rmsnorm_with_bias(use_compile):
     out = function(x, weight, bias=bias, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, bias=bias_ref, eps=eps)
 
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
-
-    grad_out = torch.randn_like(out)
-    torch.cuda.synchronize()
-    out_ref.backward(grad_out)
-    out.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
@@ -441,22 +447,22 @@ def test_rmsnorm_with_residual(backward_type, use_compile):
     out, residual_out = function(x, weight, residual=residual, eps=eps, prenorm=True)
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
 
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    if backward_type == "only_residual":
+        residual_out.backward(grad_out)
+        residual_out_ref.backward(grad_out)
+    elif backward_type == "only_output":
+        out.backward(grad_out)
+        out_ref.backward(grad_out)
+    else:
+        (out + residual_out).backward(grad_out)
+        (out_ref + residual_out_ref).backward(grad_out)
+
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-2, rtol=1e-3)
-
-    grad_out = torch.randn_like(out)
-    torch.cuda.synchronize()
-    if backward_type == "only_residual":
-        residual_out_ref.backward(grad_out)
-        residual_out.backward(grad_out)
-    elif backward_type == "only_output":
-        out_ref.backward(grad_out)
-        out.backward(grad_out)
-    else:
-        (out_ref + residual_out_ref).backward(grad_out)
-        (out + residual_out).backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)
@@ -505,13 +511,12 @@ def test_rmsnorm_prenorm_false(use_compile):
 
     out_ref, residual_out_ref = rmsnorm_ref(x_ref, weight_ref, residual=residual_ref, eps=eps)
 
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
-
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out_ref.backward(grad_out)
     out.backward(grad_out)
+    out_ref.backward(grad_out)
 
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)

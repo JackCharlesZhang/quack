@@ -48,15 +48,14 @@ def test_hadamard_transform_correctness(N, dtype):
     out = hadamard_transform(x, scale=scale)
     out_ref = hadamard_transform_ref(x_ref, scale=scale)
 
-    assert out.shape == x.shape
-    assert out.dtype == dtype
-    atol, rtol = TOLERANCES[dtype]
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-
     dy = torch.randn_like(out)
     out.backward(dy)
     out_ref.backward(dy)
 
+    assert out.shape == x.shape
+    assert out.dtype == dtype
+    atol, rtol = TOLERANCES[dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
 
 
@@ -71,13 +70,12 @@ def test_hadamard_transform_non_power_of_two(N, dtype):
     out = hadamard_transform(x, scale=scale)
     out_ref = hadamard_transform_ref(x_ref, scale=scale)
 
-    atol, rtol = TOLERANCES[dtype]
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-
     dy = torch.randn_like(out)
     out.backward(dy)
     out_ref.backward(dy)
 
+    atol, rtol = TOLERANCES[dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
 
 
