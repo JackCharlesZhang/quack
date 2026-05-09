@@ -64,7 +64,14 @@ class RMSNorm(ReductionBase):
             thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
         elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        elif self.is_layernorm:
+            # fp32 layernorm: bump cluster earlier than fp16/bf16. The 2-pass path's
+            # single-CTA tile is bandwidth-limited at N=16k/32k; cluster_n=2 splits
+            # the row across two CTAs and recovers ~3-14% at those sizes.
+            thresholds = [(8 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
         else:
+            # fp32 rmsnorm (1-pass) is already saturated at cluster_n=1 for N<=32k;
+            # bumping to cluster_n=2 there regresses ~3%.
             thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
         for limit, cluster in thresholds:
             if N <= limit:
