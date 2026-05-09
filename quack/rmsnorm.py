@@ -266,8 +266,16 @@ class RMSNorm(ReductionBase):
                 if const_expr(mRes is not None):
                     copy(tXgRes, tXrRes)
                     x += tXrRes.load().to(cute.Float32)
+            x_centered = x - mean
+            if const_expr(not is_even_N):
+                # OOB lanes are zero-filled for the mean pass, but they must contribute zero
+                # to the variance pass (not mean^2 from (0 - mean)^2).
+                tXrX_centered = cute.make_rmem_tensor_like(tXrX, Float32)
+                tXrX_centered.store(x_centered)
+                utils.fill_oob(tXrX_centered, tXpX, fill_value=Float32.zero)
+                x_centered = tXrX_centered.load()
             sum_sq_x_sub_mean = row_reduce(
-                (x - mean) * (x - mean),
+                x_centered * x_centered,
                 cute.ReductionOp.ADD,
                 threads_per_row,
                 reduction_buffer[None, None, 1],

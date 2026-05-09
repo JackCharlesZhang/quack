@@ -58,6 +58,27 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     torch.testing.assert_close(mean, mean_ref_val, atol=6e-4, rtol=6e-4)
 
 
+def test_layernorm_forward_masks_oob_variance_lanes():
+    """Regression: ragged N must not include padding lanes in LayerNorm variance."""
+    device = "cuda"
+    M, N = 3, 769  # N is not a full copy/reduction tile, so the last tile has OOB lanes.
+    eps = 1e-5
+
+    cols = torch.arange(N, device=device, dtype=torch.float32)
+    rows = torch.arange(M, device=device, dtype=torch.float32).unsqueeze(1)
+    x = 1000.0 + rows * 100.0 + ((cols % 17) - 8.0) / 8.0
+    weight = torch.ones(N, device=device, dtype=torch.float32)
+
+    out, rstd, mean = layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=True)
+    out_ref = layernorm_ref(x, weight, eps=eps)
+    rstd_ref_val = layernorm_rstd_ref(x, eps=eps)
+    mean_ref_val = layernorm_mean_ref(x)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(rstd, rstd_ref_val, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(mean, mean_ref_val, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("return_rstd", [True, False])
 @pytest.mark.parametrize("return_mean", [True, False])
 def test_layernormnorm_return_rstd_option(return_rstd, return_mean):
