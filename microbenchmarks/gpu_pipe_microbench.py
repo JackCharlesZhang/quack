@@ -8,6 +8,8 @@ repo.  One kernel template has compile-time switches for:
 * conflict-free shared-memory uint4 writes
 * warp SHFL.BFLY.B32
 * warp REDUX.SUM.S32
+* warp CREDUX.{MAX,MIN}.{S32,U32} on SM100+ via PTX redux.sync max/min
+* warp CREDUX.{MAX,MIN,MAXABS,MINABS}.F32 on SM100a/f+ via PTX redux.sync f32
 
 The point is to keep the benchmark extensible: adding a new instruction should
 only require adding a small ``dsl_user_op`` wrapper, an optional per-thread state
@@ -18,9 +20,11 @@ Counting convention:
 * SMEM bytes are real shared-memory bytes.  A uint4 op per lane is 16 B/lane.
 * SHFL bytes are useful delivered bytes: one 32-bit value per active lane, i.e.
   128 B per full-warp SHFL instruction.
-* REDUX is primarily reported as warp-instructions/clock/SM.  ``redux inB/clk``
-  is a descriptive input-byte count (one int32 input per lane), not necessarily
-  a bandwidth-pressure model.
+* REDUX/CREDUX are primarily reported as warp-instructions/clock/SM.  ``redux inB/clk``
+  is a descriptive input-byte count (one 32-bit input per lane), not necessarily
+  a bandwidth-pressure model.  CUDA ptxas emits CREDUX for integer max/min
+  reductions on SM100+, while SM90 emits REDUX.MAX/MIN.  F32 CREDUX requires
+  an architecture-specific/family-specific SM100+ target such as ``sm_103a``.
 
 Examples:
 
@@ -30,6 +34,10 @@ Examples:
     # One custom kernel variant.
     python microbenchmarks/gpu_pipe_microbench.py \
         --no-suite --smem-read --shuffle --shuffles-per-op 4
+    python microbenchmarks/gpu_pipe_microbench.py \
+        --no-suite --cred 4
+    python microbenchmarks/gpu_pipe_microbench.py \
+        --no-suite --cred-f32 4
 
     # Inspect SASS for a compiled variant via normal CuTe cache/dump tooling.
 """
@@ -48,7 +56,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
+from cutlass.base_dsl.arch import Arch
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -60,6 +69,10 @@ VEC_BYTES = 16  # uint4 shared-memory op per lane
 SHFL_BYTES = 4  # one int32 result per lane
 REDUX_INPUT_BYTES = 4
 ALIGN_BYTES = 128
+INT_REDUX_OPS = ("sum_s32", "max_s32", "min_s32", "max_u32", "min_u32")
+F32_REDUX_OPS = ("max_f32", "min_f32", "maxabs_f32", "minabs_f32")
+REDUX_OPS = (*INT_REDUX_OPS, *F32_REDUX_OPS)
+F32_REDUX_OP_SET = frozenset(F32_REDUX_OPS)
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +141,40 @@ def shfl_bfly_i32(x: Int32, mask: int, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
-def redux_add_s32(x: Int32, *, loc=None, ip=None) -> Int32:
+def redux_i32(x: Int32, op: str, *, loc=None, ip=None) -> Int32:
+    asm_by_op = {
+        "sum_s32": "redux.sync.add.s32 $0, $1, 0xffffffff;",
+        "max_s32": "redux.sync.max.s32 $0, $1, 0xffffffff;",
+        "min_s32": "redux.sync.min.s32 $0, $1, 0xffffffff;",
+        "max_u32": "redux.sync.max.u32 $0, $1, 0xffffffff;",
+        "min_u32": "redux.sync.min.u32 $0, $1, 0xffffffff;",
+    }
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [Int32(x).ir_value(loc=loc, ip=ip)],
-            "redux.sync.add.s32 $0, $1, 0xffffffff;",
+            asm_by_op[op],
             "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+        )
+    )
+
+
+@dsl_user_op
+def redux_f32(x: Float32, op: str, *, loc=None, ip=None) -> Float32:
+    asm_by_op = {
+        "max_f32": "redux.sync.max.f32 $0, $1, 0xffffffff;",
+        "min_f32": "redux.sync.min.f32 $0, $1, 0xffffffff;",
+        "maxabs_f32": "redux.sync.max.abs.f32 $0, $1, 0xffffffff;",
+        "minabs_f32": "redux.sync.min.abs.f32 $0, $1, 0xffffffff;",
+    }
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            asm_by_op[op],
+            "=f,f",
             has_side_effects=False,
             is_align_stack=False,
         )
@@ -155,6 +195,7 @@ class BenchConfig:
     redux: bool = False
     shuffles_per_op: int = 0
     reduxes_per_op: int = 0
+    redux_op: str = "sum_s32"
     ops_per_iter: int = 16
     iterations: int = 50_000
     threads: int = 256
@@ -162,6 +203,10 @@ class BenchConfig:
     @property
     def uses_smem(self) -> bool:
         return self.smem_read or self.smem_write
+
+    @property
+    def redux_is_f32(self) -> bool:
+        return self.redux_op in F32_REDUX_OP_SET
 
     @property
     def smem_op_multiplier(self) -> int:
@@ -225,18 +270,21 @@ class PipeBench:
         self.smem_write = config.smem_write
         self.shuffle = config.shuffle
         self.redux = config.redux
+        self.redux_op = config.redux_op
+        self.redux_is_f32 = config.redux_is_f32
         self.shuffles_per_op = config.shuffles_per_op if config.shuffle else 0
         self.reduxes_per_op = config.reduxes_per_op if config.redux else 0
         self.ops_per_iter = config.ops_per_iter
-        self.iterations = config.iterations
         self.threads = config.threads
         self.smem_int32 = config.smem_int32
         self.uses_smem = config.uses_smem
         self.launch_smem_bytes = launch_smem_bytes
 
     @cute.jit
-    def __call__(self, mCycles: cute.Tensor, mSink: cute.Tensor, stream: cuda.CUstream):
-        self.kernel(mCycles, mSink).launch(
+    def __call__(
+        self, mCycles: cute.Tensor, mSink: cute.Tensor, iterations: Int32, stream: cuda.CUstream
+    ):
+        self.kernel(mCycles, mSink, iterations).launch(
             grid=[mCycles.shape[0], 1, 1],
             block=[self.threads, 1, 1],
             # Reserving opt-in dynamic smem keeps the launch to one CTA/SM for
@@ -246,7 +294,7 @@ class PipeBench:
         )
 
     @cute.kernel
-    def kernel(self, mCycles: cute.Tensor, mSink: cute.Tensor):
+    def kernel(self, mCycles: cute.Tensor, mSink: cute.Tensor, iterations: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -259,6 +307,14 @@ class PipeBench:
         x5 = Int32(tidx + 81)
         x6 = Int32(tidx + 97)
         x7 = Int32(tidx + 113)
+        f0 = Float32(tidx) + Float32(0.125)
+        f1 = Float32(tidx) + Float32(17.25)
+        f2 = Float32(tidx) + Float32(33.375)
+        f3 = Float32(tidx) + Float32(49.5)
+        f4 = Float32(tidx) + Float32(65.625)
+        f5 = Float32(tidx) + Float32(81.75)
+        f6 = Float32(tidx) + Float32(97.875)
+        f7 = Float32(tidx) + Float32(113.0)
 
         if const_expr(self.uses_smem):
             smem = cutlass.utils.SmemAllocator()
@@ -282,7 +338,9 @@ class PipeBench:
         cute.arch.barrier()
         start = clock64()
 
-        for _it in cutlass.range(self.iterations):
+        # Keep the timed loop body comparable to the CUDA microbench.  With a
+        # compile-time trip count, CuTe currently software-unrolls this loop.
+        for _it in cutlass.range(iterations, unroll=1):
             for op in cutlass.range_constexpr(self.ops_per_iter):
                 if const_expr(self.uses_smem):
                     elem = (tidx + op * self.threads) * 4
@@ -321,22 +379,40 @@ class PipeBench:
                 if const_expr(self.redux):
                     for j in cutlass.range_constexpr(self.reduxes_per_op):
                         which = (op * self.reduxes_per_op + j) & 7
-                        if const_expr(which == 0):
-                            x0 = redux_add_s32(x0)
-                        elif const_expr(which == 1):
-                            x1 = redux_add_s32(x1)
-                        elif const_expr(which == 2):
-                            x2 = redux_add_s32(x2)
-                        elif const_expr(which == 3):
-                            x3 = redux_add_s32(x3)
-                        elif const_expr(which == 4):
-                            x4 = redux_add_s32(x4)
-                        elif const_expr(which == 5):
-                            x5 = redux_add_s32(x5)
-                        elif const_expr(which == 6):
-                            x6 = redux_add_s32(x6)
+                        if const_expr(self.redux_is_f32):
+                            if const_expr(which == 0):
+                                f0 = redux_f32(f0, self.redux_op)
+                            elif const_expr(which == 1):
+                                f1 = redux_f32(f1, self.redux_op)
+                            elif const_expr(which == 2):
+                                f2 = redux_f32(f2, self.redux_op)
+                            elif const_expr(which == 3):
+                                f3 = redux_f32(f3, self.redux_op)
+                            elif const_expr(which == 4):
+                                f4 = redux_f32(f4, self.redux_op)
+                            elif const_expr(which == 5):
+                                f5 = redux_f32(f5, self.redux_op)
+                            elif const_expr(which == 6):
+                                f6 = redux_f32(f6, self.redux_op)
+                            else:
+                                f7 = redux_f32(f7, self.redux_op)
                         else:
-                            x7 = redux_add_s32(x7)
+                            if const_expr(which == 0):
+                                x0 = redux_i32(x0, self.redux_op)
+                            elif const_expr(which == 1):
+                                x1 = redux_i32(x1, self.redux_op)
+                            elif const_expr(which == 2):
+                                x2 = redux_i32(x2, self.redux_op)
+                            elif const_expr(which == 3):
+                                x3 = redux_i32(x3, self.redux_op)
+                            elif const_expr(which == 4):
+                                x4 = redux_i32(x4, self.redux_op)
+                            elif const_expr(which == 5):
+                                x5 = redux_i32(x5, self.redux_op)
+                            elif const_expr(which == 6):
+                                x6 = redux_i32(x6, self.redux_op)
+                            else:
+                                x7 = redux_i32(x7, self.redux_op)
 
         cute.arch.barrier()
         stop = clock64()
@@ -344,7 +420,24 @@ class PipeBench:
         if tidx == 0:
             mCycles[bidx] = stop - start
             # Keep collective-op chains live through the timed region.
-            mSink[bidx] = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7
+            mSink[bidx] = (
+                x0
+                + x1
+                + x2
+                + x3
+                + x4
+                + x5
+                + x6
+                + x7
+                + Int32(f0)
+                + Int32(f1)
+                + Int32(f2)
+                + Int32(f3)
+                + Int32(f4)
+                + Int32(f5)
+                + Int32(f6)
+                + Int32(f7)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +450,7 @@ def _compile(config: BenchConfig, num_ctas: int, launch_smem_bytes: int):
     cycles = fake_tensor(Int64, (num_ctas,), 1)
     sink = fake_tensor(Int32, (num_ctas,), 1)
     op = PipeBench(config, launch_smem_bytes)
-    return cute.compile(op, cycles, sink, cute.runtime.make_fake_stream())
+    return cute.compile(op, cycles, sink, Int32(0), cute.runtime.make_fake_stream())
 
 
 def _summarize(config: BenchConfig, cycles: torch.Tensor) -> BenchResult:
@@ -402,12 +495,12 @@ def run_config(
     compiled = _compile(config, num_ctas, launch_smem_bytes)
 
     for _ in range(warmup):
-        compiled(cycles, sink, torch.cuda.current_stream().cuda_stream)
+        compiled(cycles, sink, config.iterations, torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
 
     best: BenchResult | None = None
     for _ in range(rep):
-        compiled(cycles, sink, torch.cuda.current_stream().cuda_stream)
+        compiled(cycles, sink, config.iterations, torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
         result = _summarize(config, cycles)
         if best is None or result.max_cycles < best.max_cycles:
@@ -419,29 +512,75 @@ def run_config(
     return best
 
 
-def default_suite(base: BenchConfig) -> list[BenchConfig]:
+def default_suite(base: BenchConfig, include_f32_credux: bool) -> list[BenchConfig]:
     common = dict(
         ops_per_iter=base.ops_per_iter,
         iterations=base.iterations,
         threads=base.threads,
     )
-    return [
+    configs = [
         BenchConfig("smem_read", smem_read=True, **common),
         BenchConfig("smem_write", smem_write=True, **common),
         BenchConfig("shuffle", shuffle=True, shuffles_per_op=4, **common),
-        BenchConfig("redux", redux=True, reduxes_per_op=4, **common),
+        BenchConfig("redux", redux=True, reduxes_per_op=4, redux_op="sum_s32", **common),
+        BenchConfig("credux_max", redux=True, reduxes_per_op=4, redux_op="max_s32", **common),
         BenchConfig("read+shuffle_r4", smem_read=True, shuffle=True, shuffles_per_op=4, **common),
         BenchConfig("write+shuffle_r4", smem_write=True, shuffle=True, shuffles_per_op=4, **common),
         BenchConfig("read+redux_r2", smem_read=True, redux=True, reduxes_per_op=2, **common),
         BenchConfig("write+redux_r2", smem_write=True, redux=True, reduxes_per_op=2, **common),
         BenchConfig("read+redux_r4", smem_read=True, redux=True, reduxes_per_op=4, **common),
         BenchConfig("write+redux_r4", smem_write=True, redux=True, reduxes_per_op=4, **common),
+        BenchConfig(
+            "read+credux_r4",
+            smem_read=True,
+            redux=True,
+            reduxes_per_op=4,
+            redux_op="max_s32",
+            **common,
+        ),
+        BenchConfig(
+            "write+credux_r4",
+            smem_write=True,
+            redux=True,
+            reduxes_per_op=4,
+            redux_op="max_s32",
+            **common,
+        ),
     ]
+    if include_f32_credux:
+        configs.extend(
+            [
+                BenchConfig(
+                    "credux_f32_max",
+                    redux=True,
+                    reduxes_per_op=4,
+                    redux_op="max_f32",
+                    **common,
+                ),
+                BenchConfig(
+                    "read+credux_f32_r4",
+                    smem_read=True,
+                    redux=True,
+                    reduxes_per_op=4,
+                    redux_op="max_f32",
+                    **common,
+                ),
+                BenchConfig(
+                    "write+credux_f32_r4",
+                    smem_write=True,
+                    redux=True,
+                    reduxes_per_op=4,
+                    redux_op="max_f32",
+                    **common,
+                ),
+            ]
+        )
+    return configs
 
 
 def print_results(results: Iterable[BenchResult]) -> None:
     print(
-        f"{'name':<18} {'R':>1} {'W':>1} {'SHF/op':>6} {'RED/op':>6} "
+        f"{'name':<18} {'R':>1} {'W':>1} {'SHF/op':>6} {'RED/op':>6} {'redop':<8} "
         f"{'max cyc':>12} {'smem B/clk':>12} {'shfl inst':>10} {'shfl B/clk':>12} "
         f"{'red inst':>10} {'red inB/clk':>12} {'total B/clk':>12}"
     )
@@ -451,6 +590,7 @@ def print_results(results: Iterable[BenchResult]) -> None:
             f"{c.name:<18} {int(c.smem_read):>1} {int(c.smem_write):>1} "
             f"{(c.shuffles_per_op if c.shuffle else 0):>6} "
             f"{(c.reduxes_per_op if c.redux else 0):>6} "
+            f"{(c.redux_op if c.redux else '-'): <8} "
             f"{r.max_cycles:>12d} {r.smem_bclk:>12.2f} {r.shfl_inst_clk:>10.2f} "
             f"{r.shfl_bclk:>12.2f} {r.redux_inst_clk:>10.2f} "
             f"{r.redux_input_bclk:>12.2f} {r.total_useful_bclk:>12.2f}"
@@ -485,10 +625,11 @@ def print_overlap_analysis(results: list[BenchResult]) -> None:
         (r for r in results if r.config.shuffle and not r.config.uses_smem and not r.config.redux),
         None,
     )
-    redux_base = next(
-        (r for r in results if r.config.redux and not r.config.uses_smem and not r.config.shuffle),
-        None,
-    )
+    redux_bases = {
+        r.config.redux_op: r
+        for r in results
+        if r.config.redux and not r.config.uses_smem and not r.config.shuffle
+    }
 
     rows = []
     for r in results:
@@ -505,6 +646,7 @@ def print_overlap_analysis(results: list[BenchResult]) -> None:
                 continue
             components.append(work["shfl_warp_inst"] / shfl_base.shfl_inst_clk)
         if c.redux:
+            redux_base = redux_bases.get(c.redux_op)
             if redux_base is None or redux_base.redux_inst_clk == 0.0:
                 continue
             components.append(work["redux_warp_inst"] / redux_base.redux_inst_clk)
@@ -529,9 +671,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smem-read", action="store_true", help="include SMEM uint4 reads")
     parser.add_argument("--smem-write", action="store_true", help="include SMEM uint4 writes")
     parser.add_argument("--shuffle", action="store_true", help="include SHFL.BFLY.B32 ops")
-    parser.add_argument("--redux", action="store_true", help="include REDUX.SUM.S32 ops")
+    parser.add_argument("--redux", action="store_true", help="include REDUX/CREDUX ops")
+    parser.add_argument(
+        "--cred",
+        nargs="?",
+        const=-1,
+        type=int,
+        default=None,
+        help="alias for --redux --redux-op max_s32; optional N sets --reduxes-per-op N",
+    )
+    parser.add_argument(
+        "--cred-f32",
+        nargs="?",
+        const=-1,
+        type=int,
+        default=None,
+        help="alias for --redux --redux-op max_f32; optional N sets --reduxes-per-op N",
+    )
     parser.add_argument("--shuffles-per-op", type=int, default=4)
     parser.add_argument("--reduxes-per-op", type=int, default=4)
+    parser.add_argument(
+        "--redux-op",
+        default="sum_s32",
+        choices=REDUX_OPS,
+    )
     parser.add_argument("--ops-per-iter", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=50_000)
     parser.add_argument("--threads", type=int, default=256)
@@ -547,6 +710,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def cute_target_supports_f32_credux() -> tuple[bool, str]:
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if isinstance(arch, Arch):
+        arch_name = arch.name
+    else:
+        arch_name = str(arch).split(".")[-1]
+    arch_suffix = arch_name.removeprefix("sm_")
+    digits = "".join(ch for ch in arch_suffix if ch.isdigit())
+    major = int(digits) // 10 if digits else 0
+    is_family_or_specific = arch_name.endswith(("a", "f"))
+    return major >= 10 and is_family_or_specific, arch_name
+
+
+def apply_redux_alias(args: argparse.Namespace, value: int | None, op: str) -> None:
+    if value is None:
+        return
+    args.redux = True
+    args.redux_op = op
+    if value >= 0:
+        args.reduxes_per_op = value
+
+
 def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
@@ -560,6 +745,14 @@ def main() -> None:
         raise ValueError("--iterations must be positive")
     if args.shuffles_per_op < 0 or args.reduxes_per_op < 0:
         raise ValueError("per-op counts must be non-negative")
+    apply_redux_alias(args, args.cred, "max_s32")
+    apply_redux_alias(args, args.cred_f32, "max_f32")
+
+    supports_f32_credux, cute_arch_name = cute_target_supports_f32_credux()
+    if args.redux and args.redux_op in F32_REDUX_OP_SET and not supports_f32_credux:
+        raise RuntimeError(
+            f"{args.redux_op} requires an SM100a/f+ CuTe target; current target is {cute_arch_name}"
+        )
 
     props = torch.cuda.get_device_properties(0)
     num_ctas = args.num_ctas or props.multi_processor_count
@@ -576,11 +769,12 @@ def main() -> None:
         redux=args.redux,
         shuffles_per_op=args.shuffles_per_op,
         reduxes_per_op=args.reduxes_per_op,
+        redux_op=args.redux_op,
         ops_per_iter=args.ops_per_iter,
         iterations=args.iterations,
         threads=args.threads,
     )
-    configs = [base] if args.no_suite else default_suite(base)
+    configs = [base] if args.no_suite else default_suite(base, supports_f32_credux)
 
     max_footprint = max(c.smem_footprint_bytes for c in configs)
     if max_footprint > launch_smem_bytes:
@@ -590,12 +784,14 @@ def main() -> None:
         )
 
     major, minor = torch.cuda.get_device_capability()
-    print(f"GPU: {torch.cuda.get_device_name()} sm_{major}{minor}")
+    print(f"GPU: {torch.cuda.get_device_name()} sm_{major}{minor}; CuTe target={cute_arch_name}")
     print(
         f"ctas={num_ctas} threads={args.threads} ops/iter={args.ops_per_iter} "
         f"iterations={args.iterations} reserve_smem={launch_smem_bytes / 1024:.1f} KiB"
     )
-    print("Counting: SHFL B/clk = 4 B/lane/result; REDUX inB/clk = 4 B/lane/input.\n")
+    print("Counting: SHFL B/clk = 4 B/lane/result; REDUX/CREDUX inB/clk = 4 B/lane/input.")
+    print("CREDUX note: integer max/min lowers to CREDUX on SM100+, REDUX on SM90.")
+    print(f"CREDUX f32: {'enabled' if supports_f32_credux else 'disabled'} for this CuTe target.\n")
 
     results: list[BenchResult] = []
     for config in configs:

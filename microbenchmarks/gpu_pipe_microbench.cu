@@ -4,15 +4,19 @@
 // Currently supports, in one templated kernel:
 //   * conflict-free shared-memory read or write: uint4 per lane
 //   * warp shuffle: shfl.sync.bfly.b32
-//   * warp integer reduction: redux.sync.add.s32
+//   * warp integer reduction / collective reduction:
+//       - redux.sync.add.s32 -> REDUX.SUM.S32
+//       - redux.sync.{max,min}.{s32,u32} -> CREDUX.{MAX,MIN} on SM100+
+//       - optionally redux.sync.{max,min}{.abs}.f32 -> CREDUX.F32 on SM100a/f+
 //
 // Counting convention:
 //   * SMEM bytes are actual shared-memory bytes.
 //   * SHFL is primarily counted as warp-instructions/clock/SM.  A 32-bit full-warp
 //     SHFL also delivers 32 * 4 B = 128 useful bytes.
-//   * REDUX is primarily counted as warp-instructions/clock/SM.  The table also
-//     prints the input-byte rate (32 * 4 B per full-warp REDUX), but the most
-//     useful number is usually the inferred SMEM-equivalent bytes/instruction.
+//   * REDUX/CREDUX are primarily counted as warp-instructions/clock/SM.  The table
+//     also prints the input-byte rate (32 * 4 B per full-warp collective).  CREDUX
+//     is a SASS instruction selected by ptxas for max/min reductions on SM100+;
+//     the PTX spelling is still redux.sync.*.
 //
 // Build:
 //   nvcc -O3 -std=c++17 -arch=native microbenchmarks/gpu_pipe_microbench.cu -o gpu_pipe_microbench
@@ -27,8 +31,17 @@
 // per iteration.  If --smem is read/write, each step also performs one SMEM op.
 //   ./gpu_pipe_microbench --single --smem read  --shfl 4
 //   ./gpu_pipe_microbench --single --smem write --redux 2
+//   ./gpu_pipe_microbench --single --smem none  --cred 4        # integer CREDUX on SM100+
+//   ./gpu_pipe_microbench --single --smem read  --redux 4 --redux-op max_s32
+//   ./gpu_pipe_microbench --single --smem none  --cred-f32 4    # f32 CREDUX; see below
 //   ./gpu_pipe_microbench --single --smem read  --shfl 2 --redux 1
 //   ./gpu_pipe_microbench --single --smem none  --shfl 8
+//
+// Note: CUDA ptxas requires an architecture-specific/family-specific SM100+
+//       target for redux.sync.*.f32.  For B300, build with e.g.
+//       nvcc -O3 -std=c++17 -gencode arch=compute_103a,code=sm_103a \
+//            -DGPU_PIPE_ENABLE_REDUX_F32=1 microbenchmarks/gpu_pipe_microbench.cu \
+//            -o gpu_pipe_microbench
 //
 // Extension point: add a new per-warp/per-lane op by adding state variables,
 // an op_step() helper, a per-step template count, and its metric fields in
@@ -62,7 +75,28 @@ constexpr int kVecBytes = 16;      // uint4 per lane for SMEM
 constexpr int kScalarBytes = 4;    // 32-bit SHFL / REDUX lane value
 constexpr int kAlignBytes = 128;
 
+#ifndef GPU_PIPE_ENABLE_REDUX_F32
+#define GPU_PIPE_ENABLE_REDUX_F32 0
+#endif
+
 enum class SmemMode { None, Read, Write };
+
+enum class ReduxOp {
+    SumS32,
+    MaxS32,
+    MinS32,
+    MaxU32,
+    MinU32,
+    MaxF32,
+    MinF32,
+    MaxAbsF32,
+    MinAbsF32,
+    Count
+};
+
+template <ReduxOp Op>
+constexpr bool is_f32_redux_v = Op == ReduxOp::MaxF32 || Op == ReduxOp::MinF32
+                             || Op == ReduxOp::MaxAbsF32 || Op == ReduxOp::MinAbsF32;
 
 enum class RowKind { Single, SweepBaseline, SweepCombined };
 
@@ -71,6 +105,7 @@ struct Spec {
     int shfl_per_step = 0;
     int redux_per_step = 0;
     RowKind kind = RowKind::Single;
+    ReduxOp redux_op = ReduxOp::SumS32;
 };
 
 struct Result {
@@ -100,6 +135,22 @@ const char* smem_mode_name(SmemMode mode) {
         case SmemMode::None: return "none";
         case SmemMode::Read: return "read";
         case SmemMode::Write: return "write";
+    }
+    return "unknown";
+}
+
+const char* redux_op_name(ReduxOp op) {
+    switch (op) {
+        case ReduxOp::SumS32: return "sum_s32";
+        case ReduxOp::MaxS32: return "max_s32";
+        case ReduxOp::MinS32: return "min_s32";
+        case ReduxOp::MaxU32: return "max_u32";
+        case ReduxOp::MinU32: return "min_u32";
+        case ReduxOp::MaxF32: return "max_f32";
+        case ReduxOp::MinF32: return "min_f32";
+        case ReduxOp::MaxAbsF32: return "maxabs_f32";
+        case ReduxOp::MinAbsF32: return "minabs_f32";
+        case ReduxOp::Count: break;
     }
     return "unknown";
 }
@@ -142,10 +193,61 @@ __device__ __forceinline__ uint32_t shfl_bfly_u32(uint32_t v, int mask) {
     return out;
 }
 
-__device__ __forceinline__ int32_t redux_add_s32(int32_t x) {
-    int32_t y;
-    asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(x));
+template <ReduxOp Op>
+__device__ __forceinline__ uint32_t redux_collective_u32(uint32_t x) {
+    if constexpr (Op == ReduxOp::SumS32) {
+        int32_t y;
+        int32_t sx = static_cast<int32_t>(x);
+        asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(sx));
+        return static_cast<uint32_t>(y);
+    } else if constexpr (Op == ReduxOp::MaxS32) {
+        int32_t y;
+        int32_t sx = static_cast<int32_t>(x);
+        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(sx));
+        return static_cast<uint32_t>(y);
+    } else if constexpr (Op == ReduxOp::MinS32) {
+        int32_t y;
+        int32_t sx = static_cast<int32_t>(x);
+        asm volatile("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(sx));
+        return static_cast<uint32_t>(y);
+    } else if constexpr (Op == ReduxOp::MaxU32) {
+        uint32_t y;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(x));
+        return y;
+    } else {
+        uint32_t y;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(y) : "r"(x));
+        return y;
+    }
+}
+
+#if GPU_PIPE_ENABLE_REDUX_F32
+template <ReduxOp Op>
+__device__ __forceinline__ float redux_collective_f32(float x) {
+    float y;
+    if constexpr (Op == ReduxOp::MaxF32) {
+        asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(y) : "f"(x));
+    } else if constexpr (Op == ReduxOp::MinF32) {
+        asm volatile("redux.sync.min.f32 %0, %1, 0xffffffff;" : "=f"(y) : "f"(x));
+    } else if constexpr (Op == ReduxOp::MaxAbsF32) {
+        asm volatile("redux.sync.max.abs.f32 %0, %1, 0xffffffff;" : "=f"(y) : "f"(x));
+    } else {
+        asm volatile("redux.sync.min.abs.f32 %0, %1, 0xffffffff;" : "=f"(y) : "f"(x));
+    }
     return y;
+}
+#endif
+
+template <ReduxOp Op>
+__device__ __forceinline__ uint32_t redux_collective(uint32_t x) {
+#if GPU_PIPE_ENABLE_REDUX_F32
+    if constexpr (is_f32_redux_v<Op>) {
+        return __float_as_uint(redux_collective_f32<Op>(__uint_as_float(x)));
+    } else
+#endif
+    {
+        return redux_collective_u32<Op>(x);
+    }
 }
 
 template <int Chain>
@@ -187,41 +289,42 @@ __device__ __forceinline__ void shfl_step(uint32_t& x0, uint32_t& x1, uint32_t& 
     }
 }
 
-template <int Chain>
-__device__ __forceinline__ void redux_chain_step(int32_t& x0, int32_t& x1, int32_t& x2,
-                                                 int32_t& x3, int32_t& x4, int32_t& x5,
-                                                 int32_t& x6, int32_t& x7) {
+template <ReduxOp Op, int Chain>
+__device__ __forceinline__ void redux_chain_step(uint32_t& x0, uint32_t& x1, uint32_t& x2,
+                                                 uint32_t& x3, uint32_t& x4, uint32_t& x5,
+                                                 uint32_t& x6, uint32_t& x7) {
     if constexpr (Chain == 0) {
-        x0 = redux_add_s32(x0);
+        x0 = redux_collective<Op>(x0);
     } else if constexpr (Chain == 1) {
-        x1 = redux_add_s32(x1);
+        x1 = redux_collective<Op>(x1);
     } else if constexpr (Chain == 2) {
-        x2 = redux_add_s32(x2);
+        x2 = redux_collective<Op>(x2);
     } else if constexpr (Chain == 3) {
-        x3 = redux_add_s32(x3);
+        x3 = redux_collective<Op>(x3);
     } else if constexpr (Chain == 4) {
-        x4 = redux_add_s32(x4);
+        x4 = redux_collective<Op>(x4);
     } else if constexpr (Chain == 5) {
-        x5 = redux_add_s32(x5);
+        x5 = redux_collective<Op>(x5);
     } else if constexpr (Chain == 6) {
-        x6 = redux_add_s32(x6);
+        x6 = redux_collective<Op>(x6);
     } else {
-        x7 = redux_add_s32(x7);
+        x7 = redux_collective<Op>(x7);
     }
 }
 
-__device__ __forceinline__ void redux_step(int32_t& x0, int32_t& x1, int32_t& x2,
-                                           int32_t& x3, int32_t& x4, int32_t& x5,
-                                           int32_t& x6, int32_t& x7, int op) {
+template <ReduxOp Op>
+__device__ __forceinline__ void redux_step(uint32_t& x0, uint32_t& x1, uint32_t& x2,
+                                           uint32_t& x3, uint32_t& x4, uint32_t& x5,
+                                           uint32_t& x6, uint32_t& x7, int op) {
     switch (op & 7) {
-        case 0: redux_chain_step<0>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 1: redux_chain_step<1>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 2: redux_chain_step<2>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 3: redux_chain_step<3>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 4: redux_chain_step<4>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 5: redux_chain_step<5>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        case 6: redux_chain_step<6>(x0, x1, x2, x3, x4, x5, x6, x7); break;
-        default: redux_chain_step<7>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 0: redux_chain_step<Op, 0>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 1: redux_chain_step<Op, 1>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 2: redux_chain_step<Op, 2>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 3: redux_chain_step<Op, 3>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 4: redux_chain_step<Op, 4>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 5: redux_chain_step<Op, 5>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        case 6: redux_chain_step<Op, 6>(x0, x1, x2, x3, x4, x5, x6, x7); break;
+        default: redux_chain_step<Op, 7>(x0, x1, x2, x3, x4, x5, x6, x7); break;
     }
 }
 
@@ -241,7 +344,7 @@ __device__ __forceinline__ void initialize_smem_conflict_free(uint32_t base) {
     }
 }
 
-template <SmemMode Mode, int ShflPerStep, int ReduxPerStep>
+template <SmemMode Mode, int ShflPerStep, int ReduxPerStep, ReduxOp Op>
 __global__ void pipe_bench_kernel(int iters, unsigned long long* cycles, uint32_t* sink) {
     const int tid = threadIdx.x;
     const uint32_t base = aligned_dynamic_smem_base();
@@ -259,14 +362,14 @@ __global__ void pipe_bench_kernel(int iters, unsigned long long* cycles, uint32_
     uint32_t s6 = 0xfd7046c5u ^ uint32_t(tid + 0xc0u);
     uint32_t s7 = 0xb55a4f09u ^ uint32_t(tid + 0xe0u);
 
-    int32_t r0 = int32_t(0x243f6a88u ^ uint32_t(tid + 0x11u));
-    int32_t r1 = int32_t(0x85a308d3u ^ uint32_t(tid + 0x31u));
-    int32_t r2 = int32_t(0x13198a2eu ^ uint32_t(tid + 0x51u));
-    int32_t r3 = int32_t(0x03707344u ^ uint32_t(tid + 0x71u));
-    int32_t r4 = int32_t(0xa4093822u ^ uint32_t(tid + 0x91u));
-    int32_t r5 = int32_t(0x299f31d0u ^ uint32_t(tid + 0xb1u));
-    int32_t r6 = int32_t(0x082efa98u ^ uint32_t(tid + 0xd1u));
-    int32_t r7 = int32_t(0xec4e6c89u ^ uint32_t(tid + 0xf1u));
+    uint32_t r0 = __float_as_uint(float(tid) + 0.125f);
+    uint32_t r1 = __float_as_uint(float(tid) + 17.25f);
+    uint32_t r2 = __float_as_uint(float(tid) + 33.375f);
+    uint32_t r3 = __float_as_uint(float(tid) + 49.5f);
+    uint32_t r4 = __float_as_uint(float(tid) + 65.625f);
+    uint32_t r5 = __float_as_uint(float(tid) + 81.75f);
+    uint32_t r6 = __float_as_uint(float(tid) + 97.875f);
+    uint32_t r7 = __float_as_uint(float(tid) + 113.0f);
 
     initialize_smem_conflict_free<Mode>(base);
     __syncthreads();
@@ -291,7 +394,7 @@ __global__ void pipe_bench_kernel(int iters, unsigned long long* cycles, uint32_
             }
 #pragma unroll
             for (int j = 0; j < ReduxPerStep; ++j) {
-                redux_step(r0, r1, r2, r3, r4, r5, r6, r7, step * ReduxPerStep + j);
+                redux_step<Op>(r0, r1, r2, r3, r4, r5, r6, r7, step * ReduxPerStep + j);
             }
         }
     }
@@ -301,7 +404,7 @@ __global__ void pipe_bench_kernel(int iters, unsigned long long* cycles, uint32_
     const unsigned long long stop = clock64();
 
     const uint32_t mixed = s0 ^ s1 ^ s2 ^ s3 ^ s4 ^ s5 ^ s6 ^ s7
-                         ^ uint32_t(r0 ^ r1 ^ r2 ^ r3 ^ r4 ^ r5 ^ r6 ^ r7)
+                         ^ (r0 ^ r1 ^ r2 ^ r3 ^ r4 ^ r5 ^ r6 ^ r7)
                          ^ lane_id() ^ uint32_t(stop);
     if (tid == 0) {
         cycles[blockIdx.x] = stop - start;
@@ -326,10 +429,10 @@ int configure_kernel(Kernel kernel, int threads, int dynamic_smem_bytes,
     return active_blocks;
 }
 
-template <SmemMode Mode, int ShflPerStep, int ReduxPerStep>
+template <SmemMode Mode, int ShflPerStep, int ReduxPerStep, ReduxOp Op>
 bool launch_once(int threads, int iters, int blocks, int dynamic_smem_bytes,
                  unsigned long long* d_cycles, uint32_t* d_sink) {
-    pipe_bench_kernel<Mode, ShflPerStep, ReduxPerStep>
+    pipe_bench_kernel<Mode, ShflPerStep, ReduxPerStep, Op>
         <<<blocks, threads, dynamic_smem_bytes>>>(iters, d_cycles, d_sink);
     cudaError_t err = cudaGetLastError();
     if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidConfiguration) {
@@ -382,26 +485,26 @@ void fill_timing(Result* result, int blocks, int threads, int iters,
                                          / double(result->max_cycles);
 }
 
-template <SmemMode Mode, int ShflPerStep, int ReduxPerStep>
+template <SmemMode Mode, int ShflPerStep, int ReduxPerStep, ReduxOp Op>
 bool run_typed(const Spec& spec, int threads, int iters, int blocks, int smem_dynamic_bytes,
                int default_smem_per_block, unsigned long long* d_cycles, uint32_t* d_sink,
                Result* result) {
     const int dynamic_smem_bytes = Mode == SmemMode::None ? 0 : smem_dynamic_bytes;
-    const int active_blocks = configure_kernel(pipe_bench_kernel<Mode, ShflPerStep, ReduxPerStep>,
-                                               threads, dynamic_smem_bytes,
-                                               default_smem_per_block);
+    const int active_blocks = configure_kernel(
+        pipe_bench_kernel<Mode, ShflPerStep, ReduxPerStep, Op>, threads, dynamic_smem_bytes,
+        default_smem_per_block);
     if (active_blocks < 1) {
         return false;
     }
 
     // Warm-up, then measured launch.  The measured value comes from clock64()
     // inside the kernel, not event time.
-    if (!launch_once<Mode, ShflPerStep, ReduxPerStep>(threads, iters, blocks,
-                                                      dynamic_smem_bytes, d_cycles, d_sink)) {
+    if (!launch_once<Mode, ShflPerStep, ReduxPerStep, Op>(threads, iters, blocks,
+                                                          dynamic_smem_bytes, d_cycles, d_sink)) {
         return false;
     }
-    if (!launch_once<Mode, ShflPerStep, ReduxPerStep>(threads, iters, blocks,
-                                                      dynamic_smem_bytes, d_cycles, d_sink)) {
+    if (!launch_once<Mode, ShflPerStep, ReduxPerStep, Op>(threads, iters, blocks,
+                                                          dynamic_smem_bytes, d_cycles, d_sink)) {
         return false;
     }
 
@@ -412,33 +515,107 @@ bool run_typed(const Spec& spec, int threads, int iters, int blocks, int smem_dy
     return true;
 }
 
+template <SmemMode Mode, int ShflPerStep, ReduxOp Op>
+bool dispatch_redux_count(const Spec& spec, int threads, int iters, int blocks,
+                          int smem_dynamic_bytes, int default_smem_per_block,
+                          unsigned long long* d_cycles, uint32_t* d_sink, Result* result) {
+    switch (spec.redux_per_step) {
+        case 0:
+            return run_typed<Mode, ShflPerStep, 0, Op>(spec, threads, iters, blocks,
+                                                       smem_dynamic_bytes, default_smem_per_block,
+                                                       d_cycles, d_sink, result);
+        case 1:
+            return run_typed<Mode, ShflPerStep, 1, Op>(spec, threads, iters, blocks,
+                                                       smem_dynamic_bytes, default_smem_per_block,
+                                                       d_cycles, d_sink, result);
+        case 2:
+            return run_typed<Mode, ShflPerStep, 2, Op>(spec, threads, iters, blocks,
+                                                       smem_dynamic_bytes, default_smem_per_block,
+                                                       d_cycles, d_sink, result);
+        case 4:
+            return run_typed<Mode, ShflPerStep, 4, Op>(spec, threads, iters, blocks,
+                                                       smem_dynamic_bytes, default_smem_per_block,
+                                                       d_cycles, d_sink, result);
+        case 8:
+            return run_typed<Mode, ShflPerStep, 8, Op>(spec, threads, iters, blocks,
+                                                       smem_dynamic_bytes, default_smem_per_block,
+                                                       d_cycles, d_sink, result);
+        default: return false;
+    }
+}
+
 template <SmemMode Mode, int ShflPerStep>
 bool dispatch_redux(const Spec& spec, int threads, int iters, int blocks, int smem_dynamic_bytes,
                     int default_smem_per_block, unsigned long long* d_cycles, uint32_t* d_sink,
                     Result* result) {
-    switch (spec.redux_per_step) {
-        case 0:
-            return run_typed<Mode, ShflPerStep, 0>(spec, threads, iters, blocks,
-                                                   smem_dynamic_bytes, default_smem_per_block,
-                                                   d_cycles, d_sink, result);
-        case 1:
-            return run_typed<Mode, ShflPerStep, 1>(spec, threads, iters, blocks,
-                                                   smem_dynamic_bytes, default_smem_per_block,
-                                                   d_cycles, d_sink, result);
-        case 2:
-            return run_typed<Mode, ShflPerStep, 2>(spec, threads, iters, blocks,
-                                                   smem_dynamic_bytes, default_smem_per_block,
-                                                   d_cycles, d_sink, result);
-        case 4:
-            return run_typed<Mode, ShflPerStep, 4>(spec, threads, iters, blocks,
-                                                   smem_dynamic_bytes, default_smem_per_block,
-                                                   d_cycles, d_sink, result);
-        case 8:
-            return run_typed<Mode, ShflPerStep, 8>(spec, threads, iters, blocks,
-                                                   smem_dynamic_bytes, default_smem_per_block,
-                                                   d_cycles, d_sink, result);
-        default: return false;
+    switch (spec.redux_op) {
+        case ReduxOp::SumS32:
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::SumS32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+        case ReduxOp::MaxS32:
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MaxS32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+        case ReduxOp::MinS32:
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MinS32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+        case ReduxOp::MaxU32:
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MaxU32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+        case ReduxOp::MinU32:
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MinU32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+        case ReduxOp::MaxF32:
+#if GPU_PIPE_ENABLE_REDUX_F32
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MaxF32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+#else
+            std::fprintf(stderr,
+                         "max_f32 requires -DGPU_PIPE_ENABLE_REDUX_F32=1 and an SM100a/f+ "
+                         "target, e.g. -gencode arch=compute_103a,code=sm_103a.\n");
+            return false;
+#endif
+        case ReduxOp::MinF32:
+#if GPU_PIPE_ENABLE_REDUX_F32
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MinF32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+#else
+            std::fprintf(stderr,
+                         "min_f32 requires -DGPU_PIPE_ENABLE_REDUX_F32=1 and an SM100a/f+ "
+                         "target, e.g. -gencode arch=compute_103a,code=sm_103a.\n");
+            return false;
+#endif
+        case ReduxOp::MaxAbsF32:
+#if GPU_PIPE_ENABLE_REDUX_F32
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MaxAbsF32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+#else
+            std::fprintf(stderr,
+                         "maxabs_f32 requires -DGPU_PIPE_ENABLE_REDUX_F32=1 and an SM100a/f+ "
+                         "target, e.g. -gencode arch=compute_103a,code=sm_103a.\n");
+            return false;
+#endif
+        case ReduxOp::MinAbsF32:
+#if GPU_PIPE_ENABLE_REDUX_F32
+            return dispatch_redux_count<Mode, ShflPerStep, ReduxOp::MinAbsF32>(
+                spec, threads, iters, blocks, smem_dynamic_bytes, default_smem_per_block,
+                d_cycles, d_sink, result);
+#else
+            std::fprintf(stderr,
+                         "minabs_f32 requires -DGPU_PIPE_ENABLE_REDUX_F32=1 and an SM100a/f+ "
+                         "target, e.g. -gencode arch=compute_103a,code=sm_103a.\n");
+            return false;
+#endif
+        case ReduxOp::Count: break;
     }
+    return false;
 }
 
 template <SmemMode Mode>
@@ -488,17 +665,18 @@ bool run_spec(const Spec& spec, int threads, int iters, int blocks, int smem_dyn
 bool valid_count(int n) { return n == 0 || n == 1 || n == 2 || n == 4 || n == 8; }
 
 void print_result_header() {
-    std::printf("%-6s %5s %5s %9s %14s %14s %14s %14s %14s %14s\n", "smem", "shfl",
-                "redux", "maxCTA/SM", "max cycles", "smem B/clk", "shfl inst/clk",
-                "shfl B/clk", "redux inst/clk", "redux inB/clk");
+    std::printf("%-6s %5s %5s %-10s %9s %14s %14s %14s %14s %14s %14s\n", "smem",
+                "shfl", "redux", "redop", "maxCTA/SM", "max cycles", "smem B/clk",
+                "shfl inst/clk", "shfl B/clk", "redux inst/clk", "redux inB/clk");
 }
 
 void print_result_row(const Result& r) {
-    std::printf("%-6s %5d %5d %9d %14llu %14.2f %14.2f %14.2f %14.2f %14.2f\n",
+    std::printf("%-6s %5d %5d %-10s %9d %14llu %14.2f %14.2f %14.2f %14.2f %14.2f\n",
                 smem_mode_name(r.spec.smem), r.spec.shfl_per_step, r.spec.redux_per_step,
-                r.active_blocks_per_sm, r.max_cycles, r.smem_bytes_per_cycle,
-                r.shfl_warp_inst_per_cycle, r.shfl_useful_bytes_per_cycle,
-                r.redux_warp_inst_per_cycle, r.redux_input_bytes_per_cycle);
+                redux_op_name(r.spec.redux_op), r.active_blocks_per_sm, r.max_cycles,
+                r.smem_bytes_per_cycle, r.shfl_warp_inst_per_cycle,
+                r.shfl_useful_bytes_per_cycle, r.redux_warp_inst_per_cycle,
+                r.redux_input_bytes_per_cycle);
 }
 
 void maybe_push(bool ok, const Result& result, std::vector<Result>* results) {
@@ -513,10 +691,14 @@ void print_usage(const char* prog) {
     std::printf("Default with no --single runs a sweep.  For a custom case use --single.\n");
     std::printf("\nOptions:\n");
     std::printf("  --single          Run one case from --smem/--shfl/--redux\n");
+    std::printf("  --cred N          Alias for --redux N --redux-op max_s32 (CREDUX on SM100+)\n");
+    std::printf("  --cred-f32 N      Alias for --redux N --redux-op max_f32 (requires SM100a/f+ build)\n");
     std::printf("  --sweep           Run the default baseline + competition sweep\n");
     std::printf("  --smem MODE       none|read|write for the single case (default: none)\n");
     std::printf("  --shfl N          SHFL instructions per interleave step; N in {0,1,2,4,8}\n");
-    std::printf("  --redux N         REDUX instructions per interleave step; N in {0,1,2,4,8}\n");
+    std::printf("  --redux N         REDUX/CREDUX instructions per interleave step; N in {0,1,2,4,8}\n");
+    std::printf("  --redux-op OP     sum_s32|max_s32|min_s32|max_u32|min_u32|max_f32|min_f32|"
+                "maxabs_f32|minabs_f32\n");
     std::printf("  --iters, -n N     Loop iterations per CTA (default: 50000)\n");
     std::printf("  --threads, -t T   Threads per CTA; multiple of 32 (default: 256)\n");
     std::printf("  --help, -h        Show this message\n");
@@ -536,6 +718,49 @@ bool parse_smem_mode(const char* s, SmemMode* mode) {
     }
     if (!std::strcmp(s, "write") || !std::strcmp(s, "store")) {
         *mode = SmemMode::Write;
+        return true;
+    }
+    return false;
+}
+
+bool parse_redux_op(const char* s, ReduxOp* op) {
+    if (!std::strcmp(s, "sum") || !std::strcmp(s, "sum_s32") || !std::strcmp(s, "redux")) {
+        *op = ReduxOp::SumS32;
+        return true;
+    }
+    if (!std::strcmp(s, "max") || !std::strcmp(s, "max_s32") || !std::strcmp(s, "cred")) {
+        *op = ReduxOp::MaxS32;
+        return true;
+    }
+    if (!std::strcmp(s, "min") || !std::strcmp(s, "min_s32")) {
+        *op = ReduxOp::MinS32;
+        return true;
+    }
+    if (!std::strcmp(s, "maxu") || !std::strcmp(s, "max_u32")) {
+        *op = ReduxOp::MaxU32;
+        return true;
+    }
+    if (!std::strcmp(s, "minu") || !std::strcmp(s, "min_u32")) {
+        *op = ReduxOp::MinU32;
+        return true;
+    }
+    if (!std::strcmp(s, "maxf") || !std::strcmp(s, "max_f32") || !std::strcmp(s, "f32")
+        || !std::strcmp(s, "credux_f32")) {
+        *op = ReduxOp::MaxF32;
+        return true;
+    }
+    if (!std::strcmp(s, "minf") || !std::strcmp(s, "min_f32")) {
+        *op = ReduxOp::MinF32;
+        return true;
+    }
+    if (!std::strcmp(s, "maxabs") || !std::strcmp(s, "maxabs_f32")
+        || !std::strcmp(s, "max_abs_f32")) {
+        *op = ReduxOp::MaxAbsF32;
+        return true;
+    }
+    if (!std::strcmp(s, "minabs") || !std::strcmp(s, "minabs_f32")
+        || !std::strcmp(s, "min_abs_f32")) {
+        *op = ReduxOp::MinAbsF32;
         return true;
     }
     return false;
@@ -587,6 +812,31 @@ int main(int argc, char** argv) {
                 return 1;
             }
             single_spec.redux_per_step = std::stoi(argv[i]);
+            run_single_case = true;
+        } else if (!std::strcmp(argv[i], "--cred") || !std::strcmp(argv[i], "--credux")) {
+            if (++i >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            single_spec.redux_per_step = std::stoi(argv[i]);
+            single_spec.redux_op = ReduxOp::MaxS32;
+            run_single_case = true;
+        } else if (!std::strcmp(argv[i], "--cred-f32")
+                   || !std::strcmp(argv[i], "--credux-f32")) {
+            if (++i >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            single_spec.redux_per_step = std::stoi(argv[i]);
+            single_spec.redux_op = ReduxOp::MaxF32;
+            run_single_case = true;
+        } else if (!std::strcmp(argv[i], "--redux-op")) {
+            if (++i >= argc || !parse_redux_op(argv[i], &single_spec.redux_op)) {
+                std::fprintf(stderr,
+                             "--redux-op expects sum_s32|max_s32|min_s32|max_u32|min_u32|"
+                             "max_f32|min_f32|maxabs_f32|minabs_f32\n");
+                return 1;
+            }
             run_single_case = true;
         } else if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
             print_usage(argv[0]);
@@ -652,7 +902,14 @@ int main(int argc, char** argv) {
     std::printf("SMEM dynamic allocation for SMEM cases: %.1f KiB/CTA\n",
                 smem_dynamic_bytes / 1024.0);
     std::printf("SMEM access: uint4/lane, contiguous/128-B aligned, bank-conflict-free\n");
-    std::printf("Per-step flags: --shfl N and --redux N, N in {0,1,2,4,8}\n\n");
+    std::printf("Per-step flags: --shfl N, --redux N, --cred N; N in {0,1,2,4,8}\n");
+    std::printf("CREDUX note: integer --redux-op max/min lowers to CREDUX on SM100+, REDUX on SM90.\n");
+#if GPU_PIPE_ENABLE_REDUX_F32
+    std::printf("CREDUX f32: enabled in this build; use --cred-f32 N or --redux-op max_f32.\n\n");
+#else
+    std::printf("CREDUX f32: disabled in this build; rebuild with -DGPU_PIPE_ENABLE_REDUX_F32=1 "
+                "and an SM100a/f+ target.\n\n");
+#endif
 
     if (run_single_case) {
         Result result;
@@ -666,8 +923,9 @@ int main(int argc, char** argv) {
         }
         print_result_header();
         print_result_row(result);
-        std::printf("\nTotals per warp per iteration: shfl=%d warp-inst, redux=%d warp-inst%s\n",
+        std::printf("\nTotals per warp per iteration: shfl=%d warp-inst, %s=%d warp-inst%s\n",
                     kInterleaveSteps * single_spec.shfl_per_step,
+                    redux_op_name(single_spec.redux_op),
                     kInterleaveSteps * single_spec.redux_per_step,
                     single_spec.smem == SmemMode::None ? "" : ", smem=16 uint4/lane ops");
         CHECK_CUDA(cudaFree(d_cycles));
@@ -694,6 +952,17 @@ int main(int argc, char** argv) {
     for (int n : {1, 2, 4, 8}) {
         run_and_push(Spec{SmemMode::None, 0, n, RowKind::SweepBaseline}, &baselines);
     }
+    // PTX redux.sync.max.s32 lowers to CREDUX.MAX.S32 on SM100+.
+    for (int n : {1, 2, 4, 8}) {
+        run_and_push(Spec{SmemMode::None, 0, n, RowKind::SweepBaseline, ReduxOp::MaxS32},
+                     &baselines);
+    }
+#if GPU_PIPE_ENABLE_REDUX_F32
+    for (int n : {1, 2, 4, 8}) {
+        run_and_push(Spec{SmemMode::None, 0, n, RowKind::SweepBaseline, ReduxOp::MaxF32},
+                     &baselines);
+    }
+#endif
 
     // Pairwise competition sweeps.
     for (int n : {1, 2, 4, 8}) {
@@ -704,6 +973,20 @@ int main(int argc, char** argv) {
         run_and_push(Spec{SmemMode::Read, 0, n, RowKind::SweepCombined}, &combined);
         run_and_push(Spec{SmemMode::Write, 0, n, RowKind::SweepCombined}, &combined);
     }
+    for (int n : {1, 2, 4, 8}) {
+        run_and_push(Spec{SmemMode::Read, 0, n, RowKind::SweepCombined, ReduxOp::MaxS32},
+                     &combined);
+        run_and_push(Spec{SmemMode::Write, 0, n, RowKind::SweepCombined, ReduxOp::MaxS32},
+                     &combined);
+    }
+#if GPU_PIPE_ENABLE_REDUX_F32
+    for (int n : {1, 2, 4, 8}) {
+        run_and_push(Spec{SmemMode::Read, 0, n, RowKind::SweepCombined, ReduxOp::MaxF32},
+                     &combined);
+        run_and_push(Spec{SmemMode::Write, 0, n, RowKind::SweepCombined, ReduxOp::MaxF32},
+                     &combined);
+    }
+#endif
     // A couple of all-three examples.
     run_and_push(Spec{SmemMode::Read, 2, 1, RowKind::SweepCombined}, &combined);
     run_and_push(Spec{SmemMode::Write, 2, 1, RowKind::SweepCombined}, &combined);
@@ -712,6 +995,7 @@ int main(int argc, char** argv) {
     double write_base = 0.0;
     double shfl_inst_base = 0.0;
     double redux_inst_base = 0.0;
+    double redux_inst_base_by_op[static_cast<int>(ReduxOp::Count)] = {};
     for (const Result& r : baselines) {
         if (r.spec.smem == SmemMode::Read) {
             read_base = std::max(read_base, r.smem_bytes_per_cycle);
@@ -720,6 +1004,9 @@ int main(int argc, char** argv) {
         }
         shfl_inst_base = std::max(shfl_inst_base, r.shfl_warp_inst_per_cycle);
         redux_inst_base = std::max(redux_inst_base, r.redux_warp_inst_per_cycle);
+        const int op_idx = static_cast<int>(r.spec.redux_op);
+        redux_inst_base_by_op[op_idx] = std::max(redux_inst_base_by_op[op_idx],
+                                                 r.redux_warp_inst_per_cycle);
     }
 
     std::printf("Baselines:\n");
@@ -737,17 +1024,29 @@ int main(int argc, char** argv) {
                     read_base / shfl_inst_base, (read_base / shfl_inst_base) / kWarpSize);
     }
     std::printf("\n");
-    std::printf("  REDUX     : %.3f warp-inst/clock/SM", redux_inst_base);
+    std::printf("  REDUX best: %.3f warp-inst/clock/SM", redux_inst_base);
     if (redux_inst_base > 0.0) {
         std::printf("  (%.1f B/warp-inst vs read baseline = %.2f B/lane)",
                     read_base / redux_inst_base, (read_base / redux_inst_base) / kWarpSize);
     }
     std::printf("\n");
+    if (redux_inst_base_by_op[static_cast<int>(ReduxOp::MaxS32)] > 0.0) {
+        const double cred_base = redux_inst_base_by_op[static_cast<int>(ReduxOp::MaxS32)];
+        std::printf("  CREDUX/MAX: %.3f warp-inst/clock/SM", cred_base);
+        std::printf("  (%.1f B/warp-inst vs read baseline = %.2f B/lane)\n",
+                    read_base / cred_base, (read_base / cred_base) / kWarpSize);
+    }
+    if (redux_inst_base_by_op[static_cast<int>(ReduxOp::MaxF32)] > 0.0) {
+        const double cred_f32_base = redux_inst_base_by_op[static_cast<int>(ReduxOp::MaxF32)];
+        std::printf("  CREDUX/F32: %.3f warp-inst/clock/SM", cred_f32_base);
+        std::printf("  (%.1f B/warp-inst vs read baseline = %.2f B/lane)\n",
+                    read_base / cred_f32_base, (read_base / cred_f32_base) / kWarpSize);
+    }
 
     std::printf("\nCombined cases:\n");
-    std::printf("%-6s %5s %5s %9s %14s %14s %14s %14s %10s %10s\n", "smem", "shfl",
-                "redux", "maxCTA/SM", "max cycles", "smem B/clk", "shfl inst/clk",
-                "redux inst/clk", "obs/ind", "obs/sum");
+    std::printf("%-6s %5s %5s %-10s %9s %14s %14s %14s %14s %10s %10s\n", "smem",
+                "shfl", "redux", "redop", "maxCTA/SM", "max cycles", "smem B/clk",
+                "shfl inst/clk", "redux inst/clk", "obs/ind", "obs/sum");
     for (const Result& r : combined) {
         double independent_cycles = 0.0;
         double additive_cycles = 0.0;
@@ -763,18 +1062,19 @@ int main(int argc, char** argv) {
             additive_cycles += shfl_cycles;
         }
         if (r.redux_warp_inst_per_block > 0.0) {
-            const double redux_cycles = r.redux_warp_inst_per_block / redux_inst_base;
+            const double op_base = redux_inst_base_by_op[static_cast<int>(r.spec.redux_op)];
+            const double redux_cycles = r.redux_warp_inst_per_block / op_base;
             independent_cycles = std::max(independent_cycles, redux_cycles);
             additive_cycles += redux_cycles;
         }
         const double obs_over_ind = double(r.max_cycles) / independent_cycles;
         const double obs_over_sum = double(r.max_cycles) / additive_cycles;
 
-        std::printf("%-6s %5d %5d %9d %14llu %14.2f %14.2f %14.2f %10.3f %10.3f\n",
+        std::printf("%-6s %5d %5d %-10s %9d %14llu %14.2f %14.2f %14.2f %10.3f %10.3f\n",
                     smem_mode_name(r.spec.smem), r.spec.shfl_per_step, r.spec.redux_per_step,
-                    r.active_blocks_per_sm, r.max_cycles, r.smem_bytes_per_cycle,
-                    r.shfl_warp_inst_per_cycle, r.redux_warp_inst_per_cycle, obs_over_ind,
-                    obs_over_sum);
+                    redux_op_name(r.spec.redux_op), r.active_blocks_per_sm, r.max_cycles,
+                    r.smem_bytes_per_cycle, r.shfl_warp_inst_per_cycle,
+                    r.redux_warp_inst_per_cycle, obs_over_ind, obs_over_sum);
     }
 
     std::printf("\nInterpretation: obs/ind ~= 1 means the observed time matches perfect overlap of "
