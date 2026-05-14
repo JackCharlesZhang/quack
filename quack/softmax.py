@@ -99,7 +99,7 @@ class Softmax(ReductionBase):
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
 
-        shape = mX.shape
+        shape = (cute.size(mX, mode=[0]), self.N)
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
@@ -175,20 +175,19 @@ class Softmax(ReductionBase):
         if tXcX[0][0] < shape[0]:
             copy(tXrO, tXgO)
 
-
-@jit_cache
-def _compile_softmax_fwd(dtype, out_dtype, N):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
-    softmax_op = Softmax(dtype, N)
-    return cute.compile(
-        softmax_op,
-        x_cute,
-        out_cute,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+    @staticmethod
+    @jit_cache
+    def compile(dtype, out_dtype, N):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
+        return cute.compile(
+            Softmax(dtype, N),
+            x_cute,
+            out_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 @cute_op("quack::_softmax_fwd", mutates_args={"out"})
@@ -205,7 +204,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
         return
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-    _compile_softmax_fwd(dtype, out_dtype, N)(x, out)
+    Softmax.compile(dtype, out_dtype, N)(x, out)
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
@@ -288,7 +287,7 @@ class SoftmaxBackward(ReductionBase):
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
         tv_layout = tiled_copy.layout_tv_tiled
 
-        shape = mdY.shape
+        shape = (cute.size(mdY, mode=[0]), self.N)
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         gdY, gY, gdX, cX = [
@@ -353,23 +352,22 @@ class SoftmaxBackward(ReductionBase):
         if tXcX[0][0] < shape[0]:
             copy(tdXrdX, tdXgdX)
 
-
-@jit_cache
-def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    dy_cute, y_cute, dx_cute = [
-        fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
-    ]
-    softmax_backward_op = SoftmaxBackward(dtype, N)
-    return cute.compile(
-        softmax_backward_op,
-        dy_cute,
-        y_cute,
-        dx_cute,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+    @staticmethod
+    @jit_cache
+    def compile(dtype, y_dtype, dx_dtype, N):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        dy_cute, y_cute, dx_cute = [
+            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
+        ]
+        return cute.compile(
+            SoftmaxBackward(dtype, N),
+            dy_cute,
+            y_cute,
+            dx_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 @cute_op("quack::_softmax_backward", mutates_args={"dx"})
@@ -390,7 +388,7 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
         return
     N = dy.size(1)
     dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-    _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
+    SoftmaxBackward.compile(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

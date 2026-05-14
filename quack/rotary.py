@@ -285,57 +285,57 @@ class RotaryKernel:
                     if tXcX[0, m, 0][0] < seq_len:
                         copy(tXrX[None, m, None], tXgO[None, m, None, h])
 
-
-@jit_cache
-def _compile_rotary(
-    dtype,
-    cossin_dtype,
-    seqlen_offsets_dtype,
-    cu_seqlens_dtype,
-    dim,
-    interleaved,
-    conjugate,
-):
-    is_varlen = cu_seqlens_dtype is not None
-    has_seqlen_offsets = seqlen_offsets_dtype is not None
-    batch_sym = cute.sym_int()
-    batch_p1_sym = cute.sym_int()
-    seqlen_sym = cute.sym_int()
-    total_seqlen_sym = cute.sym_int()
-    nheads_sym = cute.sym_int()
-    x_dim_sym = cute.sym_int()
-    seqlen_ro_sym = cute.sym_int()
-    x_shape = (
-        (total_seqlen_sym, nheads_sym, x_dim_sym)
-        if is_varlen
-        else (batch_sym, seqlen_sym, nheads_sym, x_dim_sym)
-    )
-    x_divby = math.gcd(128 // dtype.width, dim)
-    cossin_divby = math.gcd(128 // cossin_dtype.width, dim // 2)
-    x_cute = fake_tensor(dtype, x_shape, x_divby)
-    out_cute = fake_tensor(dtype, x_shape, x_divby)
-    cos_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
-    sin_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
-    seqlen_offsets_cute = (
-        cute.runtime.make_fake_tensor(
-            seqlen_offsets_dtype, (batch_sym,), stride=(cute.sym_int64(divisibility=1),)
+    @staticmethod
+    @jit_cache
+    def compile(
+        dtype,
+        cossin_dtype,
+        seqlen_offsets_dtype,
+        cu_seqlens_dtype,
+        dim,
+        interleaved,
+        conjugate,
+    ):
+        is_varlen = cu_seqlens_dtype is not None
+        has_seqlen_offsets = seqlen_offsets_dtype is not None
+        batch_sym = cute.sym_int()
+        batch_p1_sym = cute.sym_int()
+        seqlen_sym = cute.sym_int()
+        total_seqlen_sym = cute.sym_int()
+        nheads_sym = cute.sym_int()
+        x_dim_sym = cute.sym_int()
+        seqlen_ro_sym = cute.sym_int()
+        x_shape = (
+            (total_seqlen_sym, nheads_sym, x_dim_sym)
+            if is_varlen
+            else (batch_sym, seqlen_sym, nheads_sym, x_dim_sym)
         )
-        if has_seqlen_offsets
-        else None
-    )
-    cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
-    return cute.compile(
-        RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
-        x_cute,
-        cos_cute,
-        sin_cute,
-        seqlen_offsets_cute,
-        cu_seqlens_cute,
-        out_cute,
-        Int32(0),  # max_seqlen, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+        x_divby = math.gcd(128 // dtype.width, dim)
+        cossin_divby = math.gcd(128 // cossin_dtype.width, dim // 2)
+        x_cute = fake_tensor(dtype, x_shape, x_divby)
+        out_cute = fake_tensor(dtype, x_shape, x_divby)
+        cos_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
+        sin_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
+        seqlen_offsets_cute = (
+            cute.runtime.make_fake_tensor(
+                seqlen_offsets_dtype, (batch_sym,), stride=(cute.sym_int64(divisibility=1),)
+            )
+            if has_seqlen_offsets
+            else None
+        )
+        cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
+        return cute.compile(
+            RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
+            x_cute,
+            cos_cute,
+            sin_cute,
+            seqlen_offsets_cute,
+            cu_seqlens_cute,
+            out_cute,
+            Int32(0),  # max_seqlen, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 def _launch_rotary(
@@ -363,7 +363,7 @@ def _launch_rotary(
         torch2cute_dtype_map[seqlen_offsets.dtype] if seqlen_offsets is not None else None
     )
     cu_seqlens_dtype = Int32 if cu_seqlens is not None else None
-    _compile_rotary(
+    RotaryKernel.compile(
         dtype,
         cossin_dtype,
         seqlen_offsets_dtype,
