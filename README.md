@@ -16,6 +16,9 @@ uv pip install 'quack-kernels[cu13]'
 
 # Optional: install NVIDIA matmul heuristics for better untuned GEMM configs
 pip install 'quack-kernels[heuristics]'
+
+# Optional: JAX bindings (pulls in jax and jax-tvm-ffi)
+pip install 'quack-kernels[jax]'
 ```
 
 ## Requirements
@@ -40,7 +43,15 @@ pip install 'quack-kernels[heuristics]'
 from quack import rmsnorm, softmax, cross_entropy
 ```
 
+JAX bindings are also available for some kernels (see [docs/jax.md](docs/jax.md)):
+
+```
+from quack.softmax_jax import softmax
+```
+
 ## Documentations
+
+- [JAX interface](docs/jax.md) — optional `jax` + `jax-tvm-ffi` bindings, see `quack/softmax_jax.py` for an example.
 
 [2025-07-10] We have a comprehensive
 [blogpost](media/2025-07-10-membound-sol.md) on how to get memory-bound kernels
