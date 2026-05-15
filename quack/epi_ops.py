@@ -368,10 +368,11 @@ class VecLoad(EpiOp):
             tVsV = thr_copy.partition_D(smem_tensor)
             tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
             limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
-            pred = cute.make_rmem_tensor((1, cute.size(tVsV.shape[1])), Boolean)
             for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
-                pred[0, m] = tVcV[0, m] < limit
-            cute.copy(thr_copy, tVgV, tVsV, pred=pred)
+                if tVcV[0, m] < tile_dim:  # Guard to avoid writing beyond the smem we've allocated
+                    pred = cute.make_rmem_tensor(1, Boolean)
+                    pred[0] = tVcV[0, m] < limit
+                    cute.copy(thr_copy, tVgV[None, m], tVsV[None, m], pred=pred)
             tDsV = ctx.partition_for_epilogue_fn(
                 cute.make_tensor(
                     smem_tensor.iterator,
@@ -452,10 +453,11 @@ class ColVecLoad(VecLoad):
                 ctx.varlen_manager.len_m(ctx.batch_idx) - coord_idx * tile_dim,
                 tile_dim,
             )
-            pred = cute.make_rmem_tensor((1, cute.size(tVsV.shape[1])), Boolean)
             for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
-                pred[0, m] = tVcV[0, m] < limit
-            cute.copy(thr_copy, tVgV, tVsV, pred=pred)
+                if tVcV[0, m] < tile_dim:  # Guard to avoid writing beyond the smem we've allocated
+                    pred = cute.make_rmem_tensor(1, Boolean)
+                    pred[0] = tVcV[0, m] < limit
+                    cute.copy(thr_copy, tVgV[None, m], tVsV[None, m], pred=pred)
             tDsV = ctx.partition_for_epilogue_fn(
                 cute.make_tensor(
                     smem_tensor.iterator,

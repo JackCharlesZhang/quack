@@ -926,6 +926,59 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("tile_M,tile_N", [(128, 128), (128, 256), (64, 256)])
+@pytest.mark.parametrize("M,N,K", [(4096, 4096, 4096)])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
+    """Regression test for https://github.com/Dao-AILab/quack/issues/135:
+
+    Passing both colvec (rstd) and rowvec (norm_weight) to gemm_norm_act_fn
+    produced corrupted output for tile shapes where the vec smem region was
+    smaller than the tiled cp_async partition tile. cp_async with pred=False
+    zero-fills the destination instead of skipping the write, which corrupted
+    the adjacent vec smem field.
+    """
+    device = "cuda"
+    if get_device_capacity(torch.device(device))[0] != 9:
+        pytest.skip("This regression test targets SM90.")
+    from quack.gemm_norm_act import gemm_norm_act_fn
+
+    torch.manual_seed(0)
+    A = torch.randn(1, M, K, device=device, dtype=input_dtype)
+    B = torch.randn(1, N, K, device=device, dtype=input_dtype)
+    colvec = torch.randn(1, M, device=device, dtype=input_dtype)
+    rowvec = torch.randn(1, N, device=device, dtype=input_dtype)
+    ref = ((A.float() @ B.float().mT) * colvec.float()[:, :, None] * rowvec.float()[:, None, :]).to(
+        input_dtype
+    )
+    out = torch.empty(1, M, N, dtype=input_dtype, device=device)
+    gemm_norm_act_fn(
+        A,
+        B,
+        D=None,
+        C=None,
+        PostAct=out,
+        tile_count_semaphore=None,
+        activation=None,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+        colvec=colvec,
+        rowvec=rowvec,
+    )
+    # Bf16 dot-product noise tolerance: pre-fix this same test saw absolute
+    # errors of >1e3 because some output tiles were entirely zeroed out.
+    diff = (out.float() - ref.float()).abs()
+    # < 0.5% of elements should exceed an absolute tolerance of 0.5 (bf16 ulp
+    # at the magnitudes involved is roughly that scale).
+    frac_bad = (diff > 0.5).float().mean().item()
+    assert frac_bad < 5e-3, (
+        f"tile=({tile_M},{tile_N}): {frac_bad * 100:.2f}% of elements have |err|>0.5 "
+        f"(max|err|={diff.max().item():.2e}); see issue #135"
+    )
+
+
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "reglu", "geglu"])
 @pytest.mark.parametrize("n", [2048])
