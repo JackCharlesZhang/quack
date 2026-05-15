@@ -2,6 +2,34 @@
 
 Benchmark: `microbenchmarks/global_memory_coalescing.py`
 
+## Pattern legend
+
+Warp-level patterns (one warp instruction, 16B per active lane):
+
+| key | Meaning |
+| --- | --- |
+| A | 32 lanes contiguous: lane `i -> base + 16*i` (512B total). |
+| B | Two far 256B streams, even/odd lanes split between streams. |
+| C | Two far 256B streams, lanes 0..15 in stream A and 16..31 in stream B. |
+| D | Four far 128B streams, one 8-lane group per stream. |
+| E | Sixteen far 32B streams, one adjacent lane pair per stream. |
+| F | Thirty-two far 16B streams, one lane per stream. |
+| G | Contiguous 512B with byte offset sweep. |
+| H | Stride sweep: lane `i -> base + stride*i`. |
+| I_pred | Four 128B lines but only 8 active lanes, one sector per line. |
+| I_dup | Full-warp duplicate-address control: four unique sectors in four lines. |
+| I_full | Full-warp all-sector version: 16 sectors in four lines. |
+| J_packed | 16 sectors packed into four contiguous 128B lines. |
+| J_16lines | 16 sectors spread across 16 different 128B lines. |
+| J_16pages | 16 sectors spread across 16 different 4KB pages. |
+| K_same_half | 16 sectors in 8 lines, two adjacent sectors in the same 64B half of each line. |
+| K_split_half | 16 sectors in 8 lines, one sector in each 64B half of each line. |
+
+Block-permutation patterns (`--bench block-permute`) all have 128 threads writing one
+contiguous 2048B tile; only thread-to-16B-slot mapping changes.  Important names:
+`identity`, `unit8_interleave`, `sector_striped`/`pair_contiguous`, `split_halves`,
+`two_line_striped`, `affine17`, `bit_reverse`, and `warp_interleave`.
+
 ## Read-this-first takeaways
 
 1. **Loads:** model H100 warp-load traffic as:
