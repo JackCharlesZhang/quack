@@ -80,13 +80,6 @@ runs:
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
           uv pip install --system --break-system-packages --no-deps -q -e . &&
-          # TODO(remove-after-image-bump): pytest-rerunfailures is needed for
-          # the --reruns / --only-rerun flags below; the current SIF image
-          # (cu13.2-26.05.16 and earlier) doesn't ship it. It's already in
-          # pyproject.toml's [dev] extras, so once a fresh image is built and
-          # IMAGE_CU129 / IMAGE_CU132 in .github/workflows/_test.yml are
-          # bumped, this line can be deleted.
-          uv pip install --system --break-system-packages --no-cache-dir -q pytest-rerunfailures &&
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
@@ -94,31 +87,16 @@ runs:
           else
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}
           fi &&
-          # cute.compile retains one ir.Context (~1.9 MB of MLIR IR) per call
-          # in C++ state we can't reach from Python (cutlass#3062 fixed the
-          # related thread-pool leak; the Context-object leak is separate and
-          # not yet upstreamed). After several minutes a worker's RSS exceeds
-          # the apptainer cgroup limit and the OOM-killer takes it; xdist
-          # then aborts the whole run on that one death. Two mitigations:
-          #   --max-worker-restart N : let xdist spawn a fresh replacement
-          #     worker; xdist re-queues the dead worker's pending items so
-          #     the .o cache still fills completely. Budget = initial worker
-          #     count, so a genuinely broken test that crashes any fresh
-          #     worker too still aborts the run.
-          #   --reruns 1 --only-rerun  : retry exactly the one in-flight
-          #     test that was on the dead worker. The regex is matched
-          #     against the failure message (xdist emits, from
-          #     dsession.handle_crashitem, the text  worker GW crashed
-          #     while running NODEID ), so real assertion failures or
-          #     kernel correctness bugs are NOT retried.
-          # NOTE: don't put double quotes anywhere in this comment block.
-          # The whole block is the argument of bash -c (outer quoting), so an
-          # unescaped quote closes the string and breaks the script with
-          # 'syntax error: unexpected end of file'.
-          pytest tests/ --compile-only -n 24 --max-worker-restart 24 --reruns 1 --only-rerun 'worker.*crashed' &&
+          # --max-worker-restart N tolerates worker deaths (OOM-kill from
+          # the upstream cute.compile ir.Context retention leak, see
+          # tests/conftest.py:pytest_handlecrashitem for background). The
+          # conftest's pytest_handlecrashitem hook re-queues the in-flight
+          # test on the fresh worker and downgrades the failure to a skip;
+          # second crashes are NOT retried so real bugs still fail the run.
+          pytest tests/ --compile-only -n 24 --max-worker-restart 24 &&
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
           echo \"Running tests on GPUs: \$FREE_GPUS\" &&
           NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
-          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --max-worker-restart \$NUM_GPUS --reruns 1 --only-rerun 'worker.*crashed'
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --max-worker-restart \$NUM_GPUS
         "
