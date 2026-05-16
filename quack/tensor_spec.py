@@ -171,11 +171,19 @@ def make_smem_layout_mnmajor(
 
 @dataclass
 class TensorSpec:
-    """Declarative spec for a 2D operand tile. Owns dtype/shape/layout/stage so
+    """Declarative spec for an operand tile. Owns dtype/shape/layout/stage so
     SMEM layouts, TMA atoms, and MMA configs can be derived from it.
 
+    Shape rank:
+      - 2D `(rows, cols)` — matmul operand tiles. Drives `MatmulSpec`/`bind_mma`,
+        SM90/SM100 swizzled SMEM layouts, and 2-mode TMA atoms.
+      - 1D `(vec,)` — vector-with-stage aux operands (Scale, Bias, Gamma, ...).
+        `smem_layout()` returns a trivial `cute.make_layout((vec, stage))` (no
+        swizzle); `tma_copy_bytes()` and `make_tma_atom()` use `mode=[0]`. Cannot
+        be used as a matmul operand (`__matmul__` / `bind_mma` are 2D-only).
+
     `stage=None` means the tile lives in registers (no SMEM layout, no TMA).
-    `transposed=True` is a logical .T view of the same storage.
+    `transposed=True` is a logical .T view of the same storage (2D only).
 
     After `with_tma(op, gmem)`, the returned spec also carries the call-dynamic
     `tma_atom` and `gmem` (TMA tensor). The bound spec crosses the `@cute.kernel`
@@ -365,9 +373,16 @@ class TensorSpec:
         return self.stage is None
 
     @property
+    def rank(self) -> int:
+        """Shape rank: 2 for matmul operand tiles, 1 for vector-with-stage aux operands.
+        Drives the rank-1 branches in `smem_layout`/`tma_copy_bytes`/`make_tma_atom`/
+        `storage_shape` (skip swizzle/matmul-side logic)."""
+        return len(self.shape)
+
+    @property
     def storage_shape(self) -> Tuple[int, ...]:
         # 1D has nothing to transpose.
-        if len(self.shape) == 1:
+        if self.rank == 1:
             return self.shape
         return (self.shape[1], self.shape[0]) if self.transposed else self.shape
 
@@ -398,7 +413,7 @@ class TensorSpec:
         assert not self.in_rmem, "register tensor has no SMEM layout"
         if self.smem_layout_override is not None:
             return self.smem_layout_override
-        if len(self.shape) == 1:
+        if self.rank == 1:
             # 1D vector-with-stage: no swizzling needed (small + naturally aligned).
             return cute.make_layout((self.shape[0], self.stage))
         if self.smem_axis_pattern is not None:
@@ -446,11 +461,11 @@ class TensorSpec:
 
     def tma_copy_bytes(self) -> int:
         # 1D specs have a single non-stage mode; 2D specs have two.
-        modes = [0] if len(self.shape) == 1 else [0, 1]
+        modes = [0] if self.rank == 1 else [0, 1]
         return cute.size_in_bytes(self.dtype, cute.select(self.smem_layout(), mode=modes))
 
     def make_tma_atom(self, op, gmem_tensor, num_multicast: int = 1):
-        modes = [0] if len(self.shape) == 1 else [0, 1]
+        modes = [0] if self.rank == 1 else [0, 1]
         return cpasync.make_tiled_tma_atom(
             op,
             gmem_tensor,
@@ -598,14 +613,19 @@ class BoundMMA:
 
     def acc(self, shape=None, dtype=Float32) -> cute.Tensor:
         """Allocate an accumulator rmem tensor. `shape` defaults to logical (M, N).
-        When swap_AB, the physical wgmma C-side is (N, M) — we feed that to
-        partition_shape_C; the resulting rmem holds the transposed accumulator,
-        but the user can treat it as opaque (fill / pass to .fn / .r2s_C)."""
+        Extra modes after (M, N) are appended to the partitioned C layout, e.g.
+        `(M, N, stage)` becomes `(MMA, MMA_M, MMA_N, stage)`. When swap_AB, the
+        physical wgmma C-side is (N, M) — we feed that to partition_shape_C; the
+        resulting rmem holds the transposed accumulator, but the user can treat
+        it as opaque (fill / pass to .fn / .r2s_C)."""
         if shape is None:
             shape = (self.M, self.N)
         if self.swap_AB:
-            shape = (shape[1], shape[0])  # physical (N, M)
-        return cute.make_rmem_tensor(self.tiled_mma.partition_shape_C(shape), dtype)
+            shape = (shape[1], shape[0], *shape[2:])  # physical (N, M, ...)
+        acc_shape = self.tiled_mma.partition_shape_C(shape[:2])
+        for extra_mode in shape[2:]:
+            acc_shape = cute.append(acc_shape, extra_mode)
+        return cute.make_rmem_tensor(acc_shape, dtype)
 
     def clone_frag_A(self) -> cute.Tensor:
         """Allocate another rmem tensor matching this MMA's frag_A — used for
