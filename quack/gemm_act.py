@@ -77,7 +77,7 @@ class GemmActMixin(ComposableEpiMixin):
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
@@ -238,7 +238,7 @@ class GemmGatedMixin(GemmActMixin):
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 

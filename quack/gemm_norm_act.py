@@ -56,8 +56,8 @@ class GemmNormActMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
         rD = tRS_rD.load()
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -115,8 +115,8 @@ class GemmNormGatedMixin(GemmGatedMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
         rD = tRS_rD.load()
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
