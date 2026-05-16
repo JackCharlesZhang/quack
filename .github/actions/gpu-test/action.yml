@@ -79,14 +79,14 @@ runs:
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
-          pip install --break-system-packages --no-deps -q -e . &&
+          uv pip install --system --break-system-packages --no-deps -q -e . &&
           # TODO(remove-after-image-bump): pytest-rerunfailures is needed for
           # the --reruns / --only-rerun flags below; the current SIF image
           # (cu13.2-26.05.16 and earlier) doesn't ship it. It's already in
           # pyproject.toml's [dev] extras, so once a fresh image is built and
           # IMAGE_CU129 / IMAGE_CU132 in .github/workflows/_test.yml are
           # bumped, this line can be deleted.
-          pip install --break-system-packages --no-cache-dir -q pytest-rerunfailures &&
+          uv pip install --system --break-system-packages --no-cache-dir -q pytest-rerunfailures &&
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
