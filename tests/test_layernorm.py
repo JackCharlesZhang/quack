@@ -57,6 +57,17 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     torch.testing.assert_close(rstd, rstd_ref_val, atol=6e-4, rtol=6e-4)
     torch.testing.assert_close(mean, mean_ref_val, atol=6e-4, rtol=6e-4)
 
+    # Return-arity contract: each (return_rstd, return_mean) toggle pair returns
+    # the right shape tuple. Numerical correctness is already covered above with
+    # both flags True; here we only check that the alternate arities don't crash
+    # and return the right shapes.
+    out_r, rstd_only = layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=False)
+    assert out_r.shape == x.shape and rstd_only.shape == (M,) and rstd_only.dtype == torch.float32
+    out_m, mean_only = layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=True)
+    assert out_m.shape == x.shape and mean_only.shape == (M,) and mean_only.dtype == torch.float32
+    out_only = layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=False)
+    assert isinstance(out_only, torch.Tensor) and out_only.shape == x.shape
+
 
 def test_layernorm_forward_masks_oob_variance_lanes():
     """Regression: ragged N must not include padding lanes in LayerNorm variance."""
@@ -77,40 +88,6 @@ def test_layernorm_forward_masks_oob_variance_lanes():
     torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(rstd, rstd_ref_val, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(mean, mean_ref_val, atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.parametrize("return_rstd", [True, False])
-@pytest.mark.parametrize("return_mean", [True, False])
-def test_layernormnorm_return_rstd_option(return_rstd, return_mean):
-    """Test that return_rstd option works correctly."""
-    device = "cuda"
-    M, N = 32, 1024
-    eps = 1e-6
-
-    x = torch.randn(M, N, device=device, dtype=torch.float16)
-    weight = torch.randn(N, device=device, dtype=torch.float32)
-
-    if return_rstd and return_mean:
-        out, rstd, mean = layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=True)
-        assert out.shape == (M, N)
-        assert rstd.shape == (M,)
-        assert rstd.dtype == torch.float32
-        assert mean.shape == (M,)
-        assert mean.dtype == torch.float32
-    elif return_rstd and not return_mean:
-        out, rstd = layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=False)
-        assert out.shape == (M, N)
-        assert rstd.shape == (M,)
-        assert rstd.dtype == torch.float32
-    elif not return_rstd and return_mean:
-        out, mean = layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=True)
-        assert out.shape == (M, N)
-        assert mean.shape == (M,)
-        assert mean.dtype == torch.float32
-    else:
-        out = layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=False)
-        assert out.shape == (M, N)
-        assert isinstance(out, torch.Tensor)
 
 
 def test_layernorm_input_validation():

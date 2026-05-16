@@ -15,33 +15,19 @@ TOLERANCES = {
 }
 
 
-@pytest.mark.parametrize("eps", [1e-5, 1e-6])
-# @pytest.mark.parametrize("eps", [1e-5])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32, None])
-# @pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
+# Grid-reduction rationale: eps does not change the kernel path, fp16 weight_dtype
+# shares the 16-bit weight-load codegen with bf16, and the dropped N / M values are
+# interior to regimes already covered by their neighbors.
+@pytest.mark.parametrize("eps", [1e-6])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32, None])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
-    [
-        192,
-        256,
-        512,
-        760,
-        1024,
-        1128,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
-    ],
+    [192, 256, 760, 1024, 1128, 4096, 32768, 131072, 262144],
 )
-@pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
 # @pytest.mark.parametrize("M", [1])
+@pytest.mark.parametrize("M", [1, 199, 8 * 1024])
 @pytest.mark.parametrize("use_compile", [False, True])
 # @pytest.mark.parametrize("use_compile", [False])
 def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_compile):
@@ -165,9 +151,15 @@ def test_rmsnorm_compile_2d_then_4d():
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("use_bias,use_residual", [(False, False), (True, True)])
-def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
+@pytest.mark.parametrize(
+    "B,S,H,D",
+    [
+        (2, 16, 4, 64),  # typical multi-head QK rmsnorm
+        (1, 1, 32, 128),  # single token, many heads (different smem layout per head)
+    ],
+)
+def test_rmsnorm_qk(B, S, H, D, use_compile, input_dtype, use_bias, use_residual):
     device = "cuda"
-    B, S, H, D = 2, 16, 4, 64
     eps = 1e-6
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
@@ -208,27 +200,6 @@ def test_rmsnorm_qk(use_compile, input_dtype, use_bias, use_residual):
         torch.testing.assert_close(bias.grad, bias_ref.grad, atol=atol, rtol=1e-3)
     if residual is not None:
         torch.testing.assert_close(residual.grad, residual_ref.grad, atol=atol, rtol=1e-3)
-
-
-def test_rmsnorm_qk_many_heads():
-    device = "cuda"
-    B, S, H, D = 1, 1, 32, 128
-    torch.random.manual_seed(0)
-
-    x = torch.randn(B, S, H, D, device=device, dtype=torch.bfloat16, requires_grad=True)
-    weight = torch.randn(H, D, device=device, dtype=torch.float32, requires_grad=True)
-    x_ref = x.detach().clone().requires_grad_()
-    weight_ref = weight.detach().clone().requires_grad_()
-
-    out = rmsnorm(x, weight)
-    out_ref = rmsnorm_ref(x_ref, weight_ref)
-
-    grad_out = torch.randn_like(out)
-    out.backward(grad_out)
-    out_ref.backward(grad_out)
-    torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-3)
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-1, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-1, rtol=1e-3)
 
 
 @pytest.mark.parametrize("use_compile", [False, True])

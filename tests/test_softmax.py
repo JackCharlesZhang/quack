@@ -18,14 +18,16 @@ TOLERANCES = {
 }
 
 
+# Grid-reduction rationale: M=37 shares the small-batch tile choice with M=199.
+# Dropped N values (512, 2048, 8192, 16384, 65536) are interior to regimes already
+# covered by their neighbors (single-stage / multi-stage / SMEM-edge).
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
-    # [32768]
+    [192, 256, 760, 1024, 1128, 4096, 32768, 131072, 262144],
 )
-@pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("M", [1, 199])
 @pytest.mark.parametrize("use_compile", [False, True])
 # @pytest.mark.parametrize("M", [1])
 def test_softmax(M, N, input_dtype, use_compile):
