@@ -105,12 +105,16 @@ runs:
           #     the .o cache still fills completely. Budget = initial worker
           #     count, so a genuinely broken test that crashes any fresh
           #     worker too still aborts the run.
-          #   --reruns 1 --only-rerun 'worker.*crashed' : retry exactly the
-          #     one in-flight test that was on the dead worker. The regex is
-          #     matched against the failure message (xdist's
-          #     dsession.handle_crashitem emits "worker 'gwN' crashed while
-          #     running ..."), so real assertion failures or kernel
-          #     correctness bugs are NOT retried.
+          #   --reruns 1 --only-rerun  : retry exactly the one in-flight
+          #     test that was on the dead worker. The regex is matched
+          #     against the failure message (xdist emits, from
+          #     dsession.handle_crashitem, the text  worker GW crashed
+          #     while running NODEID ), so real assertion failures or
+          #     kernel correctness bugs are NOT retried.
+          # NOTE: don't put double quotes anywhere in this comment block.
+          # The whole block is the argument of bash -c (outer quoting), so an
+          # unescaped quote closes the string and breaks the script with
+          # 'syntax error: unexpected end of file'.
           pytest tests/ --compile-only -n 24 --max-worker-restart 24 --reruns 1 --only-rerun 'worker.*crashed' &&
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
