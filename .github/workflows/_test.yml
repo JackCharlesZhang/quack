@@ -82,6 +82,7 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           cuda: ${{ matrix.cuda }}
+          gpu: ${{ matrix.gpu }}
           image_cu129: ${{ env.IMAGE_CU129 }}
           image_cu132: ${{ env.IMAGE_CU132 }}
           arch: ${{ matrix.arch }}

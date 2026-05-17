@@ -4,6 +4,15 @@ inputs:
   cuda:
     description: cu129 or cu132 — selects which image to run for this job
     required: true
+  gpu:
+    description: >-
+      Runner GPU label (h100, b300). Used to pick driver-version-specific
+      apptainer flags — the cu13.2 image bundles a CUDA 13.1 libcuda.so.590
+      compat shim that's needed on the h100 runner's 575 kernel driver but
+      mismatches the b300 runner's 595 kernel driver (CUDA error 803). On
+      b300 we override LD_LIBRARY_PATH so apptainer's host-injected libcuda
+      wins instead.
+    required: true
   image_cu129:
     description: Docker image for the cu129 variant (e.g. tridao/quack-kernels:cu12.9-DATE)
     required: true
@@ -71,11 +80,24 @@ runs:
       env:
         ARCH: ${{ inputs.arch }}
         CUDA: ${{ inputs.cuda }}
+        GPU: ${{ inputs.gpu }}
       run: |
+        # The cu13.2 image's Dockerfile bakes LD_LIBRARY_PATH=/usr/local/cuda/compat
+        # so its libcuda.so.590 forward-compat shim wins over apptainer's
+        # host-injected libcuda in /.singularity.d/libs. That's correct on h100
+        # (driver 575, CUDA 12.9 — needs the 590 shim to run cu13 cute-dsl) but
+        # wrong on b300 (driver 595, CUDA 13.2 — the 590 shim is OLDER than the
+        # kernel module and triggers CUDA error 803). Override so b300 uses the
+        # host libcuda instead. cu129 image doesn't set LD_LIBRARY_PATH, so the
+        # override is a harmless no-op there.
+        EXTRA_APPTAINER_ENV=""
+        if [ "$GPU" = "b300" ]; then
+          EXTRA_APPTAINER_ENV="--env LD_LIBRARY_PATH=/.singularity.d/libs"
+        fi
         # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
         # this Python inside the SIF picks up packages from the runner user's
         # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
-        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 "$QUACK_SIF" bash -c "
+        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
