@@ -26,7 +26,6 @@ Multi-GPU with xdist:
 import os
 import subprocess
 import json
-import time
 import logging
 import tempfile
 from pathlib import Path
@@ -49,7 +48,9 @@ def _compile_only_enabled(config) -> bool:
 def _get_gpu_ids():
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
-        return [g.strip() for g in visible.split(",")]
+        gpu_ids = [g.strip() for g in visible.split(",") if g.strip()]
+        if gpu_ids:
+            return gpu_ids
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
@@ -58,7 +59,9 @@ def _get_gpu_ids():
             timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout.strip().splitlines()
+            gpu_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if gpu_ids:
+                return gpu_ids
     except (FileNotFoundError,):
         pass
     logging.warning("Failed to get gpu ids, use default '0'")
@@ -127,27 +130,28 @@ def pytest_handlecrashitem(crashitem, report, sched):
     )
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     # Compile-only context lifecycle is owned by quack.testing.pytest_plugin.
     # This hook handles only project-specific concerns: xdist GPU assignment.
+    # Run before the reusable compile-only plugin so any CUDA initialization
+    # observes the worker-local CUDA_VISIBLE_DEVICES chosen here.
     compile_only = _compile_only_enabled(config)
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
     if worker_id and not (compile_only and not _has_gpu()):
         tmp = Path(tempfile.gettempdir()) / getuser() / "quack_tests"
         tmp.mkdir(parents=True, exist_ok=True)
         worker_num = int(worker_id.replace("gw", ""))
-        cached_gpu_ids = tmp / "gpu_ids.json"
-        if worker_num == 0:
-            gpu_ids = _get_gpu_ids()
-            with cached_gpu_ids.open(mode="w") as f:
-                json.dump(gpu_ids, f)
-        else:
-            while not cached_gpu_ids.exists():
-                time.sleep(0.1)
-            with cached_gpu_ids.open() as f:
-                gpu_ids = json.load(f)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
+        gpu_ids = _get_gpu_ids()
+        assigned_gpu = gpu_ids[worker_num % len(gpu_ids)]
+        os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu
         _setup_worker_logging(worker_id, tmp)
+        logging.info(
+            "Worker %s assigned CUDA_VISIBLE_DEVICES=%s from visible GPUs %s",
+            worker_id,
+            assigned_gpu,
+            gpu_ids,
+        )
 
 
 def _has_gpu():
