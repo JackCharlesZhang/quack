@@ -42,6 +42,19 @@ torch = [
     { index = "pytorch-cu130", marker = "extra == 'cu13'" },
 ]
 
+[tool.pytest.ini_options]
+# Filters set via warnings.filterwarnings() in conftest.py don't survive pytest's
+# per-test catch_warnings context — pytest prepends its own ('always', Warning)
+# filter, which then matches before any conftest 'ignore'. Filters declared here
+# are installed by pytest *after* its 'always', so they actually win.
+#
+# torch.compile / Inductor scripts dynamically-created methods via the
+# deprecated torch.jit.script_method during tracing, firing 300+ deprecation
+# warnings per --compile-only run. Suppress at the source module.
+filterwarnings = [
+    "ignore:`torch\\.jit\\.script_method`.*Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+]
+
 [tool.ruff]
 line-length = 100
 exclude = [".#*"]

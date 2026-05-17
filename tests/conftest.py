@@ -26,7 +26,6 @@ import json
 import time
 import logging
 import tempfile
-import warnings
 from pathlib import Path
 from getpass import getuser
 
@@ -156,16 +155,6 @@ def pytest_configure(config):
         _setup_worker_logging(worker_id, tmp)
 
     if _compile_only:
-        # Compile-only runs deliberately execute many tests under FakeTensorMode.
-        # PyTorch's own compile/Inductor stack is not warning-clean there:
-        #   * torch.compile imports torch.utils.mkldnn, whose deprecated
-        #     @torch.jit.script_method decorators warn once per worker/import.
-        warnings.filterwarnings(
-            "ignore",
-            message=r"`torch\.jit\.script_method`.*Please switch to `torch\.compile` or `torch\.export`\.",
-            category=DeprecationWarning,
-            module=r"torch\.jit\._script",
-        )
         import torch
         from torch._subclasses.fake_tensor import FakeTensorMode
         import quack.cache_utils
