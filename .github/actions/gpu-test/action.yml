@@ -79,7 +79,7 @@ runs:
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
-          uv pip install --system --break-system-packages --no-deps -q -e . &&
+          pip install --break-system-packages --no-deps -q -e . &&
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
