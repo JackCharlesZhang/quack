@@ -275,6 +275,7 @@ class GemmSm100(GemmTmaBase):
         if const_expr(not self.blockscaled):
             self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.a_dtype,
+                self.b_dtype,
                 self.a_major_mode,
                 self.b_major_mode,
                 self.acc_dtype,
@@ -285,6 +286,7 @@ class GemmSm100(GemmTmaBase):
         else:
             self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_dtype,
+                self.b_dtype,
                 self.a_major_mode,
                 self.b_major_mode,
                 self.sf_dtype,
@@ -294,6 +296,7 @@ class GemmSm100(GemmTmaBase):
             )
             self.tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_dtype,
+                self.b_dtype,
                 self.a_major_mode,
                 self.b_major_mode,
                 self.sf_dtype,

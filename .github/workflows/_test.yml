@@ -16,8 +16,8 @@ on:
 
 env:
   # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.04.29
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.04.29
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.05.16
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.05.16
 
 jobs:
   lint:
@@ -65,6 +65,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both image variants run on every runner: the cu13.2 image bundles
+          # CUDA 13.x forward-compat libs (libcuda.so.590 user-mode shim) so
+          # cu13 cute-dsl JITs cleanly even on the H100 runner's 575 kernel
+          # driver. See tools/ci/docker/Dockerfile (target `cu13`).
           - { gpu: h100, cuda: cu129 }
           - { gpu: h100, cuda: cu132 }
           - { gpu: b300, cuda: cu129 }

@@ -8,7 +8,7 @@ import cutlass.cute as cute
 
 from cutlass import Int32, Int16, Boolean, const_expr
 from cutlass.base_dsl.arch import Arch
-from cutlass.cute.nvgpu import cpasync, tcgen05, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
@@ -531,7 +531,7 @@ def get_smem_store_A(
     tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, position_independent=False
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
-    transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
+    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
     copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
@@ -554,7 +554,7 @@ def get_smem_load_A(
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
-    transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
+    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
     copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)

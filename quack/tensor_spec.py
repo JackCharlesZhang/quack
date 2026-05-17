@@ -27,8 +27,11 @@ from functools import partial
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
-from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute.nvgpu import cpasync, warp, tcgen05
 from cutlass.utils import LayoutEnum
+from cutlass.cute.nvgpu import OperandMajorMode
+import cutlass.utils.blackwell_helpers as sm100_utils
+
 
 from quack import copy_utils, layout_utils
 from quack import sm90_utils
@@ -119,15 +122,13 @@ def make_smem_layout_kmajor(
     `shape = (rows, cols)`. For cta_group=2 A-side, `rows` is the per-CTA M
     (full M = rows * cta_group, split across the two CTAs).
     """
-    from cutlass.cute.nvgpu import tcgen05
-    from cutlass.utils import blackwell_helpers as sm100_utils
-
     cta_group_enum = tcgen05.CtaGroup.TWO if cta_group == 2 else tcgen05.CtaGroup.ONE
     M, K = shape[0] * cta_group, shape[1]
     dummy = sm100_utils.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         cta_group_enum,
         (M, 64),  # 64 = small valid dummy N
@@ -152,15 +153,13 @@ def make_smem_layout_mnmajor(
     via `dice (None, 1, 1)` — so this matches the existing TensorSpec convention
     where shape[0] is treated as the operand's leading dim.
     """
-    from cutlass.cute.nvgpu import tcgen05
-    from cutlass.utils import blackwell_helpers as sm100_utils
-
     cta_group_enum = tcgen05.CtaGroup.TWO if cta_group == 2 else tcgen05.CtaGroup.ONE
     N, K = shape[0], shape[1]
     dummy = sm100_utils.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.MN,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.MN,
         Float32,
         cta_group_enum,
         (64, N),  # 64 = small valid dummy M
@@ -260,15 +259,14 @@ class TensorSpec:
         cute upgrade, pass an explicit `tiled_mma` via `with_tiled_mma()` to bypass
         this path. For cta_group=1 with no explicit role we fall through the A
         branch (the resulting layout matches B's exactly — see `_mma_tiler_for_layout`)."""
-        from cutlass.cute.nvgpu import tcgen05
-        from cutlass.utils import blackwell_helpers as sm100_utils
 
         cta_group_enum = tcgen05.CtaGroup.TWO if self.cta_group == 2 else tcgen05.CtaGroup.ONE
         own_major = self.layout.mma_major_mode()
-        other_major = tcgen05.OperandMajorMode.K  # dummy — unused for our partition
+        other_major = OperandMajorMode.K  # dummy — unused for our partition
         if self.mma_role == "B":
             full_N = self.shape[0]
             return sm100_utils.make_trivial_tiled_mma(
+                self.dtype,
                 self.dtype,
                 other_major,
                 own_major,
@@ -278,6 +276,7 @@ class TensorSpec:
             )
         full_M = self.shape[0] * self.cta_group
         return sm100_utils.make_trivial_tiled_mma(
+            self.dtype,
             self.dtype,
             own_major,
             other_major,
@@ -425,15 +424,11 @@ class TensorSpec:
                 self.dtype, self.shape, self.stage, cta_group=self.cta_group
             )
         if self.is_epi:
-            from cutlass.utils import blackwell_helpers as sm100_utils  # lazy
-
             return sm100_utils.make_smem_layout_epi(self.dtype, self.layout, self.shape, self.stage)
         if self.cta_group == 2 or self.mma_role is not None:
             tm = tiled_mma if tiled_mma is not None else self._tiled_mma
             if tm is None:
                 tm = self._build_dummy_tiled_mma()
-            from cutlass.utils import blackwell_helpers as sm100_utils  # lazy
-
             mma_tiler = self._mma_tiler_for_layout()
             if self.mma_role == "B":
                 return sm100_utils.make_smem_layout_b(tm, mma_tiler, self.dtype, self.stage)

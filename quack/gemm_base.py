@@ -680,7 +680,7 @@ class GemmTmaBase(GemmBase):
         op = {
             "load": cpasync.CopyBulkTensorTileG2SOp(),
             "store": cpasync.CopyBulkTensorTileS2GOp(),
-            "add": cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD),
+            "add": cpasync.CopyReduceBulkTensorTileS2GOp(cpasync.ReductionOp.ADD),
         }[op_type]
         tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
             op, tensor_d, epi_smem_layout, d_cta_v_layout
