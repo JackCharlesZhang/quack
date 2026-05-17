@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao
+import os
 from typing import Optional, Tuple, Literal
 from functools import partial
 
@@ -1695,6 +1696,12 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     config=None (which selects the default config), triggering compilation (exports .o)
     without benchmarking or kernel launch.
     Tests use tuned=False which also selects the default config, so this is sufficient.
+
+    Set ``QUACK_COMPILE_ONLY_STRICT=1`` to re-raise exceptions instead of silently
+    swallowing them. Useful for surfacing schema drift between custom_op kwargs
+    and the underlying autotuned function (e.g. a missing entry in
+    ``_rewrite_merge_alpha``) which would otherwise silently drop compiles and
+    cause unexplained Phase-2 compile-on-demand work.
     """
     from quack.cache_utils import COMPILE_ONLY
 
@@ -1704,7 +1711,8 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     try:
         autotuned_fn.fn(*args, config=None, **kwargs)
     except Exception:
-        pass
+        if os.environ.get("QUACK_COMPILE_ONLY_STRICT") == "1":
+            raise
 
 
 @gemm_add_inplace_op.register_fake
@@ -1766,22 +1774,39 @@ def _register_precompile_fake(custom_op, autotuned_fn, rewrite=None):
         _precompile_default_config(autotuned_fn, **kw)
 
 
+# Custom_ops like gemm_out are forced to split union-typed args (alpha,
+# sr_seed) into two fixed-typed kwargs (alpha + alpha_tensor, sr_seed +
+# sr_seed_tensor) because torch.library.custom_op requires a single concrete
+# type per arg. gemm_tuned accepts the unified form. The rewrite helpers below
+# pop every *_tensor split (so it doesn't leak as an unknown kwarg to
+# gemm_tuned) and, if non-None, merge it into the unified arg.
+_ALPHA_SPLIT_MERGE = (
+    ("alpha_tensor", "alpha"),
+    ("sr_seed_tensor", "sr_seed"),
+)
+_ALPHA_BETA_SPLIT_MERGE = (
+    ("alpha_tensor", "alpha"),
+    ("beta_tensor", "beta"),
+    ("sr_seed_tensor", "sr_seed"),
+)
+
+
+def _apply_split_merge(kwargs, pairs):
+    for split, merged in pairs:
+        t = kwargs.pop(split, None)
+        if t is not None:
+            kwargs[merged] = t
+
+
 def _rewrite_merge_alpha(kwargs):
-    """Merge alpha_tensor into alpha for gemm_tuned; add C=None."""
-    at = kwargs.pop("alpha_tensor", None)
-    if at is not None:
-        kwargs["alpha"] = at
+    """Merge {alpha,sr_seed}_tensor into the unified gemm_tuned kwargs; add C=None."""
+    _apply_split_merge(kwargs, _ALPHA_SPLIT_MERGE)
     kwargs.setdefault("C", None)
 
 
 def _rewrite_merge_alpha_beta(kwargs):
-    """Merge alpha_tensor/beta_tensor into alpha/beta for gemm_tuned."""
-    at = kwargs.pop("alpha_tensor", None)
-    if at is not None:
-        kwargs["alpha"] = at
-    bt = kwargs.pop("beta_tensor", None)
-    if bt is not None:
-        kwargs["beta"] = bt
+    """Merge {alpha,beta,sr_seed}_tensor into the unified gemm_tuned kwargs."""
+    _apply_split_merge(kwargs, _ALPHA_BETA_SPLIT_MERGE)
 
 
 _register_precompile_fake(gemm_out, gemm_tuned, rewrite=_rewrite_merge_alpha)
