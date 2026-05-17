@@ -22,13 +22,10 @@ from quack.complex import (
 from quack import cache_utils
 
 
-def _skip_tvm_ffi_launch_under_compile_only():
-    # These tests call cute.compile directly, so compile-only still reaches the
-    # raw TVM-FFI launch. Under FakeTensorMode that launch would use fake CUDA
-    # pointers and can illegal-access/poison CUDA state. Call this after compile
-    # but before launch so compile coverage is preserved without executing it.
-    if cache_utils.COMPILE_ONLY:
-        pytest.skip("compiled under --compile-only; skipping FakeTensor tvm-ffi launch")
+pytestmark = pytest.mark.skipif(
+    cache_utils.COMPILE_ONLY,
+    reason="skipped under --compile-only: direct TVM-FFI compile does not warm jit cache",
+)
 
 
 class _ScaleByComplex:
@@ -92,7 +89,6 @@ def test_complex_scale_tvm_ffi(batch: int, n: int):
     scale = complex(2.0, 1.0)
 
     fn = _compile_scale_by_complex(n)
-    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(x), complex_storage(out), Complex64(scale))
     torch.cuda.synchronize()
 
@@ -177,7 +173,6 @@ def test_smem_roundtrip_complex64(batch: int):
     x = torch.randn(batch, _SMEM_BLOCK_ELEMS, dtype=torch.complex64, device="cuda")
     out = torch.empty_like(x)
     fn = _compile_smem_roundtrip()
-    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(x), complex_storage(out))
     torch.cuda.synchronize()
     torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
@@ -249,7 +244,6 @@ def _run_oneshot(body_fn, n_outputs: int) -> list[complex]:
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
-    _skip_tvm_ffi_launch_under_compile_only()
     fn(complex_storage(out))
     torch.cuda.synchronize()
     return out.tolist()

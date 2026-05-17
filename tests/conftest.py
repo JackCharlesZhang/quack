@@ -190,12 +190,13 @@ def pytest_collection_modifyitems(config, items):
     coverage — both branches hit the same ``cute.compile`` path through the fake
     impl. Inductor's pre-codegen alignment check (``_inductor/utils.py:tensor_is_aligned``)
     also calls ``data_ptr()`` on the FakeTensor input, which emits a noisy
-    deprecation warning. Skipping these parametrizations removes the warning and
+    deprecation warning. Deselecting these parametrizations removes the warning and
     saves the redundant Inductor compile work. The real GPU pass (no
     ``--compile-only``) still exercises ``torch.compile`` for coverage.
     """
     if not _compile_only:
         return
+
     deselected = [
         item
         for item in items
@@ -234,7 +235,7 @@ def pytest_runtest_setup(item):
         yield
         return
     outcome = yield
-    if outcome.excinfo is not None:
+    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
         outcome.force_result(None)
 
 
@@ -267,7 +268,7 @@ def pytest_runtest_call(item):
             item.runtest()
         return
     outcome = yield
-    if outcome.excinfo is not None:
+    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
         outcome.force_result(None)
 
 
@@ -278,5 +279,5 @@ def pytest_runtest_teardown(item, nextitem):
         yield
         return
     outcome = yield
-    if outcome.excinfo is not None:
+    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
         outcome.force_result(None)
