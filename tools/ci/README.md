@@ -40,10 +40,10 @@ back to cu130 wheels in `tools/ci/docker/build.sh`.
 
 Per `gpu-test/action.yml`:
 
-- **Pass 1** — `pytest tests/ --compile-only -n 24` (compile-only flag, no GPU
-  memory needed; warms the persistent kernel cache).
-- **Pass 2** — `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS` on
-  real GPUs (free-memory threshold 50 GB).
+- **Pass 1** — `pytest tests/ --compile-only -n 24 --dist worksteal` (compile-only
+  flag, no GPU memory needed; warms the persistent kernel cache).
+- **Pass 2** — `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal`
+  on real GPUs (free-memory threshold 50 GB).
 
 ## SIF caching on runners
 
