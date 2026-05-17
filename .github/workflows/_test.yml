@@ -65,13 +65,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both image variants run on every runner: the cu13.2 image bundles
-          # CUDA 13.x forward-compat libs (libcuda.so.590 user-mode shim) so
-          # cu13 cute-dsl JITs cleanly even on the H100 runner's 575 kernel
-          # driver. See tools/ci/docker/Dockerfile (target `cu13`).
+          # The cu129 image with torch 2.12 no longer works with B300 (bc torch is installed
+          # with cu12.6).
           - { gpu: h100, cuda: cu129 }
           - { gpu: h100, cuda: cu132 }
-          - { gpu: b300, cuda: cu129 }
           - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu129, arch: '120' }
           - { gpu: h100, cuda: cu132, arch: '120' }
