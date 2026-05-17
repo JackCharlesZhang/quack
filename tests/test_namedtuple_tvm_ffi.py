@@ -10,6 +10,7 @@ from cutlass import const_expr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.varlen_utils import VarlenArguments
+import quack.cache_utils as cache_utils
 
 
 @cute.kernel
@@ -37,6 +38,8 @@ def _compile_copy_from_varlen():
 def test_varlen_namedtuple_tvm_ffi(N):
     """Compile a kernel taking VarlenArguments (NamedTuple) via TVM-FFI and run it."""
     compiled_fn = _compile_copy_from_varlen()
+    if cache_utils.COMPILE_ONLY:
+        return
     cu_seqlens = torch.arange(N, dtype=torch.int32, device="cuda")
     out = torch.zeros(N, dtype=torch.int32, device="cuda")
     compiled_fn(out, VarlenArguments(mCuSeqlensM=cu_seqlens))

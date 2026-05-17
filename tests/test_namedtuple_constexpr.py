@@ -12,6 +12,7 @@ from cutlass import const_expr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
+import quack.cache_utils as cache_utils
 
 # Ensure the Constexpr converter patch is loaded
 import quack.cute_dsl_utils  # noqa: F401
@@ -63,6 +64,8 @@ def test_constexpr_in_namedtuple(op):
         MyArgs(mOut=out_fake, mA=a_fake, op=int(op)),
         options="--enable-tvm-ffi",
     )
+    if cache_utils.COMPILE_ONLY:
+        return
 
     a = torch.ones(32, dtype=torch.float32, device="cuda")
     out = torch.zeros(32, dtype=torch.float32, device="cuda")
