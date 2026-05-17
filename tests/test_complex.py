@@ -19,11 +19,10 @@ from quack.complex import (
     complex_storage,
     recast_to_complex64,
 )
+from quack import cache_utils
 
 
 def _skip_tvm_ffi_launch_under_compile_only():
-    import quack.cache_utils as cache_utils
-
     # These tests call cute.compile directly, so compile-only still reaches the
     # raw TVM-FFI launch. Under FakeTensorMode that launch would use fake CUDA
     # pointers and can illegal-access/poison CUDA state. Call this after compile
@@ -544,7 +543,8 @@ def test_complex_storage_view_for_complex64():
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64
-    assert v.data_ptr() == c.data_ptr()
+    if not cache_utils.COMPILE_ONLY:
+        assert v.data_ptr() == c.data_ptr()
     assert v.numel() == c.numel()
 
 
