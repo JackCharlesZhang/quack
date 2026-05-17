@@ -2,17 +2,6 @@ __version__ = "0.4.1"
 
 import os
 
-# Two CuTeDSL workarounds, both must run before the first cute.compile call:
-#   - cutlass#3161: duplicate .text section flags break MCJIT in multi-process
-#     loads (see quack.cute_dsl_elf_fix).
-#   - cutlass#3062: ir.Context spawns LLVM thread pools that leak across
-#     compiles, eventually exhausting pthreads (see quack.cute_dsl_mlir_threading).
-import quack.cute_dsl_elf_fix
-import quack.cute_dsl_mlir_threading
-
-quack.cute_dsl_elf_fix.patch()
-quack.cute_dsl_mlir_threading.patch()
-
 from quack.rmsnorm import rmsnorm  # noqa: E402
 from quack.softmax import softmax  # noqa: E402
 from quack.cross_entropy import cross_entropy  # noqa: E402
