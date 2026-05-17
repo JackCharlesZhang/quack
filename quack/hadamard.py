@@ -14,7 +14,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 from quack import copy_utils, layout_utils
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.dsl import cute_op

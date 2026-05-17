@@ -5,6 +5,9 @@ Supports:
   --compile-only    Compile all kernels (populating .o cache), skip actual execution.
                     Uses FakeTensorMode (no GPU memory) so you can use many xdist workers.
                     Works without a GPU if QUACK_ARCH and CUTE_DSL_ARCH are set.
+                    Implemented by the reusable `quack.testing.pytest_plugin`
+                    plugin (loaded below) — downstream projects can opt into the
+                    same workflow by adding the same `pytest_plugins =` line.
 
 Two-pass workflow (after changing kernel source):
   pytest tests/test_softmax.py --compile-only -n 64   # parallel compile, no GPU memory
@@ -31,19 +34,16 @@ from getpass import getuser
 
 import pytest
 
+# `--compile-only` flag, FakeTensorMode setup, and the per-phase error-swallow
+# hooks live in the reusable plugin. We just defer to it.
+pytest_plugins = ["quack.testing.pytest_plugin"]
 
-_compile_only = False
-_fake_mode = None
 
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile all kernels and export .o cache, skip actual kernel execution. "
-        "Use with -n N (pytest-xdist) for parallel compilation.",
-    )
+def _compile_only_enabled(config) -> bool:
+    try:
+        return bool(config.getoption("--compile-only", default=False))
+    except (ValueError, AttributeError):
+        return False
 
 
 def _get_gpu_ids():
@@ -128,16 +128,11 @@ def pytest_handlecrashitem(crashitem, report, sched):
 
 
 def pytest_configure(config):
-    global _compile_only, _fake_mode
-
-    try:
-        _compile_only = config.getoption("--compile-only", default=False)
-    except (ValueError, AttributeError):
-        _compile_only = False
-
-    # Assign GPUs to xdist workers round-robin (skip for CPU-only compile)
+    # Compile-only context lifecycle is owned by quack.testing.pytest_plugin.
+    # This hook handles only project-specific concerns: xdist GPU assignment.
+    compile_only = _compile_only_enabled(config)
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id and not (_compile_only and not _has_gpu()):
+    if worker_id and not (compile_only and not _has_gpu()):
         tmp = Path(tempfile.gettempdir()) / getuser() / "quack_tests"
         tmp.mkdir(parents=True, exist_ok=True)
         worker_num = int(worker_id.replace("gw", ""))
@@ -154,30 +149,12 @@ def pytest_configure(config):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
         _setup_worker_logging(worker_id, tmp)
 
-    if _compile_only:
-        import torch
-        from torch._subclasses.fake_tensor import FakeTensorMode
-        import quack.cache_utils
-
-        quack.cache_utils.COMPILE_ONLY = True
-        if torch.cuda.is_available():
-            torch.cuda.init()
-        _fake_mode = FakeTensorMode()
-        _fake_mode.__enter__()
-
 
 def _has_gpu():
     """Check for GPU without initializing CUDA."""
     import torch
 
     return torch.cuda.is_available()
-
-
-def pytest_unconfigure(config):
-    global _fake_mode
-    if _fake_mode is not None:
-        _fake_mode.__exit__(None, None, None)
-        _fake_mode = None
 
 
 def pytest_collection_modifyitems(config, items):
@@ -194,7 +171,7 @@ def pytest_collection_modifyitems(config, items):
     saves the redundant Inductor compile work. The real GPU pass (no
     ``--compile-only``) still exercises ``torch.compile`` for coverage.
     """
-    if not _compile_only:
+    if not _compile_only_enabled(config):
         return
 
     deselected = [
@@ -228,15 +205,8 @@ def pytest_collection_finish(session):
     )
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_setup(item):
-    """In --compile-only mode, swallow setup errors (e.g. fixtures allocating CUDA tensors)."""
-    if not _compile_only:
-        yield
-        return
-    outcome = yield
-    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
-        outcome.force_result(None)
+# Compile-only error-swallow hooks live in quack.testing.pytest_plugin. The
+# only normal-mode hook we keep here is the OOM-retry, which is QuACK-specific.
 
 
 def _is_oom(exc_type, exc_val):
@@ -252,32 +222,17 @@ def _is_oom(exc_type, exc_val):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """In --compile-only mode, swallow all errors — we only care about compilation.
-    In normal mode, retry once on CUDA OOM after freeing GPU memory.
-    """
-    if not _compile_only:
-        outcome = yield
-        if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
-            import gc
-            import torch
-
-            logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
-            gc.collect()
-            torch.cuda.empty_cache()
-            outcome.force_result(None)
-            item.runtest()
-        return
-    outcome = yield
-    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
-        outcome.force_result(None)
-
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_teardown(item, nextitem):
-    """In --compile-only mode, swallow teardown errors."""
-    if not _compile_only:
+    """Retry once on CUDA OOM after freeing GPU memory. No-op under --compile-only."""
+    if _compile_only_enabled(item.config):
         yield
         return
     outcome = yield
-    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
+    if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
+        import gc
+        import torch
+
+        logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
+        gc.collect()
+        torch.cuda.empty_cache()
         outcome.force_result(None)
+        item.runtest()

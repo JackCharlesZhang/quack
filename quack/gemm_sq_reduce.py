@@ -31,7 +31,7 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.rounding import RoundingMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.gemm_tvm_ffi_utils import (
     div_for_dtype,
     get_major,
@@ -298,7 +298,7 @@ def gemm_sq_reduce(
         device_capacity,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if COMPILE_ONLY:
         return

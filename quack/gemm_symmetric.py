@@ -24,7 +24,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
@@ -415,7 +415,7 @@ def gemm_symmetric(
         device_capacity,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if COMPILE_ONLY:
         return

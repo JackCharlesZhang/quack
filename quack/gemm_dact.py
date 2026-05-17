@@ -33,7 +33,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.rounding import RoundingMode
 from quack.activation import dact_fn_map, dgate_fn_map
 from quack import layout_utils
@@ -481,7 +481,7 @@ def gemm_dact(
         use_tma_gather=use_tma_gather,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if COMPILE_ONLY:
         return

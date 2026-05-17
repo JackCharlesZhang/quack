@@ -25,7 +25,7 @@ from quack.gemm_sm120 import GemmSm120
 from quack.gemm_act import GemmActMixin, GemmGatedMixin, GemmGatedSm120Mixin
 from quack.epi_ops import vec_multiply
 from quack.activation import act_fn_map, gate_fn_map
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.rounding import RoundingMode
 from quack.gemm_tvm_ffi_utils import (
     get_major,
@@ -380,7 +380,7 @@ def gemm_norm_act_fn(
         sr_seed_mode=sr_seed_mode,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if COMPILE_ONLY:
         return

@@ -1697,22 +1697,26 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     without benchmarking or kernel launch.
     Tests use tuned=False which also selects the default config, so this is sufficient.
 
-    Set ``QUACK_COMPILE_ONLY_STRICT=1`` to re-raise exceptions instead of silently
+    Set ``QUACK_COMPILE_ONLY_STRICT=1`` to surface exceptions instead of silently
     swallowing them. Useful for surfacing schema drift between custom_op kwargs
     and the underlying autotuned function (e.g. a missing entry in
-    ``_rewrite_merge_alpha``) which would otherwise silently drop compiles and
-    cause unexplained Phase-2 compile-on-demand work.
+    ``_rewrite_merge_alpha``). The exception is wrapped in
+    ``quack.cache.CompileOnlyStrictError`` so the reusable pytest plugin's
+    blanket swallow hooks (which exist to ignore expected FakeTensor errors
+    *after* a successful kernel dispatch) can let it through.
     """
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY, CompileOnlyStrictError
 
     A = args[0] if args else kwargs.get("A")
     if not COMPILE_ONLY or A is None or isinstance(A.shape[0], torch.SymInt):
         return
     try:
         autotuned_fn.fn(*args, config=None, **kwargs)
-    except Exception:
+    except Exception as e:
         if os.environ.get("QUACK_COMPILE_ONLY_STRICT") == "1":
-            raise
+            raise CompileOnlyStrictError(
+                f"precompile failed for {autotuned_fn.__name__ if hasattr(autotuned_fn, '__name__') else autotuned_fn}: {e}"
+            ) from e
 
 
 @gemm_add_inplace_op.register_fake
@@ -1826,7 +1830,7 @@ def gemm_symmetric_out_fake(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> None:
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
         return

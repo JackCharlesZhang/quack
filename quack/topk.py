@@ -17,7 +17,7 @@ import quack.copy_utils as copy_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduction_base import ReductionBase
 from quack.reduce import row_reduce
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.dsl import cute_op
 from quack.sort.bitonic_sort import bitonic_topk

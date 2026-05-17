@@ -13,7 +13,7 @@ kernel too), specialized for our setup:
 * Under ``FakeTensorMode`` with SymInt shapes (dynamic-shape tracing), skip:
   ``@jit_cache`` is an ``lru_cache`` and SymInts are unhashable.
 * In the ``COMPILE_ONLY`` scenario (``pytest --compile-only`` or the
-  ``_compile_worker`` subprocess) ``cache_utils.COMPILE_ONLY`` is already
+  ``_compile_worker`` subprocess) ``quack.cache.COMPILE_ONLY`` is already
   True on entry, so ``@jit_cache`` returns ``_noop_kernel`` for every
   ``_compile_*(...)`` it populates. The body runs end-to-end, the .o
   cache is filled, and no kernel is actually launched.
@@ -33,7 +33,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 
 import torch
 
-from quack import cache_utils
+import quack.cache
 
 
 __all__ = ["cute_op"]
@@ -100,7 +100,7 @@ def cute_op(
             # the op only mutates inputs (no fake output to produce) and the
             # body would otherwise raise for shape/dtype combos that the
             # kernel intentionally rejects.
-            if not cache_utils.COMPILE_ONLY:
+            if not quack.cache.COMPILE_ONLY:
                 return
             if _has_symint(args) or _has_symint(kw):
                 return

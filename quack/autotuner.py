@@ -173,7 +173,7 @@ class Autotuner:
         import overhead across multiple configs. The parent then loads instantly from
         the .o cache during benchmarking.
         """
-        from quack.cache_utils import CACHE_ENABLED
+        from quack.cache import CACHE_ENABLED
 
         if not CACHE_ENABLED:
             return

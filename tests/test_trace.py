@@ -12,19 +12,19 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64
 
-from quack import cache_utils
+import quack.cache
 
 # The trace tests are the one place where tracing should be enabled by default:
 # CI runs this file as part of ``pytest tests/`` without setting QUACK_TRACE.
 # Keep compile-only skipped because these raw CuTe JIT kernels do not warm quack's jit_cache.
-if not cache_utils.COMPILE_ONLY:
+if not quack.cache.COMPILE_ONLY:
     os.environ.setdefault("QUACK_TRACE", "1")
 
 from quack.trace import TraceContext, TraceSession, enabled
 
 pytestmark = [
     pytest.mark.skipif(
-        cache_utils.COMPILE_ONLY,
+        quack.cache.COMPILE_ONLY,
         reason="skipped under --compile-only: raw CuTe JIT trace kernels do not warm jit cache",
     ),
     pytest.mark.skipif(not enabled(), reason="QUACK_TRACE=1 not set"),

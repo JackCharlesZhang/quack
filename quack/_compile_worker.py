@@ -10,11 +10,11 @@ import struct
 import sys
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
 
-import quack.cache_utils
+import quack.cache
+from quack.cache import CompileOnlyFakeTensorMode
 
-quack.cache_utils.COMPILE_ONLY = True
+quack.cache.COMPILE_ONLY = True
 
 _dtype_map = {
     "torch.float16": torch.float16,
@@ -84,7 +84,7 @@ def main():
         kwargs = payload["kwargs"]
         config_kwargs = payload["config_kwargs"]
 
-        with FakeTensorMode():
+        with CompileOnlyFakeTensorMode():
             fake_args = []
             for meta in tensor_meta:
                 if isinstance(meta, dict) and "shape" in meta:

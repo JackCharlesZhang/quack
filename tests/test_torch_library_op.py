@@ -3,7 +3,7 @@
 
 The decorator registers its backend ``fn`` as both the CUDA impl and the
 fake/meta impl. Under ``FakeTensorMode`` the body runs only in the
-``cache_utils.COMPILE_ONLY`` scenario (``pytest --compile-only`` / the
+``quack.cache.COMPILE_ONLY`` scenario (``pytest --compile-only`` / the
 ``_compile_worker`` subprocess); under regular ``torch.compile`` the fake
 must be a no-op.
 
@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-import quack.cache_utils as cache_utils
+import quack.cache
 from quack.dsl.torch_library_op import _has_symint, cute_op
 
 
@@ -83,7 +83,7 @@ def test_fake_is_noop_under_torch_compile():
         op(x, out)
         return out
 
-    assert not cache_utils.COMPILE_ONLY, "test precondition: COMPILE_ONLY must be False"
+    assert not quack.cache.COMPILE_ONLY, "test precondition: COMPILE_ONLY must be False"
 
     # Use a shape that would have raised the (broken) fake body. After
     # the fix the trace completes; at runtime the eager backend then
@@ -106,22 +106,22 @@ def test_fake_is_noop_under_torch_compile():
 
 
 def test_fake_runs_body_when_compile_only():
-    """Under ``cache_utils.COMPILE_ONLY=True`` the fake body runs.
+    """Under ``quack.cache.COMPILE_ONLY=True`` the fake body runs.
 
     This is the path the ``_compile_worker`` subprocess and
     ``pytest --compile-only`` rely on to populate the .o cache.
     """
     op, call_log = _make_op("runs_under_compile_only")
 
-    saved = cache_utils.COMPILE_ONLY
-    cache_utils.COMPILE_ONLY = True
+    saved = quack.cache.COMPILE_ONLY
+    quack.cache.COMPILE_ONLY = True
     try:
         with FakeTensorMode():
             x = torch.empty(8, 1024)
             out = torch.empty(8, 1024)
             op(x, out)
     finally:
-        cache_utils.COMPILE_ONLY = saved
+        quack.cache.COMPILE_ONLY = saved
 
     assert call_log == [("fake", (8, 1024))], (
         f"fake body must run when COMPILE_ONLY is True; saw {call_log}"
@@ -206,8 +206,8 @@ def test_fake_skips_symint_under_compile_only_strict():
 
     op = getattr(getattr(torch.ops, _NS), "strict_symint").default
 
-    saved = cache_utils.COMPILE_ONLY
-    cache_utils.COMPILE_ONLY = True
+    saved = quack.cache.COMPILE_ONLY
+    quack.cache.COMPILE_ONLY = True
     try:
         # Tie the scalar ``n`` to a dynamic dim so it propagates as a
         # SymInt on the dynamic-shape compile. This exercises BOTH the
@@ -224,7 +224,7 @@ def test_fake_skips_symint_under_compile_only_strict():
         f(torch.randn(8, 1024))
         f(torch.randn(16, 2048))
     finally:
-        cache_utils.COMPILE_ONLY = saved
+        quack.cache.COMPILE_ONLY = saved
 
     # If any symbolic invocation slipped through, the body's asserts
     # would have raised and surfaced before reaching here. Records of

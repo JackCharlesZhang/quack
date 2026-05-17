@@ -19,11 +19,11 @@ from quack.complex import (
     complex_storage,
     recast_to_complex64,
 )
-from quack import cache_utils
+import quack.cache
 
 
 pytestmark = pytest.mark.skipif(
-    cache_utils.COMPILE_ONLY,
+    quack.cache.COMPILE_ONLY,
     reason="skipped under --compile-only: direct TVM-FFI compile does not warm jit cache",
 )
 
@@ -537,7 +537,7 @@ def test_complex_storage_view_for_complex64():
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64
-    if not cache_utils.COMPILE_ONLY:
+    if not quack.cache.COMPILE_ONLY:
         assert v.data_ptr() == c.data_ptr()
     assert v.numel() == c.numel()
 

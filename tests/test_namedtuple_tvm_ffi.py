@@ -12,7 +12,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import const_expr
 
-from quack import cache_utils
+import quack.cache
 
 # Ensure the Constexpr converter patch is loaded.
 import quack.cute_dsl_utils  # noqa: F401
@@ -22,7 +22,7 @@ from quack.varlen_utils import VarlenArguments
 
 
 pytestmark = pytest.mark.skipif(
-    cache_utils.COMPILE_ONLY,
+    quack.cache.COMPILE_ONLY,
     reason="skipped under --compile-only: direct TVM-FFI compile does not warm jit cache",
 )
 

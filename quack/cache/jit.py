@@ -1,14 +1,17 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
-"""Persistent .o cache for CuTe DSL compiled kernels.
+"""Persistent ``.o`` cache for CuTe DSL compiled kernels.
 
-Compiled kernels are exported as object files (.o) via export_to_c.
-On subsequent runs the .o is loaded via tvm_ffi (~1ms) instead of
-re-generating IR + re-JIT'ing (~100ms per kernel).
+Compiled kernels are exported as object files (``.o``) via ``export_to_c``. On
+subsequent runs the ``.o`` is loaded via tvm_ffi (~1 ms) instead of
+re-generating IR + re-JIT'ing (~500 ms per kernel).
 
-Controls:
-  QUACK_CACHE_ENABLED=0       — disable persistent .o cache (default: enabled)
-  QUACK_CACHE_DIR=path        — override default cache directory
+Mutable runtime flags (``COMPILE_ONLY``, ``CACHE_ENABLED``, ``CACHE_DIR``,
+``EXTRA_SOURCE_DIRS``) live in :mod:`quack.cache` (the package init), not
+here, so that ``import quack.cache as c; c.COMPILE_ONLY = True`` works without
+desyncing readers — see :mod:`quack.cache` for the rationale.
 """
+
+from __future__ import annotations
 
 import fcntl
 import functools
@@ -26,13 +29,11 @@ import cutlass
 import cutlass.cute as cute
 import tvm_ffi
 
-CACHE_ENABLED: bool = os.getenv("QUACK_CACHE_ENABLED", "1") == "1"
-CACHE_DIR: str | None = os.getenv("QUACK_CACHE_DIR", None)
-COMPILE_ONLY: bool = False
+# `quack.cache` (the package itself) holds the mutable runtime flags as a
+# single source of truth; reads happen via attribute access on `_state` so we
+# always see the live value, not a snapshot taken at module import.
+import quack.cache as _state  # noqa: E402  (intentional partial-import; see __init__.py)
 
-# Downstream projects can append directories here to include their sources
-# in the cache fingerprint. Must be set before the first jit_cache call.
-EXTRA_SOURCE_DIRS: list[Path] = []
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
@@ -44,8 +45,8 @@ def _noop_kernel(*args, **kwargs):
 
 
 def get_cache_path() -> Path:
-    if CACHE_DIR is not None:
-        cache_dir = Path(CACHE_DIR)
+    if _state.CACHE_DIR is not None:
+        cache_dir = Path(_state.CACHE_DIR)
     else:
         cache_dir = Path(tempfile.gettempdir()) / getuser() / "quack_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -70,8 +71,13 @@ def _compute_source_fingerprint() -> str:
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
-    _hash_source_dir(h, Path(__file__).resolve().parent)
-    for extra_dir in EXTRA_SOURCE_DIRS:
+    # Hash the entire `quack` package, not just `quack/cache/`. Resolving via
+    # the top-level package import keeps the fingerprint stable regardless of
+    # where inside the package this file lives.
+    import quack as _quack
+
+    _hash_source_dir(h, Path(_quack.__file__).resolve().parent)
+    for extra_dir in _state.EXTRA_SOURCE_DIRS:
         _hash_source_dir(h, Path(extra_dir).resolve())
     return h.hexdigest()
 
@@ -136,14 +142,22 @@ def jit_cache(fn):
         nonlocal hits, misses
         cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
 
+        # Snapshot mutable state once per call. The disk-write block at the
+        # bottom refers to locals (`sha`, `o_path`, `lock_path`) that are
+        # only defined when `enabled` was True at the top; re-reading
+        # `_state.CACHE_ENABLED` later would risk UnboundLocalError if a
+        # concurrent mutation flipped the flag mid-call.
+        enabled = _state.CACHE_ENABLED
+        compile_only = _state.COMPILE_ONLY
+
         # 1. In-memory hit
         if cache_key in cache:
             hits += 1
-            return _noop_kernel if COMPILE_ONLY else cache[cache_key]
+            return _noop_kernel if compile_only else cache[cache_key]
 
         # 2. Disk hit
         disk_key = (fn.__qualname__,) + cache_key
-        if CACHE_ENABLED:
+        if enabled:
             sha = _key_to_hash(disk_key)
             cache_path = get_cache_path() / _compute_source_fingerprint()
             cache_path.mkdir(parents=True, exist_ok=True)
@@ -156,7 +170,7 @@ def jit_cache(fn):
                         loaded = m[EXPORT_FUNC_NAME]
                         cache[cache_key] = loaded
                         hits += 1
-                        return _noop_kernel if COMPILE_ONLY else loaded
+                        return _noop_kernel if compile_only else loaded
             except RuntimeError:
                 pass
 
@@ -166,7 +180,7 @@ def jit_cache(fn):
 
         # 4. Store
         cache[cache_key] = compiled_fn
-        if CACHE_ENABLED:
+        if enabled:
             try:
                 with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
                     if not o_path.exists():
@@ -178,7 +192,7 @@ def jit_cache(fn):
             except Exception as e:
                 print(f"quack cache: export failed for key {sha}: {e}")
 
-        return _noop_kernel if COMPILE_ONLY else compiled_fn
+        return _noop_kernel if compile_only else compiled_fn
 
     def cache_clear():
         nonlocal hits, misses
