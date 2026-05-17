@@ -180,6 +180,35 @@ def pytest_unconfigure(config):
         _fake_mode = None
 
 
+def pytest_collection_modifyitems(config, items):
+    """Deselect ``use_compile=True`` parametrizations under ``--compile-only``.
+
+    Compile-only runs exist to populate the cute kernel .o cache via FakeTensorMode.
+    The ``use_compile=True`` parametrizations wrap the kernel entry point in
+    ``torch.compile(...)``, but the cute kernel is already an opaque ``cute_op``
+    (see ``quack/dsl/torch_library_op.py``), so Dynamo+Inductor add no cache
+    coverage — both branches hit the same ``cute.compile`` path through the fake
+    impl. Inductor's pre-codegen alignment check (``_inductor/utils.py:tensor_is_aligned``)
+    also calls ``data_ptr()`` on the FakeTensor input, which emits a noisy
+    deprecation warning. Skipping these parametrizations removes the warning and
+    saves the redundant Inductor compile work. The real GPU pass (no
+    ``--compile-only``) still exercises ``torch.compile`` for coverage.
+    """
+    if not _compile_only:
+        return
+    deselected = [
+        item
+        for item in items
+        if getattr(item, "callspec", None) is not None
+        and item.callspec.params.get("use_compile") is True
+    ]
+    if not deselected:
+        return
+    config.hook.pytest_deselected(items=deselected)
+    deselected_ids = {id(item) for item in deselected}
+    items[:] = [item for item in items if id(item) not in deselected_ids]
+
+
 def pytest_collection_finish(session):
     """Print a summary of collected tests grouped by file and function."""
     if not session.items:
