@@ -1842,11 +1842,19 @@ def gemm_symmetric_out_fake(
     dynamic_scheduler: bool = False,
     alpha: float = 1.0,
     beta: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    beta_tensor: Optional[Tensor] = None,
 ) -> None:
     from quack.cache import COMPILE_ONLY
 
     if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
         return
+    # Mirror the real body's *_tensor merge so the compile-key signature
+    # (which depends on alpha_mode = isinstance(alpha, Tensor) ? 2 : ...) matches
+    # what real-mode dispatches. Without this, tensor-alpha/beta tests silently
+    # skip precompile and Phase 2 has to compile them on demand.
+    alpha = alpha_tensor if alpha_tensor is not None else alpha
+    beta = beta_tensor if beta_tensor is not None else beta
     # gemm_symmetric is not autotuned, compile the single fixed config directly
     sm = get_device_capacity(A.device)[0]
     try:
