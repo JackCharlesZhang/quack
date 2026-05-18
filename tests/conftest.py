@@ -33,10 +33,6 @@ from getpass import getuser
 
 import pytest
 
-# `--compile-only` flag, FakeTensorMode setup, and the per-phase error-swallow
-# hooks live in the reusable plugin. We just defer to it.
-pytest_plugins = ["quack.testing.pytest_plugin"]
-
 
 def _compile_only_enabled(config) -> bool:
     try:
@@ -77,6 +73,38 @@ def _setup_worker_logging(worker_id, tmp):
     root.addHandler(handler)
     root.setLevel(logging.INFO)
     logging.info("Worker %s logging to %s", worker_id, log_file)
+
+
+def _assign_xdist_worker_gpu():
+    """Narrow each xdist worker to one GPU before any CUDA-touching imports.
+
+    Importing the reusable plugin as ``quack.testing.pytest_plugin`` first
+    imports ``quack.__init__`` and CuTe/CUTLASS modules; those imports can call
+    ``torch.cuda.is_available()``. If ``CUDA_VISIBLE_DEVICES`` still contains
+    the full free-GPU list at that point, later narrowing inside
+    ``pytest_configure`` is too late: CUDA has already cached the larger device
+    set and workers can all default to logical GPU 0.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if not worker_id:
+        return None
+    worker_num = int(worker_id.replace("gw", ""))
+    gpu_ids = _get_gpu_ids()
+    assigned_gpu = gpu_ids[worker_num % len(gpu_ids)]
+    os.environ.setdefault(
+        "QUACK_XDIST_ORIGINAL_CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu
+    return worker_id, assigned_gpu, gpu_ids
+
+
+_PRECONFIGURED_WORKER_GPU = _assign_xdist_worker_gpu()
+
+# `--compile-only` flag, FakeTensorMode setup, and the per-phase error-swallow
+# hooks live in the reusable plugin. We defer to it only after xdist workers
+# have been narrowed to a single GPU, because importing the `quack` package can
+# touch CUDA via CUTLASS/PyTorch.
+pytest_plugins = ["quack.testing.pytest_plugin"]
 
 
 # Per-session bookkeeping for the xdist worker-crash retry hook below.
@@ -133,32 +161,23 @@ def pytest_handlecrashitem(crashitem, report, sched):
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     # Compile-only context lifecycle is owned by quack.testing.pytest_plugin.
-    # This hook handles only project-specific concerns: xdist GPU assignment.
-    # Run before the reusable compile-only plugin so any CUDA initialization
-    # observes the worker-local CUDA_VISIBLE_DEVICES chosen here.
-    compile_only = _compile_only_enabled(config)
+    # This hook handles only project-specific concerns: xdist GPU assignment
+    # logging. The actual assignment happens at conftest import time above so
+    # it beats CUDA-touching imports from the reusable plugin.
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id and not (compile_only and not _has_gpu()):
+    if worker_id:
         tmp = Path(tempfile.gettempdir()) / getuser() / "quack_tests"
         tmp.mkdir(parents=True, exist_ok=True)
-        worker_num = int(worker_id.replace("gw", ""))
-        gpu_ids = _get_gpu_ids()
-        assigned_gpu = gpu_ids[worker_num % len(gpu_ids)]
-        os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu
+        assignment = _PRECONFIGURED_WORKER_GPU or _assign_xdist_worker_gpu()
         _setup_worker_logging(worker_id, tmp)
-        logging.info(
-            "Worker %s assigned CUDA_VISIBLE_DEVICES=%s from visible GPUs %s",
-            worker_id,
-            assigned_gpu,
-            gpu_ids,
-        )
-
-
-def _has_gpu():
-    """Check for GPU without initializing CUDA."""
-    import torch
-
-    return torch.cuda.is_available()
+        if assignment is not None:
+            assigned_worker, assigned_gpu, gpu_ids = assignment
+            logging.info(
+                "Worker %s assigned CUDA_VISIBLE_DEVICES=%s from visible GPUs %s",
+                assigned_worker,
+                assigned_gpu,
+                gpu_ids,
+            )
 
 
 def pytest_collection_modifyitems(config, items):

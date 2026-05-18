@@ -21,9 +21,12 @@ See :mod:`quack.cache.compile_only` for the underlying mechanism.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-from quack.cache import CompileOnlyFakeTensorMode, CompileOnlyStrictError
+if TYPE_CHECKING:
+    from quack.cache import CompileOnlyFakeTensorMode
 
 
 _fake_mode: CompileOnlyFakeTensorMode | None = None
@@ -50,6 +53,9 @@ def _should_swallow(exc_type) -> bool:
     """
     if issubclass(exc_type, pytest.skip.Exception):
         return False
+
+    from quack.cache import CompileOnlyStrictError
+
     if issubclass(exc_type, CompileOnlyStrictError):
         return False
     return True
@@ -85,6 +91,7 @@ def pytest_configure(config):
     import torch
 
     import quack.cache
+    from quack.cache import CompileOnlyFakeTensorMode
 
     _prev_compile_only = quack.cache.COMPILE_ONLY
     quack.cache.COMPILE_ONLY = True
