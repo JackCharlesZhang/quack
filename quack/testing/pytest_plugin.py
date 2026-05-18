@@ -21,12 +21,9 @@ See :mod:`quack.cache.compile_only` for the underlying mechanism.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pytest
 
-if TYPE_CHECKING:
-    from quack.cache import CompileOnlyFakeTensorMode
+from quack.cache import CompileOnlyFakeTensorMode, CompileOnlyStrictError
 
 
 _fake_mode: CompileOnlyFakeTensorMode | None = None
@@ -53,9 +50,6 @@ def _should_swallow(exc_type) -> bool:
     """
     if issubclass(exc_type, pytest.skip.Exception):
         return False
-
-    from quack.cache import CompileOnlyStrictError
-
     if issubclass(exc_type, CompileOnlyStrictError):
         return False
     return True
@@ -82,16 +76,46 @@ def _is_compile_only(config) -> bool:
         return False
 
 
+def _disable_unused_accelerator_lazy_call() -> None:
+    """No-op ``_lazy_call`` for accelerators that aren't available.
+
+    Every ``torch.manual_seed(seed)`` fans out across CUDA, MPS, XPU, MTIA, and
+    any custom device. For each *uninitialized* backend, ``_lazy_call`` takes
+    a slow path that calls ``traceback.format_stack()`` to record where the
+    seed was queued from. Under pytest the call stack is deep, so each
+    ``format_stack`` costs ~1 ms; across thousands of tests this is several
+    seconds of pure CPU overhead per worker, even though no XPU/MTIA work is
+    ever submitted.
+
+    Subtlety: ``torch.xpu/random.py`` and ``torch.cuda/random.py`` do
+    ``from . import _lazy_call`` at import time, so we must replace the name
+    on the submodule too — patching only the package attribute is not enough.
+    """
+    import torch
+
+    nop = lambda callable, **kwargs: None  # noqa: E731
+    if not torch.xpu.is_available():
+        torch.xpu._lazy_call = nop
+        torch.xpu.random._lazy_call = nop  # captured via `from . import _lazy_call`
+    if not torch.mtia.is_available():
+        torch.mtia._lazy_call = nop
+
+
 def pytest_configure(config):
     """Enter the compile-only context for the duration of the test session."""
     global _fake_mode, _prev_compile_only
+
+    # Speed up manual_seed in real (non-compile-only) runs by short-circuiting
+    # the queued-seed path on unavailable accelerators. Harmless under
+    # --compile-only too (FakeTensorMode swallows the seed call anyway).
+    _disable_unused_accelerator_lazy_call()
+
     if not _is_compile_only(config):
         return
 
     import torch
 
     import quack.cache
-    from quack.cache import CompileOnlyFakeTensorMode
 
     _prev_compile_only = quack.cache.COMPILE_ONLY
     quack.cache.COMPILE_ONLY = True
