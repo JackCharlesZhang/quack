@@ -1734,6 +1734,7 @@ def gemm_add_inplace_fake(
     batch_idx_permute: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    concat_layout: Optional[str] = None,
 ) -> None:
     alpha_val = alpha_tensor if alpha_tensor is not None else alpha
     beta_val = beta_tensor if beta_tensor is not None else beta
@@ -1752,6 +1753,7 @@ def gemm_add_inplace_fake(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
+        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
     )
 
 
@@ -1773,6 +1775,17 @@ def _register_precompile_fake(custom_op, autotuned_fn, rewrite=None):
         bound.apply_defaults()
         kw = dict(bound.arguments)
         kw.pop("tuned", None)
+        # custom_op schemas declare `concat_layout: Optional[str]` (PyTorch
+        # custom_op requires fixed types per arg) but the autotuned fn
+        # expects `Optional[tuple[str, ...]]`. The real fn body parses the
+        # string via `tuple(concat_layout.split(","))` before forwarding;
+        # mirror that here so the precompile-fake hits the same compile-key
+        # signature as a real dispatch (otherwise the autotuned fn's
+        # `tuple(sorted(concat_layout))` would iterate the string char-by-char
+        # and produce a wrong, never-used compile signature).
+        cl = kw.get("concat_layout")
+        if isinstance(cl, str):
+            kw["concat_layout"] = tuple(cl.split(",")) if cl else None
         if rewrite is not None:
             rewrite(kw)
         _precompile_default_config(autotuned_fn, **kw)
@@ -2226,19 +2239,7 @@ def gemm_norm_act_out(
     fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
-@torch.library.register_fake("quack::gemm_norm_act_out")
-def _gemm_norm_act_out_fake(
-    A,
-    B,
-    preact_out,
-    postact_out,
-    C=None,
-    rstd=None,
-    activation=None,
-    dynamic_scheduler=False,
-    tuned=True,
-) -> None:
-    pass
+_register_precompile_fake(gemm_norm_act_out, gemm_norm_act_tuned)
 
 
 @torch.library.custom_op(
@@ -2262,19 +2263,7 @@ def gemm_norm_gated_out(
     fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
-@torch.library.register_fake("quack::gemm_norm_gated_out")
-def _gemm_norm_gated_out_fake(
-    A,
-    B,
-    preact_out,
-    postact_out,
-    C=None,
-    rstd=None,
-    activation="swiglu",
-    dynamic_scheduler=False,
-    tuned=True,
-) -> None:
-    pass
+_register_precompile_fake(gemm_norm_gated_out, gemm_norm_gated_tuned)
 
 
 def gemm_norm_act(
