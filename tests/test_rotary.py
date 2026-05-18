@@ -73,8 +73,21 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
 
 
 def unpad_input(x, padding_mask):
+    from quack.cache import is_compile_only
+
     batch, seqlen = padding_mask.shape
-    indices = torch.nonzero(padding_mask.reshape(-1), as_tuple=False).flatten()
+    if is_compile_only():
+        # Under FakeTensorMode the `torch.nonzero` below raises
+        # ``DynamicOutputShapeException`` because the output shape depends on
+        # the input values. The test downstream uses ``indices`` only for the
+        # round-trip ``pad_input(out_unpad, indices, ...)``, whose numerical
+        # result the conftest plugin swallows anyway under ``--compile-only``.
+        # Build a fully-padded substitute that has the right dtypes / ranks /
+        # leading-dim contiguity so the rotary kernel still dispatches with
+        # the right compile-key signature.
+        indices = torch.arange(batch * seqlen, dtype=torch.int64, device=x.device)
+    else:
+        indices = torch.nonzero(padding_mask.reshape(-1), as_tuple=False).flatten()
     x_unpad = x.reshape(batch * seqlen, *x.shape[2:])[indices]
     lengths = padding_mask.sum(dim=1, dtype=torch.int32)
     cu_seqlens = torch.cat(
