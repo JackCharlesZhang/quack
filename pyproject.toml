@@ -43,6 +43,17 @@ torch = [
 ]
 
 [tool.pytest.ini_options]
+# Disable pytest plugins we don't need. These add per-test hook dispatch and
+# session-end work that costs ~1-2s on a 2k-test file with no functional
+# benefit for quack's CI workflow:
+#   - cacheprovider:        .pytest_cache/ lastfailed bookkeeping (writes to disk per session)
+#   - unraisableexception:  3x gc.collect() at session end to flush sys.unraisablehook (0.6s)
+#   - threadexception:      same idea for threading.excepthook (~tens of ms)
+# Disabling these is safe: pytest reports test failures the same way; we just
+# lose the rarely-useful "there was an unraisable exception during test X"
+# secondary report. Tests still fail normally on real errors.
+addopts = "-p no:cacheprovider -p no:unraisableexception -p no:threadexception"
+
 # Filters set via warnings.filterwarnings() in conftest.py don't survive pytest's
 # per-test catch_warnings context — pytest prepends its own ('always', Warning)
 # filter, which then matches before any conftest 'ignore'. Filters declared here
