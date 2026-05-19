@@ -114,11 +114,8 @@ _crash_retried: set[str] = set()
 def pytest_handlecrashitem(crashitem, report, sched):
     """Re-queue a worker-crashed test on a fresh worker.
 
-    Background. cute.compile() retains one ir.Context (~1.9 MB of MLIR IR)
-    per call in C++ state we can't reach from Python (cutlass#3062 fixed the
-    related thread-pool leak; the Context-object leak is unfixed upstream).
-    After several minutes a worker's RSS exceeds the apptainer cgroup limit
-    and the OOM-killer takes it. --max-worker-restart spawns a fresh
+    Background. Sometimes a worker crahses (idk why, still investigating).
+    --max-worker-restart spawns a fresh
     replacement worker, but xdist still marks the test that was in flight
     when the death happened as 'failed' (see xdist.dsession.handle_crashitem,
     which synthesises a TestReport with longrepr only and no excinfo).

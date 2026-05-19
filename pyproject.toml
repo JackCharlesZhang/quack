@@ -64,6 +64,13 @@ addopts = "-p no:cacheprovider -p no:unraisableexception -p no:threadexception"
 # warnings per --compile-only run. Suppress at the source module.
 filterwarnings = [
     "ignore:`torch\\.jit\\.script_method`.*Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+    # torch.profiler.profile() unconditionally warns when acc_events=False (the
+    # default) about events being cleared at each cycle. Our tests profile a
+    # single kernel launch in one cycle, so the warning is irrelevant. Silence
+    # at source rather than threading acc_events=True through every call site.
+    # NOTE: filterwarnings uses ':' as field separator, so the message regex
+    # cannot contain literal colons — match a colon-free substring instead.
+    "ignore:.*Profiler clears events at the end of each cycle.*:UserWarning:torch\\.profiler\\.profiler",
 ]
 
 [tool.ruff]
