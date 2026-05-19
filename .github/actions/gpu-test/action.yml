@@ -23,9 +23,12 @@ inputs:
     description: >-
       Optional QUACK_ARCH override (e.g. "120"). When set, quack dispatches to
       that arch's kernel implementations while still compiling/running on the
-      host GPU. QUACK_CACHE_DIR is suffixed with both the cuda variant and the
-      arch (e.g. .quack_cache_cu132_sm120), so different (cuda, arch) pairs
-      don't share a cache directory on the same self-hosted runner.
+      host GPU. QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, and TRITON_CACHE_DIR
+      are all suffixed with both the cuda variant and the arch (e.g.
+      .quack_cache_cu132_sm120), so different (cuda, arch) pairs don't share
+      a cache directory on the same self-hosted runner. See the in-line
+      comment near the cache exports for why TORCHINDUCTOR_/TRITON_ isolation
+      matters (cross-toolchain cubin collisions → cuModuleLoad SEGV).
     required: false
     default: ''
 
@@ -102,13 +105,30 @@ runs:
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
           pip install --break-system-packages --no-deps -q -e . &&
+          # Per-leg cache directories. apptainer --writable-tmpfs does NOT
+          # isolate /tmp (the host /tmp is bind-mounted in), and HOME is
+          # bound by default too — so without explicit overrides every CI
+          # leg shares torch's defaults (/tmp/torchinductor_<user> and
+          # ~/.triton/cache) across all (cuda, arch, Python, Triton, torch)
+          # combinations. A stale Inductor entry pointing at a cubin that
+          # was compiled by a different toolchain produces a SIGSEGV inside
+          # cuModuleLoad (via Triton's cuda_utils.so) when the next leg
+          # loads it. Suffixing with the cuda variant (and sm-arch when set)
+          # gives each leg its own pair of caches so cross-toolchain
+          # collisions cannot happen; cache-warmup speedups within a leg are
+          # preserved.
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
-            echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR\"
+            export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA}_sm$ARCH &&
+            export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}_sm$ARCH &&
+            echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR=\$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=\$TRITON_CACHE_DIR\"
           else
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}
+            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA} &&
+            export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA} &&
+            export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}
           fi &&
+          mkdir -p \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
           # --max-worker-restart N tolerates worker deaths (OOM-kill from
           # the upstream cute.compile ir.Context retention leak, see
           # tests/conftest.py:pytest_handlecrashitem for background). The
