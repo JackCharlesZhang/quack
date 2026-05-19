@@ -14,6 +14,38 @@ import importlib
 import pytest
 import torch
 
+import quack.cache
+
+# ---------------------------------------------------------------------------
+# Skip this whole module under ``pytest --compile-only``.
+#
+# Every test in this file is a *unit test* for the compile-only plumbing
+# itself: each one sets up its own ``COMPILE_ONLY`` value and (for the
+# FakeTensor tests) its own ``CompileOnlyFakeTensorMode``. Running them
+# inside the plugin's session-wide ``--compile-only`` context is recursive
+# (context-manager inside context-manager) and routinely leaks the flag back
+# to ``False`` on test exit — since each test does an unconditional
+# ``finally: quack.cache.COMPILE_ONLY = False``. On xdist that turns the
+# next test on the same worker into a False-flagged FakeTensor session,
+# and the ``data_ptr()`` aliasing guards in tests like
+# ``tests/test_linear_varlen_m.py`` (which read ``is_compile_only()``) take
+# the eager-path branch and emit ``UserWarning: Accessing the data pointer
+# of FakeTensor is deprecated`` on the FakeTensor outputs.
+#
+# Skipping in phase 1 is safe: none of these tests warm a CuTe kernel cache
+# (the ``@jit_cache`` exercises here use synthetic Python stubs, not real
+# ``@cute_op``-wrapped kernels), so phase 1 (cache warming) doesn't need
+# them. Phase 2 (real GPU, no ``--compile-only``) runs them normally.
+#
+# Same pattern as ``tests/test_complex.py``.
+# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.skipif(
+    quack.cache.COMPILE_ONLY,
+    reason="compile-only plumbing unit tests — each test mutates the global "
+    "COMPILE_ONLY flag and would leak False back to subsequent tests on the "
+    "same xdist worker, poisoning their data_ptr() guards",
+)
+
 
 # ---------------------------------------------------------------------------
 # Package layout / public-API surface
