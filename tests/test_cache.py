@@ -37,14 +37,30 @@ import quack.cache
 # ``@cute_op``-wrapped kernels), so phase 1 (cache warming) doesn't need
 # them. Phase 2 (real GPU, no ``--compile-only``) runs them normally.
 #
-# Same pattern as ``tests/test_complex.py``.
+# Subtle: the obvious ``pytestmark = pytest.mark.skipif(quack.cache.COMPILE_ONLY,
+# ...)`` does NOT work here. ``pytest.mark.skipif`` captures the *value* of
+# its first argument at decorator-application time (module-import time),
+# not as a deferred condition. Under xdist worksteal the worker can end up
+# importing this module before the plugin's ``pytest_configure`` has set
+# ``COMPILE_ONLY = True`` (the master collected items can be re-collected
+# at item-fetch time on the worker, ahead of the worker's own configure
+# phase). The mark then captures ``False`` and the skip never fires, the
+# tests run, the ``finally: COMPILE_ONLY = False`` leaks, and the data_ptr
+# warning surfaces in unrelated tests downstream.
+#
+# Use an autouse fixture instead — fixtures evaluate at test-setup time,
+# which is unambiguously after ``pytest_configure``.
 # ---------------------------------------------------------------------------
-pytestmark = pytest.mark.skipif(
-    quack.cache.COMPILE_ONLY,
-    reason="compile-only plumbing unit tests — each test mutates the global "
-    "COMPILE_ONLY flag and would leak False back to subsequent tests on the "
-    "same xdist worker, poisoning their data_ptr() guards",
-)
+
+
+@pytest.fixture(autouse=True)
+def _skip_under_compile_only():
+    if quack.cache.COMPILE_ONLY:
+        pytest.skip(
+            "compile-only plumbing unit tests — each test mutates the global "
+            "COMPILE_ONLY flag and would leak False back to subsequent tests on the "
+            "same xdist worker, poisoning their data_ptr() guards"
+        )
 
 
 # ---------------------------------------------------------------------------

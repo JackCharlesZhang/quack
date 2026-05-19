@@ -197,8 +197,18 @@ def pytest_collection_modifyitems(config, items):
     deselected = [
         item
         for item in items
-        if getattr(item, "callspec", None) is not None
-        and item.callspec.params.get("use_compile") is True
+        if (
+            getattr(item, "callspec", None) is not None
+            and item.callspec.params.get("use_compile") is True
+        )
+        # Belt-and-suspenders for ``tests/test_cache.py``'s autouse-fixture skip:
+        # those tests mutate the session-global ``quack.cache.COMPILE_ONLY`` flag
+        # and any one that slips through leaks ``False`` back, breaking the
+        # ``is_compile_only()`` data_ptr guards in every downstream test on the
+        # same xdist worker. Deselecting at collection time guarantees none of
+        # them ever reach the runtest protocol — independent of mark / fixture
+        # evaluation timing on the worker.
+        or item.nodeid.startswith("tests/test_cache.py")
     ]
     if not deselected:
         return
