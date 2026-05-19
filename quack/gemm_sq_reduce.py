@@ -298,9 +298,9 @@ def gemm_sq_reduce(
         device_capacity,
     )
 
-    from quack.cache import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

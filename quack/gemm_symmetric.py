@@ -415,9 +415,9 @@ def gemm_symmetric(
         device_capacity,
     )
 
-    from quack.cache import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     cluster_size = cluster_M * cluster_N

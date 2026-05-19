@@ -14,7 +14,22 @@ import torch
 import quack.cache
 from quack.cache import CompileOnlyFakeTensorMode
 
-quack.cache.COMPILE_ONLY = True
+# This subprocess lives in compile-only mode for its entire lifetime; push
+# the depth counter once at module load and let process exit pop it. We
+# deliberately reach into the underscore-prefixed ``_COMPILE_ONLY_DEPTH``
+# ContextVar instead of using ``compile_only_mode()`` because:
+#
+#   1. ``compile_only_mode()`` is a context manager that also enters a
+#      ``CompileOnlyFakeTensorMode``. The worker enters its own per-task
+#      ``CompileOnlyFakeTensorMode`` (see ``main()`` below) and doesn't want
+#      a long-lived outer one shadowing it.
+#   2. The depth is permanent for this process; there is nothing to ``.reset()``
+#      — the process terminates instead.
+#
+# This is an intentional internal exception to the rule documented in
+# ``quack/cache/__init__.py`` ("only :func:`compile_only_mode` mutates the
+# depth"). External callers should still use ``compile_only_mode()``.
+quack.cache._COMPILE_ONLY_DEPTH.set(quack.cache._COMPILE_ONLY_DEPTH.get() + 1)
 
 _dtype_map = {
     "torch.float16": torch.float16,
