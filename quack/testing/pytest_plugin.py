@@ -33,6 +33,13 @@ _fake_mode: CompileOnlyFakeTensorMode | None = None
 # set it True out-of-band before pytest started).
 _prev_compile_only: bool | None = None
 
+# Saved originals so ``pytest_unconfigure`` can restore pytest internals we
+# monkey-patched in ``pytest_configure``. Set to ``None`` when the
+# corresponding patch was skipped (e.g. pytest internals didn't match what
+# we expected, or the env-var opt-out was set).
+_orig_compat_getfuncargnames = None
+_orig_fixtures_getfuncargnames = None
+
 
 def _should_swallow(exc_type) -> bool:
     """Should a ``--compile-only`` runtime error be force-passed?
@@ -76,6 +83,133 @@ def _is_compile_only(config) -> bool:
         return False
 
 
+def _install_getfuncargnames_cache() -> None:
+    """Cache ``_pytest.compat.getfuncargnames`` by stable function identity.
+
+    Performance background
+    ----------------------
+    Pytest's fixture resolution calls ``getfuncargnames`` ~20 times per test
+    (once per active fixture / parametrize axis). Each call runs
+    ``inspect.signature(function)`` from scratch — a deep AST/Signature build
+    with no caching upstream. For a 2k-test file this is ~40k
+    ``inspect.signature`` invocations and ~1 s of pure CPU per worker. See
+    pytest-dev/pytest#11284 (open since 2023) for the underlying root cause:
+    pytest probes the entire fixture closure for every test instead of just
+    the test's ``initialnames``.
+
+    Caching by ``id(function)`` does NOT work: the ``request`` fixture is
+    rebuilt per test, producing thousands of distinct function objects with
+    identical signatures. Cache by ``(qualname, co_filename, co_firstlineno)``
+    instead — that triple is stable across the per-test wrappers and uniquely
+    identifies a Python function definition.
+
+    Deliberate tradeoffs
+    --------------------
+    This is a monkey-patch of pytest's private API (``_pytest.compat`` and
+    ``_pytest.fixtures``). We accept this because (a) the upstream fix
+    (#11284) has been stuck in deprecation cycles for years, and (b) the
+    speedup is ~1 s wall per file for parametrize-heavy suites. To minimize
+    risk we:
+
+    * Validate that ``getfuncargnames`` has the expected ``(function, *, name,
+      cls)`` signature before patching, and skip silently with a warning if
+      pytest's internals have changed.
+    * Stash the originals so ``pytest_unconfigure`` restores them.
+    * Honor ``QUACK_PYTEST_NO_GETFUNCARGNAMES_CACHE=1`` to opt out at runtime.
+
+    Subtlety: ``_pytest.fixtures`` does ``from .compat import getfuncargnames``
+    at import time, so we must rebind the name on both modules.
+    """
+    global _orig_compat_getfuncargnames, _orig_fixtures_getfuncargnames
+
+    import os
+    import warnings
+
+    if os.environ.get("QUACK_PYTEST_NO_GETFUNCARGNAMES_CACHE"):
+        return
+
+    try:
+        import _pytest.compat as _compat
+        import _pytest.fixtures as _fixtures
+    except ImportError:
+        return  # pytest internals not where we expect them
+
+    orig = getattr(_compat, "getfuncargnames", None)
+    if orig is None or getattr(_fixtures, "getfuncargnames", None) is not orig:
+        warnings.warn(
+            "quack.testing.pytest_plugin: skipping getfuncargnames cache; "
+            "pytest internals (_pytest.compat / _pytest.fixtures) do not "
+            "match expected shape. Tests still run, just without the "
+            "~1 s/file fixture-resolution speedup.",
+            stacklevel=2,
+        )
+        return
+
+    # Verify the signature is still `(function, *, name, cls)`. If pytest bumps
+    # the API we'd rather skip than silently miscache.
+    import inspect
+
+    try:
+        sig = inspect.signature(orig)
+        params = sig.parameters
+        expected = ("function", "name", "cls")
+        if not all(p in params for p in expected):
+            raise ValueError(f"unexpected params {tuple(params)!r}")
+    except (TypeError, ValueError) as e:
+        warnings.warn(
+            f"quack.testing.pytest_plugin: skipping getfuncargnames cache; "
+            f"signature check failed ({e!r}). Tests still run normally.",
+            stacklevel=2,
+        )
+        return
+
+    cache: dict = {}
+
+    def _identity_key(function):
+        code = getattr(function, "__code__", None)
+        if code is None:
+            return ("__obj__", function)
+        return (
+            getattr(function, "__qualname__", None) or function.__name__,
+            code.co_filename,
+            code.co_firstlineno,
+        )
+
+    def _patched(function, *, name="", cls=None):
+        try:
+            key = (_identity_key(function), name, cls)
+        except (AttributeError, TypeError):
+            return orig(function, name=name, cls=cls)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        result = orig(function, name=name, cls=cls)
+        cache[key] = result
+        return result
+
+    _orig_compat_getfuncargnames = orig
+    _orig_fixtures_getfuncargnames = _fixtures.getfuncargnames  # == orig
+    _compat.getfuncargnames = _patched
+    # Captured via `from .compat import getfuncargnames` at import time.
+    _fixtures.getfuncargnames = _patched
+
+
+def _restore_getfuncargnames_cache() -> None:
+    """Undo ``_install_getfuncargnames_cache``. No-op if not installed."""
+    global _orig_compat_getfuncargnames, _orig_fixtures_getfuncargnames
+    if _orig_compat_getfuncargnames is None:
+        return
+    try:
+        import _pytest.compat as _compat
+        import _pytest.fixtures as _fixtures
+    except ImportError:
+        return
+    _compat.getfuncargnames = _orig_compat_getfuncargnames
+    _fixtures.getfuncargnames = _orig_fixtures_getfuncargnames
+    _orig_compat_getfuncargnames = None
+    _orig_fixtures_getfuncargnames = None
+
+
 def _disable_unused_accelerator_lazy_call() -> None:
     """No-op ``_lazy_call`` for accelerators that aren't available.
 
@@ -110,6 +244,11 @@ def pytest_configure(config):
     # --compile-only too (FakeTensorMode swallows the seed call anyway).
     _disable_unused_accelerator_lazy_call()
 
+    # Cache inspect.signature() lookups behind _pytest.compat.getfuncargnames.
+    # Pytest re-builds signatures ~20x per test during fixture resolution; on a
+    # 2k-test file this is several seconds of pure CPU we can avoid.
+    _install_getfuncargnames_cache()
+
     if not _is_compile_only(config):
         return
 
@@ -126,8 +265,15 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
-    """Exit the compile-only context and restore the prior COMPILE_ONLY flag."""
+    """Exit the compile-only context and undo any pytest-internal patches."""
     global _fake_mode, _prev_compile_only
+
+    # Always undo the global monkey-patches we installed, even if the
+    # --compile-only branch below early-returns. This keeps the process clean
+    # for downstream callers (e.g. notebook hosts that pytest-main multiple
+    # times in the same interpreter).
+    _restore_getfuncargnames_cache()
+
     if _fake_mode is None:
         return
     _fake_mode.__exit__(None, None, None)
