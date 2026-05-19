@@ -22,13 +22,24 @@ if not quack.cache.COMPILE_ONLY:
 
 from quack.trace import TraceContext, TraceSession, enabled
 
-pytestmark = [
-    pytest.mark.skipif(
-        quack.cache.COMPILE_ONLY,
-        reason="skipped under --compile-only: raw CuTe JIT trace kernels do not warm jit cache",
-    ),
-    pytest.mark.skipif(not enabled(), reason="QUACK_TRACE=1 not set"),
-]
+# QUACK_TRACE-not-set check stays as a pytestmark (it's a static
+# environment-variable check evaluated correctly at import time). The
+# compile-only skip can NOT be a ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``:
+# that captures the *value* at decorator-application time (module-import
+# time), which on xdist worksteal workers can be False before the plugin's
+# ``pytest_configure`` has set ``COMPILE_ONLY = True``. Use an autouse
+# fixture instead — fixtures evaluate at test-setup time, unambiguously
+# after ``pytest_configure``.
+pytestmark = pytest.mark.skipif(not enabled(), reason="QUACK_TRACE=1 not set")
+
+
+@pytest.fixture(autouse=True)
+def _skip_under_compile_only():
+    if quack.cache.COMPILE_ONLY:
+        pytest.skip(
+            "skipped under --compile-only: raw CuTe JIT trace kernels do not warm jit cache"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Kernel definitions (module-level so CuTe-DSL can inspect source)

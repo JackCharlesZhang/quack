@@ -21,11 +21,24 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is r
 # Skipping in phase 1 (--compile-only / cache warming) is safe: the underlying
 # rotary kernel signatures are still warmed by other parametrized tests in this
 # file. Phase 2 (real GPU) runs them normally.
-_skip_under_compile_only = pytest.mark.skipif(
-    is_compile_only(),
-    reason="runtime invariant (data_ptr aliasing / profiler kernel count / "
-    "torch.compile dispatch) cannot be validated under FakeTensorMode",
-)
+#
+# Implementation note: this is a ``usefixtures`` mark, not the obvious
+# ``pytest.mark.skipif(is_compile_only(), ...)``. ``skipif`` captures its
+# first argument's *value* at decorator-application time (module-import
+# time), which on xdist worksteal workers can be False before the plugin's
+# ``pytest_configure`` has set ``COMPILE_ONLY = True``. ``usefixtures``
+# defers the check to fixture setup, which runs unambiguously after
+# ``pytest_configure``.
+_skip_under_compile_only = pytest.mark.usefixtures("_skip_if_compile_only")
+
+
+@pytest.fixture
+def _skip_if_compile_only():
+    if is_compile_only():
+        pytest.skip(
+            "runtime invariant (data_ptr aliasing / profiler kernel count / "
+            "torch.compile dispatch) cannot be validated under FakeTensorMode"
+        )
 
 
 def _rotary_grid_dim_pairs():
