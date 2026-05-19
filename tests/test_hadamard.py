@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+from quack.cache import is_compile_only
 from quack.hadamard import hadamard_transform, hadamard_transform_fwd, hadamard_transform_ref
 
 
@@ -79,6 +80,12 @@ def test_hadamard_transform_non_power_of_two(N, dtype):
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(
+    is_compile_only(),
+    reason="torch.compile cannot trace through the outer FakeTensorMode that "
+    "--compile-only installs (Dynamo skips frames under non-infra dispatch modes); "
+    "the underlying hadamard kernel signature is warmed by test_hadamard_transform",
+)
 def test_hadamard_transform_compile():
     torch.manual_seed(3)
     dtype = torch.bfloat16

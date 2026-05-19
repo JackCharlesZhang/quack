@@ -3,12 +3,29 @@ import math
 import pytest
 import torch
 
+from quack.cache import is_compile_only
 from quack.rotary import apply_rotary, apply_rotary_emb, apply_rotary_emb_kv_, apply_rotary_emb_qkv_
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+# Marker for tests whose entire point is a runtime invariant that FakeTensorMode
+# cannot represent:
+#   * data_ptr() aliasing (FakeTensor has no real storage; .data_ptr() emits a
+#     DeprecationWarning and will raise in PyTorch 2.5).
+#   * torch.profiler kernel counts (no real kernel launches under --compile-only).
+#   * torch.compile / Dynamo dispatch traces (Dynamo skips frames when an outer
+#     FakeTensorMode dispatch is active, producing "no compiled frames" warnings).
+# Skipping in phase 1 (--compile-only / cache warming) is safe: the underlying
+# rotary kernel signatures are still warmed by other parametrized tests in this
+# file. Phase 2 (real GPU) runs them normally.
+_skip_under_compile_only = pytest.mark.skipif(
+    is_compile_only(),
+    reason="runtime invariant (data_ptr aliasing / profiler kernel count / "
+    "torch.compile dispatch) cannot be validated under FakeTensorMode",
+)
 
 
 def _rotary_grid_dim_pairs():
@@ -207,6 +224,7 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
+@_skip_under_compile_only
 def test_rotary_emb_compile():
     torch.manual_seed(42)
     device = "cuda"
@@ -238,6 +256,7 @@ def test_rotary_emb_compile():
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
+@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_inplace_backward_no_copy(use_compile):
     torch._dynamo.reset()
@@ -593,11 +612,15 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     out.backward(grad)
     out_pt.backward(grad_pt)
 
-    assert out.data_ptr() == qkv.data_ptr()
+    # data_ptr() comparison is deprecated on FakeTensor; under --compile-only the
+    # inplace contract can't be verified anyway (no real storage to share).
+    if not is_compile_only():
+        assert out.data_ptr() == qkv.data_ptr()
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
+@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
     """Regression test for Dynamo dispatch across packed 5D QKV then 4D GQA QKV."""
@@ -680,6 +703,7 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
     run_case(gqa=True)
 
 
+@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
     torch._dynamo.reset()
@@ -748,6 +772,7 @@ def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
     torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
+@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_packed_reshape_backward_no_copy(use_compile):
     torch._dynamo.reset()

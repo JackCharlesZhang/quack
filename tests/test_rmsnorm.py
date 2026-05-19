@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from quack.cache import is_compile_only
 from quack.rmsnorm import rmsnorm, rmsnorm_ref, _compile_rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
 
 torch._dynamo.config.cache_size_limit = 1024
@@ -106,6 +107,12 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
 
 
+@pytest.mark.skipif(
+    is_compile_only(),
+    reason="torch.compile cannot trace through the outer FakeTensorMode that "
+    "--compile-only installs (Dynamo skips frames under non-infra dispatch modes); "
+    "the underlying rmsnorm kernel signatures are warmed by other parametrized tests",
+)
 def test_rmsnorm_compile_2d_then_4d():
     """Regression test: torch.compile(rmsnorm) must work when called first with 2D input
     (standard) then 4D input (per-head), without dynamo.reset() in between."""

@@ -60,6 +60,11 @@ def _make_op(op_name: str, *, unsupported_n: int | None = None):
     return op, call_log
 
 
+@pytest.mark.skipif(
+    quack.cache.COMPILE_ONLY,
+    reason="test precondition requires COMPILE_ONLY=False; under outer "
+    "--compile-only the FakeTensorMode also blocks Dynamo from compiling the frame",
+)
 def test_fake_is_noop_under_torch_compile():
     """torch.compile tracing must NOT execute the cute_op body.
 
@@ -162,6 +167,13 @@ def test_has_symint_unit():
     assert _has_symint({"x": t, "n": 5}) is False
 
 
+@pytest.mark.skipif(
+    quack.cache.COMPILE_ONLY,
+    reason="requires Dynamo to actually compile f() with dynamic=True to propagate "
+    "SymInts through the op call; the outer FakeTensorMode that --compile-only "
+    "installs causes Dynamo to skip the frame, so no SymInts are ever produced "
+    "and the test's invariant cannot be exercised",
+)
 def test_fake_skips_symint_under_compile_only_strict():
     """SymInts in tensor shape OR scalar args must bypass the body.
 

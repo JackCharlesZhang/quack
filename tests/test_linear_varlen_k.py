@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+from quack.cache import is_compile_only
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
@@ -463,7 +464,8 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre
         concat_layout=concat_layout,
     )
     out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, concat_layout=concat_layout)
-    if pre_allocate_out:
+    # Aliasing check skipped under --compile-only (FakeTensor data_ptr deprecated).
+    if pre_allocate_out and not is_compile_only():
         assert out.data_ptr() == out_buf.data_ptr()
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 

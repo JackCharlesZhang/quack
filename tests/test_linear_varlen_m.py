@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+from quack.cache import is_compile_only
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
@@ -213,7 +214,10 @@ def test_gemm_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    if pre_allocate_out:
+    # Aliasing assertions only meaningful with real storage. Under --compile-only
+    # (FakeTensorMode) data_ptr() emits a deprecation warning and the comparison
+    # is meaningless; the kernel body has already dispatched (cache warmed) above.
+    if pre_allocate_out and not is_compile_only():
         assert out.data_ptr() == out_buf.data_ptr()
     A_f, B_f = A.float(), B.float()
     out_ref = gemm_ref(A_f, B_f, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
@@ -576,7 +580,9 @@ def test_gemm_gated_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    if pre_allocate_out:
+    # Aliasing assertions are skipped under --compile-only (FakeTensor data_ptr
+    # is deprecated). Kernel cache warming still happens above.
+    if pre_allocate_out and not is_compile_only():
         assert preact.data_ptr() == preact_buf.data_ptr()
         assert postact.data_ptr() == postact_buf.data_ptr()
     assert preact.shape == (total_m, n)
@@ -666,7 +672,9 @@ def test_gemm_dgated_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    if pre_allocate_out:
+    # Aliasing assertions are skipped under --compile-only (FakeTensor data_ptr
+    # is deprecated). Kernel cache warming still happens above.
+    if pre_allocate_out and not is_compile_only():
         assert dx.data_ptr() == dx_buf.data_ptr()
         assert postact.data_ptr() == postact_buf.data_ptr()
     if colvec_reduce:
@@ -745,7 +753,8 @@ def test_gemm_varlen_m_concat(
         tuned=False,
         concat_layout=concat,
     )
-    if pre_allocate_out:
+    # Aliasing check skipped under --compile-only (FakeTensor data_ptr deprecated).
+    if pre_allocate_out and not is_compile_only():
         assert out.data_ptr() == out_buf.data_ptr()
     out_ref = gemm_ref(
         A.float(),
@@ -809,7 +818,8 @@ def test_gemm_gated_varlen_m_concat(
         tuned=False,
         concat_layout=concat,
     )
-    if pre_allocate_out:
+    # Aliasing assertions skipped under --compile-only (FakeTensor data_ptr deprecated).
+    if pre_allocate_out and not is_compile_only():
         assert preact.data_ptr() == preact_buf.data_ptr()
         assert postact.data_ptr() == postact_buf.data_ptr()
     preact_ref, postact_ref = gemm_gated_ref(
