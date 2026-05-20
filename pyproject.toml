@@ -18,6 +18,7 @@ dependencies = [
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.1"]
 heuristics = ["nvidia-matmul-heuristics"]
 jax = ["jax", "jax-tvm-ffi"]
+bench = ["pandas"]
 dev = [
     "pre-commit",
     "pytest",

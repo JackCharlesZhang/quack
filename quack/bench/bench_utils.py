@@ -1,11 +1,16 @@
 """Shared helpers for triton perf_report-based benchmarks."""
 
-import os
+from __future__ import annotations
 
-import pandas as pd
+import os
+from typing import TYPE_CHECKING
+
 import torch
 from torch import Tensor
-from triton.testing import Benchmark
+
+if TYPE_CHECKING:
+    import pandas as pd
+    from triton.testing import Benchmark
 
 
 def run_and_print(mark, save_path=None):
@@ -29,6 +34,14 @@ def run_and_print(mark, save_path=None):
 
 
 def _run_one(fn, bench: Benchmark) -> pd.DataFrame:
+    try:
+        import pandas as pd
+    except ImportError as e:
+        raise ImportError(
+            "pandas is required to format benchmark results. "
+            "Install it with `pip install pandas` or `pip install -e '.[bench]'`."
+        ) from e
+
     x_names = list(bench.x_names)
     rows = []
     stat_keys = None  # locked in from the first runner result
