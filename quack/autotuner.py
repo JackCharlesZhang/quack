@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import sys
 import time
 import inspect
 import base64
@@ -12,6 +13,11 @@ import json
 from pathlib import Path
 from functools import cached_property, partial
 from typing import Dict, Tuple, List, Optional, Any
+from quack.bench.bench_utils import (
+    _bench_cuda_graph_l2_rotate,
+    _clone_l2_rotate_inputs,
+    _pick_l2_rotate_count,
+)
 
 import torch
 from torch import Tensor
@@ -306,6 +312,45 @@ class Autotuner:
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
+        # Default path: L2-cold CUDA-graph round-robin bench. ``__call__``
+        # sets ``self._l2_cold_arg_sets`` / ``self._l2_cold_kwarg_sets`` to
+        # pre-cloned (args, kwargs) sets once per shape (reused across all
+        # configs). Round-robin over fresh sets keeps the kernel measured
+        # under the cache-cold conditions that match production access
+        # patterns, so the autotuner picks configs that win at the same
+        # workload the user actually runs.
+        l2_cold_arg_sets = getattr(self, "_l2_cold_arg_sets", None)
+        l2_cold_kwarg_sets = getattr(self, "_l2_cold_kwarg_sets", None)
+        has_hooks = self.pre_hook is not None or self.post_hook is not None
+        use_l2_cold = (
+            self._do_bench is None
+            and l2_cold_arg_sets is not None
+            and l2_cold_kwarg_sets is not None
+            and not has_hooks
+        )
+
+        if use_l2_cold:
+            try:
+                return _bench_cuda_graph_l2_rotate(
+                    self.fn,
+                    l2_cold_arg_sets,
+                    l2_cold_kwarg_sets,
+                    extra_kwargs=config.all_kwargs(),
+                    quantiles=(0.5, 0.2, 0.8),
+                )
+            except (RuntimeError, MemoryError) as e:
+                # Narrow catch: only swallow GPU-side failures (smem
+                # overflow, kernel launch errors, OOM). Programming errors
+                # (TypeError, AssertionError, ValueError from conflict check
+                # above) propagate so the user sees them.
+                if verbose:
+                    print(f"Autotuning failed with {type(e).__name__}: {e}")
+                return [float("inf"), float("inf"), float("inf")]
+
+        # Legacy path: triton.testing.do_bench or user-supplied do_bench.
+        # Used when (a) a custom do_bench was passed via the decorator's
+        # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
+        # clone/restore inside hooks doesn't work under CUDA graph capture).
         def kernel_call():
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
@@ -394,15 +439,51 @@ class Autotuner:
                 def benchmark():
                     self._precompile(*args, configs=pruned_configs, **kwargs)
                     _gpu_warmup()
+                    # Pre-allocate cloned (args, kwargs) sets once per shape;
+                    # the same sets are reused across all configs to avoid
+                    # ~400x re-cloning. Skipped when hooks are present or a
+                    # custom do_bench was supplied (legacy fallback in _bench).
+                    has_hooks = self.pre_hook is not None or self.post_hook is not None
+                    if self._do_bench is None and not has_hooks:
+                        try:
+                            n_buffers = _pick_l2_rotate_count(args, kwargs)
+                            arg_sets, kwarg_sets = _clone_l2_rotate_inputs(args, kwargs, n_buffers)
+                            self._l2_cold_arg_sets = arg_sets
+                            self._l2_cold_kwarg_sets = kwarg_sets
+                        except (RuntimeError, MemoryError):
+                            # Cloning failed (likely OOM at extreme N); legacy
+                            # do_bench path will be used by _bench.
+                            self._l2_cold_arg_sets = None
+                            self._l2_cold_kwarg_sets = None
+                    else:
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    try:
+                        timings = {
+                            config: self._bench(*args, config=config, **kwargs)
+                            for config in pruned_configs
+                        }
+                    finally:
+                        # Free the cloned sets before persisting the cache so
+                        # the user's subsequent .fn(...) call has full HBM.
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
                     bench_end = time.time()
-                    if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
+                    verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+                    if verbose:
                         for config, time_ in timings.items():
                             print(f"[{config}] -> {time_[0]:.3f}ms")
+                    # Surface bench failures (configs returning inf timings)
+                    # so smem-overflow / launch errors aren't silently masked.
+                    n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
+                    if n_failed:
+                        print(
+                            f"quack autotune: {n_failed}/{len(timings)} configs "
+                            f"failed for {self.fn.__name__}{key}; "
+                            f"set {PACKAGE_NAME.upper()}_PRINT_AUTOTUNING=1 for details",
+                            file=sys.stderr,
+                        )
                     self.bench_time = bench_end - bench_start
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     self.configs_timings = timings
