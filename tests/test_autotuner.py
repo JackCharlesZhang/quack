@@ -247,7 +247,8 @@ def test_compile_worker_watchdog_terminates_orphan(tmp_path):
          ``QUACK_COMPILE_WORKER_PARENT_PID = P.pid`` and stdin=DEVNULL
          (so even if anything ever read stdin, it wouldn't be a P-owned
          pipe).
-      3. P writes W's pid to disk and exits.
+      3. P writes W's pid to disk, waits until W reports the watchdog is
+         installed, then exits.
       4. T polls for W's death. The watchdog must fire within ~10 s.
     """
     if sys.platform.startswith("win"):
@@ -255,23 +256,32 @@ def test_compile_worker_watchdog_terminates_orphan(tmp_path):
 
     parent_script = tmp_path / "parent.py"
     pid_path = tmp_path / "worker.pid"
+    ready_path = tmp_path / "worker.ready"
 
     # The 'worker' subprocess here is a busy-sleep loop with watchdog armed.
     # Critically: it does NOT call cw.main(), so the only thing that can
     # kill it is the watchdog SIGKILL'ing itself.
-    worker_inline_src = (
-        "import os, sys, time; "
-        "import quack._compile_worker as cw; "
-        "cw._WATCHDOG_POLL_SECS = float(os.environ['_QUACK_TEST_WATCHDOG_POLL_SECS']); "
-        "cw._install_parent_watchdog(); "
+    worker_inline_src = textwrap.dedent(
+        f"""
+        import os
+        import sys
+        import time
+
+        import quack._compile_worker as cw
+
+        cw._WATCHDOG_POLL_SECS = float(os.environ["_QUACK_TEST_WATCHDOG_POLL_SECS"])
+        cw._install_parent_watchdog()
+        with open({str(ready_path)!r}, "w") as f:
+            f.write("ready")
         # Sleep well past the watchdog poll * a safety margin. If the
         # watchdog doesn't fire, the test's outer 10s poll budget will
         # fail before this sleep returns.
-        "time.sleep(120); "
+        time.sleep(120)
         # If we reach here the watchdog didn't fire and the sleep finished;
         # exit with a recognizable nonzero code so the test can distinguish
         # "watchdog failed" from "watchdog SIGKILL'd" (SIGKILL gives -9).
-        "sys.exit(42)"
+        sys.exit(42)
+        """
     )
 
     parent_script.write_text(
@@ -294,12 +304,20 @@ def test_compile_worker_watchdog_terminates_orphan(tmp_path):
             )
             with open({str(pid_path)!r}, "w") as f:
                 f.write(str(p.pid))
-            # Give the worker a beat to actually install the watchdog
-            # before we exit. The watchdog installs synchronously on
-            # ``_install_parent_watchdog()`` call, and Popen returns once
-            # exec succeeded, so a small sleep is plenty.
+
+            # Wait until the worker has actually imported quack._compile_worker
+            # and installed the watchdog before letting this parent exit. This
+            # avoids a slow-import race on loaded CI machines, while still
+            # testing the orphan path after the ready file appears.
             import time
-            time.sleep(1.0)
+            deadline = time.time() + 30.0
+            while not os.path.exists({str(ready_path)!r}):
+                rc = p.poll()
+                if rc is not None:
+                    raise SystemExit(f"worker exited before installing watchdog: rc={{rc}}")
+                if time.time() > deadline:
+                    raise SystemExit("worker did not install watchdog within 30s")
+                time.sleep(0.05)
             sys.exit(0)
             """
         )
@@ -308,7 +326,7 @@ def test_compile_worker_watchdog_terminates_orphan(tmp_path):
     parent = subprocess.run(
         [sys.executable, str(parent_script)],
         capture_output=True,
-        timeout=30,
+        timeout=45,
     )
     assert parent.returncode == 0, (
         f"parent script failed: stdout={parent.stdout!r} stderr={parent.stderr!r}"
@@ -316,23 +334,42 @@ def test_compile_worker_watchdog_terminates_orphan(tmp_path):
     assert pid_path.exists(), "parent script did not write worker pid"
     worker_pid = int(pid_path.read_text())
 
+    def _worker_has_stopped(pid: int) -> bool:
+        if sys.platform.startswith("linux"):
+            try:
+                stat = open(f"/proc/{pid}/stat").read()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                stat = ""
+            if stat:
+                # /proc/<pid>/stat field 2 is parenthesized comm (which may
+                # contain spaces); field 3 after the final ')' is process state.
+                state_fields = stat[stat.rfind(")") + 2 :].split()
+                if state_fields and state_fields[0] == "Z":
+                    return True
+        try:
+            os.kill(pid, 0)  # signal 0 = exists check
+        except ProcessLookupError:
+            return True
+        return False
+
     # Poll for worker death. Budget: 10 s. Watchdog polls every 0.5 s
     # (the inline script sets _WATCHDOG_POLL_SECS=0.5), so we expect the
     # SIGKILL within ~0.5 s of the parent exit + a small grace period.
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        try:
-            os.kill(worker_pid, 0)  # signal 0 = exists check
-        except ProcessLookupError:
-            return  # worker is gone — watchdog fired as expected
+        if _worker_has_stopped(worker_pid):
+            return  # worker is gone/zombie — watchdog fired as expected
         time.sleep(0.2)
 
-    # Worker still alive after 10 s; the watchdog didn't fire. Try to
+    # Worker still running after 10 s; the watchdog didn't fire. Try to
     # clean up so we don't leak a process from the test.
-    try:
-        os.kill(worker_pid, 9)
-    except ProcessLookupError:
-        pass
+    if not _worker_has_stopped(worker_pid):
+        try:
+            os.kill(worker_pid, 9)
+        except ProcessLookupError:
+            pass
     pytest.fail(
         f"worker pid {worker_pid} still alive 10s after parent exit; "
         f"watchdog did not fire (the inline worker would have exited with "

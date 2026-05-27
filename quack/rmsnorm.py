@@ -573,25 +573,6 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
         return dx.to(x.dtype), None
 
 
-@cute.jit
-def _copy_bwd_partial(src: cute.Tensor, dst: cute.Tensor, pred: Optional[cute.Tensor]):
-    """Copy RMSNorm backward partial dW/dB with an atom matching predicate granularity.
-
-    CUTLASS/CuTe DSL 4.5.x with cu13 can miscompile ``cute.copy(atom, src, dst, pred=pred)``
-    for the ``((vec, 1), 1, k_tiles)`` layouts used by the partial dW/dB tensors when the
-    atom covers fewer elements than one predicate group. Use one atom per predicate group.
-    See https://github.com/NVIDIA/cutlass/issues/3241
-    """
-    if const_expr(pred is None):
-        copy_utils.copy(src, dst)
-    else:
-        num_copy_bits = const_expr(src.shape[0][0] * src.element_type.width)
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), src.element_type, num_bits_per_copy=num_copy_bits
-        )
-        cute.copy(copy_atom, src, dst, pred=pred)
-
-
 class RMSNormBackward(ReductionBase):
     def __init__(
         self,
@@ -1102,7 +1083,7 @@ class RMSNormBackward(ReductionBase):
                         )
                         cute.autovec_copy(tXsdW_other, tXrdW_other)
                         tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                    _copy_bwd_partial(tXrdW, tXgdW, tXpX)
+                    copy(tXrdW, tXgdW)
                 cute.arch.barrier()
             if const_expr(mdB is not None):
                 sdB = cute.make_tensor(
@@ -1123,13 +1104,13 @@ class RMSNormBackward(ReductionBase):
                         )
                         cute.autovec_copy(tXsdB_other, tXrdB_other)
                         tXrdB.store(tXrdB.load() + tXrdB_other.load())
-                    _copy_bwd_partial(tXrdB, tXgdB, tXpX)
+                    copy(tXrdB, tXgdB)
         else:
             # dw is already in fp32, so we can directly copy to global memory
             if const_expr(mdW is not None):
-                _copy_bwd_partial(tXrdW, tXgdW, tXpX)
+                copy(tXrdW, tXgdW)
             if const_expr(mdB is not None):
-                _copy_bwd_partial(tXrdB, tXgdB, tXpX)
+                copy(tXrdB, tXgdB)
 
         if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
             # Assume state contains that next useful buffer
