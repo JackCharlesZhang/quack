@@ -21,6 +21,11 @@ if not _shim_active and os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     # embedded ptxas-library cubin with one assembled by system ptxas.
     _cute_dsl_ptxas.patch()
 
+# Pythonic CuTe tensor indexing (`:` / `...` sugar) is installed as a side effect
+# of `from quack.dsl import cute_dsl_shim` above — that import runs
+# `quack/dsl/__init__.py`, which imports `quack.dsl.cute_tensor_indexing` and
+# monkey-patches CuTe's tensor classes process-wide. No explicit import is
+# needed here; do not re-add one.
 from quack.rmsnorm import rmsnorm  # noqa: E402
 from quack.softmax import softmax  # noqa: E402
 from quack.cross_entropy import cross_entropy  # noqa: E402

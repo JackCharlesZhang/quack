@@ -2,6 +2,9 @@
 
 """CuTe DSL helpers and integration hooks."""
 
+import quack.dsl.cute_tensor_indexing  # noqa: F401
+from quack.dsl.torch_library_op import cute_op
+
 __all__ = ["cute_op"]
 
 
