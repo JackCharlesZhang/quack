@@ -101,7 +101,7 @@ def row_reduce(
     warp_op = {
         cute.ReductionOp.ADD: operator.add,
         cute.ReductionOp.MAX: cute.arch.fmax if const_expr(x.dtype == Float32) else max,
-        cute.ReductionOp.MIN: cute.arch.fmin if const_expr(x.dtype == Float32) else min,
+        cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
     val = cute.arch.warp_reduction(
