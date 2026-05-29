@@ -118,6 +118,7 @@ class RMSNorm(ReductionBase):
             max(*(t.element_type.width for t in [mX, mRes, mW, mB, mO, mResO] if t is not None))
         )
         vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        self._cap_cluster_n(vecsize)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
         mW, mB = [
@@ -644,6 +645,7 @@ class RMSNormBackward(ReductionBase):
             max(*(t.element_type.width for t in [mX, mW, mdO, mdResO, mdX, mdRes] if t is not None))
         )
         vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        self._cap_cluster_n(vecsize)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
         mW = (

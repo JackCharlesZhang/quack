@@ -594,6 +594,93 @@ def test_rmsnorm_bwd_empty(has_bias):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("threads_per_row", [32, 64])
+def test_rmsnorm_degenerate_cluster_config_is_clamped(threads_per_row):
+    """A clustered config whose single CTA tile already spans the whole row
+    (tiler_mn[1] >= N) must still compute correct fwd/bwd, not double-count.
+
+    Before the fix, local_tile collapsed every peer CTA onto tile 0, so the
+    cluster reduction summed the full row cluster_n times and scaled rstd by
+    ~1/sqrt(cluster_n) (e.g. 0.7071 for N=256, cluster_n=2). The runtime clamp
+    in ReductionBase._cap_cluster_n drops cluster_n back to a value where each
+    peer owns a distinct tile, restoring correctness.
+    """
+    device_capacity = _device_capacity_or_skip()
+    if device_capacity < 9:
+        pytest.skip("SM8x lacks cluster support")
+    torch.random.manual_seed(0)
+    device = "cuda"
+    M, N = 256, 256  # vecsize=8 -> 32 vec-blocks; tpr*cluster_n=64/128 >= 32 => degenerate
+    dtype = torch.bfloat16
+
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    weight = torch.randn(N, device=device, dtype=dtype) * 0.1
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=device, dtype=torch.float32)
+
+    fwd_config = RmsNormFwdConfig(
+        num_threads=128,
+        threads_per_row=threads_per_row,
+        cluster_n=2,  # degenerate at N=256: tile_n >= N
+        reload_from=None,
+        delay_w_load=False,
+    )
+    rmsnorm_fwd_tuned.fn(
+        x,
+        weight,
+        out,
+        bias=None,
+        rstd=rstd,
+        mean=None,
+        residual=None,
+        residual_out=None,
+        eps=1e-6,
+        is_layernorm=False,
+        per_head=False,
+        config=fwd_config,
+    )
+    out_ref = rmsnorm_ref(x, weight, eps=1e-6)
+    rstd_ref = torch.rsqrt(x.float().square().mean(dim=-1) + 1e-6)
+    # The bug corrupted rstd by ~1/sqrt(2); require it close (not off by 30%).
+    torch.testing.assert_close(rstd, rstd_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, out_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+    # Backward must be correct too.
+    dout = torch.randn(M, N, device=device, dtype=dtype)
+    dx = torch.empty_like(x)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 2
+    dw_partial = torch.empty((sm_count, N), device=device, dtype=torch.float32)
+    bwd_config = RmsNormBwdConfig(
+        num_threads=128,
+        threads_per_row=threads_per_row,
+        cluster_n=2,
+        reload_wdy=None,
+        reload_x=None,
+        use_tma=False,
+        smem_stages=2,
+    )
+    rmsnorm_bwd_tuned.fn(
+        x,
+        weight,
+        dout,
+        rstd_ref,
+        dx,
+        dw_partial=dw_partial,
+        db_partial=None,
+        dresidual_out=None,
+        dresidual=None,
+        sm_count=sm_count,
+        per_head=False,
+        has_dw_partial=True,
+        has_db_partial=False,
+        config=bwd_config,
+    )
+    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    dx_ref, dw_ref = rmsnorm_bwd_ref(x, weight, dout, rstd_ref, eps=1e-6)
+    torch.testing.assert_close(dx, dx_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+    torch.testing.assert_close(dw, dw_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+
 def _device_capacity_or_skip() -> int:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for tuned-path tests")
