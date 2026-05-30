@@ -607,6 +607,7 @@ class HadamardTransform:
     ):
         self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
         self.persistent = persistent
+        self.async_load = persistent
         # print(self.plan)  # Uncomment to see the generated schedule and bit orders.
 
     @cute.jit
@@ -686,6 +687,12 @@ class HadamardTransform:
         tXcX_full = thr_copy.partition_S(cX)
         tXrX = cute.make_rmem_tensor_like(tXgX[..., 0])
         tXrO = cute.make_rmem_tensor_like(tXgO[..., 0])
+        tXsX = None
+        if const_expr(self.async_load):
+            sX = smem.allocate_tensor(
+                plan.dtype, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            )
+            tXsX = thr_copy.partition_D(sX)
 
         num_rows = cute.size(mX.shape[0])
         is_even_N = const_expr(shape[1] == tiler_mn[1])
@@ -703,6 +710,10 @@ class HadamardTransform:
 
         nblocks_m = cute.ceil_div(num_rows, plan.rows_per_block)
         num_cta = cute.arch.grid_dim()[0] if const_expr(self.persistent) else nblocks_m
+        if const_expr(self.async_load):
+            if block_row < nblocks_m:
+                copy(tXgX[..., block_row], tXsX, is_async=True)
+                cute.arch.cp_async_commit_group()
         num_iter = (
             1 if const_expr(not self.persistent) else cute.ceil_div(nblocks_m - block_row, num_cta)
         )
@@ -710,10 +721,18 @@ class HadamardTransform:
             row_block = block_row + i * num_cta
             row = row_block * plan.rows_per_block + row_in_cta
             row_is_valid = True if const_expr(tiler_mn[0] == 1) else row < num_rows
-            if const_expr(not is_even_N):
-                tXrX.fill(tXrX.element_type.zero)
-            if row_is_valid:
-                copy(tXgX[..., row_block], tXrX)
+            if const_expr(self.async_load):
+                cute.arch.cp_async_wait_group(0)
+                cute.autovec_copy(tXsX, tXrX)
+                next_row_block = row_block + num_cta
+                if next_row_block < nblocks_m:
+                    copy(tXgX[..., next_row_block], tXsX, is_async=True)
+                    cute.arch.cp_async_commit_group()
+            else:
+                if const_expr(not is_even_N):
+                    tXrX.fill(tXrX.element_type.zero)
+                if row_is_valid:
+                    copy(tXgX[..., row_block], tXrX)
 
             x_flat = cute.composition(tXrX, cute.make_layout((cute.size(tXrX), 1)))
             x_vals = cute.make_rmem_tensor_like(x_flat, dtype=Float32)
