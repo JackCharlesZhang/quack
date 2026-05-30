@@ -8,7 +8,7 @@ import torch
 from triton.testing import Benchmark, do_bench, perf_report
 
 from quack.bench.bench_utils import run_and_print
-from quack.hadamard import hadamard_transform, hadamard_transform_ref
+from quack.transform.hadamard import hadamard_transform, hadamard_transform_ref
 
 try:
     from fast_hadamard_transform import hadamard_transform as fast_hadamard_transform

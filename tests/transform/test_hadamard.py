@@ -3,7 +3,11 @@ import math
 import pytest
 import torch
 
-from quack.hadamard import hadamard_transform, hadamard_transform_fwd, hadamard_transform_ref
+from quack.transform.hadamard import (
+    hadamard_transform,
+    hadamard_transform_fwd,
+    hadamard_transform_ref,
+)
 
 
 torch._dynamo.config.cache_size_limit = 1024
