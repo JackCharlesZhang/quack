@@ -17,7 +17,7 @@ from cutlass import Boolean, Float32, Int32, const_expr
 from quack import copy_utils, layout_utils
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import get_device_multiprocessor_count, torch2cute_dtype_map
 from quack.dsl import cute_op
 
 
@@ -60,6 +60,19 @@ def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
     if torch.compiler.is_compiling():
         return t.contiguous()
     return t if t.stride(-1) == 1 else t.contiguous()
+
+
+def _get_num_sms(device: torch.device) -> int:
+    if not torch.cuda.is_available():
+        return 1
+    device_id = torch.cuda.current_device() if device.index is None else device.index
+    return max(1, get_device_multiprocessor_count(device_id))
+
+
+def _should_use_persistent(x: Tensor, N: int) -> bool:
+    # Persistent mode is intended only for the known occupancy-1 case: 32K rows
+    # with 16-bit elements. Other sizes keep the regular CTA-per-row launch.
+    return N == _MAX_N and x.dtype in (torch.float16, torch.bfloat16)
 
 
 # ─── Compile-time bit ownership ─────────────────────────────────────────────
@@ -590,8 +603,10 @@ class HadamardTransform:
         N: int,
         ept: int | None = None,
         rows_per_block: int | None = None,
+        persistent: bool = False,
     ):
         self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
+        self.persistent = persistent
         # print(self.plan)  # Uncomment to see the generated schedule and bit orders.
 
     @cute.jit
@@ -600,6 +615,7 @@ class HadamardTransform:
         mX: cute.Tensor,
         mO: cute.Tensor,
         scale: Float32,
+        num_sms: Int32,
         stream: cuda.CUstream,
     ):
         plan = self.plan
@@ -631,8 +647,12 @@ class HadamardTransform:
             tail_store_copy = tiled_copy
         tiler_mn = (plan.rows_per_block, plan.N_padded)
         # Each CTA processes `rows_per_block` rows; ceil-div handles a trailing partial CTA.
+        num_blocks_m = cute.ceil_div(mX.shape[0], plan.rows_per_block)
+        # Persistent mode assumes this kernel is used only for shapes with occupancy 1 CTA/SM.
+        # Therefore one persistent CTA per SM is enough; do not query full occupancy here.
+        grid_x = cutlass.min(num_blocks_m, num_sms) if const_expr(self.persistent) else num_blocks_m
         self.kernel(mX, mO, scale, tiler_mn, tiled_copy, tail_store_copy, tail_store_layout).launch(
-            grid=[cute.ceil_div(mX.shape[0], plan.rows_per_block), 1, 1],
+            grid=[grid_x, 1, 1],
             block=[plan.threads_per_transform, plan.rows_per_block, 1],
             stream=stream,
         )
@@ -652,38 +672,25 @@ class HadamardTransform:
         tidx, _, _ = cute.arch.thread_idx()
         row_in_cta = 0 if const_expr(plan.rows_per_block == 1) else cute.arch.thread_idx()[1]
         block_row, _, _ = cute.arch.block_idx()
-        row = block_row * plan.rows_per_block + row_in_cta
 
         smem = cutlass.utils.SmemAllocator()
 
         shape = mX.shape
-        idX = cute.make_identity_tensor(shape)
-        # Each CTA processes a (rows_per_block, N_padded) tile starting at
+        # Each CTA, per iteration, processes a (rows_per_block, N_padded) tile starting at
         # row block_row * rows_per_block.
-        gX, gO, cX = [cute.local_tile(mT, tiler_mn, (block_row, 0)) for mT in (mX, mO, idX)]
-
+        gX, gO = [cute.local_tile(mT, tiler_mn, (None, 0)) for mT in (mX, mO)]
         thr_copy = tiled_copy.get_slice(row_in_cta * plan.threads_per_transform + tidx)
         tXgX = thr_copy.partition_S(gX)
         tXgO = thr_copy.partition_D(gO)
+        cX = cute.make_identity_tensor(tiler_mn)
         tXcX_full = thr_copy.partition_S(cX)
-        tXrX = cute.make_rmem_tensor_like(tXgX)
-        tXrO = cute.make_rmem_tensor_like(tXgO)
+        tXrX = cute.make_rmem_tensor_like(tXgX[..., 0])
+        tXrO = cute.make_rmem_tensor_like(tXgO[..., 0])
 
         num_rows = cute.size(mX.shape[0])
-        row_is_valid = True if const_expr(tiler_mn[0] == 1) else row < num_rows
-
         is_even_N = const_expr(shape[1] == tiler_mn[1])
         tXpX = None if is_even_N else copy_utils.predicate_k(tXcX_full, limit=shape[1])
         copy = partial(copy_utils.copy, pred=tXpX)
-
-        if const_expr(not is_even_N):
-            tXrX.fill(tXrX.element_type.zero)
-        if row_is_valid:
-            copy(tXgX, tXrX)
-
-        x_flat = cute.composition(tXrX, cute.make_layout((cute.size(tXrX), 1)))
-        x_vals = cute.make_rmem_tensor_like(x_flat, dtype=Float32)
-        x_vals.store(x_flat.load().to(Float32))
 
         s_exchange_layout = cute.make_ordered_layout(
             (plan.threads_per_transform * plan.ept, plan.rows_per_block), order=(0, 1)
@@ -693,57 +700,79 @@ class HadamardTransform:
         sync_fn = (
             cute.arch.sync_warp if const_expr(plan.exchange_uses_syncwarp) else cute.arch.barrier
         )
-        for stage in cutlass.range_constexpr(plan.stages):
-            bit_shift = const_expr(plan.bit_shifts[stage])
-            radix = const_expr(1 << bit_shift)
-            x_vals = cute.composition(x_vals, cute.make_layout((radix, plan.ept // radix)))
-            _hadamard_thread_col(x_vals)
-            if const_expr(stage < plan.stages - 1 or not plan.use_tail_direct_store):
-                if const_expr(stage > 0):
-                    # Before reusing the exchange buffer, wait for the previous
-                    # exchange loads to finish.  Warp-local exchange plans use a
-                    # warp fence; cross-warp plans use a CTA barrier.
-                    sync_fn()
-                x_vals = exchange(x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift)
 
-        if const_expr(plan.use_tail_direct_store):
-            tail_size = const_expr(1 << plan.tail_bit_shift)
-            rest_size = const_expr(plan.ept // (tail_size * plan.copy_vecsize))
-            x_store = cute.composition(
-                x_vals, cute.make_layout((tail_size, plan.copy_vecsize, rest_size))
-            )
-            x_store = copy_utils.contiguous(layout_utils.select(x_store, [1, 0, 2]))
-            gO_store = gO[row_in_cta, None]
-            thr_store = tail_store_copy.get_slice(tidx)
-            tOgO = thr_store.partition_D(cute.composition(gO_store, tail_store_layout))
-            tOrO = cute.make_rmem_tensor_like(tOgO, tXrO.element_type)
-            cute.coalesce(tOrO).store((cute.coalesce(x_store).load() * scale).to(tOrO.element_type))
+        nblocks_m = cute.ceil_div(num_rows, plan.rows_per_block)
+        num_cta = cute.arch.grid_dim()[0] if const_expr(self.persistent) else nblocks_m
+        num_iter = (
+            1 if const_expr(not self.persistent) else cute.ceil_div(nblocks_m - block_row, num_cta)
+        )
+        for i in cutlass.range(num_iter, unroll=2 if const_expr(self.persistent) else 1):
+            row_block = block_row + i * num_cta
+            row = row_block * plan.rows_per_block + row_in_cta
+            row_is_valid = True if const_expr(tiler_mn[0] == 1) else row < num_rows
+            if const_expr(not is_even_N):
+                tXrX.fill(tXrX.element_type.zero)
             if row_is_valid:
-                if const_expr(is_even_N):
-                    cute.copy(tail_store_copy, tOrO, tOgO)
-                else:
-                    cO_store = cute.make_identity_tensor(tail_store_layout.shape)
-                    tOcO = thr_store.partition_D(cO_store)
-                    tOpO = _tail_store_pred(tOcO, tail_store_layout, shape[1])
-                    cute.copy(tail_store_copy, tOrO, tOgO, pred=tOpO)
-        else:
-            o_flat = cute.composition(tXrO, cute.make_layout((cute.size(tXrO), 1)))
-            o_flat.store((x_vals.load() * scale).to(tXrO.element_type))
-            if row_is_valid:
-                copy(tXrO, tXgO)
+                copy(tXgX[..., row_block], tXrX)
+
+            x_flat = cute.composition(tXrX, cute.make_layout((cute.size(tXrX), 1)))
+            x_vals = cute.make_rmem_tensor_like(x_flat, dtype=Float32)
+            x_vals.store(x_flat.load().to(Float32))
+
+            for stage in cutlass.range_constexpr(plan.stages):
+                bit_shift = const_expr(plan.bit_shifts[stage])
+                radix = const_expr(1 << bit_shift)
+                x_vals = cute.composition(x_vals, cute.make_layout((radix, plan.ept // radix)))
+                _hadamard_thread_col(x_vals)
+                if const_expr(stage < plan.stages - 1 or not plan.use_tail_direct_store):
+                    if const_expr(stage > 0 or self.persistent):
+                        # Before reusing the exchange buffer, wait for the previous
+                        # exchange loads to finish.  Warp-local exchange plans use a
+                        # warp fence; cross-warp plans use a CTA barrier.
+                        sync_fn()
+                    x_vals = exchange(x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift)
+
+            if const_expr(plan.use_tail_direct_store):
+                tail_size = const_expr(1 << plan.tail_bit_shift)
+                rest_size = const_expr(plan.ept // (tail_size * plan.copy_vecsize))
+                x_store = cute.composition(
+                    x_vals, cute.make_layout((tail_size, plan.copy_vecsize, rest_size))
+                )
+                x_store = copy_utils.contiguous(layout_utils.select(x_store, [1, 0, 2]))
+                gO_store = gO[row_in_cta, None, row_block]
+                thr_store = tail_store_copy.get_slice(tidx)
+                tOgO = thr_store.partition_D(cute.composition(gO_store, tail_store_layout))
+                tOrO = cute.make_rmem_tensor_like(tOgO, tXrO.element_type)
+                cute.coalesce(tOrO).store(
+                    (cute.coalesce(x_store).load() * scale).to(tOrO.element_type)
+                )
+                if row_is_valid:
+                    if const_expr(is_even_N):
+                        cute.copy(tail_store_copy, tOrO, tOgO)
+                    else:
+                        cO_store = cute.make_identity_tensor(tail_store_layout.shape)
+                        tOcO = thr_store.partition_D(cO_store)
+                        tOpO = _tail_store_pred(tOcO, tail_store_layout, shape[1])
+                        cute.copy(tail_store_copy, tOrO, tOgO, pred=tOpO)
+            else:
+                o_flat = cute.composition(tXrO, cute.make_layout((cute.size(tXrO), 1)))
+                o_flat.store((x_vals.load() * scale).to(tXrO.element_type))
+                if row_is_valid:
+                    copy(tXrO, tXgO[..., row_block])
 
     @staticmethod
     @jit_cache
-    def compile(dtype, N):
+    def compile(dtype, N, persistent: bool = False):
         batch_sym = cute.sym_int()
         div = math.gcd(N, 128 // dtype.width)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
         out_cute = fake_tensor(dtype, (batch_sym, N), div)
         return cute.compile(
-            HadamardTransform(dtype, N),
+            HadamardTransform(dtype, N, persistent=persistent),
             x_cute,
             out_cute,
             Float32(0.0),
+            0,  # num_sms, just for compilation
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
@@ -768,7 +797,10 @@ def _hadamard_transform_fwd(x: Tensor, out: Tensor, scale: float) -> None:
     N = x.size(1)
     assert 2 <= N <= _MAX_N, f"Hadamard transform supports last dimension in [2, {_MAX_N}]"
     dtype = torch2cute_dtype_map[x.dtype]
-    HadamardTransform.compile(dtype, N)(x, out, scale)
+    persistent = _should_use_persistent(x, N)
+    compiled = HadamardTransform.compile(dtype, N, persistent)
+    num_sms = _get_num_sms(x.device) if persistent else 0
+    compiled(x, out, scale, num_sms)
 
 
 def hadamard_transform_fwd(x: Tensor, scale: float = 1.0) -> Tensor:
