@@ -537,6 +537,20 @@ def _hadamard_thread_col(vals: cute.Tensor) -> None:  # (N, col)
 
 
 @cute.jit
+def _hadamard_warp(
+    vals: cute.Tensor,
+    tidx: Int32,
+    log_width: cutlass.Constexpr[int],
+) -> None:
+    for step in cutlass.range_constexpr(log_width):
+        offset = const_expr(1 << step)
+        sign_bit = tidx & offset
+        sign = Float32(1.0) if sign_bit == 0 else Float32(-1.0)
+        for i in cutlass.range(cute.size(vals), unroll_full=True):
+            vals[i] = sign * vals[i] + cute.arch.shuffle_sync_bfly(vals[i], offset=offset)
+
+
+@cute.jit
 def exchange(
     vals: cute.Tensor,  # size ept
     smem: cute.Tensor,  # compact backing smem, size ept * threads_per_transform
@@ -608,6 +622,7 @@ class HadamardTransform:
         self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
         self.persistent = persistent
         self.async_load = persistent
+        self.use_shuffle = N <= 128  # slightly faster to use shuffles than smem for small N
         # print(self.plan)  # Uncomment to see the generated schedule and bit orders.
 
     @cute.jit
@@ -702,8 +717,10 @@ class HadamardTransform:
         s_exchange_layout = cute.make_ordered_layout(
             (plan.threads_per_transform * plan.ept, plan.rows_per_block), order=(0, 1)
         )
-        s_exchange = smem.allocate_tensor(Float32, s_exchange_layout, byte_alignment=16)
-        s_exchange = s_exchange[None, row_in_cta]
+        s_exchange = None
+        if const_expr(not self.use_shuffle):
+            s_exchange = smem.allocate_tensor(Float32, s_exchange_layout, byte_alignment=16)
+            s_exchange = s_exchange[None, row_in_cta]
         sync_fn = (
             cute.arch.sync_warp if const_expr(plan.exchange_uses_syncwarp) else cute.arch.barrier
         )
@@ -738,20 +755,24 @@ class HadamardTransform:
             x_vals = cute.make_rmem_tensor_like(x_flat, dtype=Float32)
             x_vals.store(x_flat.load().to(Float32))
 
-            for stage in cutlass.range_constexpr(plan.stages):
-                bit_shift = const_expr(plan.bit_shifts[stage])
-                radix = const_expr(1 << bit_shift)
-                x_vals = cute.composition(x_vals, cute.make_layout((radix, plan.ept // radix)))
+            if const_expr(self.use_shuffle):
                 _hadamard_thread_col(x_vals)
-                if const_expr(stage < plan.stages - 1 or not plan.use_tail_direct_store):
-                    if const_expr(stage > 0 or self.persistent):
-                        # Before reusing the exchange buffer, wait for the previous
-                        # exchange loads to finish.  Warp-local exchange plans use a
-                        # warp fence; cross-warp plans use a CTA barrier.
-                        sync_fn()
-                    x_vals = exchange(x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift)
+                _hadamard_warp(x_vals, tidx, log_width=plan.log_threads_per_transform)
+            else:
+                for stage in cutlass.range_constexpr(plan.stages):
+                    bit_shift = const_expr(plan.bit_shifts[stage])
+                    radix = const_expr(1 << bit_shift)
+                    x_vals = cute.composition(x_vals, cute.make_layout((radix, plan.ept // radix)))
+                    _hadamard_thread_col(x_vals)
+                    if const_expr(stage < plan.stages - 1 or not plan.use_tail_direct_store):
+                        if const_expr(stage > 0 or self.persistent):
+                            # Before reusing the exchange buffer, wait for the previous
+                            # exchange loads to finish.  Warp-local exchange plans use a
+                            # warp fence; cross-warp plans use a CTA barrier.
+                            sync_fn()
+                        x_vals = exchange(x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift)
 
-            if const_expr(plan.use_tail_direct_store):
+            if const_expr(not self.use_shuffle and plan.use_tail_direct_store):
                 tail_size = const_expr(1 << plan.tail_bit_shift)
                 rest_size = const_expr(plan.ept // (tail_size * plan.copy_vecsize))
                 x_store = cute.composition(
