@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -123,16 +122,6 @@ def store_shared_remote_x4(
 
 @dsl_user_op
 def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
-    if cutlass.const_expr(cutlass.CUDA_VERSION.major) == 12:
-        return Float32(
-            nvvm.fmin(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                loc=loc,
-                ip=ip,
-            )
-        )
     return Float32(
         nvvm.fmin(
             Float32(a).ir_value(loc=loc, ip=ip),
@@ -209,10 +198,11 @@ def make_vector(elem_type, *values, loc=None, ip=None):
     vec_ty = ir.VectorType.get([n], mlir_ty)
     vec = llvm.mlir_undef(vec_ty, loc=loc, ip=ip)
     for i, v in enumerate(values):
-        vec = vector.insertelement(
+        vec = vector.insert(
             elem_type(v).ir_value(loc=loc, ip=ip),
             vec,
-            position=_arith.constant(T.i32(), i, loc=loc, ip=ip),
+            dynamic_position=[],
+            static_position=[i],
             loc=loc,
             ip=ip,
         )
@@ -259,36 +249,12 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
 
 @dsl_user_op
 def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return nvvm.atomicrmw(
-            res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
-    else:
-        # New API: infers result type automatically
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return nvvm.atomicrmw(
-            res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
-    else:
-        # New API: infers result type automatically
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op
