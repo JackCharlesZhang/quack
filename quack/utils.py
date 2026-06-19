@@ -52,24 +52,18 @@ def store_shared_remote(
     loc=None,
     ip=None,
 ) -> None:
-    remote_smem_ptr_i32 = set_block_rank(
-        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip)
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip)
     if const_expr(isinstance(val, float)):
         val = Float32(val)
     assert isinstance(val, (Float32, Int32, cutlass.Int64)), "val must be Float32, Int32, or Int64"
     suffix = {Float32: "f32", Int32: "s32", cutlass.Int64: "s64"}[type(val)]
-    constraint = {Float32: "f", Int32: "r", cutlass.Int64: "l"}[type(val)]
-    llvm.inline_asm(
-        None,
-        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
-        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];",
-        f"r,{constraint},r",
-        has_side_effects=True,
-        is_align_stack=False,
+    cute.arch.inline_ptx(
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} "
+        "[{$r0}], {$r1}, [{$r2}];",
+        read_only_args=[remote_smem_ptr_i32, val, remote_mbar_ptr_i32],
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -86,37 +80,31 @@ def store_shared_remote_x4(
     loc=None,
     ip=None,
 ) -> None:
-    remote_smem_ptr_i32 = set_block_rank(
-        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip)
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip)
     assert isinstance(val0, (Float32, Int32)), "val must be Float32, or Int32"
     dtype = Float32 if isinstance(val0, Float32) else Int32
     suffix = {Float32: "f32", Int32: "s32"}[dtype]
-    constraint = {Float32: "f", Int32: "r"}[dtype]
-    llvm.inline_asm(
-        None,
-        [
-            remote_smem_ptr_i32,
-            remote_mbar_ptr_i32,
-            dtype(val0).ir_value(loc=loc, ip=ip),
-            dtype(val1).ir_value(loc=loc, ip=ip),
-            dtype(val2).ir_value(loc=loc, ip=ip),
-            dtype(val3).ir_value(loc=loc, ip=ip),
-        ],
+    cute.arch.inline_ptx(
         "{\n\t"
         f".reg .v4 .{suffix} abcd;\n\t"
-        f"mov.{suffix} abcd.x, $2;\n\t"
-        f"mov.{suffix} abcd.y, $3;\n\t"
-        f"mov.{suffix} abcd.z, $4;\n\t"
-        f"mov.{suffix} abcd.w, $5;\n\t"
-        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} [$0], abcd, [$1];\n\t"
+        f"mov.{suffix} abcd.x, {{$r2}};\n\t"
+        f"mov.{suffix} abcd.y, {{$r3}};\n\t"
+        f"mov.{suffix} abcd.z, {{$r4}};\n\t"
+        f"mov.{suffix} abcd.w, {{$r5}};\n\t"
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} "
+        "[{$r0}], abcd, [{$r1}];\n\t"
         "}\n",
-        f"r,r,{constraint},{constraint},{constraint},{constraint}",
-        has_side_effects=True,
-        is_align_stack=False,
+        read_only_args=[
+            remote_smem_ptr_i32,
+            remote_mbar_ptr_i32,
+            dtype(val0),
+            dtype(val1),
+            dtype(val2),
+            dtype(val3),
+        ],
+        loc=loc,
+        ip=ip,
     )
 
 

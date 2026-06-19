@@ -14,7 +14,6 @@ from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum
 import cutlass.pipeline
-from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
@@ -691,18 +690,16 @@ def cpasync_reduce_bulk_add_f32(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
     # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r",
+    cute.arch.inline_ptx(
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [{$r0}], [{$r1}], {$r2};",
+        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
         # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
         # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
         # "l,r,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -793,33 +790,34 @@ def tma_gather4_load(
     """
     if len(row_indices) != 4:
         raise ValueError(f"gather4 requires exactly 4 row indices, got {len(row_indices)}")
-    col_val = Int32(col_idx).ir_value()
-    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]
+    col_val = Int32(col_idx)
+    row_vals = [Int32(row_idx) for row_idx in row_indices]
     # Convert pointers to integer addresses
-    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()
-    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip)
+    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip)
     mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)
     if num_cta > 1:
         # Executed by both CTAs. Set peer bit to 0 so that the
         # transaction bytes will update CTA0's barrier.
         mbar_addr = mbar_addr & Sm100MmaPeerBitMask
-    mbar_addr = mbar_addr.ir_value()
+    mbar_addr = Int32(mbar_addr)
     # Handle multicast_mask - may already be ir.Value or Python int
     multicast_mask_val = None
     if multicast_mask is not None:
-        multicast_mask_val = Int16(multicast_mask).ir_value()
+        multicast_mask_val = Int16(multicast_mask)
     assert multicast_mask_val is None, "multicast is not supported yet"
     # Emit inline PTX for TMA gather4
     # PTX: cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes
     #      [dstMem], [tensorMap, {col, row0, row1, row2, row3}], [smem_bar];
     ptx = (
-        f"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} "
-        "[$0], [$1, {$2, $3, $4, $5, $6}], [$7];"
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes."
+        f"cta_group::{num_cta} "
+        "[{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}];"
     )
 
-    llvm.inline_asm(
-        None,
-        [
+    cute.arch.inline_ptx(
+        ptx,
+        read_only_args=[
             dst_addr,
             desc_addr,
             col_val,
@@ -829,10 +827,6 @@ def tma_gather4_load(
             row_vals[3],
             mbar_addr,
         ],
-        ptx,
-        "r,l,r,r,r,r,r,r",  # constraints: register, long, 6x register
-        has_side_effects=True,
-        is_align_stack=False,
         loc=loc,
         ip=ip,
     )
