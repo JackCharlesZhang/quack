@@ -34,6 +34,21 @@ def tanh(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 
 @dsl_user_op
+def dtanh(
+    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    if const_expr(not isinstance(x, tuple)):
+        tanh_x = tanh(x, loc=loc, ip=ip)
+        dx = dout * (1.0 - tanh_x * tanh_x)
+        return dx, tanh_x
+    else:
+        tanh_x = tanh(x, loc=loc, ip=ip)
+        sech2_x = cute.arch.fma_packed_f32x2(tanh_x, (-tanh_x[0], -tanh_x[1]), (1.0, 1.0))
+        dx = cute.arch.mul_packed_f32x2(dout, sech2_x)
+        return dx, tanh_x
+
+
+@dsl_user_op
 def sigmoid_tanh(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
         # return 0.5 + 0.5 * cute.math.tanh(0.5 * x, fastmath=True)
@@ -178,11 +193,16 @@ def dgelu_tanh_approx(
 
         # Compute gradient
         # sech^2(z) = 1 - tanh^2(z)
-        sech2_z = 1 - tanh_z * tanh_z
+        # Keep this as a multiply-add expression so vectorize=True lowers to
+        # FFMA2 like the explicit F32x2 path; `1.0 - tanh_z * tanh_z` costs
+        # an extra FADD2/FMUL2 pair per vector.
+        sech2_z = tanh_z * (-tanh_z) + 1.0
         # dz/dx = c1 + 3 * c2 * x^2
         dz_dx = sqrt_2_over_pi + sqrt_2_over_pi_coeff_3 * x_sq
         # d/dx[gelu(x)] = 0.5 * (1 + tanh(z)) + 0.5 * x * sech^2(z) * dz/dx
-        dgelu = half_tanh_z_plus_one + x * (0.5 * (sech2_z * dz_dx))
+        sech2_dz_dx = sech2_z * dz_dx
+        x_sech2_dz_dx = x * sech2_dz_dx
+        dgelu = x_sech2_dz_dx * 0.5 + half_tanh_z_plus_one
 
         dx = dout * dgelu
         return dx, gelu_out
@@ -335,7 +355,7 @@ def dsilu_tanh(
             tanh_x = tanh(x)
             sigmoid_x = 0.5 * tanh_x + 0.5
             silu_x = x * tanh_x + x
-        d_silu_x_dout = (sigmoid_x - silu_x * sigmoid_x + silu_x) * dout
+        d_silu_x_dout = (sigmoid_x + silu_x * (1.0 - sigmoid_x)) * dout
         return d_silu_x_dout, silu_x
     else:
         if const_expr(not already_halved):
@@ -404,7 +424,9 @@ def dswiglu(
         # = (sigmoid_x + silu_x * (1 - sigmoid_x)) * dout
         # = (sigmoid_x + silu_x - silu_x * sigmoid_x) * dout
         # = (sigmoid_x - silu_x * sigmoid_x) * dout + silu_x * dout
-        d_silu_x_dout = (sigmoid_x - silu_x * sigmoid_x) * dout + silu_x_dout  # FFMA, FFMA
+        # This form lets ptxas recover the same two packed FFMA instructions
+        # as the explicit F32x2 path while reusing silu_x_dout for dy.
+        d_silu_x_dout = (sigmoid_x + (-silu_x) * sigmoid_x) * dout + silu_x_dout
         dx = d_silu_x_dout * y  # FMUL
         dy = silu_x_dout
         swiglu_out = silu_x * y  # FMUL
@@ -449,7 +471,7 @@ def dswiglu_tanh(
             sigmoid_x = 0.5 * tanh_x + 0.5
             silu_x = x * tanh_x + x
         silu_x_dout = silu_x * dout
-        d_silu_x_dout = (sigmoid_x - silu_x * sigmoid_x) * dout + silu_x_dout
+        d_silu_x_dout = (sigmoid_x + (-silu_x) * sigmoid_x) * dout + silu_x_dout
         dx = d_silu_x_dout * y
         dy = silu_x_dout
         swiglu_out = silu_x * y
@@ -529,7 +551,12 @@ def dswiglu_oai(
         sigmoid_alpha_x = sigmoid(alpha * x)
         silu_x = x * sigmoid_alpha_x
         silu_x_dout = silu_x * dout
-        d_silu_x_dout = (sigmoid_alpha_x + alpha * (silu_x - silu_x * sigmoid_alpha_x)) * dout
+        # Keep this as two multiply-add expressions. With vectorize=True this
+        # matches the explicit F32x2 path; spelling it as (1 - sigmoid) costs
+        # an extra FADD2/FMUL2 pair per vector.
+        silu_x_minus_product = silu_x * (-sigmoid_alpha_x) + silu_x
+        sigmoid_plus_alpha_diff = silu_x_minus_product * alpha + sigmoid_alpha_x
+        d_silu_x_dout = sigmoid_plus_alpha_diff * dout
         dx = d_silu_x_dout * y + d_silu_x_dout
         dy = silu_x_dout
         swiglu_out = silu_x * y + silu_x
@@ -562,7 +589,11 @@ def dswiglu_oai_tanh(
         sigmoid_alpha_x = 0.5 + 0.5 * tanh(alpha_x_half)
         silu_x = x * sigmoid_alpha_x
         silu_x_dout = silu_x * dout
-        d_silu_x_dout = (sigmoid_alpha_x + alpha * (silu_x - silu_x * sigmoid_alpha_x)) * dout
+        # Same spelling as dswiglu_oai: this preserves the packed FFMA2 chain
+        # under cutlass.range(..., vectorize=True).
+        silu_x_minus_product = silu_x * (-sigmoid_alpha_x) + silu_x
+        sigmoid_plus_alpha_diff = silu_x_minus_product * alpha + sigmoid_alpha_x
+        d_silu_x_dout = sigmoid_plus_alpha_diff * dout
         dx = d_silu_x_dout * y + d_silu_x_dout
         dy = silu_x_dout
         swiglu_out = silu_x * y + silu_x
@@ -662,7 +693,8 @@ def dreglu(
     if const_expr(not isinstance(x, tuple)):
         x_pos = Boolean(x > 0)
         relu_x = relu(x, loc=loc, ip=ip)
-        dx = (dout * y) if x_pos else Float32(0.0)
+        dout_y = dout * y
+        dx = dout_y if x_pos else Float32(0.0)
         dy = dout * relu_x
         reglu_out = relu_x * y
         return dx, dy, reglu_out
@@ -740,9 +772,7 @@ dact_fn_map = {
     "relu": drelu,
     "relu_sq": drelu_sq,
     "gelu_tanh_approx": dgelu_tanh_approx,
-    # "tanh" is intentionally absent: only the forward epilogue exists. Adding a
-    # None entry would make gemm_dact silently skip the derivative (the identity
-    # path reserved for activation=None) instead of rejecting the activation.
+    "tanh": dtanh,
 }
 
 gate_fn_map = {

@@ -158,26 +158,17 @@ class GemmDGatedMixin(GemmActMixin):
                         tRS_rD_scaled_mn[m, n] = tRS_rD_mn[m, n] * scale
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch != 100):
-            for i in cutlass.range(cute.size(tRS_rD)):
-                (
-                    tRS_rdXY_f32x2[2 * i],
-                    tRS_rdXY_f32x2[2 * i + 1],
-                    tRS_rOut[i],
-                ) = params.act_bwd_fn(
-                    tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i]
-                )
-        else:
-            for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (
-                    (tRS_rdXY_f32x2[4 * i], tRS_rdXY_f32x2[4 * i + 2]),
-                    (tRS_rdXY_f32x2[4 * i + 1], tRS_rdXY_f32x2[4 * i + 3]),
-                    (tRS_rOut[2 * i], tRS_rOut[2 * i + 1]),
-                ) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2]),
-                    (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3]),
-                    (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
-                )
+        tRS_rXY_pair = cute.flat_divide(tRS_rXY_f32x2, cute.make_layout(2))
+        tRS_rX = tRS_rXY_pair[0, ...]
+        tRS_rY = tRS_rXY_pair[1, ...]
+        tRS_rdXY_pair = cute.flat_divide(tRS_rdXY_f32x2, cute.make_layout(2))
+        tRS_rdX = tRS_rdXY_pair[0, ...]
+        tRS_rdY = tRS_rdXY_pair[1, ...]
+        vectorize = const_expr(self.arch == 100)
+        for i in cutlass.range(cute.size(tRS_rD), vectorize=vectorize):
+            tRS_rdX[i], tRS_rdY[i], tRS_rOut[i] = params.act_bwd_fn(
+                tRS_rX[i], tRS_rY[i], tRS_rD_scaled[i]
+            )
         if const_expr(tDrColVecReduce is not None):
             # Accumulate postact * dout before D is scaled by colvec_scale
             colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rOut, rScale=tRS_rD)
