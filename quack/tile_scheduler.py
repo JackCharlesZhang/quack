@@ -587,7 +587,7 @@ def triangular_idx_to_coord(idx: Int32) -> Tuple[Int32, Int32]:
     Convert a triangular index to 2D coordinates.
     This is used to convert the linear index to 2D coordinates for triangular matrices.
     """
-    row = utils.ceil((utils.sqrt(2 * idx + 2.25) - 0.5)) - 1
+    row = Int32(cute.math.ceil(cute.math.sqrt(2 * idx + 2.25, approx=True) - 0.5)) - 1
     col = idx - (row * (row + 1)) // 2
     return row, col
 
@@ -732,8 +732,11 @@ class TriangularTileScheduler(TileScheduler):
         params = self.params
         group_size = params.group_size_fdd.divisor
         group_id = (
-            utils.ceil(
-                (utils.sqrt(2 * cluster_id_in_problem + 2.25) - 0.5) * params.group_size_inv_f32
+            Int32(
+                cute.math.ceil(
+                    (cute.math.sqrt(2 * cluster_id_in_problem + 2.25, approx=True) - 0.5)
+                    * params.group_size_inv_f32
+                )
             )
             - 1
         )

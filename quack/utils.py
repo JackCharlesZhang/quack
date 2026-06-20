@@ -99,34 +99,6 @@ def store_shared_remote_x4(
     )
 
 
-@dsl_user_op
-def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "sqrt.approx.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-        )
-    )
-
-
-@dsl_user_op
-def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "cvt.rpi.ftz.s32.f32 $0, $1;",
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-        )
-    )
-
-
 @cute.jit
 def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
     """Fill out-of-bounds values in shared memory tensor.

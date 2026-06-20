@@ -151,16 +151,11 @@ class GemmDGatedMixin(GemmActMixin):
                     tRS_rD_scaled, tDrColVec.layout
                 )
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
                     for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
                     ):
-                        (
-                            tRS_rD_scaled_mn[m, 2 * n],
-                            tRS_rD_scaled_mn[m, 2 * n + 1],
-                        ) = cute.arch.mul_packed_f32x2(
-                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
-                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                        )
+                        tRS_rD_scaled_mn[m, n] = tRS_rD_mn[m, n] * scale
         else:
             tRS_rD_scaled.store(tRS_rD.load())
         if const_expr(self.arch != 100):
@@ -194,15 +189,11 @@ class GemmDGatedMixin(GemmActMixin):
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
                 tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
                     for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
                     ):
-                        tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
-                                (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                            )
-                        )
+                        tRS_rOut_mn[m, n] = tRS_rOut_mn[m, n] * scale
         # Type conversion
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
