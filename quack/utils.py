@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
@@ -29,17 +29,8 @@ def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
 ) -> Int32:
     """Map the given smem pointer to the address at another CTA rank in the cluster."""
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-        )
-    )
+    dsmem_ptr = cute.arch.map_dsmem_ptr(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip)
+    return Int32(dsmem_ptr.toint(loc=loc, ip=ip))
 
 
 @dsl_user_op
@@ -105,18 +96,6 @@ def store_shared_remote_x4(
         ],
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
-    return Float32(
-        nvvm.fmin(
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            loc=loc,
-            ip=ip,
-        )
     )
 
 
@@ -233,44 +212,6 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
         if lane >= offset:
             val += partial_sum
     return val
-
-
-@dsl_user_op
-def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
-
-
-@dsl_user_op
-def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
-
-
-@dsl_user_op
-def issue_clc_query_nomulticast(
-    mbar_ptr: cute.Pointer,
-    clc_response_ptr: cute.Pointer,
-    loc=None,
-    ip=None,
-) -> None:
-    """
-    The clusterlaunchcontrol.try_cancel instruction requests atomically cancelling the launch
-    of a cluster that has not started running yet. It asynchronously writes an opaque response
-    to shared memory indicating whether the operation succeeded or failed. On success, the
-    opaque response contains the ctaid of the first CTA of the canceled cluster.
-
-    :param mbar_ptr: A pointer to the mbarrier address in SMEM
-    :type mbar_ptr:  Pointer
-    :param clc_response_ptr: A pointer to the cluster launch control response address in SMEM
-    :type clc_response_ptr:  Pointer
-    """
-    mbar_llvm_ptr = mbar_ptr.llvm_ptr
-    clc_response_llvm_ptr = clc_response_ptr.llvm_ptr
-    nvvm.clusterlaunchcontrol_try_cancel(
-        clc_response_llvm_ptr,
-        mbar_llvm_ptr,
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op

@@ -84,21 +84,11 @@ def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
 
     Returns (hi, lo) as a pair of Uint32 values.
     """
-    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    result = llvm.inline_asm(
-        struct_ty,
-        [
-            Uint32(a).ir_value(loc=loc, ip=ip),
-            Uint32(b).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n  .reg .u64 prod;\n  mul.wide.u32 prod, $2, $3;\n  mov.b64 {$1, $0}, prod;\n}",
-        "=r,=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    i32_ty = T.i32()
-    hi = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [0], loc=loc, ip=ip))
-    lo = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [1], loc=loc, ip=ip))
+    prod = cute.arch.mul_wide(Uint32(a), Uint32(b), loc=loc, ip=ip)
+    # ptxas folds the shift and to(Uint32) into the same IMAD.WIDE.U32 register pair
+    # that the previous inline PTX mov.b64 split produced.
+    hi = (prod >> 32).to(Uint32, loc=loc, ip=ip)
+    lo = prod.to(Uint32, loc=loc, ip=ip)
     return hi, lo
 
 
