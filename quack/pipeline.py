@@ -290,7 +290,7 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
             loc=loc,
             ip=ip,
         )
-        if const_expr(extra_tx_count == 0):
+        if const_expr(isinstance(extra_tx_count, int) and extra_tx_count == 0):
             self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
