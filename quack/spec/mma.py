@@ -82,7 +82,12 @@ def make_tiled_mma_for_arch(
         assert cta_group == 1, f"SM90 tiled_mma requires cta_group=1, got {cta_group}"
         assert source in ("SS", "RS"), f"SM90 tiled_mma source must be SS or RS, got {source}"
         assert permutation_mnk is None, "SM90 tiled_mma does not accept permutation_mnk"
-        a_major = spec._operand_major(spec.A, is_A=True)
+        # WGMMA RS source means the physical A operand is a register fragment,
+        # whose layout convention is K-major. This can differ from the logical
+        # TensorSpec storage (e.g. a P.T view may have MN-major SMEM backing but
+        # be fed directly from registers). Treat RS A as K-major regardless of
+        # the spec's SMEM layout.
+        a_major = "K" if source == "RS" else spec._operand_major(spec.A, is_A=True)
         b_major = spec._operand_major(spec.B, is_A=False)
         mode = {"K": cute.nvgpu.OperandMajorMode.K, "MN": cute.nvgpu.OperandMajorMode.MN}
         a_source = warpgroup.OperandSource.RMEM if source == "RS" else warpgroup.OperandSource.SMEM
@@ -93,7 +98,10 @@ def make_tiled_mma_for_arch(
             mode[b_major],
             acc_dtype,
             atom_layout_mnk=atom_layout_mnk,
-            tiler_mn=(64, spec.N),
+            # `atom_layout_mnk[1]` partitions the logical/physical N tile across
+            # warp-groups. The WGMMA atom's per-warpgroup N extent is therefore
+            # the full matmul N divided by that atom-layout N factor.
+            tiler_mn=(64, spec.N // atom_layout_mnk[1]),
             a_source=a_source,
         )
     elif arch.major in [8, 12]:  # SM8x and SM12x — warp-level MMA

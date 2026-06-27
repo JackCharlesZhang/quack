@@ -80,6 +80,11 @@ class TensorSpec:
     # is only a logical view flag from `.T`: the same storage can be used as a
     # transposed matmul operand without changing its backing layout/bytes.
     layout: LayoutEnum = LayoutEnum.ROW_MAJOR
+    # Optional override for the swizzled major-mode extent used to select the
+    # SMEM atom. Most kernels can derive this from `shape`, but multi-warpgroup
+    # SM90 kernels sometimes intentionally split the major mode per warpgroup
+    # while keeping the same logical tile shape.
+    major_mode_size: Optional[int] = None
     transposed: bool = False
     # TMA binding: one bundled `cpasync.TmaInfo` (atom + TMA coordinate tensor
     # + construction smem layout) — what _make_tma_atom returns. `tma_atom`/`gmem`
@@ -161,12 +166,19 @@ class TensorSpec:
         """
         return replace(self, gmem_raw=gmem)
 
-    def with_smem(self, storage_or_tensor) -> "TensorSpec":
+    def with_smem(self, storage_or_tensor, *, layout=None) -> "TensorSpec":
         """Return a new spec with the SMEM tensor attached (call inside the kernel).
         Accepts either a SmemAllocator storage field (derives the tensor with this
         spec's layout) or an already-built cute.Tensor (uses it directly — handy
-        when the kernel allocated SMEM via an external layout)."""
-        if hasattr(storage_or_tensor, "get_tensor"):
+        when the kernel allocated SMEM via an external layout). Pass `layout=` to
+        bind a storage field using a kernel-specific custom layout while keeping
+        the TensorSpec's logical shape/dtype/stage for byte counts and MMA roles."""
+        if layout is not None:
+            if hasattr(layout, "outer"):
+                smem = storage_or_tensor.get_tensor(layout.outer, swizzle=layout.inner)
+            else:
+                smem = storage_or_tensor.get_tensor(layout)
+        elif hasattr(storage_or_tensor, "get_tensor"):
             smem = self.get_smem_tensor(storage_or_tensor)
         else:
             smem = storage_or_tensor
@@ -280,7 +292,13 @@ class TensorSpec:
         if self.rank == 1:
             # 1D vector-with-stage: no swizzling needed (small + naturally aligned).
             return cute.make_layout((self.shape[0], self.stage))
-        return spec_smem.make_smem_layout(self.dtype, self.layout, self.storage_shape, self.stage)
+        return spec_smem.make_smem_layout(
+            self.dtype,
+            self.layout,
+            self.storage_shape,
+            self.stage,
+            self.major_mode_size,
+        )
 
     def tma_copy_bytes(self) -> int:
         # 1D specs have a single non-stage mode; 2D specs have two.
@@ -805,7 +823,9 @@ class MatmulSpec:
         - `sA`/`sB` default to `spec.smem`, **auto-transposed when the operand's
           major mode is "MN"**.
         - For `source="RS"`, `frag_A` is auto-allocated as an rmem tensor with
-          shape `tiled_mma.partition_shape_A((M, K))`.
+          shape `tiled_mma.partition_shape_A((M, K))`; on SM90 the physical A
+          operand is treated as K-major even if the logical TensorSpec also has
+          an MN-major SMEM backing.
         - `tiled_mma`: pass a pre-built TiledMma to bypass the arch-dispatched
           default (e.g. for warp-level MMA with custom permutation_mnk on SM120,
           or any non-default MMA op selection).
