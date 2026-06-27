@@ -679,6 +679,79 @@ def get_smem_load_A(
     return copy_fn if not with_dst_tensor else copy_fn_w_dst_tensor, thr_copy, tSR_sA
 
 
+def _cpasync_reduction_kind_name(reduction_kind: Any) -> str:
+    name = (
+        reduction_kind.lower() if isinstance(reduction_kind, str) else reduction_kind.name.lower()
+    )
+    assert name in {"add", "min", "max", "inc", "dec", "and", "or", "xor"}, (
+        f"Unsupported cp.reduce.async.bulk reduction kind: {reduction_kind}"
+    )
+    return name
+
+
+def _cpasync_bulk_reduce_suffix(
+    reduction_kind: Any,
+    dtype: Type[cutlass.Numeric],
+) -> str:
+    op = _cpasync_reduction_kind_name(reduction_kind)
+    if dtype is cutlass.Float16:
+        assert op in {"add", "min", "max"}, f"{op} is not supported for f16 bulk reduce"
+        return f"{op}.noftz.f16" if op == "add" else f"{op}.f16"
+    if dtype is cutlass.BFloat16:
+        assert op in {"add", "min", "max"}, f"{op} is not supported for bf16 bulk reduce"
+        return f"{op}.noftz.bf16" if op == "add" else f"{op}.bf16"
+    if dtype is cutlass.Float32:
+        assert op == "add", f"{op} is not supported for f32 bulk reduce"
+        return "add.f32"
+    if dtype is cutlass.Float64:
+        assert op == "add", f"{op} is not supported for f64 bulk reduce"
+        return "add.f64"
+
+    signed = getattr(dtype, "signed", None)
+    width = getattr(dtype, "width", None)
+    if signed is not None:
+        assert width in (32, 64), f"Unsupported integer bulk-reduce width: {width}"
+        if op in {"and", "or", "xor"}:
+            return f"{op}.b{width}"
+        if op in {"min", "max", "add"}:
+            return f"{op}.{'s' if signed else 'u'}{width}"
+        assert op in {"inc", "dec"} and dtype is cutlass.Uint32, (
+            f"{op} bulk reduce is only supported for u32"
+        )
+        return f"{op}.u32"
+
+    raise TypeError(f"Unsupported cp.reduce.async.bulk dtype: {dtype}")
+
+
+@dsl_user_op
+def cpasync_bulk_s2g(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int | Int32,
+    *,
+    reduction_kind: Optional[Any] = None,
+    dtype: Optional[Type[cutlass.Numeric]] = None,
+    loc=None,
+    ip=None,
+):
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
+    if reduction_kind is None:
+        ptx = "cp.async.bulk.global.shared::cta.bulk_group [{$r0}], [{$r1}], {$r2};"
+    else:
+        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
+        ptx = (
+            "cp.reduce.async.bulk.global.shared::cta.bulk_group."
+            f"{_cpasync_bulk_reduce_suffix(reduction_kind, dtype)} "
+            "[{$r0}], [{$r1}], {$r2};"
+        )
+    cute.arch.inline_ptx(
+        ptx,
+        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def cpasync_reduce_bulk_add_f32(
     smem_ptr: cute.Pointer,
@@ -688,14 +761,12 @@ def cpasync_reduce_bulk_add_f32(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
-    # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
-    cute.arch.inline_ptx(
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [{$r0}], [{$r1}], {$r2};",
-        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
-        # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
-        # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
-        # "l,r,r,l",
+    cpasync_bulk_s2g(
+        smem_ptr,
+        gmem_ptr,
+        store_bytes,
+        reduction_kind=cpasync.ReductionOp.ADD,
+        dtype=cutlass.Float32,
         loc=loc,
         ip=ip,
     )
@@ -834,15 +905,57 @@ def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
     single_stage: bool = False,
+    reduction_kind: Optional[cute.nvgpu.cpasync.ReductionKind] = None,
     **kwargs,
 ) -> Callable:
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    dst_is_smem = const_expr(
+        isinstance(dst_tensor.iterator, cute.Pointer)
+        and dst_tensor.memspace == cute.AddressSpace.smem
+    )
+    if const_expr(reduction_kind is not None):
+        assert src_is_smem and not dst_is_smem, "cp.reduce.async.bulk only supports SMEM -> GMEM"
     group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
     group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     src = cute.group_modes(src_tensor, 0, group_rank_src)
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
 
+    if const_expr(src_is_smem and not dst_is_smem):
+
+        def copy_bulk_s2g(src_idx, dst_idx, **new_kwargs):
+            store_bytes = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
+            with cute.arch.elect_one():
+                cpasync_bulk_s2g(
+                    src[None, src_idx].iterator,
+                    dst[None, dst_idx].iterator,
+                    store_bytes,
+                    reduction_kind=reduction_kind,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+        def copy_bulk_s2g_single_stage(**new_kwargs):
+            store_bytes = const_expr(cute.size(src.shape) * src.element_type.width // 8)
+            with cute.arch.elect_one():
+                cpasync_bulk_s2g(
+                    src.iterator,
+                    dst.iterator,
+                    store_bytes,
+                    reduction_kind=reduction_kind,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+        return copy_bulk_s2g if const_expr(not single_stage) else copy_bulk_s2g_single_stage
+
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
         with cute.arch.elect_one():
             cute.copy(
@@ -855,6 +968,7 @@ def cpasync_bulk_get_copy_fn(
             )
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
         with cute.arch.elect_one():
             cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
