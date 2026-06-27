@@ -129,9 +129,7 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
-        src_cvt.store(src.load().to(dst.element_type))
-        src = src_cvt
+        src = src.to(dst.element_type, loc=loc, ip=ip)
     if const_expr(retile):
         src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)

@@ -161,8 +161,7 @@ class GemmActMixin(ComposableEpiMixin):
             raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
             tRS_rAuxOut_out.store(TensorSSA(raw_vec, src_vec.shape, self.aux_out_dtype))
         else:
-            tRS_rAuxOut_out = cute.make_rmem_tensor_like(tRS_rAuxOut, self.aux_out_dtype)
-            tRS_rAuxOut_out.store(tRS_rAuxOut.load().to(self.aux_out_dtype))
+            tRS_rAuxOut_out = tRS_rAuxOut.to(self.aux_out_dtype)
         return tRS_rAuxOut_out
 
     @cute.jit
