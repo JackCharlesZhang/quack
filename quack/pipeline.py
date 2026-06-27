@@ -13,6 +13,7 @@ from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
+from cutlass.pipeline import PipelineTmaStore as PipelineTmaStoreOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
 from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
@@ -297,6 +298,31 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
+
+
+# ── PipelineTmaStore ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PipelineTmaStore(PipelineTmaStoreOg):
+    """PipelineTmaStore with configurable cp.async.bulk wait read flag."""
+
+    _read: bool = True
+
+    @staticmethod
+    def create(*args, read: bool = True, **kwargs):
+        obj = PipelineTmaStoreOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineTmaStore)
+        object.__setattr__(obj, "_read", read)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=self._read, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def producer_tail(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(0, read=self._read, loc=loc, ip=ip)
 
 
 # ── PipelineTmaUmma ─────────────────────────────────────────────────────────
