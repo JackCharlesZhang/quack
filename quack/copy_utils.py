@@ -976,6 +976,68 @@ def cpasync_bulk_get_copy_fn(
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
 
+def cpasync_bulk_get_store_or_add_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    store_first_contribution: bool,
+    single_stage: bool = False,
+    **kwargs,
+) -> Callable:
+    assert not single_stage, "store-or-add helper only supports staged SMEM -> GMEM tensors"
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    dst_is_smem = const_expr(
+        isinstance(dst_tensor.iterator, cute.Pointer)
+        and dst_tensor.memspace == cute.AddressSpace.smem
+    )
+    assert src_is_smem and not dst_is_smem, "store-or-add helper only supports SMEM -> GMEM"
+    group_rank_src = const_expr(cute.rank(src_tensor))
+    group_rank_dst = const_expr(cute.rank(dst_tensor))
+    src = cute.group_modes(src_tensor, 0, group_rank_src - 1)
+    dst = cute.group_modes(dst_tensor, 0, group_rank_dst - 1)
+
+    @cute.jit
+    def copy_bulk_s2g_store_or_add(src_idx, dst_idx, idx, **new_kwargs):
+        store_bytes = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
+        src_ptr = src[None, src_idx].iterator
+        dst_ptr = dst[None, dst_idx].iterator
+        with cute.arch.elect_one():
+            if const_expr(store_first_contribution):
+                if idx == 0:
+                    cpasync_bulk_s2g(
+                        src_ptr,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind=None,
+                        **new_kwargs,
+                        **kwargs,
+                    )
+                else:
+                    cpasync_bulk_s2g(
+                        src_ptr,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind=cpasync.ReductionOp.ADD,
+                        dtype=src.element_type,
+                        **new_kwargs,
+                        **kwargs,
+                    )
+            else:
+                cpasync_bulk_s2g(
+                    src_ptr,
+                    dst_ptr,
+                    store_bytes,
+                    reduction_kind=cpasync.ReductionOp.ADD,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+    return copy_bulk_s2g_store_or_add
+
+
 @dsl_user_op
 def tma_get_copy_fn(
     atom: cute.CopyAtom,
