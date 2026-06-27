@@ -493,20 +493,25 @@ class BoundMMA:
         return cute.make_rmem_tensor(self.frag_A.layout, self.frag_A.element_type)
 
     def fn(self, acc, zero_init=False, frag_A=None, frag_B=None):
-        """Return a partial that captures `acc`/frags — call per-iteration in a loop.
-        `frag_A`/`frag_B` override the bound fragments (multi-stage RS pattern).
+        """Return a callable that captures `acc`/default frags — call per-iteration in a loop.
+        `frag_A`/`frag_B` override the bound fragments either here or at call time
+        (multi-stage RS pattern where the A fragment is produced in the loop).
         When swap_AB, A_idx/B_idx are user-logical and get swapped internally."""
-        fA = frag_A if frag_A is not None else self.frag_A
-        fB = frag_B if frag_B is not None else self.frag_B
-        inner = partial(sm90_utils.gemm_w_idx, self.tiled_mma, acc, fA, fB, zero_init=zero_init)
-        if self.swap_AB:
-            # Wrap so logical (A_idx, B_idx) map to physical (B_idx, A_idx); all other
-            # kwargs (including caller-overridden zero_init/wg_wait) pass through `inner`.
-            def _fn(A_idx=None, B_idx=None, **kw):
-                return inner(A_idx=B_idx, B_idx=A_idx, **kw)
+        default_A = frag_A if frag_A is not None else self.frag_A
+        default_B = frag_B if frag_B is not None else self.frag_B
 
-            return _fn
-        return inner
+        def _fn(A_idx=None, B_idx=None, wg_wait=-1, zero_init=zero_init, frag_A=None, frag_B=None):
+            fA = frag_A if frag_A is not None else default_A
+            fB = frag_B if frag_B is not None else default_B
+            if self.swap_AB:
+                return sm90_utils.gemm_w_idx(
+                    self.tiled_mma, acc, fA, fB, zero_init, B_idx, A_idx, wg_wait
+                )
+            return sm90_utils.gemm_w_idx(
+                self.tiled_mma, acc, fA, fB, zero_init, A_idx, B_idx, wg_wait
+            )
+
+        return _fn
 
     def fn_zero_init(self, shape=None, frag_A=None, frag_B=None):
         """Return a partial for the zero-init gemm variant (allocates its own acc).
