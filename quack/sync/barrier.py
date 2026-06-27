@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Int32, Int64, const_expr
 
 
 @cute.jit
@@ -25,13 +25,31 @@ def wait_eq(
     thread_idx: Int32,
     flag_offset: Int32 | Int64,
     val: Int32,
+    skip_zero: bool = False,
+    sync: Literal["none", "warp", "cta"] = "none",
 ) -> None:
     """Wait until ``lock_ptr[flag_offset] == val`` using ``thread_idx == 0``."""
-    flag_ptr = lock_ptr + flag_offset
-    if thread_idx == 0:
-        read_val = Int32(0)
-        while read_val != val:
-            read_val = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
+    if const_expr(skip_zero):
+        if val != 0:
+            flag_ptr = lock_ptr + flag_offset
+            if thread_idx == 0:
+                read_val = Int32(0)
+                while read_val != val:
+                    read_val = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
+            if const_expr(sync == "warp"):
+                cute.arch.sync_warp()
+            elif const_expr(sync == "cta"):
+                cute.arch.sync_threads()
+    else:
+        flag_ptr = lock_ptr + flag_offset
+        if thread_idx == 0:
+            read_val = Int32(0)
+            while read_val != val:
+                read_val = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
+        if const_expr(sync == "warp"):
+            cute.arch.sync_warp()
+        elif const_expr(sync == "cta"):
+            cute.arch.sync_threads()
 
 
 @cute.jit
@@ -76,10 +94,21 @@ class Semaphore:
         elif self.sync == "cta":
             cute.arch.sync_threads()
 
-    def wait_eq(self, val: int | Int32, flag_offset: Optional[int | Int32 | Int64] = None) -> None:
+    def wait_eq(
+        self,
+        val: int | Int32,
+        flag_offset: Optional[int | Int32 | Int64] = None,
+        skip_zero: bool = False,
+    ) -> None:
         flag_offset = 0 if flag_offset is None else flag_offset
-        wait_eq(self.lock_ptr, self.thread_idx, flag_offset, val)
-        self._sync()
+        wait_eq(
+            self.lock_ptr,
+            self.thread_idx,
+            flag_offset,
+            val,
+            skip_zero=skip_zero,
+            sync=self.sync,
+        )
 
     def arrive_inc(
         self, val: int | Int32 = 1, flag_offset: Optional[int | Int32 | Int64] = None
