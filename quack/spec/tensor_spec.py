@@ -166,23 +166,62 @@ class TensorSpec:
         """
         return replace(self, gmem_raw=gmem)
 
-    def with_smem(self, storage_or_tensor, *, layout=None) -> "TensorSpec":
+    def with_smem(
+        self, storage_or_tensor, *, layout=None, single_stage: bool = False
+    ) -> "TensorSpec":
         """Return a new spec with the SMEM tensor attached (call inside the kernel).
-        Accepts either a SmemAllocator storage field (derives the tensor with this
-        spec's layout) or an already-built cute.Tensor (uses it directly — handy
-        when the kernel allocated SMEM via an external layout). Pass `layout=` to
-        bind a storage field using a kernel-specific custom layout while keeping
-        the TensorSpec's logical shape/dtype/stage for byte counts and MMA roles."""
+        Semantics:
+        - storage field, no layout: derive this spec's `smem_layout()` and recast
+          the backing pointer to this spec's dtype if the storage field differs.
+        - storage field, layout: use the supplied layout and recast to this spec's dtype.
+        - cute.Pointer, no layout: derive this spec's `smem_layout()` and reinterpret the
+          pointer as this spec's dtype/layout.
+        - cute.Pointer, layout: reinterpret the pointer as this spec's dtype with the layout.
+        - cute.Tensor, no layout: bind the tensor exactly as-is; dtype must already match.
+        - cute.Tensor, layout: unsupported; pass `tensor.iterator` to request reinterpretation."""
+        is_storage_field = const_expr(hasattr(storage_or_tensor, "get_tensor"))
+        is_tensor = const_expr(hasattr(storage_or_tensor, "iterator"))
+        is_pointer = const_expr(isinstance(storage_or_tensor, cute.Pointer))
+
         if layout is not None:
-            if hasattr(layout, "outer"):
-                smem = storage_or_tensor.get_tensor(layout.outer, swizzle=layout.inner)
+            assert not is_tensor, (
+                "with_smem(tensor, layout=...) is unsupported; pass tensor.iterator"
+            )
+            if const_expr(is_storage_field):
+                if hasattr(layout, "outer"):
+                    smem = storage_or_tensor.get_tensor(layout.outer, swizzle=layout.inner)
+                else:
+                    smem = storage_or_tensor.get_tensor(layout)
+                if const_expr(smem.element_type != self.dtype):
+                    smem = cute.make_tensor(
+                        cute.recast_ptr(smem.iterator, dtype=self.dtype), smem.layout
+                    )
             else:
-                smem = storage_or_tensor.get_tensor(layout)
-        elif hasattr(storage_or_tensor, "get_tensor"):
+                assert is_pointer, "with_smem(..., layout=...) expects a storage field or pointer"
+                smem = self._make_smem_tensor_from_ptr(storage_or_tensor, layout)
+        elif is_storage_field:
             smem = self.get_smem_tensor(storage_or_tensor)
+        elif is_pointer:
+            smem = self._make_smem_tensor_from_ptr(storage_or_tensor, self.smem_layout())
         else:
+            assert is_tensor, "with_smem expects a storage field or cute.Tensor"
             smem = storage_or_tensor
+            assert const_expr(smem.element_type == self.dtype), "SMEM tensor dtype mismatch"
+        if const_expr(single_stage):
+            assert self.stage == 1, "single_stage=True requires TensorSpec stage=1"
+            assert const_expr(cute.rank(smem) == self.rank + 1), (
+                "single_stage=True expects a staged SMEM tensor"
+            )
+            smem = smem[..., 0]
         return replace(self, smem=smem)
+
+    def _make_smem_tensor_from_ptr(self, ptr: cute.Pointer, layout) -> cute.Tensor:
+        """Reinterpret an SMEM pointer with `layout` and this spec's dtype."""
+        if hasattr(layout, "outer"):
+            return cute.make_tensor(
+                cute.recast_ptr(ptr, layout.inner, dtype=self.dtype), layout.outer
+            )
+        return cute.make_tensor(cute.recast_ptr(ptr, dtype=self.dtype), layout)
 
     def tmem_layout(self, *, cta_group: int = 1):
         """Role-free flat TMEM storage layout for this spec.
@@ -354,8 +393,12 @@ class TensorSpec:
         """Materialize the SMEM tensor backed by `storage_field` with this spec's layout."""
         layout = self.smem_layout()
         if hasattr(layout, "outer"):
-            return storage_field.get_tensor(layout.outer, swizzle=layout.inner)
-        return storage_field.get_tensor(layout)
+            smem = storage_field.get_tensor(layout.outer, swizzle=layout.inner)
+        else:
+            smem = storage_field.get_tensor(layout)
+        if const_expr(smem.element_type != self.dtype):
+            smem = cute.make_tensor(cute.recast_ptr(smem.iterator, dtype=self.dtype), smem.layout)
+        return smem
 
     @property
     def smem_T(self) -> cute.Tensor:

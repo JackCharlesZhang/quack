@@ -290,7 +290,7 @@ def mma_partition_C_vec(
     )
     stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
     sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
-    tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_C(sVec_mma))
+    tC_sVec = reshape_acc_to_mn(thr_mma.partition_C(sVec_mma))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
 
@@ -307,7 +307,7 @@ def mma_partition_A_vec(
     )
     stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
     sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
-    tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_A(sVec_mma))
+    tC_sVec = reshape_acc_to_mn(thr_mma.partition_A(sVec_mma))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
 
