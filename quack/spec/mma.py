@@ -8,7 +8,7 @@ from cutlass import Float32
 from cutlass.cute.nvgpu import warp, warpgroup, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Numeric
-import cutlass.utils.hopper_helpers as sm90_utils_og
+import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import LayoutEnum
 
@@ -91,7 +91,7 @@ def make_tiled_mma_for_arch(
         b_major = spec._operand_major(spec.B, is_A=False)
         mode = {"K": cute.nvgpu.OperandMajorMode.K, "MN": cute.nvgpu.OperandMajorMode.MN}
         a_source = warpgroup.OperandSource.RMEM if source == "RS" else warpgroup.OperandSource.SMEM
-        return sm90_utils_og.make_trivial_tiled_mma(
+        return sm90_utils.make_trivial_tiled_mma(
             spec.A.dtype,
             spec.B.dtype,
             mode[a_major],
