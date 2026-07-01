@@ -196,6 +196,7 @@ def load_t2r(
     tiled_copy: cute.TiledCopy,
     src: cute.Tensor,
     *,
+    fence: bool = False,
     loc=None,
     ip=None,
 ) -> cute.Tensor:
@@ -206,6 +207,8 @@ def load_t2r(
     """
     dst = tmem_reg_frag(tiled_copy, src, loc=loc, ip=ip)
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
+    if const_expr(fence):
+        cute.arch.fence_view_async_tmem_load()
     return dst
 
 
