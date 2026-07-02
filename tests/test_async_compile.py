@@ -7,9 +7,11 @@ quack/testing/pytest_plugin.py.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -219,3 +221,76 @@ def test_warm_session_with_flag_submits_nothing(tmp_path):
     assert second.returncode == 0, out
     assert "0 keys submitted" in out, out
     assert "0 test deferrals" in out, out
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="end-to-end defer needs a GPU"
+)
+def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
+    """OOM-retry hookwrapper + CompilePending on the retry must defer cleanly.
+
+    Regression: tests/conftest.py's OOM-retry hook re-invokes
+    ``item.runtest()`` inside an old-style hookwrapper teardown. When the
+    retry hit a cold jit_cache miss (--async-compile), the resulting
+    ``CompilePending`` escaped the teardown: pluggy emitted
+    ``PluggyTeardownRaisedWarning``, the plugin's defer machinery (which had
+    already run for this phase) never saw it, and the test reported as a
+    CompilePending *failure* instead of deferring (or, worse, passing from a
+    half-run attempt). Full analysis: the ``pytest_runtest_call`` docstring
+    in tests/conftest.py.
+
+    Uses the real repo conftest so the actual hook code is exercised. The
+    inner test scripts the exact sequence: attempt 1 raises a synthetic OOM,
+    the in-teardown retry raises CompilePending, and the defer-loop retry
+    passes (the sha is unknown to the pool, so it polls "new" and re-runs
+    immediately).
+    """
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    shutil.copy(Path(__file__).parent / "conftest.py", suite / "conftest.py")
+    (suite / "test_oom_retry.py").write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from quack.cache.async_compile import CompilePending
+
+            CALLS = {"n": 0}
+
+            def test_oom_then_cold_compile():
+                CALLS["n"] += 1
+                if CALLS["n"] == 1:
+                    raise torch.OutOfMemoryError("synthetic CUDA out of memory")
+                if CALLS["n"] == 2:
+                    # This is the conftest OOM-retry's item.runtest() call:
+                    # simulate the retry hitting a cold kernel compile.
+                    raise CompilePending("a" * 64, "fake._compile_rmsnorm_bwd")
+                assert CALLS["n"] == 3  # defer-loop retry succeeds
+            """
+        )
+    )
+
+    env = dict(os.environ)
+    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env.pop("PYTEST_XDIST_WORKER", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(suite),
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--async-compile=2",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        cwd=str(suite),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, f"inner pytest failed:\n{out}"
+    assert "1 passed" in out, out
+    assert "PluggyTeardownRaisedWarning" not in out, out
+    assert "1 test deferrals" in out, out

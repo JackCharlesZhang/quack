@@ -203,7 +203,40 @@ def _is_oom(exc_type, exc_val):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """Retry once on CUDA OOM after freeing GPU memory."""
+    """Retry once on CUDA OOM after freeing GPU memory.
+
+    The retry runs inside this hookwrapper's *teardown* (the code after
+    ``yield``), and pluggy's contract for old-style hookwrappers is that
+    teardown code must not raise: an escaping exception triggers
+    ``PluggyTeardownRaisedWarning`` and skips the remaining (outer) wrapper
+    teardowns (see pluggy ``_callers.py::_multicall``). So everything the
+    retried ``item.runtest()`` raises must be routed through the pluggy
+    ``Result`` (``outcome``), never re-raised.
+
+    The case that found this (CI, shared GPU + cold kernel cache): a test
+    OOMs while allocating its *inputs* (before any kernel call), memory is
+    freed, and the retry then reaches ``jit_cache`` where a cold ``.o`` miss
+    under ``--async-compile`` raises ``CompilePending`` — a ``BaseException``
+    by design, so nothing below can swallow it. Letting it escape here meant:
+
+    * pluggy warned (``PluggyTeardownRaisedWarning: CompilePending: kernel
+      compile pending in pool: _compile_rmsnorm_bwd [...]``), and
+    * the defer machinery in ``quack.testing.pytest_plugin`` (whose own
+      ``pytest_runtest_call`` wrapper had already run, or was skipped by the
+      teardown abort) never saw it, so ``item._quack_pending_sha`` stayed
+      unset and the test was reported from this half-run attempt instead of
+      being deferred and retried once its ``.o`` landed.
+
+    Hence the shape below: ``CompilePending`` is handed to the defer
+    machinery exactly the way ``_defer_if_compile_pending`` would
+    (``_quack_pending_sha`` + force-pass; the defer loop discards this
+    attempt's reports and re-runs the test later), and any other retry
+    exception — including a second OOM — becomes the recorded outcome via
+    ``force_exception`` so it is reported as an ordinary failure.
+
+    Regression test:
+    ``tests/test_async_compile.py::test_oom_retry_compile_pending_defers_not_warns``.
+    """
     outcome = yield
     if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
         import gc
@@ -212,5 +245,19 @@ def pytest_runtest_call(item):
         logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
         gc.collect()
         torch.cuda.empty_cache()
-        outcome.force_result(None)
-        item.runtest()
+        try:
+            item.runtest()
+        except BaseException as e:
+            from quack.cache.async_compile import CompilePending
+
+            if isinstance(e, CompilePending):
+                # Defer: mirror _defer_if_compile_pending (force-pass; the
+                # defer loop discards this attempt and retries the test).
+                item._quack_pending_sha = e.sha
+                outcome.force_result(None)
+            else:
+                # Real retry failure: report it through the outcome instead
+                # of raising out of the teardown (see docstring).
+                outcome.force_exception(e)
+        else:
+            outcome.force_result(None)
