@@ -377,11 +377,6 @@ def gemm_norm_act_fn(
         sr_seed_mode=sr_seed_mode,
     )
 
-    from quack.cache import is_compile_only
-
-    if is_compile_only():
-        return
-
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
     def scalar_arg(scalar, mode, dtype=Int32):

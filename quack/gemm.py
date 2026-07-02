@@ -251,11 +251,6 @@ def gemm(
         num_warps,
     )
 
-    from quack.cache import is_compile_only
-
-    if is_compile_only():
-        return
-
     def scalar_arg(scalar, mode, dtype=Float32):
         if mode == 0:
             return None

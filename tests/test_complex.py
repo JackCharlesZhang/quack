@@ -19,16 +19,6 @@ from quack.complex import (
     complex_storage,
     recast_to_complex64,
 )
-import quack.cache
-
-
-# Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
-# compile path here does not warm quack's jit cache, so the tests add nothing
-# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
-# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
-# ordering (unlike ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``
-# which captures at decorator-application time).
-pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
 
 
 class _ScaleByComplex:
@@ -540,8 +530,7 @@ def test_complex_storage_view_for_complex64():
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64
-    if not quack.cache.COMPILE_ONLY:
-        assert v.data_ptr() == c.data_ptr()
+    assert v.data_ptr() == c.data_ptr()
     assert v.numel() == c.numel()
 
 

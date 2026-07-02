@@ -10,13 +10,6 @@ import cutlass.cute.tensor as cute_tensor
 from quack.dsl import cute_tensor_indexing
 from quack.dsl.cute_tensor_indexing import _canonicalize_cute_tensor_index
 
-# These tests only exercise pure-Python canonicalization, monkey-patch installation,
-# and MLIR-builder construction (no kernel compile, no GPU). Under --compile-only
-# they would contribute nothing to the .o cache, so skip them entirely.
-pytestmark = pytest.mark.compile_only_skip(
-    "pure-Python / MLIR-builder tests; no kernel compile to cache"
-)
-
 
 def test_canonicalize_colon_and_ellipsis() -> None:
     assert _canonicalize_cute_tensor_index((1, slice(None), 2)) == (1, None, 2)
