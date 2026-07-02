@@ -1168,6 +1168,15 @@ def tmem_reg_frag(
     return cute.make_rmem_tensor((val_shape, *iters), frag_dtype, loc=loc, ip=ip)
 
 
+def coord_frag(tiled_copy: cute.TiledCopy, tidx: Int32, shape) -> cute.Tensor:
+    """Per-thread (row, col) coordinates aligned with a tiled copy's register
+    fragments (`tmem_reg_frag` / `load_t2r`): the register-side partition of
+    an identity tensor over `shape`. Deliberately partition_D — partition_S of
+    a TMEM tiled copy keeps whole warp-addressed atom tiles instead of
+    distributing elements over lanes."""
+    return tiled_copy.get_slice(tidx).partition_D(cute.make_identity_tensor(shape))
+
+
 def r2s_partition_from_t2r(
     tiled_copy_t2r: cute.TiledCopy,
     s: cute.Tensor,

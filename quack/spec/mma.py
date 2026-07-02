@@ -69,15 +69,16 @@ def make_tiled_mma_for_arch(
     acc_dtype: Type[cutlass.Numeric] = Float32,
     permutation_mnk: Optional[Tuple[int, int, int]] = None,
     arch=None,
-    *,
-    cta_group: int = 1,
 ) -> cute.TiledMma:
     """Arch-dispatched TiledMma builder for a MatmulSpec.
 
     Source modes are arch-specific: SM90 accepts SS/RS, SM100 accepts SS/TS.
+    cta_group comes off the spec (a storage-distribution property of the
+    operands); spec.M/N/K are full-tile dims.
     """
     if arch is None:
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    cta_group = spec.cta_group
     if arch.major == 9:  # Hopper — WGMMA
         assert cta_group == 1, f"SM90 tiled_mma requires cta_group=1, got {cta_group}"
         assert source in ("SS", "RS"), f"SM90 tiled_mma source must be SS or RS, got {source}"
@@ -131,7 +132,7 @@ def make_tiled_mma_for_arch(
         assert source in ("SS", "TS"), f"SM100 tiled_mma source must be SS or TS, got {source}"
         assert permutation_mnk is None, "SM100 tiled_mma does not accept permutation_mnk"
         cta_group_enum = tcgen05.CtaGroup.TWO if cta_group == 2 else tcgen05.CtaGroup.ONE
-        m_full, n_full = spec.M * cta_group, spec.N * cta_group
+        m_full, n_full = spec.M, spec.N
         n_inst = n_full if n_full <= 256 else n_full // 2
         if source == "TS":
             # TMEM A is a freshly materialized physical operand, not a logical
