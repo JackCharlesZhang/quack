@@ -42,14 +42,14 @@ ARG PYTHON_VERSION=3.12
 ARG CUDA_APT_SUFFIX=13-3
 ARG TORCH_CUDA=cu132
 ARG TORCH_VERSION=2.12.1
-ARG CUDNN_VERSION=9.23.2.1
+ARG CUDNN_VERSION=9.24.0.43
 ARG CUDNN_FRONTEND_VERSION=1.25.0
 ARG CUDA_PYTHON_VERSION=13.3.1
 ARG MATMUL_HEURISTICS_VERSION=0.1.0.27
 ARG NSIGHT_PYTHON_VERSION=0.9.6
-ARG COMPILEIQ_VERSION=1.0.1
+ARG COMPILEIQ_VERSION=1.0.2
 ARG UV_VERSION=0.11.22
-ARG CUTLASS_DSL_VERSION=4.6.0.dev0
+ARG CUTLASS_DSL_VERSION=4.6.0
 ARG TILELANG_VERSION=0.1.11
 ARG GH_VERSION=2.95.0
 
@@ -187,9 +187,7 @@ ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH}
 # and `pip check` treat that cuDNN version as the expected one.
 #
 # Install basic nsight-python, not nsight-python[cu13], so cuda-core[cu13] does
-# not pull an additional CUDA toolkit stack. Use pip for CUTLASS DSL: uv can
-# install the cu13 overlay in the wrong order
-# (https://github.com/NVIDIA/cutlass/issues/3259).
+# not pull an additional CUDA toolkit stack.
 RUN python -m pip install --upgrade pip "setuptools<82" wheel packaging "uv==${UV_VERSION}" && \
     export UV_CACHE_DIR=/tmp/uv-cache && \
     uv pip install \
@@ -220,9 +218,10 @@ RUN python -m pip install --upgrade pip "setuptools<82" wheel packaging "uv==${U
         "torch==${TORCH_VERSION}" && \
     uv pip install "nvidia-cudnn-cu13==${CUDNN_VERSION}" && \
     CUDNN_VERSION="${CUDNN_VERSION}" python -c 'from importlib.metadata import distribution; from pathlib import Path; import os, re; version=os.environ["CUDNN_VERSION"]; meta=Path(distribution("torch")._path)/"METADATA"; text=meta.read_text(); pattern=re.compile("^(Requires-Dist: nvidia-cudnn-cu13==)([^;\\s]+)(; platform_system == "+chr(34)+"Linux"+chr(34)+")$", re.M); new,count=pattern.subn(lambda m: f"{m.group(1)}{version}{m.group(3)}", text); assert count == 1, f"patched {count} torch cuDNN dependency lines"; meta.write_text(new)' && \
-    python -m pip install "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" && \
-    uv pip install "tilelang==${TILELANG_VERSION}" && \
-    python -m pip check && \
+    uv pip install \
+        "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+        "tilelang==${TILELANG_VERSION}" && \
+    uv pip check && \
     rm -rf /tmp/uv-cache && \
     rm -f \
         /opt/venv/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/lib/cupti/libcupti_static.a \
