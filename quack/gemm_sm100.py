@@ -2099,9 +2099,11 @@ class GemmSm100(GemmTmaBase):
         if const_expr(not self.gather_A or self.use_tma_gather):
             producer_cnt = 1
         else:
-            producer_cnt = self.num_ab_load_warps * 32 + (
-                1 if const_expr(not self.use_2cta_instrs) else 2
-            )
+            producer_cnt = self.num_ab_load_warps * cute.arch.WARP_SIZE
+            if const_expr(not self.use_2cta_instrs):
+                producer_cnt += 1
+            else:
+                producer_cnt += Int32(2) if is_leader_cta else Int32(0)
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
@@ -2125,9 +2127,6 @@ class GemmSm100(GemmTmaBase):
                 consumer_group=ab_pipeline_consumer_group,
                 tx_count=self.num_tma_load_bytes,
                 cta_layout_vmnk=cluster_layout_vmnk,
-                producer_drop_count=None
-                if not self.use_2cta_instrs
-                else (2 if not is_leader_cta else 0),
                 defer_sync=True,
             )
         return pipeline_ab

@@ -6,10 +6,7 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
-from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp
-from cutlass.pipeline import alloc_reserved_mbarrier
 from cutlass.pipeline import PipelineState, PipelineUserType
-from cutlass.pipeline import Agent, agent_sync
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
@@ -540,54 +537,6 @@ class PipelineTmaCpAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 PipelineTmaCpAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaCpAsync)
 
 
-# ── MbarrierArrayWDropCount ─────────────────────────────────────────────────
-
-
-class MbarrierArrayWDropCount(MbarrierArray):
-    @dsl_user_op
-    def __init__(
-        self,
-        barrier_storage: cute.Pointer,
-        num_stages: int,
-        agent: tuple[PipelineOp, CooperativeGroup],
-        tx_count: int = 0,
-        drop_count: Optional[Int32] = None,
-        *,
-        loc=None,
-        ip=None,
-    ) -> None:
-        self.barrier_storage = barrier_storage
-        self.tx_count = tx_count
-        self.num_stages = num_stages
-        self.op_type, self.cg = agent
-        self.arrive_count = self.cg.size
-        self.drop_count = drop_count
-
-        if self.num_stages <= 0:
-            raise ValueError("Error: Mbarrier stage count must be greater than 0.")
-        if self.arrive_count <= 0:
-            raise ValueError("Error: Mbarrier arrive count must be greater than 0.")
-        if self.op_type is PipelineOp.TmaLoad and self.tx_count < 0:
-            raise ValueError("Error: Mbarrier tx count must not be less than 0 for TMA ops.")
-
-        if const_expr(drop_count is not None):
-            self.arrive_count = self.arrive_count - drop_count
-
-        # Store mbarrier base pointer
-        self.mbarrier_base = self.barrier_storage
-
-        # Mbarrier initialization in constructor
-        self.mbarrier_init(loc=loc, ip=ip)
-
-    def __extract_mlir_values__(self):
-        return [self.barrier_storage, self.drop_count]
-
-    def __new_from_mlir_values__(self, values):
-        return MbarrierArrayWDropCount(
-            values[0], self.num_stages, (self.op_type, self.cg), self.tx_count, values[1]
-        )
-
-
 # ── PipelineTmaCpAsyncUmma ──────────────────────────────────────────────────
 
 
@@ -597,110 +546,6 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
     PipelineTmaCpAsync is used for CpAsync + TMA producers and UMMA consumers
     (e.g. Blackwell mainloops)
     """
-
-    @dsl_user_op
-    @staticmethod
-    def create(
-        *,
-        num_stages: int,
-        producer_group: CooperativeGroup,
-        consumer_group: CooperativeGroup,
-        tx_count: int,
-        barrier_storage: Optional[cute.Pointer] = None,
-        cta_layout_vmnk: Optional[cute.Layout] = None,
-        mcast_mode_mn: tuple[int, int] = (1, 1),
-        defer_sync: bool = False,
-        producer_drop_count: Optional[Int32] = None,
-        loc=None,
-        ip=None,
-    ):
-        """Creates and initializes a new PipelineTmaUmma instance.
-
-        :param num_stages: Number of buffer stages for this pipeline
-        :type num_stages: int
-        :param producer_group: CooperativeGroup for the producer agent
-        :type producer_group: CooperativeGroup
-        :param consumer_group: CooperativeGroup for the consumer agent
-        :type consumer_group: CooperativeGroup
-        :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
-        :type tx_count: int
-        :param barrier_storage: Pointer to the shared memory address for this pipeline's mbarriers
-        :type barrier_storage: cute.Pointer, optional
-        :param cta_layout_vmnk: Layout of the cluster shape
-        :type cta_layout_vmnk: cute.Layout, optional
-        :param mcast_mode_mn: Tuple specifying multicast modes for m and n dimensions (each 0 or 1)
-        :type mcast_mode_mn: tuple[int, int], optional
-        :raises ValueError: If barrier_storage is not a cute.Pointer instance
-        :return: A new PipelineTmaUmma instance configured with the provided parameters
-        :rtype: PipelineTmaUmma
-        """
-        if barrier_storage is None:
-            barrier_storage = alloc_reserved_mbarrier(num_stages)
-        if not isinstance(barrier_storage, cute.Pointer):
-            raise TypeError(
-                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
-            )
-
-        producer_type = PipelineOp.TmaLoad
-        consumer_type = PipelineOp.TCGen05Mma
-
-        producer = (producer_type, producer_group)
-        consumer = (consumer_type, consumer_group)
-
-        sync_object_full = MbarrierArrayWDropCount(
-            barrier_storage.align(min_align=8),
-            num_stages,
-            producer,
-            tx_count,
-            drop_count=producer_drop_count,
-            loc=loc,
-            ip=ip,
-        )
-        sync_object_empty = PipelineTmaUmmaOg._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages,
-            num_stages,
-            consumer,
-            loc=loc,
-            ip=ip,
-        )
-
-        if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, loc=loc, ip=ip) == 1:
-            # No mcast mask if not using clusters
-            producer_mask = None
-            # All threadblocks are leaders if not using clusters
-            is_leader_cta = True
-        else:
-            producer_mask = PipelineTmaUmmaOg._compute_mcast_arrival_mask(
-                cta_layout_vmnk, mcast_mode_mn, loc=loc, ip=ip
-            )
-            is_leader_cta = PipelineTmaUmmaOg._compute_is_leader_cta(
-                cta_layout_vmnk, loc=loc, ip=ip
-            )
-
-        cta_group = (
-            cute.nvgpu.tcgen05.CtaGroup.ONE
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0], loc=loc, ip=ip) == 1
-            else cute.nvgpu.tcgen05.CtaGroup.TWO
-        )
-
-        consumer_mask = producer_mask
-
-        if not defer_sync:
-            cute.arch.mbarrier_init_fence()
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, loc=loc, ip=ip) == 1:
-                agent_sync(Agent.ThreadBlock)
-            else:
-                agent_sync(Agent.ThreadBlockCluster, is_relaxed=True)
-
-        return PipelineTmaCpAsyncUmma(
-            sync_object_full,
-            sync_object_empty,
-            num_stages,
-            producer_mask,
-            consumer_mask,
-            is_leader_cta,
-            cta_group,
-        )
 
     @dsl_user_op
     def producer_acquire(
@@ -739,3 +584,6 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
         cute.arch.cp_async_mbarrier_arrive_noinc(
             self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip
         )
+
+
+PipelineTmaCpAsyncUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaCpAsyncUmma)
