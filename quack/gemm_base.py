@@ -15,7 +15,7 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes
-from quack.pipeline import PipelineTmaCpAsync
+from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.tile_scheduler import (
     PersistenceMode,
@@ -158,9 +158,7 @@ class GemmBase:
                         )
                     self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        epi_pipeline.consumer_release(epi_read_state)
+                    epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
@@ -676,12 +674,14 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        return pipeline.PipelineTmaAsync.create(
+        return PipelineTmaAsync.create(
             num_stages=self.epi_c_stage,
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tx_count,
             defer_sync=True,
+            elect_one_release=True,
+            syncwarp_before_release=True,
         )
 
     def make_epi_store_pipeline(self):

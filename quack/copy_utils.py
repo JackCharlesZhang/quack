@@ -1494,9 +1494,7 @@ def gather_k_get_copy_fn(
         for k in cutlass.range(cols_per_thread):
             col_idx = tAcA[0, 0, k][1]
             k_idx[k] = sAIdx_cur[col_idx]
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return k_idx, tApA_k
 
     def copy_fn(
@@ -1608,9 +1606,7 @@ def gather_k_get_tma_copy_fn(
     ) -> cute.Tensor:
         a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
         tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return tSR_rAIdx
 
     def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):

@@ -24,7 +24,12 @@ from cutlass.cute.nvgpu.warp import (
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum, SmemPartition
 
-from quack.pipeline import PipelineCpAsync, PipelineTmaUmma, PipelineTmaCpAsyncUmma
+from quack.pipeline import (
+    PipelineCpAsync,
+    PipelineTmaUmma,
+    PipelineTmaCpAsyncUmma,
+    PipelineUmmaAsync,
+)
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -1128,9 +1133,7 @@ class GemmSm100(GemmTmaBase):
                         warp_idx,
                     )
                     if const_expr(varlen_m):
-                        cute.arch.sync_warp()
-                        with cute.arch.elect_one():
-                            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+                        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
                         a_prefetch_consumer_state.advance()
                     if const_expr(prefetch_A is not None):
                         prefetch_A = partial(prefetch_A, a_prefetch_pipeline)
@@ -1915,8 +1918,7 @@ class GemmSm100(GemmTmaBase):
         assert epi_coord[0] == 0  # For Sm100, we assume epi_M = 1
         if epi_coord[1] == acc_release_idx:
             cute.arch.fence_view_async_tmem_load()
-            with cute.arch.elect_one():
-                acc_pipeline.consumer_release(acc_consumer_state)
+            acc_pipeline.consumer_release(acc_consumer_state)
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -2100,12 +2102,15 @@ class GemmSm100(GemmTmaBase):
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
-        return pipeline.PipelineUmmaAsync.create(
+        return PipelineUmmaAsync.create(
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
+            elect_one_release=True,
+            # TMEM load consumers are already ordered by fence_view_async_tmem_load()
+            syncwarp_before_release=False,
         )
 
     def make_sched_pipeline(
@@ -2149,6 +2154,8 @@ class GemmSm100(GemmTmaBase):
             producer_group=a_prefetch_producer_group,
             consumer_group=a_prefetch_consumer_group,
             defer_sync=True,
+            elect_one_release=True,
+            syncwarp_before_release=True,
         )
 
     @classmethod

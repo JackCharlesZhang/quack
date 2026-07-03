@@ -268,7 +268,23 @@ class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
 
 @dataclass(frozen=True)
 class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
-    """Override producer_acquire to take in extra_tx_count parameter."""
+    """PipelineTmaAsync with extra_tx_count plus optional elected consumer release."""
+
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
+
+    @staticmethod
+    def create(
+        *args,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineTmaAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineTmaAsync)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
 
     @dsl_user_op
     def producer_acquire(
@@ -295,8 +311,17 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
-
-PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineTmaAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
 
 # ── PipelineTmaStore ────────────────────────────────────────────────────────
