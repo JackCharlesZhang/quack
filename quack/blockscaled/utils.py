@@ -726,8 +726,9 @@ def compile_blockscaled_gemm_tvm_ffi(
         # Sub-byte (fp4) operands need the contiguous K extent statically divisible
         # by the packing factor; harmless for 8-bit dtypes.
         k_sym = cute.sym_int(divisibility=div_for_dtype(ab_dtype) if ab_dtype.width < 8 else 1)
-        # Detect each operand's leading (stride-1) dim so m-major A / n-major B
-        # are accepted for varlen_m (mxfp8 only; fp4 operands are always K-major).
+        # Detect B's leading (stride-1) dim so n-major B is accepted for varlen_m
+        # (mxfp8 only; fp4 is always K-major). A must be K-major for varlen_m —
+        # the public API enforces this (see quack/gemm.py) for all dtypes.
         fake_mA = fake_tensor(
             ab_dtype,
             (total_m_sym, k_sym),

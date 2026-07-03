@@ -107,6 +107,30 @@ def test_blockscaled_gemm_sf_slice():
     assert torch.equal(out_ref, out_slice)
 
 
+@pytest.mark.parametrize("a_major", ["k", "m"])
+@pytest.mark.parametrize("b_major", ["k", "n"])
+def test_blockscaled_gemm_major_modes(a_major, b_major):
+    """MXFP8 with A in {k,m}-major x B in {k,n}-major through the public interface.
+
+    Majorness is inferred from operand strides; the SF tensors are identical in
+    all four cases (the (rm, rk, 32, 4, 4) hardware format does not depend on
+    how the operand values are stored).
+    """
+    _skip_if_not_sm100()
+    m, n, k = 256, 320, 512  # n not a multiple of 128 (padded SF rows)
+    (qa, sfa), (B, sfw) = _quantized_operands("mxfp8", m, n, k, batched=False)
+    ref = gemm_blockscaled_ref((qa, sfa), (B, sfw))
+    if a_major == "m":
+        qa = qa.t().contiguous().t()  # (m, k) with M contiguous
+        assert qa.stride() == (1, m)
+    if b_major == "n":
+        B = B.contiguous()  # (k, n) with N contiguous -> (n, k) n-major after .mT
+        assert B.stride() == (n, 1)
+    out = gemm((qa, sfa), (B, sfw), tuned=False)
+    rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+    assert rel < 5e-3, f"A={a_major}-major B={b_major}-major: rel_err={rel}"
+
+
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("seqlens_m", [[128, 128, 128], [100, 200, 150], [1, 128, 127, 129]])
 def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
