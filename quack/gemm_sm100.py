@@ -609,8 +609,12 @@ class GemmSm100(GemmTmaBase):
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = None, None
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            self.cluster_shape_mnk, self.tiled_mma.thr_id
+        a_op = (
+            cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+            if const_expr(not self.gather_A)
+            else sm100_utils.cluster_shape_to_tma_atom_A(
+                self.cluster_shape_mnk, self.tiled_mma.thr_id
+            )
         )
         if const_expr(not self.gather_A):
             tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
@@ -638,9 +642,9 @@ class GemmSm100(GemmTmaBase):
                 tma_smem_layout.shape,
                 internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
             )
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma.thr_id
-        )
+        # block_copy takes compiler-driven multicast metadata at the copy site,
+        # so the TMA atom itself must stay the non-multicast variant here.
+        b_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
@@ -655,9 +659,7 @@ class GemmSm100(GemmTmaBase):
         tma_atom_sfb, tma_tensor_sfb = None, None
         if const_expr(self.blockscaled):
             # Setup TMA load for SFA
-            sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
-                self.cluster_shape_mnk, self.tiled_mma.thr_id
-            )
+            sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
             sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
             tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
                 sfa_op,
@@ -669,9 +671,7 @@ class GemmSm100(GemmTmaBase):
                 internal_type=cutlass.Int16,
             )
             # Setup TMA load for SFB
-            sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
-                self.cluster_shape_mnk, self.tiled_mma.thr_id
-            )
+            sfb_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
             sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
             tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
                 sfb_op,
@@ -1029,30 +1029,6 @@ class GemmSm100(GemmTmaBase):
                 cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
-            # Compute multicast mask for A/B buffer full
-            block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-            block_in_cluster_coord_sfb_vmnk = None
-            if const_expr(self.blockscaled):
-                block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
-                    cta_rank_in_cluster
-                )
-            a_mcast_mask, b_mcast_mask = None, None
-            sfa_mcast_mask, sfb_mcast_mask = None, None
-            if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-                a_mcast_mask = cpasync.create_tma_multicast_mask(
-                    cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-                )
-                b_mcast_mask = cpasync.create_tma_multicast_mask(
-                    cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-                )
-                if const_expr(self.blockscaled):
-                    sfa_mcast_mask = cpasync.create_tma_multicast_mask(
-                        cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-                    )
-                    sfb_mcast_mask = cpasync.create_tma_multicast_mask(
-                        cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
-                    )
-
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -1115,21 +1091,24 @@ class GemmSm100(GemmTmaBase):
                 # Partition global tensor for TiledMMA_A/B/D
                 # Then partition global/shared tensor for TMA load A/B
                 len_k = varlen_manager.len_k(batch_idx)
-                # TMA load A partition_S/D
-                a_cta_layout = cute.make_layout(
-                    cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-                )
+                # block_copy's lowering wants the coordinate held fixed by the
+                # multicast mask: A/SFA are same-M across N peers, while B/SFB
+                # are same-N across M peers. Degenerate cluster dimensions are
+                # left for the compiler lowering to simplify.
+                a_tma_multicast = {
+                    "cluster_shape": self.cluster_shape_mnk[:2],
+                    "multicast_dim": "M",
+                }
+                b_tma_multicast = {
+                    "cluster_shape": self.cluster_shape_mnk[:2],
+                    "multicast_dim": "N",
+                }
                 copy_A, prefetch_A = None, None
                 if const_expr(not self.gather_A):
                     # (MMA, MMA_M, MMA_K, RestK)
                     tCgA = thr_mma.partition_A(gA_mk)
-                    copy_A, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_a,
-                        cta_coord=block_in_cluster_coord_vmnk[2],
-                        cta_layout=a_cta_layout,
-                        src_tensor=tCgA,
-                        dst_tensor=sA,
-                        mcast_mask=a_mcast_mask,
+                    copy_A = copy_utils.tma_get_block_copy_fn(
+                        tma_atom_a, src_tensor=tCgA, dst_tensor=sA, tma_multicast=a_tma_multicast
                     )
                 else:
                     # For varlen_m paths (TMA or cp.async): consume indices from
@@ -1163,40 +1142,24 @@ class GemmSm100(GemmTmaBase):
                     # (MMA, MMA_N, MMA_K)
                     tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
                 # TMA load B partition_S/D
-                copy_B, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_b,
-                    cta_coord=block_in_cluster_coord_vmnk[1],
-                    cta_layout=cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                    ),
-                    src_tensor=tCgB,
-                    dst_tensor=sB,
-                    mcast_mask=b_mcast_mask,
+                copy_B = copy_utils.tma_get_block_copy_fn(
+                    tma_atom_b, src_tensor=tCgB, dst_tensor=sB, tma_multicast=b_tma_multicast
                 )
                 copy_SFA, copy_SFB = None, None
                 if const_expr(self.blockscaled):
                     #  TMA load SFA partition_S/D
-                    copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+                    copy_SFA = copy_utils.tma_get_block_copy_fn(
                         tma_atom_sfa,
-                        cta_coord=block_in_cluster_coord_vmnk[2],
-                        cta_layout=a_cta_layout,
                         src_tensor=tCgSFA,
                         dst_tensor=sSFA,
-                        filter_zeros=True,
-                        mcast_mask=sfa_mcast_mask,
+                        tma_multicast=a_tma_multicast,
                     )
                     # TMA load SFB partition_S/D
-                    sfb_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
-                    )
-                    copy_SFB, _, _ = copy_utils.tma_get_copy_fn(
+                    copy_SFB = copy_utils.tma_get_block_copy_fn(
                         tma_atom_sfb,
-                        cta_coord=block_in_cluster_coord_sfb_vmnk[1],
-                        cta_layout=sfb_cta_layout,
                         src_tensor=tCgSFB,
                         dst_tensor=sSFB,
-                        filter_zeros=True,
-                        mcast_mask=sfb_mcast_mask,
+                        tma_multicast=b_tma_multicast,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 iket.range_push("tma_load")

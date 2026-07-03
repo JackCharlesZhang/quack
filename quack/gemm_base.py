@@ -720,16 +720,8 @@ class GemmTmaBase(GemmBase):
         mcast_dim: int,
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for input tensors."""
-        op = (
-            cpasync.CopyBulkTensorTileG2SOp()
-            if mcast_dim == 1
-            else cpasync.CopyBulkTensorTileG2SMulticastOp()
-        )
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            tensor,
-            smem_layout,
-            smem_tile,
-            num_multicast=mcast_dim,
-        )
+        # block_copy takes compiler-driven multicast metadata at the copy site,
+        # so the TMA atom itself must stay the non-multicast variant here.
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(op, tensor, smem_layout, smem_tile)
         return tma_atom, tma_tensor
