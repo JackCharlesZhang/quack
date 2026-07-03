@@ -19,17 +19,34 @@ packing. For `varlen_k`, per-expert `k_i` is arbitrary — not even
 expert's last scale block covering a partial chunk, and the ragged value TMA
 zero-fills beyond `cu_seqlens_k[i+1]`, so the tail contributes exactly 0.
 
-**Finite-SF-pad contract (`varlen_k`, TODO fix):** K is the *reduction* dim, so
-the pad inside each expert's last SF atom column is read by the kernel (SF TMA
-loads whole 512 B atoms; unlike A/B it is not ragged-bounded) and multiplied
-against the zero-filled value tail. Those pad bytes must be **finite**:
-zero bytes are safe (e8m0 `0x00` = 2^-127, giving `0 × 2^-127 = 0`), but
-`0xFF` (e8m0 NaN) would poison the accumulator — so SF buffers must be
-zero-initialized (`torch.zeros`), never `torch.empty`. Ragged SF TMA cannot
-lift this: the ragged-extent trick cuts at whole-atom (128 source-K)
-granularity, and the dangerous bytes are *inside* the last atom. Lifting it
-needs a kernel-side fix. (`varlen_m` has no such issue: its M-pad garbage
-lands in output rows the epilogue never stores.)
+**SF pad and ragged K:** K is the *reduction* dim, so the pad inside each
+expert's last SF atom column is loaded by the kernel (SF TMA loads whole
+512 B atoms; unlike A/B it is not ragged-bounded) and would pair with the
+zero-filled value tail — `0xFF` there (e8m0 NaN) would poison the accumulator
+via `0 × NaN`. The kernel avoids this by **skipping the MMA instructions for
+pad blocks**: for mxfp8, one tcgen05 blockscaled MMA instruction consumes
+exactly one SF k-block (`inst_k = 256 bits / 8 = 32 = sf_vec_size`), so on a
+ragged batch's last k-tile the mma loop issues only the
+`ceil((len_k % 128) / 32)` valid instructions (see `GemmSm100.mma`,
+`sf_valid_insts`). The skipped instructions' A/B values are TMA-zero-filled
+and contribute nothing, so this changes no numerics — it just never
+references the pad scales in tmem. Instruction issue is a leader-only
+decision, so 2-CTA MMA (tile_M 256) is covered with no extra
+synchronization. Measured cost: ~0 (it strictly *removes* MMA work on ragged
+tails). So gmem SF pad may be arbitrary bytes — `torch.empty` buffers are
+fine.
+
+Notes: (1) an earlier prototype instead zeroed the pad bytes in smem from
+the MMA warp (32-bit RMW per scale word + `fence.proxy.async.shared` before
+the UTCCP) — also ~free, but it could not cover 2-CTA, where the UTCCP
+sources SF from both CTAs' smem and only the leader waits on the stage;
+instruction skipping made it obsolete. (2) Ragged SF TMA is not an
+alternative: the ragged-extent trick cuts at whole-atom (128 source-K)
+granularity, and the dangerous bytes are *inside* the last atom. (3) The
+skip requires `inst_k == sf_vec_size`; mxfp4/nvfp4 (inst_k spans 2/4 SF
+blocks) keep the zero-init-pad contract — moot for `varlen_k`, which is
+MXFP8-only. (4) `varlen_m` has no such issue at all: its M-pad garbage lands
+in output rows the epilogue never stores.
 
 ## Notation
 

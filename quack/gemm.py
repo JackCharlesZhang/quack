@@ -188,8 +188,9 @@ def gemm(
     num_warps: Optional[int] = None,
     # SFA/SFB: (l, rm/rn, rk, 32, 4, 4) blocked scale factors. For varlen_m, SFA is
     # M-padded (1, total_padded_rm, rk, 32, 4, 4) while SFB stays per-batch. For
-    # varlen_k, BOTH are K-padded (1, rm/rn, total_padded_rk, 32, 4, 4) and the pad
-    # must be finite — zero-init it. See AI/varlen_blockscaled_sf_layout.md.
+    # varlen_k, BOTH are K-padded (1, rm/rn, total_padded_rk, 32, 4, 4); pad bytes
+    # may be arbitrary (the kernel skips the MMA instructions covering them).
+    # See AI/varlen_blockscaled_sf_layout.md.
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
 ) -> None:

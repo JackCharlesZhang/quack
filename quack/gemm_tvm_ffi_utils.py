@@ -41,10 +41,10 @@ def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity, num_batches=None, v
     K-padded with tile-aligned per-batch padding:
     (1, rm/rn, total_padded_rk, 32, 4, 4) with
     total_padded_rk >= ceil(total_k/128) + (num_batches - 1).
-    Contract (not checkable here): SF pad bytes inside each batch's last atom
-    are read by the kernel and paired with zero-filled values, so they must be
-    finite — zero bytes (e8m0 2^-127) are safe, 0xFF (e8m0 NaN) poisons the
-    accumulator. Zero-initialize the pad. TODO: lift this via a kernel-side fix.
+    SF pad bytes inside each batch's last atom are loaded by the kernel but
+    never consumed: the mma loop skips the MMA instructions for pad k-blocks
+    (one instruction per SF block for mxfp8; see GemmSm100.mma), so the pad
+    may be arbitrary bytes — torch.empty buffers are fine.
     Returns (sf_dtype, sf_vec_size) as (cutlass dtype, int).
     """
     varlen_m = num_batches is not None and not varlen_k

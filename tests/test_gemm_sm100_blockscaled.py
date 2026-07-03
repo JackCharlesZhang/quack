@@ -823,6 +823,52 @@ def test_blockscaled_varlen_k_public_api(seqlens_k):
         assert err < 5e-3, f"public API varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
 
 
+@pytest.mark.parametrize(
+    "tile_cluster",
+    [((128, 128), (1, 1)), ((128, 256), (1, 2)), ((256, 128), (2, 1)), ((256, 256), (2, 2))],
+)
+@pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
+def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
+    """For mxfp8 one MMA instruction consumes exactly one SF k-block, so the
+    kernel skips the instructions for pad blocks on the ragged last k-tile
+    (their A/B values are TMA-zero-filled, contributing nothing) — pad scales
+    are never consumed and the gmem SF pad may be arbitrary. Poison it with
+    0xFF (e8m0 NaN): any pad byte reaching an MMA would turn whole output rows
+    NaN via 0-value x NaN-scale products in the K tail. Instruction issue is a
+    leader-only decision, so 2-CTA MMA (tile_M 256) is covered too."""
+    _skip_if_not_sm100()
+    from quack.gemm import gemm as gemm_public
+
+    (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k, sf_pad_byte=0xFF
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB,
+        mD,
+        None,
+        None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
+        cluster_N=cluster_n,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    torch.cuda.synchronize()
+    assert not mD.isnan().any(), "NaN leaked from poisoned SF pad into the output"
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, f"poisoned pad seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("b_major", ["k", "n"])
 @pytest.mark.parametrize(

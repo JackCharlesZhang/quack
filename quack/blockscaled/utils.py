@@ -578,6 +578,7 @@ def create_blockscaled_varlen_k_operands(
     *,
     randn_std: Optional[float] = None,
     seqlens_k: Optional[list] = None,
+    sf_pad_byte: int = 0,
 ):
     """Generate bf16 randn + quantize for a varlen_k blockscaled GEMM.
 
@@ -591,12 +592,12 @@ def create_blockscaled_varlen_k_operands(
     `(cu_seqlens_k[i] + i * 128) // 128 * 128` (in source-K units). A and B
     operand data stay packed and unpadded along K — only their SF buffers pad.
 
-    Contract: SF pad regions inside each expert's last 512 B atom ARE read by the
-    kernel (TMA loads whole atom columns) and multiplied against the zero-filled
-    value tail — they must hold finite encodings. Zero bytes are safe (e8m0 0x00
-    = 2^-127) and `torch.zeros` below guarantees that; 0xFF (e8m0 NaN) would
-    poison the accumulation. TODO: remove this finite-pad requirement (ragged SF
-    TMA can only cut at whole-atom granularity, so it needs a kernel-side fix).
+    SF pad regions inside each expert's last 512 B atom are loaded by the
+    kernel (TMA loads whole atom columns) but never consumed: the mma loop
+    skips the MMA instructions for pad k-blocks (one instruction per SF block
+    for mxfp8; see `GemmSm100.mma`), so the pad may hold arbitrary bytes —
+    including 0xFF (e8m0 NaN). `sf_pad_byte` sets the pad fill so tests can
+    poison it deliberately.
 
     Returns (a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k):
       a_ref_list: list of per-expert (m, k_i) fp32 dequantized A.
@@ -669,8 +670,12 @@ def create_blockscaled_varlen_k_operands(
     total_padded_rk = (total_k + tile - 1) // tile + (num_experts - 1)
     total_padded_k = total_padded_rk * tile
     total_padded_sf_k = total_padded_k // sf_vec_size
-    sa_2d_padded = torch.zeros(m, total_padded_sf_k, dtype=a_sc_list[0].dtype, device="cuda")
-    sb_2d_padded = torch.zeros(n, total_padded_sf_k, dtype=b_sc_list[0].dtype, device="cuda")
+    sa_2d_padded = torch.full(
+        (m, total_padded_sf_k), sf_pad_byte, dtype=torch.uint8, device="cuda"
+    ).view(a_sc_list[0].dtype)
+    sb_2d_padded = torch.full(
+        (n, total_padded_sf_k), sf_pad_byte, dtype=torch.uint8, device="cuda"
+    ).view(b_sc_list[0].dtype)
     k_offset = 0
     for i, k_i in enumerate(seqlens_k):
         sf_k_i = (k_i + sf_vec_size - 1) // sf_vec_size

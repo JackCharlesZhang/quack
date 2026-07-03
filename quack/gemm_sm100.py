@@ -1451,9 +1451,23 @@ class GemmSm100(GemmTmaBase):
                         tCtSFB.layout,
                     )
                 copy_s2t_sfa, copy_s2t_sfb = None, None
+                sf_valid_insts = None
                 if const_expr(self.blockscaled):
                     copy_s2t_sfa = copy_utils.s2t_get_copy_fn(sSFA, tCtSFA, self.cta_group)
                     copy_s2t_sfb = copy_utils.s2t_get_copy_fn(sSFB, tCtSFB, self.cta_group)
+                    # Exploits the fact that for mxfp8 the MMA instruction K size
+                    # equals the SF vec size (== 32), so one instruction consumes
+                    # exactly one SF block and the mma loop can skip the
+                    # instructions for SF pad blocks on a ragged-K last tile (see
+                    # the comment in self.mma). fp4 has inst_k 64 spanning
+                    # multiple SF blocks, but we don't do varlen_k for
+                    # mxfp4/nvfp4. Valid instructions in that tile; % maps
+                    # "aligned or full tile" to 0 = nothing to skip.
+                    if const_expr(self.mma_inst_shape_mnk[2] == self.sf_vec_size):
+                        num_insts = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
+                        sf_valid_insts = (
+                            cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
+                        )
                 iket.range_push("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
@@ -1471,6 +1485,7 @@ class GemmSm100(GemmTmaBase):
                     tCtSFB_mma,
                     copy_s2t_sfa,
                     copy_s2t_sfb,
+                    sf_valid_insts,
                 )
                 if const_expr(self.overlap_accum_sf):
                     # After iter 0, 2, ..., shift tmem ptr by -256.
@@ -1832,11 +1847,13 @@ class GemmSm100(GemmTmaBase):
         tCtSFB: Optional[cute.Tensor] = None,
         copy_s2t_sfa: Optional[Callable] = None,
         copy_s2t_sfb: Optional[Callable] = None,
+        sf_valid_insts_last_tile: Optional[Int32] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState, cute.TiledMma]:
         blockscaled = const_expr(copy_s2t_sfa is not None)
         if const_expr(blockscaled):
             assert all(x is not None for x in (tCtSFA, tCtSFB))
             assert copy_s2t_sfb is not None
+        skip_sf_pad_insts = const_expr(sf_valid_insts_last_tile is not None)
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
         # arrive at an mbarrier on the non-leader CTA side, then the mma warp of the non-leader
         # CTA will wait for that then arrive at the mbarrier on the leader CTA.
@@ -1870,15 +1887,43 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(blockscaled):
                     copy_s2t_sfa(ab_consumer_state.index)
                     copy_s2t_sfb(ab_consumer_state.index)
+                # Ragged K: the last k-tile's SF atom holds pad bytes beyond the
+                # valid scale blocks. We exploit the fact that for mxfp8 the MMA
+                # instruction K size equals the SF vec size (both 32), i.e. each
+                # instruction consumes exactly one SF block: skipping the
+                # instructions for pad blocks — whose A/B values are
+                # TMA-zero-filled and contribute nothing — means the pad scales
+                # are never consumed and the gmem pad may be arbitrary (e8m0 0xFF
+                # = NaN would otherwise poison the accumulator via 0-value x
+                # NaN-scale products). Instruction issue is a leader-only
+                # decision, so this covers 2-CTA MMA too. fp4 has inst_k 64 (2
+                # SF blocks for mxfp4, 4 for nvfp4), but we don't do varlen_k
+                # for those formats.
+                # (The set/gemm sequence is duplicated below because the DSL
+                # rejects closures capturing staged values inside a dynamic if.)
+                if const_expr(skip_sf_pad_insts):
+                    num_mma_insts = Int32(num_k_blocks)
+                    if sf_valid_insts_last_tile > 0 and k_tile == k_tile_cnt - 1:
+                        num_mma_insts = sf_valid_insts_last_tile
                 for k_blk_idx in cutlass.range(num_k_blocks, unroll_full=True):
                     k_blk_coord = (None, None, k_blk_idx, ab_consumer_state.index)
                     if const_expr(blockscaled):
                         # Set SFA/SFB tensor to tiled_mma
                         sf_kblock_coord = (None, None, k_blk_idx)
-                        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-                    cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if const_expr(skip_sf_pad_insts):
+                            if k_blk_idx < num_mma_insts:
+                                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+                                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+                                cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        else:
+                            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+                            cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    else:
+                        cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 # Async arrive AB buffer empty
                 ab_pipeline.consumer_release(ab_consumer_state)
             ab_consumer_state.advance()
