@@ -345,6 +345,25 @@ class GemmSm100(GemmTmaBase):
                 self.mma_tiler_sfb[1],
                 self.mma_tiler_sfb[2],
             )
+            # The SF atom fixed by the tcgen05 MMA (BlockScaledBasicChunk) is 128 wide
+            # in N, but cta_tile_n need not be a multiple of 128. Two derived
+            # quantities localize all the resulting special handling:
+            # - sfb_tiles_per_atom: adjacent N-tiles that share one 128-wide atom
+            #   (tile_n=64) load the same SFB atom; gmem N-tile coords are divided
+            #   by this.
+            # - sfb_n_atom_misaligned: tile_n an odd multiple of 64 (64, 192) puts
+            #   odd N-tiles 64 into an atom; the MMA's SFB tmem base shifts by 2
+            #   columns for odd N-tile coords, and tile_n=192 additionally needs
+            #   the overlapped-window TMA remap at the SFB TMA setup in __call__.
+            # tile_n=224 is rejected: its tiles start at 32-column offsets within
+            # the atom ((224*j) % 128 cycles 0/96/64/32), which neither mechanism
+            # covers.
+            assert self.cta_tile_shape_mnk[1] in (64, 128, 192, 256), (
+                f"blockscaled tile_n must be in (64, 128, 192, 256), "
+                f"got {self.cta_tile_shape_mnk[1]}"
+            )
+            self.sfb_tiles_per_atom = max(128 // self.cta_tile_shape_mnk[1], 1)
+            self.sfb_n_atom_misaligned = (self.cta_tile_shape_mnk[1] // 64) % 2 == 1
         else:
             self.cta_tile_shape_mnk_sfb = None
 
@@ -689,9 +708,15 @@ class GemmSm100(GemmTmaBase):
                 self.cluster_layout_sfb_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            if const_expr(
-                self.cta_tile_shape_mnk[1] == 192 and self.sf_dtype is cutlass.Float8E8M0FNU
-            ):
+            # tile_n=192 spans 1.5 SF atoms, so consecutive N-tiles straddle atom
+            # boundaries and a TMA box can't be placed at a half-atom offset.
+            # Instead each tile loads a 2-atom (256-wide) window: remap the gmem
+            # atom sequence to [a0 a1 | a1 a2 | a3 a4 | a4 a5 | ...] (groups of 4
+            # presented atoms at offsets (0, x, x, 2x), advancing by 3 atoms) so
+            # that tile j's window lands on atoms (3j//2, 3j//2 + 1). Odd tiles
+            # start 64 into their first atom; the mma warp corrects for that via
+            # the sfb_n_atom_misaligned tmem offset.
+            if const_expr(self.cta_tile_shape_mnk[1] == 192):
                 x = tma_tensor_sfb.stride[0][1]
                 y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
                 tma_tensor_sfb = cute.make_tensor(
@@ -1082,17 +1107,12 @@ class GemmSm100(GemmTmaBase):
                     )
                     # (bN, bK)
                     # SFB uses the tile-aligned per-batch K offset in varlen_k (padded SF layout).
+                    # N-tiles sharing one 128-wide SF atom (tile_n=64) load the same
+                    # atom, so the gmem N-tile coord is divided by sfb_tiles_per_atom.
                     gSFB_nkl = cute.local_tile(
                         varlen_manager.offset_batch_SFB(mSFB_nkl, batch_idx),
                         cute.select(self.mma_tiler_sfb, [1, 2]),
-                        (
-                            (
-                                mma_tile_coord_mnl[1] // 2
-                                if self.cta_tile_shape_mnk[1] == 64
-                                else mma_tile_coord_mnl[1]
-                            ),
-                            None,
-                        ),
+                        (mma_tile_coord_mnl[1] // self.sfb_tiles_per_atom, None),
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
@@ -1444,7 +1464,10 @@ class GemmSm100(GemmTmaBase):
                 )
                 tCtAcc = tCtAcc_base[None, None, None, acc_stage_idx]
                 tCtSFB_mma = tCtSFB
-                if const_expr(self.blockscaled and self.mma_inst_shape_mnk[1] in (64, 192)):
+                if const_expr(self.blockscaled and self.sfb_n_atom_misaligned):
+                    # Odd N-tiles start 64 into a 128-wide SF atom: shift the SFB
+                    # tmem base by 2 columns (in the atom layout (32,4):(16,4),
+                    # N+64 is element offset 8 = 2 tmem columns).
                     tCtSFB_mma = cute.make_tensor(
                         cute.recast_ptr(
                             sfb_tmem_base_ptr + Int32((tile_coord_mnkl[1] % 2) * 2),

@@ -323,18 +323,6 @@ def test_blockscaled_validation():
             1,
         ),
         (
-            cutlass.Float8E4M3FN,
-            cutlass.Float8E8M0FNU,
-            32,
-            cutlass.Float32,
-            (256, 224),
-            (2, 1),
-            256,
-            224,
-            256,
-            1,
-        ),
-        (
             cutlass.Float4E2M1FN,
             cutlass.Float8E8M0FNU,
             32,
@@ -343,18 +331,6 @@ def test_blockscaled_validation():
             (1, 1),
             256,
             256,
-            256,
-            1,
-        ),
-        (
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E8M0FNU,
-            32,
-            cutlass.Float32,
-            (256, 224),
-            (2, 1),
-            256,
-            224,
             256,
             1,
         ),
@@ -394,15 +370,30 @@ def test_blockscaled_validation():
             256,
             1,
         ),
+        # tile_n=192 with multiple N-tiles: exercises the overlapped-window SFB
+        # TMA remap for e4m3 scale factors (regression: was gated on e8m0 only,
+        # loading wrong SFB atoms for N-tile index >= 1)
         (
             cutlass.Float4E2M1FN,
             cutlass.Float8E4M3FN,
             16,
             cutlass.Float32,
-            (256, 224),
+            (128, 192),
+            (1, 1),
+            256,
+            384,
+            256,
+            1,
+        ),
+        (
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            16,
+            cutlass.Float32,
+            (256, 192),
             (2, 1),
             256,
-            224,
+            576,
             256,
             1,
         ),
@@ -493,7 +484,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
 @pytest.mark.parametrize(
     "mma_tiler_mn,cluster_shape_mn,m,n,k",
     [
-        # All 5 supported blockscaled tile_n values (64, 128, 192, 224, 256).
+        # All supported blockscaled tile_n values (64, 128, 192, 256).
         ((128, 64), (1, 1), 256, 64, 512),
         ((128, 128), (1, 1), 256, 256, 256),
         ((128, 128), (1, 1), 512, 512, 512),
@@ -503,8 +494,6 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
         ((256, 192), (2, 1), 256, 192, 256),
         ((256, 192), (2, 1), 256, 384, 256),
         ((256, 192), (2, 1), 512, 192, 512),
-        ((256, 224), (2, 1), 256, 224, 256),
-        ((256, 224), (2, 1), 512, 224, 512),
         ((256, 256), (2, 1), 512, 256, 512),
     ],
 )
