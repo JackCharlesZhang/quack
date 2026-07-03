@@ -29,6 +29,8 @@ from quack.pipeline import (
     PipelineTmaUmma,
     PipelineTmaCpAsyncUmma,
     PipelineUmmaAsync,
+    mbarrier_arrive_release_cluster,
+    mbarrier_acquire_cluster,
 )
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
@@ -1876,13 +1878,26 @@ class GemmSm100(GemmTmaBase):
                 if not is_leader_cta:
                     ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
                     with cute.arch.elect_one():
-                        # The odd CTA signals the even CTA
-                        ab_pipeline.sync_object_full.arrive_mbarrier(
-                            ab_consumer_state.index, dst_rank=cta_rank_in_cluster & 0xFE
+                        # The odd CTA signals the even CTA. The arrive must release this
+                        # CTA's cp.async smem writes at cluster scope so that the leader's
+                        # 2-CTA MMA, which reads our smem over DSMEM, is guaranteed to
+                        # observe them; a plain mbarrier.arrive is only release.cta
+                        # (https://github.com/Dao-AILab/quack/issues/63).
+                        mbarrier_arrive_release_cluster(
+                            ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index),
+                            cta_rank_in_cluster & 0xFE,
                         )
             if is_leader_cta:
                 # Conditionally wait for AB buffer full
                 ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                if const_expr(need_nonleader_cta):
+                    # consumer_wait acquires at cta scope only; pair the non-leader's
+                    # cluster-scope release with a cluster-scope acquire of the (already
+                    # completed) phase before the MMA reads the peer CTA's smem.
+                    mbarrier_acquire_cluster(
+                        ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index),
+                        ab_consumer_state.phase,
+                    )
                 #  Copy SFA/SFB from smem to tmem
                 if const_expr(blockscaled):
                     copy_s2t_sfa(ab_consumer_state.index)

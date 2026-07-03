@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
+from cutlass._mlir.dialects import nvvm as _nvvm, llvm
+from cutlass.cute.typing import AddressSpace, Int, Pointer
 from cutlass.pipeline import PipelineState, PipelineUserType
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
@@ -31,6 +33,72 @@ def _override_create(parent_cls, child_cls):
         return obj
 
     return create
+
+
+@dsl_user_op
+def mbarrier_arrive_release_cluster(
+    mbar_ptr: Pointer, peer_cta_rank_in_cluster: Int, *, loc=None, ip=None
+) -> None:
+    """Arrive on a peer CTA's mbarrier with cluster-scope release semantics.
+
+    cute.arch.mbarrier_arrive with a peer rank emits mbarrier.arrive with the default
+    .release.cta semantics, which does not order this CTA's smem writes with the peer
+    CTA's reads of them (e.g. a 2-CTA tcgen05.mma reading our smem over DSMEM). Emit
+    fence.release.sync_restrict::shared::cta.cluster followed by
+    mbarrier.arrive.relaxed.cluster.shared::cluster instead: the fence releases all smem
+    writes this thread has observed at cluster scope, and a cluster-scope acquire of the
+    barrier phase on the consumer side (mbarrier_test_wait_acquire_cluster) completes the
+    release-acquire relation. This is the cheaper form of mbarrier.arrive.release.cluster,
+    which lowers to MEMBAR.GPU.
+    """
+    _nvvm.fence_sync_restrict(_nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
+    remote_ptr = _nvvm.mapa(
+        llvm.PointerType.get(AddressSpace.dsmem),
+        mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+        Int32(peer_cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    _nvvm.mbarrier_arrive(
+        None,
+        remote_ptr,
+        count=Int32(1).ir_value(loc=loc, ip=ip),
+        scope=_nvvm.MemScopeKind.CLUSTER,
+        relaxed=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_acquire_cluster(mbar_ptr: Pointer, phase: Int, *, loc=None, ip=None) -> None:
+    """Cluster-scope acquire observation of an already-completed mbarrier phase.
+
+    Emits mbarrier.test_wait.parity.acquire.cluster. The regular waits
+    (mbarrier.try_wait.parity) only acquire at cta scope, which cannot pair with a
+    cluster-scope release from another CTA (mbarrier_arrive_release_cluster). Call this
+    after a regular wait on the same (barrier, phase) has already succeeded: the test_wait
+    then observes the completed phase and upgrades the observation to cluster scope.
+    The result must feed control flow, otherwise the test_wait is dead-code-eliminated;
+    branch to a (never-taken) blocking wait so the observation cannot be dropped.
+    """
+    status = Boolean(
+        _nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            _nvvm.MBarrierWaitKind.TEST,
+            scope=_nvvm.MBarrierScopeKind.CLUSTER,
+            order=_nvvm.MemOrderKind.ACQUIRE,
+            loc=loc,
+            ip=ip,
+        )
+    )
+    if_generate(
+        status == 0,
+        lambda: cute.arch.mbarrier_wait(mbar_ptr, phase, loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _make_state(index: Int32, phase: Int32) -> PipelineState:
