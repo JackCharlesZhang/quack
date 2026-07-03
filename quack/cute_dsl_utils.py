@@ -163,8 +163,46 @@ def _namedtuple_new_from_mlir_values(self, values):
     return self.__class__(*new_fields)
 
 
+def _namedtuple_dynamic_fields(self):
+    """Yield fields that are represented by MLIR/runtime values.
+
+    Keep this in sync with ``_namedtuple_new_from_mlir_values``: fields that
+    are ``None`` or plain Python compile-time constants are preserved from the
+    compile-time template and do not consume MLIR block arguments.
+    """
+    for field_val in self:
+        if field_val is None or isinstance(field_val, StaticTypes):
+            continue
+        yield field_val
+
+
+def _namedtuple_c_pointers(self):
+    """Generic ``JitArgument.__c_pointers__`` for ``@mlir_namedtuple`` classes."""
+    from cutlass.base_dsl.typing import get_c_pointers
+
+    ptrs = []
+    for field_val in _namedtuple_dynamic_fields(self):
+        ptrs.extend(get_c_pointers(field_val))
+    return ptrs
+
+
+def _namedtuple_get_mlir_types(self):
+    """Generic ``JitArgument.__get_mlir_types__`` for ``@mlir_namedtuple`` classes."""
+    from cutlass.base_dsl.typing import get_mlir_types
+
+    types = []
+    for field_val in _namedtuple_dynamic_fields(self):
+        types.extend(get_mlir_types(field_val))
+    return types
+
+
 def mlir_namedtuple(cls):
-    """Decorator that adds MLIR value reconstruction to a NamedTuple class.
+    """Decorator that makes a NamedTuple usable as a CuTe JIT argument.
+
+    Adds the full ``JitArgument`` protocol.  This matters even when a concrete
+    instance has no dynamic fields: newer CuTe DSL versions warn for non-
+    constexpr compile-only arguments that flatten to zero MLIR values unless
+    they explicitly implement the protocol.
 
     Usage::
 
@@ -173,6 +211,8 @@ def mlir_namedtuple(cls):
             tensor_arg: cute.Tensor
             const_arg: cutlass.Constexpr[int] = 0
     """
+    cls.__c_pointers__ = _namedtuple_c_pointers
+    cls.__get_mlir_types__ = _namedtuple_get_mlir_types
     cls.__new_from_mlir_values__ = _namedtuple_new_from_mlir_values
     return cls
 
