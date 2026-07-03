@@ -13,7 +13,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
-from quack.mx_utils import (
+from quack.blockscaled.quantize import (
     to_mx_compiled,
     to_mxfp4_compiled,
     to_nvfp4_compiled,
@@ -263,6 +263,74 @@ def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
     return blocks.view(l, rm, rk, 512).view(orig_dtype)
 
 
+def unpack_scale_blocked_to_2d(blocked: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
+    """Unswizzle (l, rm, rk, 32, 4, 4) blocked scale factors to (l, mn, sf_k)."""
+    l, rm, rk = blocked.shape[:3]
+    assert tuple(blocked.shape[3:]) == (32, 4, 4)
+    orig_dtype = blocked.dtype
+    u8 = blocked.view(torch.uint8)
+    # (32=m%32, 4=m//32, 4=k%4) -> (4, 32, 4) -> (l, rm, rk, 128, 4) -> (l, mn_pad, sf_k_pad)
+    u8 = u8.transpose(3, 4).reshape(l, rm, rk, 128, 4)
+    u8 = u8.permute(0, 1, 3, 2, 4).reshape(l, rm * 128, rk * 4)
+    return u8[:, :mn, :sf_k].contiguous().view(orig_dtype)
+
+
+def dequant_operand(x: torch.Tensor) -> torch.Tensor:
+    """Dequantize an operand tensor to float32 values (without scale factors).
+
+    fp8 tensors convert directly; ``float4_e2m1fn_x2`` tensors unpack two codes
+    per byte (low nibble = even K, high nibble = odd K), doubling the last dim.
+    """
+    if x.dtype == torch.float4_e2m1fn_x2:
+        u8 = x.view(torch.uint8)
+        lo = _fp4_unpacked_to_value(u8 & 0x0F)
+        hi = _fp4_unpacked_to_value((u8 >> 4) & 0x0F)
+        return torch.stack([lo, hi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
+    return x.float()
+
+
+BLOCKSCALED_FORMATS = {
+    # format: (torch operand dtype, torch SF dtype, sf_vec_size)
+    "mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, 32),
+    "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, 32),
+    "nvfp4": (torch.float4_e2m1fn_x2, torch.float8_e4m3fn, 16),
+}
+
+
+def blockscaled_quantize(
+    x: torch.Tensor, format: str = "mxfp8", per_tensor_scale: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a (M, K) or (L, M, K) bf16/fp32 tensor along K for blockscaled GEMM.
+
+    Returns ``(q, sf)`` ready to pass as an ``(A, SFA)`` / ``(B, SFB)`` tuple to
+    :func:`quack.gemm_interface.gemm`:
+      q:  same leading shape as ``x``; fp8 for mxfp8 (M, K), packed fp4x2 for
+          mxfp4/nvfp4 (M, K/2), K-contiguous.
+      sf: blocked scale factors, (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4).
+    For nvfp4, ``per_tensor_scale`` (scalar fp32) folds the global scale; pass the
+    product of A's and B's per-tensor scales as ``alpha`` to the GEMM.
+    """
+    from quack.blockscaled.quantize import to_mx_compiled, to_mxfp4_compiled, to_nvfp4_compiled
+
+    assert format in BLOCKSCALED_FORMATS, f"unknown blockscaled format: {format}"
+    q_dtype, sf_dtype, sf_vec = BLOCKSCALED_FORMATS[format]
+    assert x.shape[-1] % sf_vec == 0, f"K ({x.shape[-1]}) must be divisible by {sf_vec}"
+    batched = x.ndim == 3
+    l, mn, k = x.shape if batched else (1, *x.shape)
+    x_flat = x.reshape(l * mn, k)
+    if format == "mxfp8":
+        q, sc = to_mx_compiled(x_flat, sf_vec)
+    elif format == "mxfp4":
+        q, sc = to_mxfp4_compiled(x_flat, sf_vec)
+    else:
+        q, sc, _ = to_nvfp4_compiled(x_flat, sf_vec, per_tensor_scale)
+    q = q.view(torch.uint8).view(q_dtype) if q_dtype == torch.float4_e2m1fn_x2 else q
+    q = q.reshape(*x.shape[:-1], -1)
+    sf = pack_scale_2d_to_blocked_contig(sc.view(l, mn, k // sf_vec))
+    sf = sf.view(l, sf.shape[1], sf.shape[2], 32, 4, 4)
+    return q, sf if batched else sf.squeeze(0)
+
+
 def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int) -> torch.Tensor:
     """Validate a (l, rm, rk, 512) scale tensor and return it unchanged.
     Only the innermost 512-B tile must be contiguous (stride 1, size 512);
@@ -430,7 +498,7 @@ def create_blockscaled_varlen_m_operands(
     sf_k = k // sf_vec_size
 
     if ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32:
-        from quack.mx_utils import to_mx_compiled
+        from quack.blockscaled.quantize import to_mx_compiled
 
         to_fn = to_mx_compiled
     else:
@@ -537,7 +605,7 @@ def create_blockscaled_varlen_k_operands(
     std = randn_std if randn_std is not None else (max(seqlens_k)) ** -0.5
     sf_k_total = total_k // sf_vec_size
 
-    from quack.mx_utils import to_mx_compiled
+    from quack.blockscaled.quantize import to_mx_compiled
 
     a_q_list, a_sc_list, a_ref_list = [], [], []
     b_q_list, b_sc_list, b_ref_list = [], [], []

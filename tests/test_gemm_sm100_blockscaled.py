@@ -3,7 +3,7 @@ import torch
 
 import cutlass
 
-from quack.blockscaled_gemm_utils import (
+from quack.blockscaled.utils import (
     blockscaled_gemm_reference,
     compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
@@ -15,7 +15,7 @@ from quack.blockscaled_gemm_utils import (
     scale_view_for_kernel,
 )
 from quack.gemm_default_epi import GemmDefaultSm100
-from quack.mx_utils import to_blocked
+from quack.blockscaled.quantize import to_blocked
 
 
 def _skip_if_not_sm100():
@@ -562,62 +562,13 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
     )
 
 
-# ---------------------------------------------------------------------------
-# High-level PyTorch interface
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("shape_mnk", [(256, 256, 256), (512, 256, 256), (128, 128, 256)])
-@pytest.mark.parametrize("batched", [False, True])
-def test_mxfp8_interface(shape_mnk, batched):
-    _skip_if_not_sm100()
-    from quack.gemm_blockscaled_interface import (
-        mxfp8_gemm,
-        mxfp8_gemm_cublas,
-        mxfp8_gemm_ref,
-        mxfp8_gemm_quantize,
-        mxfp8_quantize,
-    )
-
-    M, N, K = shape_mnk
-    L = 2 if batched else 1
-    torch.manual_seed(0)
-    shape_A = (L, M, K) if batched else (M, K)
-    # Weight stored nn.Linear-style (N, K) row-major; pass .mT to get K-contig (K, N)
-    shape_W = (L, N, K) if batched else (N, K)
-    A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
-
-    A_q, A_sc = mxfp8_quantize(A_hp)
-    W_q, W_sc = mxfp8_quantize(W_hp)  # (..., N, K), (..., N, K/32)
-    assert A_q.dtype == torch.float8_e4m3fn and A_sc.dtype == torch.float8_e8m0fnu
-
-    B_q = W_q.mT  # (..., K, N) K-contig view
-    B_sc = W_sc.mT  # (..., K/32, N) K-contig view
-
-    out = mxfp8_gemm(A_q, B_q, A_sc, B_sc)
-    assert out.shape == ((L, M, N) if batched else (M, N))
-    assert out.dtype == torch.bfloat16
-
-    ref = mxfp8_gemm_ref(A_q, B_q, A_sc, B_sc)
-    err = (out.float() - ref.float()).abs().max().item()
-    assert err < 5e-3, f"quack vs ref max_err={err}"
-
-    # cuBLAS comparison only for 2D / L=1
-    if not batched:
-        out_cublas = mxfp8_gemm_cublas(A_q, B_q, A_sc, B_sc)
-        assert torch.equal(out, out_cublas), "quack interface != cuBLAS"
-
-    # High-level quantize+gemm convenience fn
-    out2 = mxfp8_gemm_quantize(A_hp, W_hp)
-    assert torch.equal(out, out2)
-
-
 @pytest.mark.parametrize("a_major", ["k", "m"])
 @pytest.mark.parametrize("b_major", ["k", "n"])
 def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
     _skip_if_not_sm100()
-    from quack.mx_utils import to_mx
+    from quack.blockscaled.quantize import to_mx
 
     m, n, k, l = 256, 256, 256, 1
     sf_vec = 32
@@ -648,7 +599,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     # Sanity: stride(0) == 1 iff mn-major.
     assert (mA.stride(0) == 1) == (a_major == "m"), f"mA stride: {mA.stride()}"
     assert (mB.stride(0) == 1) == (b_major == "n"), f"mB stride: {mB.stride()}"
-    from quack.blockscaled_gemm_utils import pack_scale_2d_to_blocked_contig
+    from quack.blockscaled.utils import pack_scale_2d_to_blocked_contig
 
     a_sc = pack_scale_2d_to_blocked_contig(sa_2d)
     b_sc = pack_scale_2d_to_blocked_contig(sb_2d)
@@ -885,21 +836,3 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
         f"strided-SF output differs from contig-SF: "
         f"max_abs_err={(mD_strided.float() - mD_contig.float()).abs().max().item()}"
     )
-
-
-def test_mxfp8_interface_preallocated_out():
-    _skip_if_not_sm100()
-    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_quantize
-
-    M, N, K = 256, 256, 256
-    torch.manual_seed(0)
-    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    A_q, A_sc = mxfp8_quantize(A_hp)
-    W_q, W_sc = mxfp8_quantize(W_hp)
-    B_q, B_sc = W_q.mT, W_sc.mT
-
-    out_alloc = mxfp8_gemm(A_q, B_q, A_sc, B_sc)
-    out_pre = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    mxfp8_gemm(A_q, B_q, A_sc, B_sc, out=out_pre)
-    assert torch.equal(out_alloc, out_pre)

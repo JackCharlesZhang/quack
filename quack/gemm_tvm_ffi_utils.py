@@ -3,6 +3,7 @@
 
 from functools import partial
 
+import torch
 
 import cutlass.cute as cute
 from cutlass import Int32, Float32
@@ -12,6 +13,41 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
+
+# Blockscaled scale-factor dtype determines the quantization block size along K:
+# e8m0 -> MX formats (32-element blocks), e4m3 -> NVFP4 (16-element blocks).
+SF_DTYPE_TO_VEC_SIZE = {
+    torch.float8_e8m0fnu: 32,
+    torch.float8_e4m3fn: 16,
+}
+
+
+def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity):
+    """Validate blockscaled scale factors against kernel-layout operands.
+
+    A is (l, m, k[/2 if fp4]) and B is (l, n, k[/2]); SFA/SFB are
+    (l, rm/rn, rk, 32, 4, 4) with the inner (32, 4, 4) block contiguous
+    (strides (16, 4, 1) — one 512 B atom per 128 rows x 4 K-blocks).
+    Returns (sf_dtype, sf_vec_size) as (cutlass dtype, int).
+    """
+    assert SFB is not None, "SFA and SFB must be provided together"
+    assert device_capacity[0] in [10, 11], "Blockscaled GEMM requires SM100/SM110"
+    assert SFA.dtype == SFB.dtype, f"SF dtype mismatch: {SFA.dtype} vs {SFB.dtype}"
+    assert SFA.dtype in SF_DTYPE_TO_VEC_SIZE, f"unsupported SF dtype: {SFA.dtype}"
+    sf_vec_size = SF_DTYPE_TO_VEC_SIZE[SFA.dtype]
+    sf_dtype = torch2cute_dtype_map[SFA.dtype]
+    # A.shape[-1] is packed K for fp4 (two elements per byte) while dlpack presents
+    # the logical extent to the kernel, so validate rk against logical K.
+    k_logical = A.shape[-1] * (2 if A.dtype == torch.float4_e2m1fn_x2 else 1)
+    rk = (k_logical + 4 * sf_vec_size - 1) // (4 * sf_vec_size)
+    for name, SF, mn in (("SFA", SFA, A.shape[-2]), ("SFB", SFB, B.shape[-2])):
+        expected = (A.shape[0], (mn + 127) // 128, rk, 32, 4, 4)
+        assert tuple(SF.shape) == expected, f"{name} shape {tuple(SF.shape)} != {expected}"
+        assert SF.stride()[-3:] == (16, 4, 1), (
+            f"{name}: inner (32, 4, 4) block must be contiguous with strides (16, 4, 1), "
+            f"got {SF.stride()[-3:]}"
+        )
+    return sf_dtype, sf_vec_size
 
 
 def div_for_dtype(dtype):
@@ -136,7 +172,11 @@ def make_fake_gemm_tensors(
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
     c_leading = 1 if c_major == "n" else 0
-    m, n, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
+    m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    # Sub-byte (fp4) tensors need their contiguous extent statically divisible by the
+    # packing factor; fp4 operands are k-major, so mark k. Harmless for 8-bit+ dtypes.
+    k_div = div_for_dtype(a_dtype) if a_dtype.width < 8 else 1
+    k = cute.sym_int(divisibility=k_div)
     div_a = div_for_dtype(a_dtype)
     div_b = div_for_dtype(b_dtype)
     div_d = div_for_dtype(d_dtype) if d_dtype is not None else 1
@@ -165,6 +205,32 @@ def make_fake_gemm_tensors(
     return mA, mB, mD, mC, m, n, k, l
 
 
+def make_fake_sf_tensor(sf_dtype, l):
+    """Fake (l, rm, rk, 32, 4, 4) blockscaled scale-factor tensor.
+
+    The inner (32, 4, 4) block has static strides (16, 4, 1) — one contiguous
+    512 B atom per 128 rows x 4 K-blocks, so TMA loads it as one box. The
+    kernel only consumes the base pointer and the outer (l, rm, rk) strides
+    (the atom layout is hardware-fixed); outer strides are dynamic but
+    atom-granular, so slices of larger scale buffers are accepted without a
+    copy.
+    """
+    rm, rk = cute.sym_int(), cute.sym_int()
+    return cute.runtime.make_fake_tensor(
+        sf_dtype,
+        (l, rm, rk, 32, 4, 4),
+        stride=(
+            cute.sym_int64(divisibility=512),
+            cute.sym_int64(divisibility=512),
+            cute.sym_int64(divisibility=512),
+            16,
+            4,
+            1,
+        ),
+        assumed_align=16,
+    )
+
+
 def compile_gemm_kernel(
     GemmCls,
     a_dtype,
@@ -188,6 +254,7 @@ def compile_gemm_kernel(
     use_tma_gather=False,
     concat_layout=None,
     num_warps=None,
+    sf_vec_size=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] == 8:
@@ -201,6 +268,7 @@ def compile_gemm_kernel(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,
             use_tma_gather=use_tma_gather,
+            sf_vec_size=sf_vec_size,
         )
     gemm_obj = GemmCls(
         Float32,

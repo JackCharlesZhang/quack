@@ -29,7 +29,9 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     make_fake_varlen_args,
     make_fake_gemm_tensors,
+    make_fake_sf_tensor,
     compile_gemm_kernel,
+    validate_blockscaled_sf,
 )
 
 
@@ -64,6 +66,8 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     num_warps,
+    sf_dtype=None,
+    sf_vec_size=None,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -117,6 +121,11 @@ def _compile_gemm(
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    if sf_dtype is not None:
+        mSFA = make_fake_sf_tensor(sf_dtype, l)
+        mSFB = make_fake_sf_tensor(sf_dtype, l)
+    else:
+        mSFA, mSFB = None, None
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -134,9 +143,12 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
+        mSFA=mSFA,
+        mSFB=mSFB,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         num_warps=num_warps,
+        sf_vec_size=sf_vec_size,
     )
 
 
@@ -171,11 +183,14 @@ def gemm(
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
     num_warps: Optional[int] = None,
+    SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors
+    SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
+    blockscaled = SFA is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
@@ -193,6 +208,12 @@ def gemm(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    sf_dtype, sf_vec_size = None, None
+    if blockscaled:
+        assert not varlen and not gather_A, "Blockscaled GEMM does not support varlen/gather yet"
+        assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
+        assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
+        sf_dtype, sf_vec_size = validate_blockscaled_sf(A, B, SFA, SFB, device_capacity)
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
     if rounding_mode == RoundingMode.RS:
@@ -249,6 +270,8 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         num_warps,
+        sf_dtype,
+        sf_vec_size,
     )
 
     def scalar_arg(scalar, mode, dtype=Float32):
@@ -282,6 +305,6 @@ def gemm(
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, SFA, SFB)
     else:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
