@@ -7,6 +7,7 @@ import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
 from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp
+from cutlass.pipeline import alloc_reserved_mbarrier
 from cutlass.pipeline import PipelineState, PipelineUserType
 from cutlass.pipeline import Agent, agent_sync
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
@@ -239,11 +240,12 @@ class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
     @staticmethod
     def create(
         *args,
+        barrier_storage: Optional[cute.Pointer] = None,
         elect_one_release: bool = False,
         syncwarp_before_release: bool = True,
         **kwargs,
     ):
-        obj = PipelineCpAsyncOg.create(*args, **kwargs)
+        obj = PipelineCpAsyncOg.create(*args, barrier_storage=barrier_storage, **kwargs)
         object.__setattr__(obj, "__class__", PipelineCpAsync)
         object.__setattr__(obj, "_elect_one_release", elect_one_release)
         object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
@@ -604,7 +606,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
         producer_group: CooperativeGroup,
         consumer_group: CooperativeGroup,
         tx_count: int,
-        barrier_storage: cute.Pointer = None,
+        barrier_storage: Optional[cute.Pointer] = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         mcast_mode_mn: tuple[int, int] = (1, 1),
         defer_sync: bool = False,
@@ -632,6 +634,8 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
         :return: A new PipelineTmaUmma instance configured with the provided parameters
         :rtype: PipelineTmaUmma
         """
+        if barrier_storage is None:
+            barrier_storage = alloc_reserved_mbarrier(num_stages)
         if not isinstance(barrier_storage, cute.Pointer):
             raise TypeError(
                 f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"

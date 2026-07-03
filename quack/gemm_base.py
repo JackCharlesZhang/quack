@@ -646,7 +646,6 @@ class GemmTmaBase(GemmBase):
         self,
         tiled_mma: cute.TiledMma,
         cluster_layout_vmnk: cute.Layout,
-        ab_pipeline_mbar_ptr: cute.Pointer,
     ):
         # Threads/warps participating in this pipeline
         producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
@@ -659,7 +658,6 @@ class GemmTmaBase(GemmBase):
         )
         pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
         return pipeline_cls.create(
-            barrier_storage=ab_pipeline_mbar_ptr,
             num_stages=self.ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
@@ -670,7 +668,6 @@ class GemmTmaBase(GemmBase):
 
     def make_epi_pipeline(
         self,
-        epi_pipeline_mbar_ptr: cute.Pointer,
         tx_count: int,
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -680,7 +677,6 @@ class GemmTmaBase(GemmBase):
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
         return pipeline.PipelineTmaAsync.create(
-            barrier_storage=epi_pipeline_mbar_ptr,
             num_stages=self.epi_c_stage,
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,

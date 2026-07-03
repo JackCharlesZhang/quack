@@ -17,7 +17,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.utils import LayoutEnum, SmemPartition
 
 
 from quack import layout_utils
@@ -464,10 +464,6 @@ class GemmSm90(GemmTmaBase):
 
         @cute.struct
         class SharedStorage:
-            ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
-            epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
-            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -598,23 +594,23 @@ class GemmSm90(GemmTmaBase):
         ab_pipeline = self.make_ab_pipeline(
             tiled_mma=tiled_mma,
             cluster_layout_vmnk=cute.make_layout((1, *cluster_layout_mnk.shape)),
-            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
         epi_pipeline = None
         if const_expr(has_epi_load):
-            epi_pipeline = self.make_epi_pipeline(
-                epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
-                tx_count=self.epi_load_bytes_per_stage,
-            )
+            epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(
-                cluster_layout_mnk,
-                sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                varlen_k=varlen_k,
+            sched_pipeline = self.make_sched_pipeline(cluster_layout_mnk, varlen_k=varlen_k)
+            # Keep scheduler scratch out of SharedStorage. A small buffer before
+            # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
+            # responses also use i128 copies, so this stays 16-byte aligned.
+            sched_data = smem.allocate_tensor(
+                Int32,
+                cute.make_layout((4, self.sched_stage)),
+                byte_alignment=16,
+                partition=SmemPartition.RESERVED,
             )
-            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -1209,9 +1205,7 @@ class GemmSm90(GemmTmaBase):
             number_of_threads=2 * self.num_threads_per_warp_group,
         )
 
-    def make_sched_pipeline(
-        self, cluster_layout_mnk: cute.Layout, sched_pipeline_mbar_ptr: cute.Pointer, varlen_k: bool
-    ):
+    def make_sched_pipeline(self, cluster_layout_mnk: cute.Layout, varlen_k: bool):
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
         # Each warp will contribute 1 to the arrive count
@@ -1225,7 +1219,6 @@ class GemmSm90(GemmTmaBase):
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
         return pipeline.PipelineAsync.create(
-            barrier_storage=sched_pipeline_mbar_ptr,
             num_stages=self.sched_stage,
             producer_group=sched_pipeline_producer_group,
             consumer_group=sched_pipeline_consumer_group,

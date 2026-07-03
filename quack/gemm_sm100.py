@@ -22,9 +22,9 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.utils import LayoutEnum, SmemPartition
 
-from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
+from quack.pipeline import PipelineCpAsync, PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -759,16 +759,6 @@ class GemmSm100(GemmTmaBase):
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
-            ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
-            epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
-            acc_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            a_prefetch_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.a_prefetch_stage * 2
-            ]
-            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 12]
-            tmem_dealloc_mbar_ptr: cutlass.Int64
-            tmem_holding_buf: Int32
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD: cute.struct.Align[
@@ -929,33 +919,28 @@ class GemmSm100(GemmTmaBase):
         ab_pipeline = self.make_ab_pipeline(
             tiled_mma=tiled_mma,
             cluster_layout_vmnk=cluster_layout_vmnk,
-            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
             is_leader_cta=is_leader_cta,
         )
         epi_pipeline = None
         if const_expr(has_epi_load):
-            epi_pipeline = self.make_epi_pipeline(
-                epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
-                tx_count=self.epi_load_bytes_per_stage,
-            )
-        acc_pipeline = self.make_acc_pipeline(
-            cluster_layout_vmnk=cluster_layout_vmnk,
-            acc_pipeline_mbar_ptr=storage.acc_pipeline_array_ptr.data_ptr(),
-        )
+            epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
+        acc_pipeline = self.make_acc_pipeline(cluster_layout_vmnk=cluster_layout_vmnk)
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(
-                self.cluster_shape_mnk,
-                sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                has_C=has_epi_load,
+            sched_pipeline = self.make_sched_pipeline(self.cluster_shape_mnk, has_C=has_epi_load)
+            # Keep scheduler scratch out of SharedStorage. A small buffer before
+            # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
+            # responses also use i128 copies, so this stays 16-byte aligned.
+            sched_data = smem.allocate_tensor(
+                Int32,
+                cute.make_layout((12, self.sched_stage)),
+                byte_alignment=16,
+                partition=SmemPartition.RESERVED,
             )
-            sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
-            a_prefetch_pipeline = self.make_a_prefetch_pipeline(
-                storage.a_prefetch_pipeline_array_ptr.data_ptr(),
-            )
+            a_prefetch_pipeline = self.make_a_prefetch_pipeline()
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierGemm.TmemPtr),
@@ -963,11 +948,9 @@ class GemmSm100(GemmTmaBase):
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # Cluster arrive after barrier init
@@ -2104,7 +2087,6 @@ class GemmSm100(GemmTmaBase):
         self,
         tiled_mma: cute.TiledMma,
         cluster_layout_vmnk: cute.Layout,
-        ab_pipeline_mbar_ptr: cute.Pointer,
         is_leader_cta: Boolean,
     ) -> pipeline.PipelineAsync:
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
@@ -2127,19 +2109,8 @@ class GemmSm100(GemmTmaBase):
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        if const_expr(not self.gather_A):
-            pipeline_ab = pipeline.PipelineTmaUmma.create(
-                barrier_storage=ab_pipeline_mbar_ptr,
-                num_stages=self.ab_stage,
-                producer_group=ab_pipeline_producer_group,
-                consumer_group=ab_pipeline_consumer_group,
-                tx_count=self.num_tma_load_bytes,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            )
-        elif const_expr(self.use_tma_gather):
+        if const_expr(not self.gather_A or self.use_tma_gather):
             pipeline_ab = PipelineTmaUmma.create(
-                barrier_storage=ab_pipeline_mbar_ptr,
                 num_stages=self.ab_stage,
                 producer_group=ab_pipeline_producer_group,
                 consumer_group=ab_pipeline_consumer_group,
@@ -2149,7 +2120,6 @@ class GemmSm100(GemmTmaBase):
             )
         else:
             pipeline_ab = PipelineTmaCpAsyncUmma.create(
-                barrier_storage=ab_pipeline_mbar_ptr,
                 num_stages=self.ab_stage,
                 producer_group=ab_pipeline_producer_group,
                 consumer_group=ab_pipeline_consumer_group,
@@ -2162,16 +2132,13 @@ class GemmSm100(GemmTmaBase):
             )
         return pipeline_ab
 
-    def make_acc_pipeline(
-        self, cluster_layout_vmnk: cute.Layout, acc_pipeline_mbar_ptr: cute.Pointer
-    ) -> pipeline.PipelineAsync:
+    def make_acc_pipeline(self, cluster_layout_vmnk: cute.Layout) -> pipeline.PipelineAsync:
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = self.num_epi_warps * (2 if self.use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
         return pipeline.PipelineUmmaAsync.create(
-            barrier_storage=acc_pipeline_mbar_ptr,
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
@@ -2182,7 +2149,6 @@ class GemmSm100(GemmTmaBase):
     def make_sched_pipeline(
         self,
         cluster_layout_mnk: cute.Layout,
-        sched_pipeline_mbar_ptr: cute.Pointer,
         has_C: bool = False,
     ) -> pipeline.PipelineAsync:
         # Threads/warps participating in this pipeline
@@ -2200,7 +2166,6 @@ class GemmSm100(GemmTmaBase):
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
         return pipeline.PipelineAsync.create(
-            barrier_storage=sched_pipeline_mbar_ptr,
             num_stages=self.sched_stage,
             producer_group=sched_pipeline_producer_group,
             consumer_group=sched_pipeline_consumer_group,
@@ -2210,17 +2175,14 @@ class GemmSm100(GemmTmaBase):
         )
 
     @cute.jit
-    def make_a_prefetch_pipeline(
-        self, a_prefetch_pipeline_mbar_ptr: cute.Pointer
-    ) -> pipeline.PipelineAsync:
+    def make_a_prefetch_pipeline(self) -> pipeline.PipelineAsync:
         producer_cnt = 32
         a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         consumer_arrive_cnt = self.num_ab_load_warps
         a_prefetch_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        return pipeline.PipelineCpAsync.create(
-            barrier_storage=a_prefetch_pipeline_mbar_ptr,
+        return PipelineCpAsync.create(
             num_stages=self.a_prefetch_stage,
             producer_group=a_prefetch_producer_group,
             consumer_group=a_prefetch_consumer_group,

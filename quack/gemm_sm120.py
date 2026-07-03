@@ -17,6 +17,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32, Boolean, const_expr
+from cutlass.utils import SmemPartition
 
 from quack.varlen_utils import VarlenManager
 from quack.pipeline import make_pipeline_state
@@ -201,24 +202,24 @@ class GemmSm120(GemmSm90):
         ab_pipeline = self.make_ab_pipeline(
             tiled_mma=tiled_mma,
             cluster_layout_vmnk=cute.make_layout((1, *cluster_layout_mnk.shape)),
-            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
         epi_pipeline = None
         has_epi_load = const_expr(self.epi_c_stage > 0)
         if const_expr(has_epi_load):
-            epi_pipeline = self.make_epi_pipeline(
-                epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
-                tx_count=self.epi_load_bytes_per_stage,
-            )
+            epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(
-                cluster_layout_mnk,
-                sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                varlen_k=varlen_k,
+            sched_pipeline = self.make_sched_pipeline(cluster_layout_mnk, varlen_k=varlen_k)
+            # Keep scheduler scratch out of SharedStorage. A small buffer before
+            # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
+            # responses also use i128 copies, so this stays 16-byte aligned.
+            sched_data = smem.allocate_tensor(
+                Int32,
+                cute.make_layout((4, self.sched_stage)),
+                byte_alignment=16,
+                partition=SmemPartition.RESERVED,
             )
-            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         # Cluster sync
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
