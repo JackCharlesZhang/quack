@@ -729,12 +729,16 @@ def test_blockscaled_varlen_m_nonaligned(seqlens_m, b_major, fmt):
         [128, 256, 128],  # 128-aligned mixed sizes
         [96, 160, 128],  # not 128-aligned (but all sf_vec-aligned)
         [32, 256, 64, 128],  # small + varied
+        [100, 220, 65],  # not even sf_vec(32)-aligned: partial last scale block
+        [1, 33, 158, 192],  # boundary conditions, non-aligned
     ],
 )
 def test_blockscaled_mxfp8_varlen_k(seqlens_k):
-    """varlen_k blockscaled: per-expert k_i (must be sf_vec-aligned; 128-alignment
-    is NOT required). SFA/SFB use tile-aligned per-batch K padding and the kernel
-    reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
+    """varlen_k blockscaled: per-expert k_i is arbitrary (neither 128- nor
+    sf_vec(32)-alignment required; a partial last scale block pairs with the
+    ragged TMA's zero-filled value tail). SFA/SFB use tile-aligned per-batch K
+    padding and the kernel reads them via offset_batch_SFA/offset_batch_SFB
+    padded-K formula."""
     _skip_if_not_sm100()
     num_experts = len(seqlens_k)
     m, n = 256, 256
@@ -772,6 +776,51 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
         out_i = mD[:, :, i].float()
         err = (out_i - ref_i).abs().max().item()
         assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
+@pytest.mark.parametrize(
+    "seqlens_k",
+    [
+        [128, 128, 128],  # baseline: all aligned
+        [96, 160, 128],  # not 128-aligned
+        [100, 220, 65],  # not even sf_vec(32)-aligned
+    ],
+)
+def test_blockscaled_varlen_k_public_api(seqlens_k):
+    """varlen_k through the public quack.gemm.gemm API (jit-cached compile path).
+    A is (m, total_k) m-major, B is (n, total_k) n-major, and BOTH SFA/SFB are
+    tile-aligned K-padded buffers passed as (1, rm/rn, total_padded_rk, 32, 4, 4)."""
+    _skip_if_not_sm100()
+    from quack.gemm import gemm as gemm_public
+
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
+        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,  # (m, total_k) m-major
+        mB,  # (n, total_k) n-major
+        mD,  # (L, m, n); gemm() permutes to (m, n, L) internally
+        None,
+        None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=a_sc_contig,
+        SFB=b_sc_contig,
+    )
+    torch.cuda.synchronize()
+
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, f"public API varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
 
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])

@@ -357,9 +357,7 @@ def gemm_tuned(
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
     if blockscaled:
-        assert not varlen_k and not gather_A, (
-            "Blockscaled GEMM does not support varlen_k/gather_A yet"
-        )
+        assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert not config.swap_ab, "Blockscaled GEMM does not support swap_ab yet"
     if gather_A:

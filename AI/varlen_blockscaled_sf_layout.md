@@ -14,7 +14,22 @@ requirement coincides with `varlen_m`'s (A must be K-major), and per-batch
 offsets slice whole M rows, which stay byte-aligned (`k/2` bytes/row) and
 TMA-aligned (`k % 32`). `varlen_k` is MXFP8-only: it needs M/N-major operands
 (conflicting with fp4's K-major), and per-expert K offsets would hit sub-byte
-packing.
+packing. For `varlen_k`, per-expert `k_i` is arbitrary — not even
+`sf_vec_size` (32) alignment is required: a non-aligned `k_i` leaves the
+expert's last scale block covering a partial chunk, and the ragged value TMA
+zero-fills beyond `cu_seqlens_k[i+1]`, so the tail contributes exactly 0.
+
+**Finite-SF-pad contract (`varlen_k`, TODO fix):** K is the *reduction* dim, so
+the pad inside each expert's last SF atom column is read by the kernel (SF TMA
+loads whole 512 B atoms; unlike A/B it is not ragged-bounded) and multiplied
+against the zero-filled value tail. Those pad bytes must be **finite**:
+zero bytes are safe (e8m0 `0x00` = 2^-127, giving `0 × 2^-127 = 0`), but
+`0xFF` (e8m0 NaN) would poison the accumulator — so SF buffers must be
+zero-initialized (`torch.zeros`), never `torch.empty`. Ragged SF TMA cannot
+lift this: the ragged-extent trick cuts at whole-atom (128 source-K)
+granularity, and the dangerous bytes are *inside* the last atom. Lifting it
+needs a kernel-side fix. (`varlen_m` has no such issue: its M-pad garbage
+lands in output rows the epilogue never stores.)
 
 ## Notation
 
@@ -200,14 +215,20 @@ a tile-unit offset integer.
   - Both fill a source-unit torch buffer at offset
     `(c_b // 128 + b) * 128`, then pass through
     `pack_scale_2d_to_blocked_contig` to the `(1, rmn, rk, 32, 4, 4)` layout.
-- Public API (`varlen_m` only; `varlen_k` still blocked there):
+- Public API (both `varlen_m` and `varlen_k`):
   - `quack/gemm.py::gemm(..., cu_seqlens_m=..., SFA=..., SFB=...)` — SFA is the
     padded buffer viewed as `(1, total_padded_rm, rk, 32, 4, 4)`, SFB per-batch
     `(L, rn, rk, 32, 4, 4)`. In `_compile_gemm` the fake SFA gets its own batch
     sym (its batch dim is 1, not `l`).
-  - `quack/gemm_tvm_ffi_utils.py::validate_blockscaled_sf(num_batches=...)` —
-    checks `SFA.shape[1] >= ceil(total_m/128) + (L-1)`.
-  - `quack/gemm_interface.py::gemm((A, SFA), (B, SFB), cu_seqlens_m=...)`.
+  - `quack/gemm.py::gemm(..., cu_seqlens_k=..., SFA=..., SFB=...)` — A is
+    `(m, total_k)` m-major, B `(n, total_k)` n-major; both SFA and SFB are
+    K-padded `(1, rm/rn, total_padded_rk, 32, 4, 4)` buffers (both fake SF
+    tensors get their own batch syms).
+  - `quack/gemm_tvm_ffi_utils.py::validate_blockscaled_sf(num_batches=..., varlen_k=...)` —
+    checks `SFA.shape[1] >= ceil(total_m/128) + (L-1)` (varlen_m) or
+    `SF*.shape[2] >= ceil(total_k/128) + (L-1)` (varlen_k, both buffers).
+  - `quack/gemm_interface.py::gemm((A, SFA), (B, SFB), cu_seqlens_m=...)` and
+    `gemm((A, SFA), (B, SFB), cu_seqlens_k=...)` (B passed as `(total_k, n)`).
 - `quack/layout_utils.py`
   - `tile_atom_to_shape_SF_strided(shape, sf_vec_size, sf_strides)` — builds
     the CuTe layout using mSFA's own strides and shape, so the padded total
@@ -216,14 +237,18 @@ a tile-unit offset integer.
 ## Tests
 
 `tests/test_gemm_sm100_blockscaled.py`:
-- `test_blockscaled_mxfp8_varlen_m_public_api` — same setup through
-  `quack.gemm.gemm` (3 patterns × 2 B-majors); interface-level coverage in
+- `test_blockscaled_varlen_m_public_api` — same setup through
+  `quack.gemm.gemm` (3 patterns × 2 B-majors × 3 formats); interface-level coverage in
   `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_m`.
-- `test_blockscaled_mxfp8_varlen_m_nonaligned` — 4 seqlen patterns × 2 B-majors = 8 cases.
+- `test_blockscaled_varlen_m_nonaligned` — 4 seqlen patterns × 2 B-majors × 3 formats.
   Patterns include `[128, 128, 128]`, `[100, 200, 150]`, `[30, 300, 64, 200]`,
   `[1, 128, 127, 129]`.
-- `test_blockscaled_mxfp8_varlen_k` — 4 patterns including non-128-aligned
-  `[96, 160, 128]` and `[32, 256, 64, 128]`.
+- `test_blockscaled_mxfp8_varlen_k` — 6 patterns including non-128-aligned
+  `[96, 160, 128]`, `[32, 256, 64, 128]` and non-32-aligned `[100, 220, 65]`,
+  `[1, 33, 158, 192]` (partial last scale block per expert).
+- `test_blockscaled_varlen_k_public_api` — same through `quack.gemm.gemm`
+  (3 patterns incl. non-32-aligned); interface-level coverage in
+  `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_k`.
 
 All per-expert reference checks use `a_ref_list[i] @ b_ref_list[i].T` (or
 equivalent cat along the non-varying dim) against the kernel's single-pass

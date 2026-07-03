@@ -165,6 +165,31 @@ def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
     assert err < 5e-3, f"varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
 
 
+@pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128], [100, 220, 65]])
+def test_blockscaled_gemm_varlen_k(seqlens_k):
+    """Grouped varlen_k blockscaled GEMM through the unified interface (MXFP8 only:
+    fp4 must be K-major, varlen_k needs m-major A / n-major B). Both SFA and SFB
+    are single K-padded buffers (tile-aligned per-batch padding, batch dim 1).
+    Per-expert k_i is arbitrary — not even sf_vec(32)-aligned."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, qa, qb, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k
+    )
+    # Interface takes B as (total_K, N); qb is (n, total_k) n-major so .t() is
+    # the (total_k, n) row-major view and gemm_tuned's .mT restores n-major.
+    out = gemm((qa, SFA), (qb.t(), SFB), cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert out.shape == (num_experts, m, n)
+
+    ref = torch.stack([a_ref_list[i] @ b_ref_list[i].T for i in range(num_experts)])
+    err = (out.float() - ref).abs().max().item()
+    assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} max_err={err}"
+
+
 def test_blockscaled_gemm_vs_cublas():
     """Bit-exact comparison against torch._scaled_mm (cuBLAS MXFP8 path)."""
     _skip_if_not_sm100()

@@ -122,10 +122,11 @@ def _compile_gemm(
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
     if sf_dtype is not None:
-        # For varlen_m, SFA is one M-padded buffer with batch dim 1 while mB/mSFB
-        # keep batch dim l, so SFA's batch dim needs its own sym.
-        mSFA = make_fake_sf_tensor(sf_dtype, cute.sym_int() if varlen_m else l)
-        mSFB = make_fake_sf_tensor(sf_dtype, l)
+        # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
+        # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
+        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m.
+        mSFA = make_fake_sf_tensor(sf_dtype, 1 if (varlen_m or varlen_k) else l)
+        mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_k else l)
     else:
         mSFA, mSFB = None, None
     return compile_gemm_kernel(
@@ -185,10 +186,12 @@ def gemm(
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
     num_warps: Optional[int] = None,
-    # (l, rm, rk, 32, 4, 4) blocked scale factors, or (1, total_padded_rm, rk, 32, 4, 4)
-    # if varlen_m (M-padded, see AI/varlen_blockscaled_sf_layout.md)
+    # SFA/SFB: (l, rm/rn, rk, 32, 4, 4) blocked scale factors. For varlen_m, SFA is
+    # M-padded (1, total_padded_rm, rk, 32, 4, 4) while SFB stays per-batch. For
+    # varlen_k, BOTH are K-padded (1, rm/rn, total_padded_rk, 32, 4, 4) and the pad
+    # must be finite — zero-init it. See AI/varlen_blockscaled_sf_layout.md.
     SFA: Optional[Tensor] = None,
-    SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
+    SFB: Optional[Tensor] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -214,18 +217,17 @@ def gemm(
     )
     sf_dtype, sf_vec_size = None, None
     if blockscaled:
-        assert not varlen_k and not gather_A, (
-            "Blockscaled GEMM does not support varlen_k/gather_A yet"
-        )
+        assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
+        if varlen_m:
+            num_batches = cu_seqlens_m.shape[0] - 1
+        elif varlen_k:
+            num_batches = cu_seqlens_k.shape[0] - 1
+        else:
+            num_batches = None
         sf_dtype, sf_vec_size = validate_blockscaled_sf(
-            A,
-            B,
-            SFA,
-            SFB,
-            device_capacity,
-            num_batches=cu_seqlens_m.shape[0] - 1 if varlen_m else None,
+            A, B, SFA, SFB, device_capacity, num_batches=num_batches, varlen_k=varlen_k
         )
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"

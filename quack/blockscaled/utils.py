@@ -581,12 +581,22 @@ def create_blockscaled_varlen_k_operands(
 ):
     """Generate bf16 randn + quantize for a varlen_k blockscaled GEMM.
 
-    Per-expert `k_i` must be a multiple of `sf_vec_size` (quantization chunk)
-    but NOT necessarily a multiple of `sf_vec_size * 4` (= 128 for MXFP8).
+    Per-expert `k_i` is arbitrary (any positive int): neither `sf_vec_size` nor
+    `sf_vec_size * 4` (= 128 for MXFP8) alignment is required. A non-multiple-of-32
+    `k_i` just means the expert's last scale block covers a partial chunk; the
+    kernel's ragged value TMA zero-fills beyond `cu_seqlens_k[i+1]`, so the tail
+    contributes exactly 0.
     The SF buffer uses tile-aligned per-batch K padding: each expert `i`'s scales occupy
     `ceildiv(k_i, 128) * 128` bytes worth of K at offset
     `(cu_seqlens_k[i] + i * 128) // 128 * 128` (in source-K units). A and B
     operand data stay packed and unpadded along K — only their SF buffers pad.
+
+    Contract: SF pad regions inside each expert's last 512 B atom ARE read by the
+    kernel (TMA loads whole atom columns) and multiplied against the zero-filled
+    value tail — they must hold finite encodings. Zero bytes are safe (e8m0 0x00
+    = 2^-127) and `torch.zeros` below guarantees that; 0xFF (e8m0 NaN) would
+    poison the accumulation. TODO: remove this finite-pad requirement (ragged SF
+    TMA can only cut at whole-atom granularity, so it needs a kernel-side fix).
 
     Returns (a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k):
       a_ref_list: list of per-expert (m, k_i) fp32 dequantized A.
@@ -610,30 +620,37 @@ def create_blockscaled_varlen_k_operands(
         f"seqlens_k length {len(seqlens_k)} != num_experts {num_experts}"
     )
     for i, k_i in enumerate(seqlens_k):
-        assert k_i % sf_vec_size == 0, (
-            f"seqlens_k[{i}]={k_i} must be divisible by sf_vec_size={sf_vec_size}"
-        )
+        assert k_i > 0, f"seqlens_k[{i}]={k_i} must be positive"
     total_k = int(sum(seqlens_k))
     std = randn_std if randn_std is not None else (max(seqlens_k)) ** -0.5
-    sf_k_total = total_k // sf_vec_size
 
     from quack.blockscaled.quantize import to_mx_compiled
+
+    def quantize(mn, k_i):
+        # The quantizer reshapes K into sf_vec_size chunks, so zero-pad k_i up to a
+        # multiple of it; zeros never raise a chunk amax, so the real elements
+        # quantize identically. Values are sliced back to k_i; scales keep the
+        # ceil(k_i / sf_vec_size) blocks (the last one covers a partial chunk).
+        k_q = (k_i + sf_vec_size - 1) // sf_vec_size * sf_vec_size
+        hp = torch.zeros(mn, k_q, dtype=torch.bfloat16, device="cuda")
+        hp[:, :k_i] = torch.randn(mn, k_i, dtype=torch.bfloat16, device="cuda") * std
+        q, sc = to_mx_compiled(hp, sf_vec_size)
+        q = q[:, :k_i]
+        ref = q.float() * sc.float().repeat_interleave(sf_vec_size, dim=-1)[:, :k_i]
+        return q, sc, ref
 
     a_q_list, a_sc_list, a_ref_list = [], [], []
     b_q_list, b_sc_list, b_ref_list = [], [], []
     for k_i in seqlens_k:
-        # A slice: (m, k_i) bf16 -> fp8, scales (m, k_i // sf_vec_size).
-        a_hp = (torch.randn(m, k_i, dtype=torch.bfloat16, device="cuda") * std).contiguous()
-        a_q, a_sc = to_mx_compiled(a_hp, sf_vec_size)
+        a_q, a_sc, a_ref = quantize(m, k_i)
         a_q_list.append(a_q)
         a_sc_list.append(a_sc)
-        a_ref_list.append(a_q.float() * a_sc.float().repeat_interleave(sf_vec_size, dim=-1))
+        a_ref_list.append(a_ref)
 
-        b_hp = (torch.randn(n, k_i, dtype=torch.bfloat16, device="cuda") * std).contiguous()
-        b_q, b_sc = to_mx_compiled(b_hp, sf_vec_size)
+        b_q, b_sc, b_ref = quantize(n, k_i)
         b_q_list.append(b_q)
         b_sc_list.append(b_sc)
-        b_ref_list.append(b_q.float() * b_sc.float().repeat_interleave(sf_vec_size, dim=-1))
+        b_ref_list.append(b_ref)
 
     # Pack operand data along K: (m, total_k), (n, total_k). varlen_k's
     # ragged TMA descriptors are built for MN-major operands (stride 1 on
@@ -656,7 +673,7 @@ def create_blockscaled_varlen_k_operands(
     sb_2d_padded = torch.zeros(n, total_padded_sf_k, dtype=b_sc_list[0].dtype, device="cuda")
     k_offset = 0
     for i, k_i in enumerate(seqlens_k):
-        sf_k_i = k_i // sf_vec_size
+        sf_k_i = (k_i + sf_vec_size - 1) // sf_vec_size
         k_offset_padded = (k_offset // tile + i) * tile
         sf_k_offset_padded = k_offset_padded // sf_vec_size
         sa_2d_padded[:, sf_k_offset_padded : sf_k_offset_padded + sf_k_i] = a_sc_list[i]
