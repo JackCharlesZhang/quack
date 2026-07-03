@@ -451,7 +451,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     scale_2d = torch.randint(0, 255, (l, mn, sf_k), device="cuda", dtype=torch.uint8)
 
     # Build our contiguous scale storage via create_blockscaled_operand_quantized's
-    # rearrangement logic: pad + (l, rm, 128, rk, 4) -> (l, rm, rk, 512)
+    # rearrangement logic: pad + (l, rm, 128, rk, 4) -> (l, rm, rk, 32, 4, 4)
     rm = (mn + 127) // 128
     rk = (sf_k + 3) // 4
     mn_pad = rm * 128
@@ -460,11 +460,13 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     padded[:, :mn, :sf_k] = scale_2d
     blocks = padded.view(l, rm, 128, rk, 4).permute(0, 1, 3, 2, 4)
     blocks = blocks.reshape(l, rm, rk, 4, 32, 4).transpose(3, 4).contiguous()
-    scale_contig = blocks.view(l, rm, rk, 512)  # (l, rm, rk, 512)
+    scale_contig = blocks  # (l, rm, rk, 32, 4, 4)
 
     # kernel view indexing: byte offset within tile = (m%32)*16 + ((m//32)%4)*4 + (k%4)
-    kv = scale_view_for_kernel(scale_contig.view(torch.float8_e8m0fnu), mn, sf_k, l).view(
-        torch.uint8
+    kv = (
+        scale_view_for_kernel(scale_contig.view(torch.float8_e8m0fnu), mn, sf_k, l)
+        .view(torch.uint8)
+        .flatten(-3)
     )
     m_positions = sorted({0, 1, 17, 31, 33, 127, min(128, mn - 1), mn - 1} & set(range(mn)))
     k_positions = sorted({0, 1, 3, 4, 7, sf_k - 1} & set(range(sf_k)))
@@ -641,6 +643,15 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     assert err < 5e-3, f"A={a_major} B={b_major} max_err={err}"
 
 
+VARLEN_FMT = {
+    # format: (ab_dtype, sf_dtype, sf_vec_size)
+    "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
+    "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
+}
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("b_major", ["k", "n"])
 @pytest.mark.parametrize(
     "seqlens_m",
@@ -651,14 +662,16 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
         [1, 128, 127, 129],  # boundary conditions
     ],
 )
-def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
+def test_blockscaled_varlen_m_nonaligned(seqlens_m, b_major, fmt):
     """varlen_m with per-expert seqlens not divisible by 128, plus k/n-major B.
-    SFA is stored in dQaccum-style padded format; kernel reads it via
+    SFA is stored with tile-aligned per-batch padding; kernel reads it via
     offset_batch_SFA."""
     _skip_if_not_sm100()
+    if fmt != "mxfp8" and b_major == "n":
+        pytest.skip("fp4 operands must be K-major")
+    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
     num_experts = len(seqlens_m)
     n, k = 256, 256
-    sf_vec = 32
     mma_tiler_mn = (128, 128)
     cluster_shape_mn = (1, 1)
 
@@ -670,22 +683,24 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
             n,
             k,
             sf_vec,
+            ab_dtype,
+            sf_dtype,
             seqlens_m=seqlens_m,
             b_major=b_major,
         )
     )
-    expected_b_stride0 = 1 if b_major == "n" else k
+    expected_b_stride0 = 1 if b_major == "n" else mB.shape[1]  # k, or k/2 for packed fp4
     assert mB.stride(0) == expected_b_stride0, (
         f"b_major={b_major} → mB.stride(0) should be {expected_b_stride0}, got {mB.stride()}"
     )
     total_m = int(sum(seqlens_m))
-    mSFA = a_sc_contig  # (1, total_padded_rm, rk, 512)
-    mSFB = b_sc_contig  # (L, rn, rk, 512)
+    mSFA = a_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4)
+    mSFB = b_sc_contig  # (L, rn, rk, 32, 4, 4)
 
     mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
     runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
+        ab_dtype,
+        sf_dtype,
         sf_vec,
         cutlass.BFloat16,
         mma_tiler_mn,
@@ -704,7 +719,7 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
     cu = cu_seqlens_m.tolist()
     ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
     err = (mD.float() - ref).abs().max().item()
-    assert err < 5e-3, f"varlen_m non-aligned seqlens_m={seqlens_m} max_err={err}"
+    assert err < 5e-3, f"varlen_m non-aligned {fmt} seqlens_m={seqlens_m} max_err={err}"
 
 
 @pytest.mark.parametrize(
@@ -718,7 +733,7 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
 )
 def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     """varlen_k blockscaled: per-expert k_i (must be sf_vec-aligned; 128-alignment
-    is NOT required). SFA/SFB use dQaccum-style K-padded storage and the kernel
+    is NOT required). SFA/SFB use tile-aligned per-batch K padding and the kernel
     reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
     _skip_if_not_sm100()
     num_experts = len(seqlens_k)
@@ -759,6 +774,60 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
         assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
 
 
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("b_major", ["k", "n"])
+@pytest.mark.parametrize(
+    "seqlens_m",
+    [
+        [128, 128, 128],  # baseline: all aligned
+        [100, 200, 150],  # none aligned to 128
+        [1, 128, 127, 129],  # boundary conditions
+    ],
+)
+def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
+    """varlen_m through the public quack.gemm.gemm API (jit-cached compile path).
+    SFA is the tile-aligned M-padded buffer passed as a
+    (1, total_padded_rm, rk, 32, 4, 4) view."""
+    _skip_if_not_sm100()
+    if fmt != "mxfp8" and b_major == "n":
+        pytest.skip("fp4 operands must be K-major")
+    from quack.gemm import gemm as gemm_public
+
+    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+
+    torch.manual_seed(0)
+    a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
+        create_blockscaled_varlen_m_operands(
+            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m, b_major=b_major
+        )
+    )
+    total_m = int(sum(seqlens_m))
+    SFA, SFB = a_sc_contig, b_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4), (L, rn, rk, 32, 4, 4)
+    mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB.permute(2, 0, 1),  # (n, k, l) -> (l, n, k); gemm() permutes back internally
+        mD,
+        None,
+        None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    torch.cuda.synchronize()
+
+    cu = cu_seqlens_m.tolist()
+    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
+    err = (mD.float() - ref).abs().max().item()
+    assert err < 5e-3, f"public API varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
+
+
 @pytest.mark.parametrize("rk_pad", [1, 3, 5])
 def test_blockscaled_mxfp8_strided_sf(rk_pad):
     """Verify the kernel honors mSFA/mSFB's actual outer strides (doesn't
@@ -779,13 +848,13 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
 
     # Allocate padded scale buffers (rk + rk_pad along K-blocks), copy valid
     # tiles into the prefix, slice back to rk.  The slice is non-contig:
-    # stride(1) = (rk + rk_pad) * 512 instead of rk * 512.
-    a_sc_big = torch.zeros(l, rm, rk + rk_pad, 512, dtype=torch.float8_e8m0fnu, device="cuda")
-    b_sc_big = torch.zeros(l, rn, rk + rk_pad, 512, dtype=torch.float8_e8m0fnu, device="cuda")
-    a_sc_big[:, :, :rk, :] = a_sc
-    b_sc_big[:, :, :rk, :] = b_sc
-    mSFA_strided = a_sc_big[:, :, :rk, :]
-    mSFB_strided = b_sc_big[:, :, :rk, :]
+    # stride(1) = (rk + rk_pad) * 512 elements instead of rk * 512.
+    a_sc_big = torch.zeros(l, rm, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    b_sc_big = torch.zeros(l, rn, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    a_sc_big[:, :, :rk] = a_sc
+    b_sc_big[:, :, :rk] = b_sc
+    mSFA_strided = a_sc_big[:, :, :rk]
+    mSFB_strided = b_sc_big[:, :, :rk]
     assert not mSFA_strided.is_contiguous()
     assert mSFA_strided.stride(-1) == 1
     assert mSFA_strided.stride(1) == (rk + rk_pad) * 512, (

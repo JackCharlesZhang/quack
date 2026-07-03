@@ -188,7 +188,7 @@ def create_blockscaled_operand_tensor(
 
 
 def _pack_blockscaled_scales(ref_blocks: torch.Tensor) -> torch.Tensor:
-    """Rearrange (mn, sf_k, l) scales into the (l, rm, rk, 512) blocked layout."""
+    """Rearrange (mn, sf_k, l) scales into the (l, rm, rk, 32, 4, 4) blocked layout."""
     mn, sf_k, l = ref_blocks.shape
     rm = ceil_div(mn, 128)
     rk = ceil_div(sf_k, 4)
@@ -205,7 +205,7 @@ def _pack_blockscaled_scales(ref_blocks: torch.Tensor) -> torch.Tensor:
         k_idx[None, :, None] // 4,
         l_idx[None, None, :],
     ] = ref_blocks
-    return packed_6d.view(l, rm, rk, 512)
+    return packed_6d
 
 
 def create_blockscaled_scale_tensor(
@@ -237,10 +237,10 @@ def create_blockscaled_scale_tensor(
 
 def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
     """Rearrange a (l, mn, sf_k) or (mn, sf_k) e8m0 scale tensor into the
-    contiguous (l, rm, rk, 512) blocked layout shared by the quack kernel and
-    cuBLAS's block-scaling. Each 512 B inner block holds one 128 MN × 4 K
-    swizzled tile. Pads `mn` to a multiple of 128 and `sf_k` to a multiple of
-    4 with zeros."""
+    contiguous (l, rm, rk, 32, 4, 4) blocked layout shared by the quack kernel
+    and cuBLAS's block-scaling. Each inner (32, 4, 4) atom (512 B) holds one
+    128 MN × 4 K swizzled tile. Pads `mn` to a multiple of 128 and `sf_k` to a
+    multiple of 4 with zeros."""
     if scale_2d.dim() == 2:
         scale_2d = scale_2d.unsqueeze(0)
     assert scale_2d.dim() == 3, f"expected (l, mn, sf_k), got shape {tuple(scale_2d.shape)}"
@@ -260,7 +260,7 @@ def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
     blocks = padded.view(l, rm, 128, rk, 4).permute(0, 1, 3, 2, 4)
     # split 128 into (4 outer, 32 inner), then swap to (32, 4)
     blocks = blocks.reshape(l, rm, rk, 4, 32, 4).transpose(3, 4).contiguous()
-    return blocks.view(l, rm, rk, 512).view(orig_dtype)
+    return blocks.view(orig_dtype)
 
 
 def unpack_scale_blocked_to_2d(blocked: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
@@ -327,23 +327,25 @@ def blockscaled_quantize(
     q = q.view(torch.uint8).view(q_dtype) if q_dtype == torch.float4_e2m1fn_x2 else q
     q = q.reshape(*x.shape[:-1], -1)
     sf = pack_scale_2d_to_blocked_contig(sc.view(l, mn, k // sf_vec))
-    sf = sf.view(l, sf.shape[1], sf.shape[2], 32, 4, 4)
     return q, sf if batched else sf.squeeze(0)
 
 
 def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int) -> torch.Tensor:
-    """Validate a (l, rm, rk, 512) scale tensor and return it unchanged.
-    Only the innermost 512-B tile must be contiguous (stride 1, size 512);
-    outer (L, rm, rk) strides are free — the kernel reads them from the
-    passed tensor. This lets callers pass a slice/view of a larger buffer
-    with no extra copy. Works for both E8M0 (MX) and E4M3 (NVFP4)."""
+    """Validate a (l, rm, rk, 32, 4, 4) scale tensor and return it unchanged.
+    Only the innermost (32, 4, 4) atom (one 512 B tile) must be contiguous
+    (strides (16, 4, 1)); outer (L, rm, rk) strides are free — the kernel
+    reads them from the passed tensor. This lets callers pass a slice/view of
+    a larger buffer with no extra copy. Works for both E8M0 (MX) and E4M3
+    (NVFP4)."""
     rm = ceil_div(mn, 128)
     rk = ceil_div(sf_k, 4)
-    assert scale_contig.shape == (l, rm, rk, 512), (
-        f"expected (l, rm, rk, 512) = ({l}, {rm}, {rk}, 512), got {tuple(scale_contig.shape)}"
+    assert scale_contig.shape == (l, rm, rk, 32, 4, 4), (
+        f"expected (l, rm, rk, 32, 4, 4) = ({l}, {rm}, {rk}, 32, 4, 4), "
+        f"got {tuple(scale_contig.shape)}"
     )
-    assert scale_contig.stride(-1) == 1, (
-        f"innermost 512-B dim must be unit-stride, got stride {scale_contig.stride(-1)}"
+    assert scale_contig.stride()[-3:] == (16, 4, 1), (
+        f"inner (32, 4, 4) atom must be contiguous with strides (16, 4, 1), "
+        f"got {scale_contig.stride()[-3:]}"
     )
     return scale_contig
 
@@ -351,9 +353,9 @@ def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int
 def scale_blocked_for_cublas(
     scale_contig: torch.Tensor, mn: int, sf_k: int, l_idx: int = 0
 ) -> torch.Tensor:
-    """Flatten a (l, rm, rk, 512) scale tensor to the 1D swizzled layout
+    """Flatten a (l, rm, rk, 32, 4, 4) scale tensor to the 1D swizzled layout
     torch._scaled_mm expects. Uses a single l slice."""
-    assert scale_contig.is_contiguous() and scale_contig.dim() == 4
+    assert scale_contig.is_contiguous() and scale_contig.dim() == 6
     return scale_contig[l_idx].reshape(-1)
 
 
@@ -396,8 +398,8 @@ def create_blockscaled_operand_quantized(
     ref:   (mn, k, l) float32 dequantized reference
     q_mkl: (mn, k, l) operand tensor in the layout the quack kernel consumes
            (float8_e4m3fn for fp8 formats; int8 with packed nibbles for fp4)
-    scale_contig: (l, rm, rk, 512) contiguous scale storage. Each 512 B
-           inner block is one 128 MN × 4 K swizzled tile. Byte layout matches
+    scale_contig: (l, rm, rk, 32, 4, 4) contiguous scale storage. Each inner
+           (32, 4, 4) atom (512 B) is one 128 MN × 4 K swizzled tile. Byte layout matches
            cuBLAS `to_blocked`. Pass directly to the quack kernel, or use
            `scale_blocked_for_cublas` for cuBLAS.
     """
@@ -471,7 +473,7 @@ def create_blockscaled_varlen_m_operands(
     """Generate bf16 randn + quantize for a varlen_m blockscaled GEMM.
 
     Per-expert seqlens may be arbitrary (not required to be multiples of 128).
-    SF is stored in dQaccum-style padded format: each expert `i`'s scales
+    SF is stored with tile-aligned per-batch padding: each expert `i`'s scales
     occupy `ceildiv(m_i, 128) * 128` rows at offset
     `(cu_seqlens_m[i] + i * 128) // 128 * 128` in the padded scale buffer.
     The kernel decodes via `VarlenManager.offset_batch_SFA` which applies the
@@ -482,10 +484,14 @@ def create_blockscaled_varlen_m_operands(
       b_ref: (num_experts, n, k) fp32 dequantized
       qa:   (total_m, k) 2D K-major quantized operand (fp8) or (total_m, k/2) (fp4)
       qb:   (n, k, num_experts) 3D K-major quantized operand (fp8) or (n, k/2, num_experts) (fp4)
-      a_sc_contig: (1, total_padded_rm, rk, 512) — dQaccum-padded SFA.
+      a_sc_contig: (1, total_padded_rm, rk, 32, 4, 4) — M-padded SFA (tile-aligned per batch).
         total_padded_rm = ((total_m + num_experts * 128) // 128).
-      b_sc_contig: (num_experts, rn, rk, 512) — regular per-expert SFB.
+      b_sc_contig: (num_experts, rn, rk, 32, 4, 4) — regular per-expert SFB.
       cu_seqlens_m: (num_experts+1,) int32
+
+    Supports MXFP8 / MXFP4 / NVFP4; fp4 formats require b_major="k" (tcgen05
+    MMA needs K-major fp4 operands). NVFP4 uses no per-tensor scale here (it
+    would just fold into alpha).
     """
     assert k % sf_vec_size == 0
     if seqlens_m is None:
@@ -497,23 +503,31 @@ def create_blockscaled_varlen_m_operands(
     std = randn_std if randn_std is not None else k**-0.5
     sf_k = k // sf_vec_size
 
-    if ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32:
-        from quack.blockscaled.quantize import to_mx_compiled
+    fmt = _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size)
+    if fmt != "mxfp8":
+        assert b_major == "k", f"{fmt} requires K-major operands, got b_major={b_major!r}"
 
-        to_fn = to_mx_compiled
-    else:
-        raise NotImplementedError(
-            f"varlen_m currently only supports MXFP8 (got ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}). "
-            "FP4 support pending."
-        )
+    def quantize(x2d):
+        """(rows, k) bf16 -> (q, scale_2d, dequant_ref); q is fp8 (rows, k) or fp4x2 (rows, k/2)."""
+        if fmt == "mxfp8":
+            q, sc = to_mx_compiled(x2d, sf_vec_size)
+            vals = q.float()
+        else:
+            if fmt == "mxfp4":
+                q_packed, sc = to_mxfp4_compiled(x2d, sf_vec_size)
+            else:  # nvfp4
+                q_packed, sc, _ = to_nvfp4_compiled(x2d, sf_vec_size, None)
+            q = q_packed.view(torch.uint8).view(torch.float4_e2m1fn_x2)
+            vals = dequant_operand(q)
+        ref = vals * sc.float().repeat_interleave(sf_vec_size, dim=-1)
+        return q, sc, ref
 
-    # Quantize A: (total_m, k) bf16 -> (total_m, k) fp8 K-major.
+    # Quantize A: (total_m, k) bf16 -> (total_m, k[/2]) K-major.
     # A data itself is stored packed (no per-expert padding); only SFA is padded.
     a_hp = (torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
-    qa, sa_2d = to_fn(a_hp, sf_vec_size)  # (total_m, k), (total_m, sf_k)
-    a_ref = qa.float() * sa_2d.float().repeat_interleave(sf_vec_size, dim=-1)
+    qa, sa_2d, a_ref = quantize(a_hp)  # (total_m, k[/2]), (total_m, sf_k), (total_m, k)
 
-    # Build padded SFA storage (dQaccum format). Each expert's m_i rows of
+    # Build padded SFA storage (tile-aligned per-batch). Each expert's m_i rows of
     # scales are written at padded tile offset `cu_seqlens[i] // 128 + i`.
     # Allocation: `ceildiv(total_m, 128) + (L - 1)` tiles — proven sufficient
     # in AI/varlen_blockscaled_sf_layout.md (proof 2's "tighter alternative").
@@ -530,24 +544,22 @@ def create_blockscaled_varlen_m_operands(
         offset += m_i
     a_sc_contig = pack_scale_2d_to_blocked_contig(sa_2d_padded.view(1, total_padded_m, sf_k))
 
-    # Quantize B: (num_experts, n, k) bf16 -> (n, k, num_experts). b_major selects
-    # k-major (stride (k, 1, n*k)) or n-major (stride (1, n, n*k)).
+    # Quantize B: (num_experts, n, k) bf16 -> (n, k[/2], num_experts). b_major selects
+    # k-major (stride (kb, 1, n*kb)) or n-major (stride (1, n, n*k), mxfp8 only).
     assert b_major in ("k", "n"), f"b_major must be 'k' or 'n', got {b_major!r}"
     b_hp = (torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
-    qb_flat, sb_2d = to_fn(b_hp.view(num_experts * n, k), sf_vec_size)
+    qb_flat, sb_2d, b_ref_flat = quantize(b_hp.view(num_experts * n, k))
+    kb = qb_flat.shape[-1]  # k for fp8, k/2 for packed fp4
     if b_major == "k":
         qb = (
-            qb_flat.view(num_experts, n, k).contiguous().permute(1, 2, 0)
-        )  # (n, k, l) stride (k, 1, n*k)
+            qb_flat.view(num_experts, n, kb).contiguous().permute(1, 2, 0)
+        )  # (n, kb, l) stride (kb, 1, n*kb)
     else:
         qb = (
-            qb_flat.view(num_experts, n, k).transpose(1, 2).contiguous().permute(2, 1, 0)
+            qb_flat.view(num_experts, n, kb).transpose(1, 2).contiguous().permute(2, 1, 0)
         )  # (n, k, l) stride (1, n, n*k)
-    sb_2d = sb_2d.view(num_experts, n, sf_k)
-    b_sc_contig = pack_scale_2d_to_blocked_contig(sb_2d)
-    b_ref = qb_flat.float().view(num_experts, n, k) * sb_2d.float().repeat_interleave(
-        sf_vec_size, dim=-1
-    )
+    b_sc_contig = pack_scale_2d_to_blocked_contig(sb_2d.view(num_experts, n, sf_k))
+    b_ref = b_ref_flat.view(num_experts, n, k)
 
     cu_seqlens_m = torch.tensor(
         [0] + list(itertools.accumulate(seqlens_m)), dtype=torch.int32, device="cuda"
@@ -571,7 +583,7 @@ def create_blockscaled_varlen_k_operands(
 
     Per-expert `k_i` must be a multiple of `sf_vec_size` (quantization chunk)
     but NOT necessarily a multiple of `sf_vec_size * 4` (= 128 for MXFP8).
-    The SF buffer uses dQaccum-style K padding: each expert `i`'s scales occupy
+    The SF buffer uses tile-aligned per-batch K padding: each expert `i`'s scales occupy
     `ceildiv(k_i, 128) * 128` bytes worth of K at offset
     `(cu_seqlens_k[i] + i * 128) // 128 * 128` (in source-K units). A and B
     operand data stay packed and unpadded along K — only their SF buffers pad.
@@ -581,8 +593,8 @@ def create_blockscaled_varlen_k_operands(
       b_ref_list: list of per-expert (n, k_i) fp32 dequantized B.
       qa:  (m, total_k) K-major fp8 (stride (total_k, 1)).
       qb:  (n, total_k) K-major fp8 (stride (total_k, 1)).
-      a_sc_contig: (1, rm, total_padded_rk, 512) dQaccum-padded SFA.
-      b_sc_contig: (1, rn, total_padded_rk, 512) dQaccum-padded SFB.
+      a_sc_contig: (1, rm, total_padded_rk, 32, 4, 4) K-padded SFA (tile-aligned per batch).
+      b_sc_contig: (1, rn, total_padded_rk, 32, 4, 4) K-padded SFB (tile-aligned per batch).
       cu_seqlens_k: (num_experts+1,) int32.
     """
     if not (
@@ -710,9 +722,12 @@ def compile_blockscaled_gemm_tvm_ffi(
     # Fake operand tensors with sym_ints (varlen-aware shapes).
     if varlen_m:
         total_m_sym = cute.sym_int()
-        n_sym, k_sym, l_sym = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        n_sym, l_sym = cute.sym_int(), cute.sym_int()
+        # Sub-byte (fp4) operands need the contiguous K extent statically divisible
+        # by the packing factor; harmless for 8-bit dtypes.
+        k_sym = cute.sym_int(divisibility=div_for_dtype(ab_dtype) if ab_dtype.width < 8 else 1)
         # Detect each operand's leading (stride-1) dim so m-major A / n-major B
-        # are accepted for varlen_m (MXFP8 only — fp4 is rejected upstream).
+        # are accepted for varlen_m (mxfp8 only; fp4 operands are always K-major).
         fake_mA = fake_tensor(
             ab_dtype,
             (total_m_sym, k_sym),

@@ -22,14 +22,21 @@ SF_DTYPE_TO_VEC_SIZE = {
 }
 
 
-def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity):
+def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity, num_batches=None):
     """Validate blockscaled scale factors against kernel-layout operands.
 
     A is (l, m, k[/2 if fp4]) and B is (l, n, k[/2]); SFA/SFB are
     (l, rm/rn, rk, 32, 4, 4) with the inner (32, 4, 4) block contiguous
     (strides (16, 4, 1) — one 512 B atom per 128 rows x 4 K-blocks).
+
+    When num_batches is not None (varlen_m), A is (total_m, k) and SFA must be
+    a single M-padded buffer (tile-aligned per-batch padding) (1, total_padded_rm, rk, 32, 4, 4)
+    with total_padded_rm >= ceil(total_m/128) + (num_batches - 1) — the bound
+    from AI/varlen_blockscaled_sf_layout.md that suffices for any per-batch
+    split of total_m. SFB stays per-batch: (num_batches, rn, rk, 32, 4, 4).
     Returns (sf_dtype, sf_vec_size) as (cutlass dtype, int).
     """
+    varlen_m = num_batches is not None
     assert SFB is not None, "SFA and SFB must be provided together"
     assert device_capacity[0] in [10, 11], "Blockscaled GEMM requires SM100/SM110"
     assert SFA.dtype == SFB.dtype, f"SF dtype mismatch: {SFA.dtype} vs {SFB.dtype}"
@@ -40,9 +47,27 @@ def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity):
     # the logical extent to the kernel, so validate rk against logical K.
     k_logical = A.shape[-1] * (2 if A.dtype == torch.float4_e2m1fn_x2 else 1)
     rk = (k_logical + 4 * sf_vec_size - 1) // (4 * sf_vec_size)
-    for name, SF, mn in (("SFA", SFA, A.shape[-2]), ("SFB", SFB, B.shape[-2])):
-        expected = (A.shape[0], (mn + 127) // 128, rk, 32, 4, 4)
+    if varlen_m:
+        assert A.ndim == 2, f"varlen_m expects A as (total_m, k), got shape {tuple(A.shape)}"
+        assert B.shape[0] == num_batches, (
+            f"B batch dim {B.shape[0]} != len(cu_seqlens_m) - 1 = {num_batches}"
+        )
+        min_rm = (A.shape[0] + 127) // 128 + (num_batches - 1)
+        assert SFA.shape[0] == 1 and tuple(SFA.shape[2:]) == (rk, 32, 4, 4), (
+            f"SFA shape {tuple(SFA.shape)} != (1, total_padded_rm, {rk}, 32, 4, 4)"
+        )
+        assert SFA.shape[1] >= min_rm, (
+            f"SFA padded rm {SFA.shape[1]} < ceil(total_m/128) + (L-1) = {min_rm}"
+        )
+        shapes = [("SFB", SFB, (num_batches, (B.shape[-2] + 127) // 128, rk, 32, 4, 4))]
+    else:
+        shapes = [
+            (name, SF, (A.shape[0], (mn + 127) // 128, rk, 32, 4, 4))
+            for name, SF, mn in (("SFA", SFA, A.shape[-2]), ("SFB", SFB, B.shape[-2]))
+        ]
+    for name, SF, expected in shapes:
         assert tuple(SF.shape) == expected, f"{name} shape {tuple(SF.shape)} != {expected}"
+    for name, SF in (("SFA", SFA), ("SFB", SFB)):
         assert SF.stride()[-3:] == (16, 4, 1), (
             f"{name}: inner (32, 4, 4) block must be contiguous with strides (16, 4, 1), "
             f"got {SF.stride()[-3:]}"

@@ -122,7 +122,9 @@ def _compile_gemm(
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
     if sf_dtype is not None:
-        mSFA = make_fake_sf_tensor(sf_dtype, l)
+        # For varlen_m, SFA is one M-padded buffer with batch dim 1 while mB/mSFB
+        # keep batch dim l, so SFA's batch dim needs its own sym.
+        mSFA = make_fake_sf_tensor(sf_dtype, cute.sym_int() if varlen_m else l)
         mSFB = make_fake_sf_tensor(sf_dtype, l)
     else:
         mSFA, mSFB = None, None
@@ -183,7 +185,9 @@ def gemm(
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
     num_warps: Optional[int] = None,
-    SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors
+    # (l, rm, rk, 32, 4, 4) blocked scale factors, or (1, total_padded_rm, rk, 32, 4, 4)
+    # if varlen_m (M-padded, see AI/varlen_blockscaled_sf_layout.md)
+    SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -210,10 +214,19 @@ def gemm(
     )
     sf_dtype, sf_vec_size = None, None
     if blockscaled:
-        assert not varlen and not gather_A, "Blockscaled GEMM does not support varlen/gather yet"
+        assert not varlen_k and not gather_A, (
+            "Blockscaled GEMM does not support varlen_k/gather_A yet"
+        )
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
-        sf_dtype, sf_vec_size = validate_blockscaled_sf(A, B, SFA, SFB, device_capacity)
+        sf_dtype, sf_vec_size = validate_blockscaled_sf(
+            A,
+            B,
+            SFA,
+            SFB,
+            device_capacity,
+            num_batches=cu_seqlens_m.shape[0] - 1 if varlen_m else None,
+        )
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
     if rounding_mode == RoundingMode.RS:

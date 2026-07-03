@@ -591,7 +591,7 @@ class GemmSm100(GemmTmaBase):
             # so non-packed buffers work (e.g. a slice of a larger scale tensor).
             # Only the innermost 512-B tile must be contiguous.
             # For varlen_m, mSFA is sized for per-expert 128-row-padded storage
-            # (dQaccum format), so use its own M dim (= total_padded_rm * 128)
+            # (tile-aligned per-batch padding), so use its own M dim (= total_padded_rm * 128)
             # instead of mA.shape[0] (= total_m, unpadded).
             if const_expr(cute.rank(mA) == 3):
                 sfa_shape = mA.shape
@@ -1070,7 +1070,7 @@ class GemmSm100(GemmTmaBase):
                 )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
-                    # SFA uses padded per-expert offset (dQaccum format), not
+                    # SFA uses the tile-aligned per-batch offset (padded SF layout), not
                     # the A-data offset — allows varlen_m seqlens that aren't
                     # multiples of 128.
                     gSFA_mkl = cute.local_tile(
@@ -1079,7 +1079,7 @@ class GemmSm100(GemmTmaBase):
                         (mma_tile_coord_mnl[0], None),
                     )
                     # (bN, bK)
-                    # SFB uses padded per-expert K offset in varlen_k (dQaccum format).
+                    # SFB uses the tile-aligned per-batch K offset in varlen_k (padded SF layout).
                     gSFB_nkl = cute.local_tile(
                         varlen_manager.offset_batch_SFB(mSFB_nkl, batch_idx),
                         cute.select(self.mma_tiler_sfb, [1, 2]),

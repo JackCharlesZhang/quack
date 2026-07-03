@@ -107,14 +107,48 @@ def test_blockscaled_gemm_sf_slice():
     assert torch.equal(out_ref, out_slice)
 
 
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("seqlens_m", [[128, 128, 128], [100, 200, 150], [1, 128, 127, 129]])
+def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
+    """Grouped (varlen_m) blockscaled GEMM through the unified interface. SFA is a
+    single M-padded buffer (tile-aligned per-batch padding, batch dim 1); SFB stays per-expert."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+
+    fmt_map = {
+        "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+        "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
+        "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
+    }
+    ab_dtype, sf_dtype, sf_vec = fmt_map[fmt]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    torch.manual_seed(0)
+    a_ref_dq, b_ref_dq, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_m = (
+        create_blockscaled_varlen_m_operands(
+            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m
+        )
+    )
+    SFA, SFB = a_sc_contig, b_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4), (L, rn, rk, 32, 4, 4)
+    B = qb.permute(2, 1, 0)  # (n, k[/2], L) -> (L, K[/2], N) with K contiguous
+    out = gemm((qa, SFA), (B, SFB), cu_seqlens_m=cu_seqlens_m, tuned=False)
+
+    cu = cu_seqlens_m.tolist()
+    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
+    err = (out.float() - ref).abs().max().item()
+    assert err < 5e-3, f"varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
+
+
 def test_blockscaled_gemm_vs_cublas():
     """Bit-exact comparison against torch._scaled_mm (cuBLAS MXFP8 path)."""
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     (qa, sfa), (B, sfw) = _quantized_operands("mxfp8", m, n, k, batched=False)
     out = gemm((qa, sfa), (B, sfw), tuned=False)
-    sfa_flat = scale_blocked_for_cublas(sfa.flatten(-3).unsqueeze(0), m, k // 32)
-    sfw_flat = scale_blocked_for_cublas(sfw.flatten(-3).unsqueeze(0), n, k // 32)
+    sfa_flat = scale_blocked_for_cublas(sfa.unsqueeze(0), m, k // 32)
+    sfw_flat = scale_blocked_for_cublas(sfw.unsqueeze(0), n, k // 32)
     out_cublas = torch._scaled_mm(
         qa, B, scale_a=sfa_flat, scale_b=sfw_flat, out_dtype=torch.bfloat16
     )
@@ -131,7 +165,7 @@ def test_blockscaled_gemm_bad_sf_layout_rejected():
     bad = sfa.transpose(-1, -2)
     with pytest.raises(AssertionError, match="inner"):
         gemm((qa, bad), (B, sfw), tuned=False)
-    # the 512-flattened kernel form is not part of the interface contract
+    # a flattened (rm, rk, 512) form is not part of the interface contract
     with pytest.raises(AssertionError, match="32, 4, 4"):
         gemm((qa, sfa.flatten(-3)), (B, sfw.flatten(-3)), tuned=False)
     # SF on only one operand must be rejected
