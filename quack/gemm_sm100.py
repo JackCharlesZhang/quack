@@ -22,7 +22,7 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.utils import LayoutEnum, SmemPartition
+from cutlass.utils import LayoutEnum
 
 from quack.pipeline import (
     PipelineCpAsync,
@@ -32,6 +32,7 @@ from quack.pipeline import (
     mbarrier_arrive_release_cluster,
     mbarrier_acquire_cluster,
 )
+from quack.dsl.smem_struct import Reserved, partitioned_struct
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -788,9 +789,18 @@ class GemmSm100(GemmTmaBase):
                 self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
             )
 
-        # Define shared storage for kernel
-        @cute.struct
+        # Define shared storage for kernel. sched_data lives in the RESERVED
+        # smem partition (with the pipeline mbarriers / TMEM holding buf): a
+        # small buffer before the 1024-byte aligned epilogue tensors would add
+        # a 1 KiB pad; CLC responses use i128 copies, so it stays 16-byte
+        # aligned.
+        sched_smem_size = 12 * self.sched_stage if self.is_persistent else 0
+
+        @partitioned_struct
         class SharedStorage:
+            sched_data: Reserved[
+                cute.struct.Align[cute.struct.MemRange[Int32, sched_smem_size], 16]
+            ]
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD: cute.struct.Align[
@@ -945,7 +955,7 @@ class GemmSm100(GemmTmaBase):
 
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
+        storage = self.shared_storage.allocate(smem)
 
         # Initialize pipelines and states
         ab_pipeline = self.make_ab_pipeline(
@@ -961,15 +971,7 @@ class GemmSm100(GemmTmaBase):
         sched_data = None
         if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(self.cluster_shape_mnk, has_C=has_epi_load)
-            # Keep scheduler scratch out of SharedStorage. A small buffer before
-            # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
-            # responses also use i128 copies, so this stays 16-byte aligned.
-            sched_data = smem.allocate_tensor(
-                Int32,
-                cute.make_layout((12, self.sched_stage)),
-                byte_alignment=16,
-                partition=SmemPartition.RESERVED,
-            )
+            sched_data = storage.sched_data.get_tensor(cute.make_layout((12, self.sched_stage)))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline()
