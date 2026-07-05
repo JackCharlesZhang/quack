@@ -1300,6 +1300,10 @@ class GemmSm100(GemmTmaBase):
                     # End of persistent scheduler loop
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
+                    # Drain the pending-cluster tail (varlen padding) with unobserved
+                    # cancels so it never launches; see cancel_pending_tail for the
+                    # grant-monotonicity assumption this relies on.
+                    tile_scheduler.cancel_pending_tail()
 
         # Specialized A-index prefetch warp (gather_A only)
         if const_expr(self.gather_A):
@@ -1637,6 +1641,13 @@ class GemmSm100(GemmTmaBase):
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
             )
             while work_tile.is_valid_tile:
+                # Prefetch the next work tile before the epilogue: the response is
+                # already in smem (3-stage sched pipeline), and consuming it here
+                # hides the ~300ns decode (swizzle + async fence) behind this tile's
+                # epilogue — the pacing chain for small-K / double-store epilogues.
+                # advance_to_next_work stays after the body: num_tiles_executed must
+                # count completed tiles during the body (sD stage cycling).
+                next_work_tile = tile_scheduler.get_current_work()
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
@@ -1716,7 +1727,7 @@ class GemmSm100(GemmTmaBase):
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+                work_tile = next_work_tile
 
             # Wait for D store complete
             if is_tma_warp:

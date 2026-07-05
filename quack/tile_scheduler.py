@@ -44,6 +44,35 @@ class PersistenceMode(IntEnum):
 # expect_tx count both producers arm on the full barrier.
 SCHED_SLOT_BYTES = 16
 
+# Cap on fire-and-forget try_cancels a retiring cluster sprays to drain the pending
+# pool tail (see TileScheduler.cancel_pending_tail). There is no loop: looping
+# "until the pool is empty" requires observing responses, which is the synchronous
+# drain this design replaces — a fixed blind count is the only non-observing option,
+# and the launched-straggler cascade acts as the loop across generations.
+#
+# Sizing rule: CLC_DRAIN_CANCELS * num_resident_clusters >= typical padding, so the
+# residents' first volley covers the pool in generation zero. Varlen padding is
+# bounded by (L - 1) M-slots * ncluster_n (~2k for L=512, N-tiles=8); 32 * ~74
+# residents = ~2.4k covers it (traced: only ~19 cancel/launch-race stragglers
+# launch, no generational waves). Bounded from above by three costs: (1) on
+# exact-grid kernels (dense/symmetric) the pool is already empty at retirement, so
+# ALL sprays fail — a per-kernel tax that must stay cheap (measured free at 32);
+# (2) the issuer stalls on async-proxy backpressure while enqueueing, holding its
+# SM slot and delaying kernel end when there is nothing left to cancel; (3) past
+# the pool size, extra cancels buy nothing.
+#
+# The budget is dynamic between these bounds (blog-style tiering, see
+# cancel_pending_tail): a retiring cluster estimates the remaining tail from the
+# phantom index it just decoded (tail <= grid_total - w) and sprays
+# ceil(tail / max_active_clusters), so block-aligned seqlens (maximal padding,
+# ~2x the random-length average) still drain in generation zero. The MIN keeps
+# the estimate-free fallback; the MAX bounds the enqueue-backpressure stall a
+# retiring cluster's SM slot endures (~256 * ~8ns = ~2us) — beyond it, extra
+# generations (~20us empty-cluster waves) are cheaper than deeper stalls, and the
+# batched-spray-plus-one-peek design is the real upgrade path.
+CLC_DRAIN_CANCELS_MIN = 32
+CLC_DRAIN_CANCELS_MAX = 256
+
 
 @cute.jit
 def cluster_idx_from_block_idx(
@@ -100,6 +129,13 @@ class TileSchedulerArguments:
 
 
 class TileScheduler:
+    # Whether the launched grid can exceed the real work, i.e. whether padding work
+    # indices exist. Exact-grid schedulers retire only on pool-empty (every granted
+    # steal is a real tile), so the retirement cancel spray is dead code for them;
+    # the varlen scheduler over-provisions (worst-case per-batch padding, see its
+    # get_grid_shape) and overrides this.
+    grid_may_exceed_work: bool = False
+
     @dataclass
     class Params:
         problem_shape_ncluster_mnl: cute.Shape
@@ -297,12 +333,8 @@ class TileScheduler:
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
-            # if cid_slow % 2 == 1:  # inner serpentine
-            #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
         else:  # tail part
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
-            # if cid_slow % 2 == 1:  # inner serpentine
-            #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
@@ -430,6 +462,9 @@ class TileScheduler:
             Int32(Uint32(bidz) // params.cluster_shape_mnk[2]),
         )
         work_idx, batch_idx = self._cluster_idx_to_work_idx_batch(params, cluster_idx)
+        # Remember the last decoded work index: at retirement it is the first phantom
+        # this cluster saw, giving cancel_pending_tail its remaining-tail estimate.
+        self._current_work_idx = work_idx
         ret = self._delinearize_work_idx(work_idx, batch_idx, Boolean(valid), loc=loc, ip=ip)
         iket.range_pop()
         return ret
@@ -465,6 +500,60 @@ class TileScheduler:
             if is_producer_warp:
                 self._throttle_barrier.arrive()
 
+    @cute.jit
+    def cancel_pending_tail(self, *, loc=None, ip=None) -> None:
+        """Fire-and-forget drain of the pending-cluster tail, called by the scheduler
+        warp when its persistent loop exits (i.e. a steal decoded to an invalid tile).
+
+        CORRECTNESS ASSUMPTION (grant monotonicity): once any fetch decodes into the
+        invalid/padding region, no pending cluster maps to real work — so canceling
+        arbitrary pending clusters without inspecting them is safe. PTX does not
+        document try_cancel grant order; this holds for the observed FIFO-ish drain
+        and is the same assumption made by the capped spray-and-pray drain in
+        https://drisspg.github.io/nuggets/A-Tale-of-Two-Schedulers (which hits this
+        problem at up to 64x padding in capacity-sized grouped GEMM). If it were
+        violated, a real tile could be canceled unprocessed.
+
+        Fires CLC_DRAIN_CANCELS non-multicast try_cancels at issue rate with no
+        response waits (responses land in the dead stage-0 slot, tx pre-armed so the
+        barrier stays balanced; nobody observes either again). The cancel requests
+        outlive this cluster: their pool-removal effect happens at the work
+        distributor whether or not the issuer is still resident; only the (unread)
+        response write-back is orphaned by the exit.
+
+        Pending clusters that launch anyway (cancel/launch races at retirement, or
+        padding beyond the residents' first volley) see an invalid initial tile,
+        skip their loop, and spray again on exit. Launches are gated by SM capacity
+        and the sprayers die near-simultaneously (shared CWD backlog), so
+        stragglers arrive in machine-width waves, each min(num_residents,
+        remaining pool) clusters and costing ~one empty-cluster lifetime — a
+        decaying cascade instead of the full launch stampede. See
+        CLC_DRAIN_CANCELS for the cap sizing and why there is no drain loop."""
+        if const_expr(
+            self.params.persistence_mode == PersistenceMode.CLC and self.grid_may_exceed_work
+        ):
+            params = self.params
+            # Remaining tail <= total work indices - the phantom index we just drew;
+            # split it across the resident clusters, which all retire around now.
+            grid_total = Int32(Uint32(cute.arch.grid_dim()[0]) // params.cluster_shape_mnk[0])
+            tail = grid_total - self._current_work_idx
+            budget = cutlass.min(
+                Int32(CLC_DRAIN_CANCELS_MAX),
+                cutlass.max(
+                    Int32(CLC_DRAIN_CANCELS_MIN),
+                    (tail + params.max_active_clusters - 1) // params.max_active_clusters,
+                ),
+            )
+            state0 = PipelineStateWAdvance(
+                self._pipeline_state.stages, Int32(0), Int32(0), Int32(0)
+            )
+            mbar_ptr = self._scheduler_pipeline.producer_get_barrier(state0)
+            resp_ptr = self._sched_smem[None, 0].iterator
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, SCHED_SLOT_BYTES * budget)
+                for _ in cutlass.range(budget):
+                    cute.arch.issue_clc_query(mbar_ptr, resp_ptr, multicast=False, loc=loc, ip=ip)
+
     def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         return self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
 
@@ -477,13 +566,6 @@ class TileScheduler:
         )
         if const_expr(params.persistence_mode == PersistenceMode.STATIC):
             return self._current_work_idx + num_persistent_clusters
-            # Serpentine: alternate wave direction for a bit better load balancing
-            # But currently seems a tiny bit slower, disabling for now.
-            # c = Int32(cute.arch.cluster_idx()[2])
-            # next_work_idx = self._current_work_idx + 2 * c + 1
-            # if self.num_tiles_executed % 2 == 1:
-            #     next_work_idx = self._current_work_idx + 2 * (num_persistent_clusters - 1 - c) + 1
-            # return next_work_idx
         elif const_expr(params.persistence_mode == PersistenceMode.DYNAMIC):
             next_work_linear_idx = Int32(0)
             if cute.arch.lane_idx() == 0:
@@ -824,6 +906,7 @@ class VarlenMTileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
     cu_seqlens_m: cute.Tensor
+    max_active_clusters: Int32
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
     tile_shape_mn: cutlass.Constexpr[cute.Shape]
@@ -833,11 +916,14 @@ class VarlenMTileSchedulerArguments:
 
 
 class VarlenMTileScheduler(TileScheduler):
+    grid_may_exceed_work: bool = True
+
     @dataclass
     class Params:
         problem_shape_ncluster_mnl: cute.Shape
         total_m: Int32
         cu_seqlens_m: cute.Tensor
+        max_active_clusters: Int32
         raster_order: cutlass.Constexpr[RasterOrder]
         group_size: Int32
         group_size_fdd: Optional[FastDivmod]
@@ -887,6 +973,7 @@ class VarlenMTileScheduler(TileScheduler):
                 problem_shape_ncluster_mnl,
                 args.total_m,
                 args.cu_seqlens_m,
+                args.max_active_clusters,
                 raster_order,
                 group_size,
                 FastDivmod(group_size) if ncluster_fast is not None else None,
@@ -930,6 +1017,10 @@ class VarlenMTileScheduler(TileScheduler):
     ) -> Tuple[Int32, Int32, Int32]:
         block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
         num_batch = params.problem_shape_ncluster_mnl[2]
+        # Tight upper bound on sum(ceil(len_i / block)) given only (total_m, L):
+        # achieved by adversarial lengths ≡ 1 (mod block), so no smaller grid is safe
+        # without per-batch seqlens (a too-small grid = tiles with no work index =
+        # wrong results under CLC). cancel_pending_tail makes the padding slots cheap.
         total_clusters_m_max = (params.total_m + num_batch * (block_size - 1)) // block_size
         total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1]
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
@@ -965,12 +1056,8 @@ class VarlenMTileScheduler(TileScheduler):
             num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
             if (group_id + 1) * num_clusters_in_group <= num_clusters:
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
-                # if cid_slow % 2 == 1:  # inner serpentine
-                #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
             else:  # tail part
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
-                # if cid_slow % 2 == 1:  # inner serpentine
-                #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         else:
             assert params.raster_order == RasterOrder.AlongM
             group_size_actual = cutlass.min(
@@ -978,8 +1065,6 @@ class VarlenMTileScheduler(TileScheduler):
             )
             cid_slow = id_in_group // group_size_actual
             cid_fast_in_group = id_in_group - cid_slow * group_size_actual
-            # if cid_slow % 2 == 1:  # inner serpentine
-            #     cid_fast_in_group = group_size_actual - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
