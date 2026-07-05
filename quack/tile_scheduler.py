@@ -204,6 +204,8 @@ class TileScheduler:
         num_tiles_executed: Int32,
         current_batch_idx: Int32,
         num_work_idx_before_cur_batch: Int32,
+        cur_batch_end: Int32,
+        cur_num_clusters_m: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -217,6 +219,12 @@ class TileScheduler:
         self.num_tiles_executed = num_tiles_executed
         self._current_batch_idx = current_batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        # Varlen fast-path cache: work-idx end (exclusive) and M-cluster count of the
+        # batch resolved by the previous delinearize. A steal landing inside
+        # [_num_work_idx_before_cur_batch, _cur_batch_end) skips the warp-cooperative
+        # cu_seqlens window scan entirely. Unused (constant 0) for dense schedulers.
+        self._cur_batch_end = cur_batch_end
+        self._cur_num_clusters_m = cur_num_clusters_m
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -284,6 +292,8 @@ class TileScheduler:
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # cur_batch_end (empty window: first delinearize takes the scan)
+            Int32(0),  # cur_num_clusters_m
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -684,6 +694,8 @@ class TileScheduler:
             self.num_tiles_executed,
             self._current_batch_idx,
             self._num_work_idx_before_cur_batch,
+            self._cur_batch_end,
+            self._cur_num_clusters_m,
             self._sched_smem,
             self._scheduler_pipeline,
             self._pipeline_state,
@@ -703,6 +715,8 @@ class TileScheduler:
                 self.num_tiles_executed,
                 self._current_batch_idx,
                 self._num_work_idx_before_cur_batch,
+                self._cur_batch_end,
+                self._cur_num_clusters_m,
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
@@ -1118,44 +1132,71 @@ class VarlenMTileScheduler(TileScheduler):
         # Pre-init: assigned under a dynamic `if` below, but read outside it (DSL
         # scoping requires the outer definition).
         num_work_idx_before_cur_batch = self._num_work_idx_before_cur_batch
-        num_clusters_m, num_clusters_cumulative, clusters_in_problems = Int32(0), Int32(0), Int32(0)
+        cur_batch_end = self._cur_batch_end
+        num_clusters_m = self._cur_num_clusters_m
+        num_clusters_cumulative, clusters_in_problems = Int32(0), Int32(0)
         is_valid = True if const_expr(is_valid_ is None) else is_valid_
+        # Fast path: the work index lands in the batch resolved by the previous call
+        # (cached window), so skip the warp-cooperative cu_seqlens window scan below.
+        # The scan is a long serial dependence chain — gmem cu_seqlens load, warp
+        # prefix-sum, ballot, shuffles — and without the cache it re-ran on EVERY
+        # fetch (the loop condition seeds from the batch START, which is always
+        # <= next_tile_idx). This exists for CLC: under the static scheduler,
+        # work_idx is a register recurrence (idx += stride) known a full tile in
+        # advance, so the SASS scheduler overlaps the chain with the loop body's
+        # stalls (~140 cy/tile exposed, measured); a CLC steal doesn't exist until
+        # the response mbarrier is consumed + fence.proxy.async, so nothing can be
+        # hoisted and every warp ate the chain at its fetch site (~800-1100
+        # cy/steal), a per-tile bubble in the tcgen05 issue stream that cost ~3-9%
+        # e2e on mainloop-bound varlen shapes. With the cache, a steal within the
+        # current batch decodes as cheaply as the dense scheduler; the scan only
+        # runs when the batch actually changes.
+        need_scan = (next_tile_idx < num_work_idx_before_cur_batch) | (
+            next_tile_idx >= cur_batch_end
+        )
         if is_valid:
-            while problems_end_tile <= next_tile_idx:
-                num_clusters_m = self._get_num_m_blocks(
-                    lane_idx, bidb_start=batch_idx, block_size=block_size
-                )
-                num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
-                num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
-                # Total number of blocks for the next 31 problems, same for all lanes
-                clusters_in_problems = cute.arch.shuffle_sync(
-                    num_clusters_cumulative, cute.arch.WARP_SIZE - 1
-                )
-                problems_end_tile += clusters_in_problems
-                if problems_end_tile <= next_tile_idx:
-                    batch_idx += cute.arch.WARP_SIZE - 1
-                if batch_idx >= num_batch:
-                    batch_idx = Int32(num_batch)
-                    problems_end_tile = next_tile_idx + 1
+            if need_scan:
+                while problems_end_tile <= next_tile_idx:
+                    num_clusters_m = self._get_num_m_blocks(
+                        lane_idx, bidb_start=batch_idx, block_size=block_size
+                    )
+                    num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+                    num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
+                    # Total number of blocks for the next 31 problems, same for all lanes
+                    clusters_in_problems = cute.arch.shuffle_sync(
+                        num_clusters_cumulative, cute.arch.WARP_SIZE - 1
+                    )
+                    problems_end_tile += clusters_in_problems
+                    if problems_end_tile <= next_tile_idx:
+                        batch_idx += cute.arch.WARP_SIZE - 1
+                    if batch_idx >= num_batch:
+                        batch_idx = Int32(num_batch)
+                        problems_end_tile = next_tile_idx + 1
+                if batch_idx < num_batch:
+                    problems_start_tile = problems_end_tile - clusters_in_problems
+                    # The next problem to process is the first one that does not have
+                    # ending tile position that is greater than or equal to tile index.
+                    batch_idx_in_problems = cute.arch.popc(
+                        cute.arch.vote_ballot_sync(
+                            problems_start_tile + num_clusters_cumulative <= next_tile_idx
+                        )
+                    )
+                    batch_idx += batch_idx_in_problems
+                    num_clusters_prev_lane = (
+                        0
+                        if batch_idx_in_problems == 0
+                        else cute.arch.shuffle_sync(
+                            num_clusters_cumulative, batch_idx_in_problems - 1
+                        )
+                    )
+                    num_clusters_m = cute.arch.shuffle_sync(num_clusters_m, batch_idx_in_problems)
+                    num_work_idx_before_cur_batch = problems_start_tile + num_clusters_prev_lane
+                    cur_batch_end = (
+                        num_work_idx_before_cur_batch
+                        + num_clusters_m * params.problem_shape_ncluster_mnl[1]
+                    )
         else:
             batch_idx = Int32(num_batch)
-        if batch_idx < num_batch:
-            problems_start_tile = problems_end_tile - clusters_in_problems
-            # The next problem to process is the first one that does not have ending tile
-            # position that is greater than or equal to tile index.
-            batch_idx_in_problems = cute.arch.popc(
-                cute.arch.vote_ballot_sync(
-                    problems_start_tile + num_clusters_cumulative <= next_tile_idx
-                )
-            )
-            batch_idx += batch_idx_in_problems
-            num_clusters_prev_lane = (
-                0
-                if batch_idx_in_problems == 0
-                else cute.arch.shuffle_sync(num_clusters_cumulative, batch_idx_in_problems - 1)
-            )
-            num_clusters_m = cute.arch.shuffle_sync(num_clusters_m, batch_idx_in_problems)
-            num_work_idx_before_cur_batch = problems_start_tile + num_clusters_prev_lane
 
         is_valid = batch_idx < num_batch
         if const_expr(params.persistence_mode == PersistenceMode.NONE):
@@ -1170,4 +1211,6 @@ class VarlenMTileScheduler(TileScheduler):
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        self._cur_batch_end = cur_batch_end
+        self._cur_num_clusters_m = num_clusters_m
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
