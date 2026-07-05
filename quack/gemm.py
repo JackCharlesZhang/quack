@@ -315,7 +315,10 @@ def gemm(
     scheduler_args = make_scheduler_args(
         max_active_clusters,
         max_swizzle_size,
-        tile_count_semaphore,
+        # Must mirror make_fake_scheduler_args in _compile_gemm: only the SM8x/SM90
+        # dynamic scheduler consumes the semaphore; SM100 uses CLC instead, and the
+        # compiled signature has None there.
+        tile_count_semaphore if (is_dynamic_persistent and device_capacity[0] <= 9) else None,
         batch_idx_permute,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
