@@ -37,6 +37,9 @@ class NamedBarrierGemm(enum.IntEnum):
     EpiWG0 = enum.auto()
     EpiWG1 = enum.auto()
     TmemPtr = enum.auto()
+    # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
+    # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
+    ClcThrottle = enum.auto()
 
 
 class GemmBase:

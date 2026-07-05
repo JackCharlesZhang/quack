@@ -26,7 +26,7 @@ from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
 # return PipelineStateWAdvance instead of PipelineState
-from quack.pipeline import make_pipeline_state
+from quack.pipeline import PipelineAsync as QuackPipelineAsync, make_pipeline_state
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
 
@@ -1211,13 +1211,16 @@ class GemmSm90(GemmTmaBase):
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        return pipeline.PipelineAsync.create(
+        return QuackPipelineAsync.create(
             num_stages=self.sched_stage,
             producer_group=sched_pipeline_producer_group,
             consumer_group=sched_pipeline_consumer_group,
             # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
             consumer_mask=None if const_expr(cluster_size == 1) else 0,
             defer_sync=True,
+            # One arrive per consumer warp (consumer_arrive_cnt counts warps): syncwarp
+            # so every lane's slot read is complete, then one elected lane signals.
+            elect_one_release=True,
         )
 
     @classmethod
