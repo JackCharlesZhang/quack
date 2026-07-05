@@ -128,7 +128,16 @@ runs:
             export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA} &&
             export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}
           fi &&
-          mkdir -p \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
+          mkdir -p \$QUACK_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
+          # Keep the persistent QuACK .o cache bounded on self-hosted
+          # runners. Cache entries live under source-fingerprint directories;
+          # once a fingerprint is older than a week it is unlikely to be reused
+          # by active PRs, and stale .o.tmp.* files are interrupted exports.
+          (
+            if command -v flock >/dev/null 2>&1; then flock 9 || exit 0; fi
+            find \"\$QUACK_CACHE_DIR\" -mindepth 1 -maxdepth 1 -type d -mtime +7 -prune -exec rm -rf {} + || true
+            find \"\$QUACK_CACHE_DIR\" -type f -name '*.tmp.*' -mtime +1 -delete || true
+          ) 9>\"\$QUACK_CACHE_DIR/.prune.lock\" &&
           # --max-worker-restart N tolerates worker deaths (OOM-kill from
           # the upstream cute.compile ir.Context retention leak, see
           # tests/conftest.py:pytest_handlecrashitem for background). The

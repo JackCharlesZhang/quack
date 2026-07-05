@@ -45,7 +45,9 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
   pool of 24 CPU workers (forkserver sidecar, GPU-blind) while the affected
   tests defer and retry once their `.o` lands; warm runs pay nothing. The
   persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
-  on the same runner.
+  on the same runner. CI prunes QuACK source-fingerprint cache directories
+  older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
+  older than 1 day.
 
 ## SIF caching on runners
 
