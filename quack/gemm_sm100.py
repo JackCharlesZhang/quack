@@ -292,13 +292,6 @@ class GemmSm100(GemmTmaBase):
             mma_inst_shape_n,
             mma_inst_bits_k // self.a_dtype.width,
         )
-        # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
-        self.mma_inst_shape_mnk_sfb = (
-            self.mma_inst_shape_mnk[0] // (2 if self.use_2cta_instrs else 1),
-            cute.round_up(self.mma_inst_shape_mnk[1], 128),
-            self.mma_inst_shape_mnk[2],
-        )
-
         # Configure tiled mma
         if const_expr(not self.blockscaled):
             self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -310,7 +303,6 @@ class GemmSm100(GemmTmaBase):
                 self.cta_group,
                 self.mma_inst_shape_mnk[:2],
             )
-            self.tiled_mma_sfb = None
         else:
             self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_dtype,
@@ -321,16 +313,6 @@ class GemmSm100(GemmTmaBase):
                 self.sf_vec_size,
                 self.cta_group,
                 self.mma_inst_shape_mnk[:2],
-            )
-            self.tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                tcgen05.CtaGroup.ONE,
-                self.mma_inst_shape_mnk_sfb[:2],
             )
 
         # Compute mma/cluster/tile shapes
@@ -347,59 +329,36 @@ class GemmSm100(GemmTmaBase):
             self.mma_tiler[1],
             self.mma_inst_shape_mnk[2] * mma_inst_tile_k,
         )
-        if const_expr(self.blockscaled):
-            self.mma_tiler_sfb = (
-                self.mma_inst_shape_mnk_sfb[0],
-                self.mma_inst_shape_mnk_sfb[1],
-                self.mma_inst_shape_mnk_sfb[2] * mma_inst_tile_k,
-            )
-        else:
-            self.mma_tiler_sfb = None
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // cute.size(self.tiled_mma.thr_id.shape),
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
         if const_expr(self.blockscaled):
-            self.cta_tile_shape_mnk_sfb = (
-                self.mma_tiler_sfb[0] // cute.size(self.tiled_mma.thr_id.shape),
-                self.mma_tiler_sfb[1],
-                self.mma_tiler_sfb[2],
-            )
-            # The SF atom fixed by the tcgen05 MMA (BlockScaledBasicChunk) is 128 wide
-            # in N, but cta_tile_n need not be a multiple of 128. Two derived
-            # quantities localize all the resulting special handling:
-            # - sfb_tiles_per_atom: adjacent N-tiles that share one 128-wide atom
-            #   (tile_n=64) load the same SFB atom; gmem N-tile coords are divided
-            #   by this.
-            # - sfb_n_atom_misaligned: tile_n an odd multiple of 64 (64, 192) puts
-            #   odd N-tiles 64 into an atom; the MMA's SFB tmem base shifts by 2
-            #   columns for odd N-tile coords, and tile_n=192 additionally needs
-            #   the overlapped-window TMA remap at the SFB TMA setup in __call__.
-            # tile_n=224 is rejected: its tiles start at 32-column offsets within
-            # the atom ((224*j) % 128 cycles 0/96/64/32), which neither mechanism
-            # covers.
-            assert self.cta_tile_shape_mnk[1] in (64, 128, 192, 256), (
-                f"blockscaled tile_n must be in (64, 128, 192, 256), "
-                f"got {self.cta_tile_shape_mnk[1]}"
-            )
-            self.sfb_tiles_per_atom = max(128 // self.cta_tile_shape_mnk[1], 1)
+            # The SF atom fixed by the tcgen05 MMA (BlockScaledBasicChunk) is 128
+            # wide in N and one atom is 512 contiguous gmem bytes (128 N x 4
+            # sf-k blocks), but cta_tile_n need not be a multiple of 128. SFB is
+            # loaded per atom with free-form atom coordinates (see the SFB TMA
+            # setup in __call__); tile_n=64/192 tiles that start 64 into an atom
+            # are handled by a per-tile SFB tmem column offset in the mma warp
+            # (sfb_n_atom_misaligned). tile_n must be a multiple of 64: the SF
+            # tmem datapath (both the tcgen05.cp write and the MMA read) is
+            # 2-column / 64-N granular, so odd multiples of 32 (96, 160, 224)
+            # are hardware-unreachable without rotating the SF content by 32 N.
+            assert (
+                self.cta_tile_shape_mnk[1] % 64 == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
+            ), f"blockscaled tile_n must be a multiple of 64, got {self.cta_tile_shape_mnk[1]}"
             self.sfb_n_atom_misaligned = (self.cta_tile_shape_mnk[1] // 64) % 2 == 1
-        else:
-            self.cta_tile_shape_mnk_sfb = None
+            # SFB smem/tmem window per tile, in 128-wide SF atoms.
+            self.sfb_window_atoms = cute.round_up(self.cta_tile_shape_mnk[1], 128) // 128
+            # 512-byte SF chunks (one atom-N x 4 sf-k blocks) per k-tile.
+            self.sfb_chunks_per_ktile = self.mma_tiler[2] // (self.sf_vec_size * 4)
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
             (self.tiled_mma.thr_id.shape,),
         )
-        if const_expr(self.blockscaled):
-            self.cluster_layout_sfb_vmnk = cute.tiled_divide(
-                cute.make_layout(self.cluster_shape_mnk),
-                (self.tiled_mma_sfb.thr_id.shape,),
-            )
-        else:
-            self.cluster_layout_sfb_vmnk = None
 
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
@@ -408,9 +367,6 @@ class GemmSm100(GemmTmaBase):
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
-        if const_expr(self.blockscaled):
-            self.num_mcast_ctas_sfb = cute.size(self.cluster_layout_sfb_vmnk.shape[1])
-            self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
         # Compute epilogue subtile
         tile_load_layout = None
@@ -636,8 +592,8 @@ class GemmSm100(GemmTmaBase):
         self._setup_attributes(epilogue_args, varlen_args)
 
         if const_expr(self.blockscaled):
-            # Rebuild the SFA/SFB layouts from mSFA/mSFB's actual strides
-            # so non-packed buffers work (e.g. a slice of a larger scale tensor).
+            # Rebuild the SFA layout from mSFA's actual strides so non-packed
+            # buffers work (e.g. a slice of a larger scale tensor).
             # Only the innermost 512-B tile must be contiguous.
             # For varlen_m, mSFA is sized for per-expert 128-row-padded storage
             # (tile-aligned per-batch padding), so use its own M dim (= total_padded_rm * 128)
@@ -650,12 +606,18 @@ class GemmSm100(GemmTmaBase):
                 sfa_shape = (mA.shape[0], mSFA.shape[2] * 128)
             sfa_layout = tile_atom_to_shape_SF_strided(sfa_shape, self.sf_vec_size, mSFA.stride)
             mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)
-            if const_expr(cute.rank(mB) == 3):
-                sfb_shape = mB.shape
-            else:  # varlen_k: mB is (n, total_k)
-                sfb_shape = (mB.shape[0], mSFB.shape[2] * 128)
-            sfb_layout = tile_atom_to_shape_SF_strided(sfb_shape, self.sf_vec_size, mSFB.stride)
-            mSFB = cute.make_tensor(mSFB.iterator, sfb_layout)
+            # SFB needs no (N, K, L) logical layout: it is loaded per 512-B SF
+            # atom (chunk) with free-form atom coordinates. View the raw
+            # (L, RN, RK, 32, 4, 4) scale tensor as (chunk, RK, RN, L) in Int16
+            # (TMA box inner dim is capped at 256 elements, so a 512-B chunk is
+            # 256 x Int16). The (256):(1) chunk mode is the blocked SF format's
+            # contract (hardware-fixed packed atom) and must be imposed
+            # statically — dlpack strides are dynamic and TMA needs a static
+            # V-map — so only the outer modes come from the tensor.
+            mSFB_i16 = layout_utils.select(cute.recast_tensor(mSFB, cutlass.Int16), [2, 1, 0])
+            mSFB = cute.make_tensor(
+                mSFB_i16.iterator, cute.prepend(mSFB_i16.layout, cute.make_layout(256))
+            )
 
         atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
 
@@ -724,44 +686,49 @@ class GemmSm100(GemmTmaBase):
                 self.cluster_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            # Setup TMA load for SFB
+            # Setup TMA load for SFB.
+            # One box per stage covering the tile's SF window at chunk
+            # granularity: (256 Int16 = one 512-B atom-chunk, chunks-per-k-tile,
+            # window atoms). Because the box coordinates are free-form (not
+            # tiler multiples), a tile whose window starts mid-way into the
+            # atom sequence (tile_n=192 advances 1.5 atoms per tile) needs no
+            # layout tricks: the kernel computes first_atom = j*tile_n//128 and
+            # slices there. Tiles start (j*tile_n) % 128 into their first atom;
+            # the mma warp corrects for that via an SFB tmem column offset.
+            # The atom-n dim's extent is the allocated atom count, so a last
+            # tile whose window straddles past it (tile_n=192 with e.g. N=448:
+            # window atoms {3,4}, only 4 allocated) gets the out-of-range atom
+            # hardware-zero-filled — its columns are beyond N, where B is
+            # zero-filled too. This invariant is load-bearing: the previous
+            # overlapped-window remap presented atoms in groups of 4 and
+            # zero-filled past the *presented* extent instead, silently zeroing
+            # the last valid columns (see the N=448 regression test).
+            # SFB is multicast across all cluster-M CTAs (compiler-driven at the
+            # copy site, like B); the op carries cta_group so 2-CTA kernels use
+            # cta_group::2 multicast, whose transaction bytes aggregate at the
+            # pair leader's barrier as num_tma_load_bytes expects. The atom
+            # stays the non-multicast variant with num_multicast=1 (same as
+            # A/B): block_copy's lowering derives the mask and slicing from the
+            # tma_multicast dict.
             sfb_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
             sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-            tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
+            # Compact column-major: (chunk, k-chunks, window atoms).
+            sfb_window_layout = cute.make_layout(
+                (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms)
+            )
+            # The chunk view must tile the actual SFB smem stage bytes exactly
+            # (atom-major, k-chunks inner — the order make_smem_layout_sfb
+            # produces).
+            assert cute.cosize(sfb_smem_layout) == 2 * cute.cosize(sfb_window_layout)
+            assert cute.cosize(self.sfb_smem_layout_staged) == (
+                2 * cute.cosize(sfb_window_layout) * self.ab_stage
+            )
+            tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
                 sfb_op,
                 mSFB,
-                sfb_smem_layout,
-                self.mma_tiler_sfb,
-                self.tiled_mma_sfb,
-                self.cluster_layout_sfb_vmnk.shape,
-                internal_type=cutlass.Int16,
+                sfb_window_layout,
+                sfb_window_layout.shape,
             )
-            # tile_n=192 spans 1.5 SF atoms, so consecutive N-tiles straddle atom
-            # boundaries and a TMA box can't be placed at a half-atom offset.
-            # Instead each tile loads a 2-atom (256-wide) window: remap the gmem
-            # atom sequence to [a0 a1 | a1 a2 | a3 a4 | a4 a5 | ...] (groups of 4
-            # presented atoms at offsets (0, x, x, 2x), advancing by 3 atoms) so
-            # that tile j's window lands on atoms (3j//2, 3j//2 + 1). Odd tiles
-            # start 64 into their first atom; the mma warp corrects for that via
-            # the sfb_n_atom_misaligned tmem offset.
-            if const_expr(self.cta_tile_shape_mnk[1] == 192):
-                x = tma_tensor_sfb.stride[0][1]
-                y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
-                tma_tensor_sfb = cute.make_tensor(
-                    tma_tensor_sfb.iterator,
-                    cute.make_layout(
-                        (
-                            (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
-                            tma_tensor_sfb.shape[1],
-                            tma_tensor_sfb.shape[2],
-                        ),
-                        stride=(
-                            (tma_tensor_sfb.stride[0][0], ((x, x), 3 * x)),
-                            tma_tensor_sfb.stride[1],
-                            tma_tensor_sfb.stride[2],
-                        ),
-                    ),
-                )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         if const_expr(not self.gather_A or self.use_tma_gather):
@@ -872,7 +839,6 @@ class GemmSm100(GemmTmaBase):
         # Launch the kernel synchronously
         self.kernel(
             self.tiled_mma,
-            self.tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a if const_expr(not self.gather_A or self.use_tma_gather) else mA,
             tma_atom_b,
@@ -888,7 +854,6 @@ class GemmSm100(GemmTmaBase):
             epilogue_params,
             varlen_params,
             self.cluster_layout_vmnk,
-            self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
             self.a_smem_load_layout_staged,
             self.b_smem_layout_staged,
@@ -914,7 +879,6 @@ class GemmSm100(GemmTmaBase):
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: Optional[cute.TiledMma],
         tma_atom_a: Optional[cute.CopyAtom],
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
@@ -922,7 +886,7 @@ class GemmSm100(GemmTmaBase):
         tma_atom_sfa: Optional[cute.CopyAtom],
         mSFA_mkl: Optional[cute.Tensor],
         tma_atom_sfb: Optional[cute.CopyAtom],
-        mSFB_nkl: Optional[cute.Tensor],
+        mSFB_chunks: Optional[cute.Tensor],
         tma_atom_d: Optional[cute.CopyAtom],
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
@@ -930,7 +894,6 @@ class GemmSm100(GemmTmaBase):
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
-        cluster_layout_sfb_vmnk: Optional[cute.Layout],
         a_smem_layout: cute.ComposedLayout,
         a_smem_load_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
@@ -1029,12 +992,22 @@ class GemmSm100(GemmTmaBase):
             a_idx_smem_dim = self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
             a_idx_smem_layout = cute.make_layout((a_idx_smem_dim, self.a_prefetch_stage))
             sAIdx = storage.sAIdx.get_tensor(a_idx_smem_layout)
-        sSFA, sSFB = None, None
+        sSFA, sSFB, sSFB_chunks = None, None, None
         if const_expr(self.blockscaled):
             # (MMA, MMA_M, MMA_K, STAGE)
             sSFA = storage.sSFA.get_tensor(sfa_smem_layout)
             # (MMA, MMA_N, MMA_K, STAGE)
             sSFB = storage.sSFB.get_tensor(sfb_smem_layout)
+            # Chunk view of the same bytes for the SFB TMA load: one 512-B SF
+            # atom-chunk = 256 x Int16, k-chunks inner, atoms outer (the order
+            # make_smem_layout_sfb produces; asserted against sfb_smem_layout
+            # at TMA setup). Compact column-major.
+            sSFB_chunks = cute.make_tensor(
+                cute.recast_ptr(sSFB.iterator, dtype=cutlass.Int16),
+                cute.make_layout(
+                    (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms, self.ab_stage)
+                ),
+            )
         sD = None
         if const_expr(has_D):
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
@@ -1045,9 +1018,6 @@ class GemmSm100(GemmTmaBase):
         epi_smem_tensors = self.epi_get_smem_tensors(epilogue_params, storage)
 
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        thr_mma_sfb = (
-            tiled_mma_sfb.get_slice(mma_tile_coord_v) if const_expr(self.blockscaled) else None
-        )
 
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
@@ -1148,14 +1118,20 @@ class GemmSm100(GemmTmaBase):
                         cute.select(self.mma_tiler, [0, 2]),
                         (mma_tile_coord_mnl[0], None),
                     )
-                    # (bN, bK)
-                    # SFB uses the tile-aligned per-batch K offset in varlen_k (padded SF layout).
-                    # N-tiles sharing one 128-wide SF atom (tile_n=64) load the same
-                    # atom, so the gmem N-tile coord is divided by sfb_tiles_per_atom.
-                    gSFB_nkl = cute.local_tile(
-                        varlen_manager.offset_batch_SFB(mSFB_nkl, batch_idx),
-                        cute.select(self.mma_tiler_sfb, [1, 2]),
-                        (mma_tile_coord_mnl[1] // self.sfb_tiles_per_atom, None),
+                    # (chunk, chunks-per-k-tile, window-atoms, RestK)
+                    # SFB is chunk-granular: place the tile's SF window at atom
+                    # coordinate j*tile_n/128, as a domain_offset because it is
+                    # free-form, not a tiler multiple (tile_n=64 shares an atom
+                    # between adjacent tiles, tile_n=192 advances 1.5 atoms per
+                    # tile — both are just this one formula).
+                    sfb_first_atom = (mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]) // 128
+                    gSFB_chunks = cute.local_tile(
+                        cute.domain_offset(
+                            (None, None, sfb_first_atom),
+                            varlen_manager.offset_batch_SFB(mSFB_chunks, batch_idx),
+                        ),
+                        (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms),
+                        (0, None, 0),
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
@@ -1172,6 +1148,17 @@ class GemmSm100(GemmTmaBase):
                 b_tma_multicast = {
                     "cluster_shape": self.cluster_shape_mnk[:2],
                     "multicast_dim": "N",
+                }
+                # SFB is duplicated (not V-split like B) across the 2-CTA MMA
+                # pair, so unlike B its multicast group spans every cluster-M
+                # CTA including the pair peer: use_2cta_mma_inst=False makes
+                # the lowering slice/multicast across all of them (halving SFB
+                # gmem traffic within a pair), while the op's cta_group still
+                # aggregates transaction bytes at the pair leader's barrier.
+                sfb_tma_multicast = {
+                    "cluster_shape": self.cluster_shape_mnk[:2],
+                    "multicast_dim": "N",
+                    "use_2cta_mma_inst": False,
                 }
                 copy_A, prefetch_A = None, None
                 if const_expr(not self.gather_A):
@@ -1207,8 +1194,6 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(self.blockscaled):
                     # (MMA, MMA_M, MMA_K)
                     tCgSFA = thr_mma.partition_A(gSFA_mkl)
-                    # (MMA, MMA_N, MMA_K)
-                    tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
                 # TMA load B partition_S/D
                 copy_B = copy_utils.tma_get_block_copy_fn(
                     tma_atom_b, src_tensor=tCgB, dst_tensor=sB, tma_multicast=b_tma_multicast
@@ -1222,12 +1207,13 @@ class GemmSm100(GemmTmaBase):
                         dst_tensor=sSFA,
                         tma_multicast=a_tma_multicast,
                     )
-                    # TMA load SFB partition_S/D
+                    # SFB multicast: same-N across all cluster-M CTAs (see
+                    # sfb_tma_multicast above).
                     copy_SFB = copy_utils.tma_get_block_copy_fn(
                         tma_atom_sfb,
-                        src_tensor=tCgSFB,
-                        dst_tensor=sSFB,
-                        tma_multicast=b_tma_multicast,
+                        src_tensor=gSFB_chunks,
+                        dst_tensor=sSFB_chunks,
+                        tma_multicast=sfb_tma_multicast,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 iket.range_push("tma_load")
@@ -2637,8 +2623,10 @@ class GemmSm100(GemmTmaBase):
             if mma_inst_n not in range(32, 257, 32):
                 is_valid = False
         else:
-            # Blockscaled currently supports tile_n in {64, 128, 192, 256}.
-            if mma_tiler_mnk[1] not in [64, 128, 192, 256]:
+            # Blockscaled supports tile_n multiples of 64: the SF tmem datapath
+            # (tcgen05.cp write and MMA read) is 64-N granular, so odd
+            # multiples of 32 (96, 160, 224) are unreachable.
+            if mma_tiler_mnk[1] % 64 != 0 or not (64 <= mma_tiler_mnk[1] <= 256):
                 is_valid = False
         if cluster_shape_mn[0] % (2 if mma_tiler_mnk[0] == 256 else 1) != 0:
             is_valid = False

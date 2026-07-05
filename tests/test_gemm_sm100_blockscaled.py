@@ -370,9 +370,28 @@ def test_blockscaled_validation():
             256,
             1,
         ),
-        # tile_n=192 with multiple N-tiles: exercises the overlapped-window SFB
-        # TMA remap for e4m3 scale factors (regression: was gated on e8m0 only,
-        # loading wrong SFB atoms for N-tile index >= 1)
+        # tile_n=192 with N=448: the last N-tile's SF window (atoms 3,4)
+        # straddles past the last allocated SF atom (ceil(448/128)=4).
+        # Regression: the old overlapped-window TMA remap presented atoms in
+        # groups of 4 and zero-filled past the presented extent, silently
+        # zeroing the last 64 output columns; the chunk-granular SFB load
+        # bounds-checks the atom-n dim and zero-fills only the truly
+        # out-of-range atom.
+        (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E8M0FNU,
+            32,
+            cutlass.BFloat16,
+            (128, 192),
+            (1, 1),
+            256,
+            448,
+            256,
+            1,
+        ),
+        # tile_n=192 with multiple N-tiles: exercises mid-atom SF window starts
+        # for e4m3 scale factors (regression: the old remap was gated on e8m0
+        # only, loading wrong SFB atoms for N-tile index >= 1)
         (
             cutlass.Float4E2M1FN,
             cutlass.Float8E4M3FN,
