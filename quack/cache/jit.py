@@ -187,6 +187,20 @@ def jit_cache(fn):
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
             return m[EXPORT_FUNC_NAME]
 
+        def _quarantine_corrupt(exc: Exception) -> None:
+            """A cached .o that fails to load (truncated write from a killed
+            worker, missing __tvm_ffi_func, ...) is a cache miss, not an error:
+            delete it so this and future processes recompile instead of failing
+            forever (the CI cache persists across runs)."""
+            print(
+                f"quack cache: corrupt cached object for key {sha} "
+                f"({type(exc).__name__}: {exc}); deleting and recompiling"
+            )
+            try:
+                o_path.unlink()
+            except OSError:
+                pass
+
         # 3. Fast path: optimistic existence check, then shared-lock load.
         #    The unlocked ``.exists()`` is a no-cost short-circuit for warm
         #    caches; the shared lock guards against reading a partial file
@@ -195,10 +209,16 @@ def jit_cache(fn):
             try:
                 with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
                     if o_path.exists():
-                        loaded = _load_cached()
-                        cache[cache_key] = loaded
-                        hits += 1
-                        return loaded
+                        try:
+                            loaded = _load_cached()
+                        except Exception as e:
+                            # Corrupt entry: recover under the exclusive lock in
+                            # the slow path (shared lock can't safely delete).
+                            _quarantine_corrupt(e)
+                        else:
+                            cache[cache_key] = loaded
+                            hits += 1
+                            return loaded
             except RuntimeError:
                 pass  # lock timeout; fall through to slow path
 
@@ -229,10 +249,14 @@ def jit_cache(fn):
                 try:
                     with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
                         if o_path.exists():
-                            loaded = _load_cached()
-                            cache[cache_key] = loaded
-                            hits += 1
-                            return loaded
+                            try:
+                                loaded = _load_cached()
+                            except Exception as e:
+                                _quarantine_corrupt(e)
+                            else:
+                                cache[cache_key] = loaded
+                                hits += 1
+                                return loaded
                 except RuntimeError:
                     pass  # lock timeout; fall through to slow path
             else:  # "failed"
@@ -248,20 +272,36 @@ def jit_cache(fn):
         try:
             with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
                 if o_path.exists():
-                    loaded = _load_cached()
-                    cache[cache_key] = loaded
-                    hits += 1
-                    return loaded
+                    try:
+                        loaded = _load_cached()
+                    except Exception as e:
+                        _quarantine_corrupt(e)  # holds the exclusive lock: safe
+                    else:
+                        cache[cache_key] = loaded
+                        hits += 1
+                        return loaded
 
                 misses += 1
                 compiled_fn = fn(*args, **kwargs)
+                # Export to a private temp file, then atomically rename into
+                # place: a process killed mid-export (xdist worker OOM-kill,
+                # timeout) must never leave a truncated .o at the final path —
+                # the advisory flock dies with the process, and a persistent
+                # cache (CI keeps one in $HOME) would then fail every future
+                # run on this key with "Symbols not found: __tvm_ffi_func".
+                tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
                 try:
                     compiled_fn.export_to_c(
-                        object_file_path=str(o_path),
+                        object_file_path=str(tmp_path),
                         function_name=EXPORT_FUNC_NAME,
                     )
+                    os.replace(tmp_path, o_path)
                 except Exception as e:
                     print(f"quack cache: export failed for key {sha}: {e}")
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
                 cache[cache_key] = compiled_fn
                 return compiled_fn
         except RuntimeError as e:
