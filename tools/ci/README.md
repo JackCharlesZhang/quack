@@ -49,6 +49,12 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
   older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
   older than 1 day.
 
+On test-step failure, a follow-up step dumps recent NVIDIA `Xid`/`NVRM` lines
+from the host kernel log. One Xid mid-run poisons that xdist worker's CUDA
+context and cascades into dozens of "illegal memory access" test failures (and
+can silently corrupt another test's numerics via wild writes before the fault
+lands), so when many tests go red at once, check the Xid dump first.
+
 ## SIF caching on runners
 
 The action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`

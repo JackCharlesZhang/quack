@@ -160,3 +160,23 @@ runs:
           NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
           CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
         "
+
+    - name: Dump GPU Xid faults (test step failed)
+      if: failure()
+      shell: bash
+      run: |
+        # A single Xid (GPU-level fault) mid-run poisons that xdist worker's
+        # CUDA context: every later test in the worker fails with "an illegal
+        # memory access was encountered", and wild writes can silently corrupt
+        # another test's numerics before the fault lands. Dozens of red tests
+        # are often ONE event — triage starts here, not at the failure list.
+        # Runs on the host, not in the SIF (Xid lines are kernel-side).
+        # Xid quick reference: 13 = warp exception (OOR addr / illegal
+        # instruction), 31 = MMU fault, 43 = channel reset after a fault.
+        echo "Test step failed at $(date '+%F %T %Z'); kernel Xid/NVRM events below (correlate timestamps with the job window):"
+        events=$( (dmesg -T 2>/dev/null || journalctl -k --no-pager 2>/dev/null) | grep -E "Xid|NVRM" | tail -100 || true)
+        if [ -n "$events" ]; then
+          echo "$events"
+        else
+          echo "(no Xid/NVRM events in readable kernel log — dmesg may be restricted on this runner)"
+        fi
