@@ -293,7 +293,9 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
                 and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
                 and c.tile_k is None  # tile_k is derived from the MMA instruction
                 and c.tile_m in (128, 256)
+                # SF tmem datapath is 64-N granular; tcgen05 MMA N is capped at 256
                 and c.tile_n % 64 == 0
+                and 64 <= c.tile_n <= 256
                 # SF multicast is limited to 4 CTAs per cluster dim
                 and c.cluster_m <= 4
                 and c.cluster_n <= 4

@@ -347,7 +347,10 @@ class GemmSm100(GemmTmaBase):
             # are hardware-unreachable without rotating the SF content by 32 N.
             assert (
                 self.cta_tile_shape_mnk[1] % 64 == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
-            ), f"blockscaled tile_n must be a multiple of 64, got {self.cta_tile_shape_mnk[1]}"
+            ), (
+                f"blockscaled tile_n must be a multiple of 64 in [64, 256], "
+                f"got {self.cta_tile_shape_mnk[1]}"
+            )
             self.sfb_n_atom_misaligned = (self.cta_tile_shape_mnk[1] // 64) % 2 == 1
             # SFB smem/tmem window per tile, in 128-wide SF atoms.
             self.sfb_window_atoms = cute.round_up(self.cta_tile_shape_mnk[1], 128) // 128
