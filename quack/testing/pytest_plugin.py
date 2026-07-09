@@ -235,12 +235,23 @@ def pytest_unconfigure(config):
             "quack-defer-loop"
         ) or config.pluginmanager.get_plugin("quack-xdist-defer")
         defers = defer_plugin.defer_count if defer_plugin else 0
-        print(
-            f"\nasync-compile: {stats['submitted']} keys submitted, "
+        summary = (
+            f"async-compile: {stats['submitted']} keys submitted, "
             f"{stats['failed']} failed, {defers} test deferrals"
         )
-        for sha, err in stats["errors"][:5]:
-            print(f"  pool compile error [{sha[:12]}]: {err}")
+        detail = [f"  pool compile error [{sha[:12]}]: {err}" for sha, err in stats["errors"][:5]]
+        tr = config.pluginmanager.get_plugin("terminalreporter")
+        if stats["failed"] and tr is not None:
+            # Failures degrade to in-process compiles (tests still pass), so
+            # paint the summary red or it reads as routine bookkeeping.
+            print()
+            tr.write_line(summary, red=True, bold=True)
+            for line in detail:
+                tr.write_line(line, red=True)
+        else:
+            print(f"\n{summary}")
+            for line in detail:
+                print(line)
         deactivate()
 
     # Always undo the global monkey-patches we installed. This keeps the

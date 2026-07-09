@@ -20,6 +20,8 @@ import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.dsl import cute_op
+
+from quack.pipeline import make_pipeline_state, PipelineStasAsync
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
@@ -600,16 +602,23 @@ class RMSNormBackward(ReductionBase):
         dout_dtype: Optional[Type[cutlass.Numeric]] = None,
         T_hint: int = 0,
         per_head: bool = False,
+        is_layernorm: bool = False,
         weight_offset: float = 0.0,
+        num_acc: int = 1,
         config: Optional["RmsNormBwdConfig"] = None,
     ):
-        # 2 stages for double buffering when computing mean of x_hat * wdy
-        super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
+        # stage counts sync stages: double-buffering across row iterations => 2.
+        # Each row reduces 1 value (mean(x_hat * wdy)) for RMSNorm, 2 for LayerNorm
+        # (additionally mean(wdy)) — LN's pair shares its stage's barrier and only
+        # widens the reduction buffer (bufs_per_stage slots per stage).
+        self.is_layernorm = is_layernorm
+        self.bufs_per_stage = 2 if is_layernorm else 1
         self.weight_offset = weight_offset
+        super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
         dout_width = dout_dtype.width if dout_dtype is not None else dtype.width
         if config is None:
             config = RmsNormBwdConfig.from_analytical_heuristic(
-                N, dtype.width, dout_width, T_hint=T_hint
+                N, dtype.width, dout_width, T_hint=T_hint, num_acc=num_acc
             )
         self.config = config
         self.reload_wdy = config.reload_wdy
@@ -652,6 +661,7 @@ class RMSNormBackward(ReductionBase):
         mdO: cute.Tensor,
         mdResO: Optional[cute.Tensor],
         mRstd: cute.Tensor,
+        mMean: Optional[cute.Tensor],
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
@@ -660,6 +670,8 @@ class RMSNormBackward(ReductionBase):
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
+        if const_expr(self.is_layernorm):
+            assert mMean is not None, "LayerNorm backward requires the mean tensor"
         self._set_cluster_n()
         largest_dtype_width = const_expr(
             max(*(t.element_type.width for t in [mX, mW, mdO, mdResO, mdX, mdRes] if t is not None))
@@ -689,6 +701,7 @@ class RMSNormBackward(ReductionBase):
             mdO,
             mdResO,
             mRstd,
+            mMean,
             mdX,
             mdW,
             mdB,
@@ -715,6 +728,7 @@ class RMSNormBackward(ReductionBase):
         mdO: cute.Tensor,
         mdResO: Optional[cute.Tensor],
         mRstd: cute.Tensor,
+        mMean: Optional[cute.Tensor],
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
@@ -744,6 +758,8 @@ class RMSNormBackward(ReductionBase):
                 for mT in (mX, mW, mdO, mdResO, mdX, mdW, mdB, mdRes)
             ]
             mRstd = mRstd[None, bidz]
+            if const_expr(mMean is not None):
+                mMean = mMean[None, bidz]
 
         shape = mX.shape
         M = shape[0]
@@ -760,13 +776,15 @@ class RMSNormBackward(ReductionBase):
         smem_align = const_expr(128 if USE_TMA else 16)
         sX = smem.allocate_tensor(mX.element_type, smem_layout, byte_alignment=smem_align)
         sdO = smem.allocate_tensor(mdO.element_type, smem_layout, byte_alignment=smem_align)
-        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(
-            smem, tv_layout, is_persistent=True
+        # Barriers live in the reserved smem partition, allocated by PipelineStasAsync.
+        # The buffer holds bufs_per_stage value slots per sync stage.
+        reduction_buffer = smem.allocate_tensor(
+            self.reduction_dtype,
+            self._get_reduction_buffer_layout(
+                tv_layout, self.cluster_n, num_slots=self.stage * self.bufs_per_stage
+            ),
+            byte_alignment=8,
         )
-        if const_expr(mbar_ptr is not None):
-            mbar_full_ptr, mbar_empty_ptr = mbar_ptr, mbar_ptr + 2
-        else:
-            mbar_full_ptr, mbar_empty_ptr = None, None
 
         thr_copy_X = tiled_copy.get_slice(tidx)
 
@@ -829,7 +847,22 @@ class RMSNormBackward(ReductionBase):
         if const_expr(USE_TMA):
             tma_mbar_ptr = smem.allocate_array(Int64, num_elems=NUM_PIPE_STAGES * 2)
 
-        self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
+        # Cluster reduction-buffer exchange (see PipelineStasAsync). Sync stages are
+        # decoupled from buffer slots: LN reduces two values per row iteration
+        # (mean_xhat_wdy and mean_wdy) into a pair of adjacent buffer slots guarded by
+        # ONE barrier pair — a single combined-tx wait, one cluster round trip.
+        pipeline_reduce = None
+        if const_expr(self.cluster_n > 1):
+            pipeline_reduce = PipelineStasAsync.create(
+                num_stages=self.stage,
+                num_warps=num_warps,
+                cluster_n=self.cluster_n,
+                defer_sync=True,
+            )
+            cute.arch.mbarrier_init_fence()
+            # Arrive now; the matching cluster_wait comes after the weight load below
+            # so the cluster sync overlaps it.
+            cute.arch.cluster_arrive_relaxed()
 
         tXrW = None
         if const_expr(mW is not None):
@@ -886,9 +919,11 @@ class RMSNormBackward(ReductionBase):
             tXrdW.fill(0.0)
         if const_expr(mdB is not None):
             tXrdB.fill(0.0)
-        stage = Int32(0)
-        producer_phase = Int32(1)
-        consumer_phase = Int32(0)
+        # This CTA is both producer and consumer of the reduction buffers: the producer
+        # view gates publishing on the empty barriers, the consumer view tracks the
+        # full-barrier phase. Both advance in lockstep, one stage per row iteration.
+        prod_state_reduce = make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage)
+        cons_state_reduce = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage)
         next_wave_work_id = (NUM_PIPE_STAGES - 1) * gdim
         next_wave_row_id = next_wave_work_id * tiler_mn[0]
 
@@ -999,8 +1034,11 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.cp_async_commit_group()
                 producer_state.advance()
             rstd = cutlass.Float.zero
+            row_mean = cutlass.Float.zero
             if row < M or tiler_mn[0] == 1:
                 rstd = mRstd[row]
+                if const_expr(self.is_layernorm):
+                    row_mean = mMean[row]
             if const_expr(mdResO is not None):
                 if row < M or tiler_mn[0] == 1:
                     copy(tXgdResO[None, None, None, bidx], tXrdResO)
@@ -1015,39 +1053,62 @@ class RMSNormBackward(ReductionBase):
             x = tXrX.load().to(cute.Float32)
             cute.autovec_copy(tXsdO[None, None, None, smem_stage], tXrdO)
             dout = tXrdO.load().to(cute.Float32)
-            x_hat = x * rstd
+            x_hat = (x - row_mean) * rstd if const_expr(self.is_layernorm) else x * rstd
             wdy = dout
             if const_expr(mW is not None):
                 w = tXrW.load().to(Float32)
                 if const_expr(self.weight_offset != 0.0):
                     w += Float32(self.weight_offset)
                 wdy *= w
+            red_slot = cons_state_reduce.index * self.bufs_per_stage
             if const_expr(self.cluster_n > 1):
-                cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
-            mean_xhat_wdy = (
-                row_reduce(
-                    x_hat * wdy,
+                pipeline_reduce.producer_acquire(prod_state_reduce)
+            red_mbar = (
+                pipeline_reduce.producer_get_barrier(prod_state_reduce)
+                if const_expr(self.cluster_n > 1)
+                else None
+            )
+            mean_wdy = cutlass.Float.zero
+            if const_expr(self.is_layernorm):
+                # Both LN reductions share red_mbar: one combined-tx expect, one wait,
+                # one cluster round trip instead of two (see cluster_reduce). Passing
+                # the live wdy TensorSSA is safe here: row_reduce thread-local-reduces
+                # every element BEFORE the barriers, so the fragment's registers die
+                # pre-wait (reload_wdy re-materializes it afterwards) — no spill at
+                # large fragments, unlike feeding it to a second row_reduce call.
+                mean_xhat_wdy, mean_wdy = row_reduce(
+                    (x_hat * wdy, wdy),
                     cute.ReductionOp.ADD,
                     threads_per_row,
-                    reduction_buffer[None, None, stage],
-                    (mbar_full_ptr + stage if const_expr(self.cluster_n > 1) else None),
-                    phase=consumer_phase,
+                    (
+                        reduction_buffer[None, None, red_slot],
+                        reduction_buffer[None, None, red_slot + 1],
+                    ),
+                    red_mbar,
+                    phase=cons_state_reduce.phase,
                     init_val=0.0,
                 )
-                / shape[1]
-            )
+                mean_xhat_wdy /= shape[1]
+                mean_wdy /= shape[1]
+            else:
+                mean_xhat_wdy = (
+                    row_reduce(
+                        x_hat * wdy,
+                        cute.ReductionOp.ADD,
+                        threads_per_row,
+                        reduction_buffer[None, None, red_slot],
+                        red_mbar,
+                        phase=cons_state_reduce.phase,
+                        init_val=0.0,
+                    )
+                    / shape[1]
+                )
 
             if const_expr(self.cluster_n > 1):
-                # Need this fence since the STAS from the producer is using the async proxy.
+                # The STAS stores travel the async proxy; fence before releasing so
+                # peers' subsequent writes to the slot cannot pass our reads.
                 cute.arch.fence_view_async_shared()
-                # It's faster to have 1 lane per warp to signal the mbar, rather than all lanes
-                # Requires adjusting the thread_count when initializing the mbar
-                cute.arch.sync_warp()
-                lane_idx = cute.arch.lane_idx()
-                if lane_idx < self.cluster_n:
-                    cute.arch.mbarrier_arrive(
-                        mbar_empty_ptr + stage, peer_cta_rank_in_cluster=lane_idx
-                    )
+                pipeline_reduce.consumer_release(cons_state_reduce)
 
             if const_expr(self.reload_wdy == "smem"):
                 cute.autovec_copy(tXsdO[None, None, None, smem_stage], tXrdO)
@@ -1062,9 +1123,12 @@ class RMSNormBackward(ReductionBase):
             if const_expr(self.reload_x == "smem"):
                 cute.autovec_copy(tXsX[None, None, None, smem_stage], tXrX)
                 x = tXrX.load().to(cute.Float32)
-                x_hat = x * rstd
+                x_hat = (x - row_mean) * rstd if const_expr(self.is_layernorm) else x * rstd
 
-            dx = (wdy - x_hat * mean_xhat_wdy) * rstd
+            if const_expr(self.is_layernorm):
+                dx = (wdy - mean_wdy - x_hat * mean_xhat_wdy) * rstd
+            else:
+                dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             if const_expr(mdResO is not None):
                 dx += tXrdResO.load().to(cute.Float32)
             tXrdX.store(dx.to(tXrdX.element_type))
@@ -1084,11 +1148,8 @@ class RMSNormBackward(ReductionBase):
                     consumer_state.index, tma_pipeline.consumer_mask
                 )
             consumer_state.advance()
-
-            stage ^= 1
-            if stage == 0:
-                consumer_phase ^= 1
-                producer_phase ^= 1
+            prod_state_reduce.advance()
+            cons_state_reduce.advance()
 
         if const_expr(tiler_mn[0] > 1):
             if const_expr(mdW is not None):
@@ -1140,13 +1201,8 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdB is not None):
                 copy(tXrdB, tXgdB)
 
-        if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
-            # Assume state contains that next useful buffer
-            # So we only need to advance to num_stages - 1 times to last used buffer
-            stage ^= 1
-            if stage == 0:
-                producer_phase ^= 1
-            cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
+        if const_expr(self.cluster_n > 1):
+            pipeline_reduce.producer_tail(prod_state_reduce)
 
 
 @cute_op(
@@ -1154,7 +1210,7 @@ class RMSNormBackward(ReductionBase):
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count=None, float weight_offset=0.) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count=None, Tensor? mean=None, bool is_layernorm=False, float weight_offset=0.) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
@@ -1167,14 +1223,18 @@ def _rmsnorm_bwd(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    mean: Optional[Tensor] = None,
+    is_layernorm: bool = False,
     weight_offset: float = 0.0,
 ) -> None:
-    """RMSNorm backward pass.
+    """RMSNorm/LayerNorm backward pass.
     Args:
         x: Input tensor of shape (M, N) or (M, H, N) for per-head
         weight: Optional weight tensor of shape (N,) or (H, N) for per-head
         dout: Upstream gradients tensor of shape (M, N) or (M, H, N)
         rstd: Reciprocal standard deviation tensor of shape (M,) or (M, H)
+        mean: Row means of shape (M,) or (M, H); required iff is_layernorm
+        is_layernorm: If True, compute the LayerNorm backward instead of RMSNorm
         weight_offset: Constant added to the weight in fp32 (Gemma-style 1+w)
     Returns:
         Tuple of (dx, dw) where:
@@ -1184,6 +1244,7 @@ def _rmsnorm_bwd(
     assert x.dim() in (2, 3), "Input must be 2D or 3D"
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
     assert x.dtype in supported_types, "Unsupported dtype"
+    assert (mean is not None) == is_layernorm, "mean is required iff is_layernorm"
     per_head = x.dim() == 3
     if weight is not None:
         assert weight.dtype in supported_types, "Weight must be float32, float16 or bfloat16"
@@ -1220,8 +1281,9 @@ def _rmsnorm_bwd(
         dw_partial is not None,
         per_head,
         T_hint=T_hint,
+        is_layernorm=is_layernorm,
         weight_offset=weight_offset,
-    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
+    )(x, weight, dout, dresidual_out, rstd, mean, dx, dw_partial, dresidual, db_partial, sm_count)
 
 
 @jit_cache
@@ -1237,6 +1299,7 @@ def _compile_rmsnorm_bwd(
     has_dw_partial,
     per_head=False,
     T_hint=0,
+    is_layernorm=False,
     weight_offset=0.0,
     config: Optional[RmsNormBwdConfig] = None,
 ):
@@ -1252,6 +1315,7 @@ def _compile_rmsnorm_bwd(
     weight_shape = (head_sym, N) if per_head else (N,)
     weight_cute = fake_tensor(weight_dtype, weight_shape, div)
     rstd_cute = fake_tensor(Float32, batch_shape)
+    mean_cute = fake_tensor(Float32, batch_shape) if is_layernorm else None
     dw_shape = (batch_partial_sym, head_sym, N) if per_head else (batch_partial_sym, N)
     dw_partial_cute = fake_tensor(Float32, dw_shape, div) if has_dw_partial else None
     db_partial_cute = fake_tensor(Float32, dw_shape, div) if has_db_partial else None
@@ -1262,7 +1326,9 @@ def _compile_rmsnorm_bwd(
             dout_dtype=dout_dtype,
             T_hint=T_hint,
             per_head=per_head,
+            is_layernorm=is_layernorm,
             weight_offset=weight_offset,
+            num_acc=int(has_dw_partial) + int(has_db_partial),
             config=config,
         ),
         x_cute,
@@ -1270,6 +1336,7 @@ def _compile_rmsnorm_bwd(
         dout_cute,
         dres_out_cute,
         rstd_cute,
+        mean_cute,
         dx_cute,
         dw_partial_cute,
         dres_cute,
@@ -1341,7 +1408,7 @@ def rmsnorm_bwd(
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_bwd_configs()],
-    key=["per_head", "has_dw_partial", "has_db_partial"],
+    key=["per_head", "has_dw_partial", "has_db_partial", "is_layernorm"],
     prune_configs_by={"early_config_prune": prune_invalid_rmsnorm_bwd_configs},
 )
 def rmsnorm_bwd_tuned(
@@ -1358,6 +1425,8 @@ def rmsnorm_bwd_tuned(
     per_head: bool = False,
     has_dw_partial: bool = False,
     has_db_partial: bool = False,
+    mean: Optional[Tensor] = None,
+    is_layernorm: bool = False,
     weight_offset: float = 0.0,
     config: Optional[RmsNormBwdConfig] = None,
 ) -> None:
@@ -1404,9 +1473,10 @@ def rmsnorm_bwd_tuned(
         has_dw_partial,
         per_head,
         T_hint=0,
+        is_layernorm=is_layernorm,
         weight_offset=weight_offset,
         config=config,
-    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
+    )(x, weight, dout, dresidual_out, rstd, mean, dx, dw_partial, dresidual, db_partial, sm_count)
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -1598,6 +1668,60 @@ def layernorm_fwd(
     elif return_mean:
         return out, mean
     return out
+
+
+def layernorm_bwd(
+    x: Tensor,
+    weight: Tensor,
+    dout: Tensor,
+    rstd: Tensor,
+    mean: Tensor,
+    has_bias: bool = True,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """LayerNorm backward pass using the unified RMSNorm/LayerNorm backward kernel.
+
+    Args:
+        x: Input tensor of shape (M, N)
+        weight: Weight tensor of shape (N,)
+        dout: Upstream gradients tensor of shape (M, N)
+        rstd: Reciprocal standard deviation of shape (M,), float32
+        mean: Row means of shape (M,), float32
+        has_bias: If True, also compute db = dout.sum(dim=0)
+
+    Returns:
+        (dx, dw, db) where db is None when has_bias=False. dw/db are computed
+        as fp32 partials per persistent CTA and summed on the host side, same
+        as rmsnorm_bwd.
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight.dim() == 1, "Weight must be 1D"
+    device = x.device
+    N = x.size(-1)
+    dx = torch.empty_like(x)
+    sm_count = get_sm_count(N, device)
+    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+    db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
+    if x.numel() > 0:
+        _rmsnorm_bwd(
+            x,
+            weight,
+            dout,
+            rstd,
+            dx,
+            dw_partial,
+            db_partial,
+            None,
+            None,
+            sm_count,
+            mean=mean,
+            is_layernorm=True,
+        )
+        dw = dw_partial.sum(dim=0).to(weight.dtype)
+        db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+    else:
+        dw = torch.zeros_like(weight)
+        db = torch.zeros_like(weight) if has_bias else None
+    return dx, dw, db
 
 
 def layernorm_ref(x: Tensor, w: Tensor, eps: float = 1e-6) -> Tensor:
