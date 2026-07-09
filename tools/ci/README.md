@@ -22,7 +22,7 @@ and on PRs.
 | `cu129` | `tridao/quack-kernels:cu12.9-DATE` | base cute-dsl |
 | `cu132` | `tridao/quack-kernels:cu13.2-DATE` | cute-dsl[cu13] |
 
-The cu12.9 variant uses torch cu126 wheels (newest CUDA 12.x PyTorch 2.12 index).
+The cu12.9 variant uses torch cu129 wheels (CUDA 12.9 PyTorch 2.13 index).
 The cu13.2 variant uses torch cu132 wheels plus the Dockerfile's CUDA 13 forward-
 compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 
@@ -33,7 +33,7 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 | GPU | Arch override | cu129 | cu132 |
 |-----|----------------|-------|-------|
 | h100 | (none, sm90) | ✓ | ✓ |
-| b300 | (none, sm100) | — | ✓ |
+| b300 | (none, sm100) | ✓ | ✓ |
 | h100 | sm120 | ✓ | ✓ |
 
 ## Test strategy
