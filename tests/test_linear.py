@@ -699,20 +699,17 @@ def test_autocast(fn_name, use_compile):
 
 
 @pytest.mark.parametrize("sr_seed", [0, 42])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512, 1024])
 @pytest.mark.parametrize("k", [256, 768])
 @pytest.mark.parametrize("m", [480, 960])
 def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
-    """Test GEMM with stochastic rounding on SM100/SM110.
+    """Test GEMM with stochastic rounding (hw cvt.rs on SM100/SM103, sw emulation on SM90/SM120).
 
     Validates that SR produces results close to RNE (within BF16 tolerance)
     and that the output has correct shape and dtype.
     """
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
@@ -726,30 +723,13 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
     assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-3
 
 
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-def test_gemm_sr_requires_sm100(input_dtype):
-    """Assert that SR raises on non-SM100 hardware."""
-    device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] == 10:
-        pytest.skip("This test is for non-SM100 hardware")
-    torch.random.manual_seed(0)
-    A = torch.randn((128, 256), device=device, dtype=input_dtype)
-    B = torch.randn((256, 128), device=device, dtype=input_dtype)
-    with pytest.raises(AssertionError, match="SM100"):
-        gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS)
-
-
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("m", [480])
 def test_gemm_sr_different_seeds(m, k, n, input_dtype):
     """Different SR seeds should produce different results (non-deterministic rounding)."""
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
