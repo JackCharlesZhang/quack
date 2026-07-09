@@ -177,7 +177,12 @@ def test_gemm_split_k_staged_grid_not_inflated():
 
 
 def _max_gemm_grid_z(fn):
-    """Largest kernel grid.z launched by fn() (the GEMM dominates; reduce z is just L)."""
+    """Largest kernel grid.z launched by fn() (the GEMM dominates; reduce z is just L).
+
+    grid.z is NOT split_k directly: the default config runs a persistent (pingpong)
+    scheduler, so grid.z == num_persistent_clusters == n_clusters * split_k when the
+    problem fits in one wave. Callers must normalize by the split_k=1 launch to recover
+    the split factor (z(split_k) / z(1) == split_k)."""
     import json
     import tempfile
 
@@ -218,12 +223,19 @@ def test_gemm_split_k_config_autotuner_surface():
         _assert_close_double_baseline(out, out_ref, A @ B, mult=2)
         return out
 
+    # The persistent scheduler folds n_clusters and split_k into grid.z, so normalize by
+    # the split_k=1 launch: z(split_k) == split_k * z(1). z1 is the per-split cluster count.
+    z1 = _max_gemm_grid_z(lambda: run(split_k=1))
     z_from_config = _max_gemm_grid_z(lambda: run(split_k=None))
     z_override = _max_gemm_grid_z(lambda: run(split_k=2))
-    if z_from_config is None or z_override is None:
+    if z1 is None or z_from_config is None or z_override is None:
         pytest.skip("profiler does not expose kernel grids in this torch build")
-    assert z_from_config == 4, f"config.split_k not honored: grid z = {z_from_config}"
-    assert z_override == 2, f"explicit split_k must override config: grid z = {z_override}"
+    assert z_from_config == 4 * z1, (
+        f"config.split_k not honored: grid z = {z_from_config} (base {z1})"
+    )
+    assert z_override == 2 * z1, (
+        f"explicit split_k must override config: grid z = {z_override} (base {z1})"
+    )
 
     # Prune-hook expansion: split_k=None on a starved shape adds split-k variants...
     base = [AutotuneConfig(config=default_config(A.device))]
