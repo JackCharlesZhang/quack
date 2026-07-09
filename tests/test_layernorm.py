@@ -161,9 +161,9 @@ def test_layernorm_input_validation():
     x_cpu = torch.randn(32, 1024, dtype=torch.float16)
     weight_cpu = torch.randn(1024, dtype=torch.float32)
 
-    # with pytest.raises(AssertionError, match="Tensors must be on CUDA device"):
-    # With torch.library custom op, this now fails with NotImplementedError
-    with pytest.raises(NotImplementedError):
+    # Eager calls bypass the torch.library dispatcher, so TVM-FFI performs the
+    # device validation directly.
+    with pytest.raises(ValueError, match="expected device_type=cuda"):
         layernorm_fwd(x_cpu, weight_cpu)
 
     # Test unsupported dtype
