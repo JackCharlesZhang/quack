@@ -24,6 +24,7 @@ import pickle
 import sys
 import tempfile
 import time
+import warnings
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
@@ -260,9 +261,15 @@ def jit_cache(fn):
                 except RuntimeError:
                     pass  # lock timeout; fall through to slow path
             else:  # "failed"
-                print(
+                # warnings.warn, not print: this fires inside a test whose stdout
+                # pytest captures and discards on pass (the in-process fallback
+                # usually succeeds), so a print never reaches the user — the
+                # warning lands in pytest's warnings summary instead.
+                warnings.warn(
                     f"quack cache: async compile failed for {fn.__qualname__} "
-                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback"
+                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
 
         # 4. Slow path: take EXCLUSIVE lock and compile under it. The recheck
@@ -297,7 +304,12 @@ def jit_cache(fn):
                     )
                     os.replace(tmp_path, o_path)
                 except Exception as e:
-                    print(f"quack cache: export failed for key {sha}: {e}")
+                    warnings.warn(
+                        f"quack cache: export failed for key {sha}: {e} "
+                        f"(this key will recompile every run)",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     try:
                         tmp_path.unlink()
                     except OSError:
@@ -308,9 +320,11 @@ def jit_cache(fn):
             # Lock acquisition timed out (heavy contention or stuck holder).
             # Fall back to in-process compile, no disk write. Better to do
             # the work twice than to fail the test.
-            print(
+            warnings.warn(
                 f"quack cache: lock timeout for key {sha}: {e}; "
-                f"falling back to in-process compile without disk cache"
+                f"falling back to in-process compile without disk cache",
+                RuntimeWarning,
+                stacklevel=2,
             )
             misses += 1
             compiled_fn = fn(*args, **kwargs)
