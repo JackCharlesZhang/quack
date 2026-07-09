@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao
 from dataclasses import replace
 from typing import Optional, Tuple, Literal
-from functools import partial
+from functools import lru_cache, partial
 
 import torch
 import torch.nn.functional as F
@@ -146,6 +146,16 @@ def _concat_interleave_bias(t):
 # (two elements per byte); K here always refers to logical K.
 
 
+def _launch(op):
+    """Pick the raw impl for eager calls: the pure-Python custom-op boundary
+    (autograd wrapper + per-call mutates_args aliasing checks) costs ~85us per
+    call and only pays for itself under torch.compile/fake tensors, where the
+    op schema is required."""
+    if torch.compiler.is_compiling():
+        return op
+    return getattr(op, "_init_fn", op)
+
+
 def _unpack_operand(X) -> Tuple[Tensor, Optional[Tensor]]:
     """Split an ``A`` / ``B`` argument into (data, scale_factor or None)."""
     if isinstance(X, (tuple, list)):
@@ -188,8 +198,13 @@ def _sf_encode(SF: Tensor) -> Tensor:
     "auto_functionalized_v2 was not removed" (e4m3 is unaffected), breaking
     torch.compile. The uint8 view is zero-copy and unambiguous (uint8 == e8m0,
     e4m3 stays itself); :func:`_sf_decode` restores the dtype inside the op.
+
+    Eager calls skip the view: they bypass the custom-op boundary entirely
+    (see :func:`_launch`), and :func:`_sf_decode` no-ops on non-uint8 input.
     """
-    return SF.view(torch.uint8) if SF.dtype == torch.float8_e8m0fnu else SF
+    if SF.dtype == torch.float8_e8m0fnu and torch.compiler.is_compiling():
+        return SF.view(torch.uint8)
+    return SF
 
 
 def _sf_decode(SF: Optional[Tensor]) -> Optional[Tensor]:
@@ -200,7 +215,11 @@ def _sf_decode(SF: Optional[Tensor]) -> Optional[Tensor]:
 
 
 def default_config(device):
-    cap = get_device_capacity(device)[0]
+    return _default_config_for_cap(get_device_capacity(device)[0])
+
+
+@lru_cache(maxsize=None)
+def _default_config_for_cap(cap):
     if cap == 8:
         return GemmConfig(
             tile_m=128,
@@ -258,6 +277,11 @@ def blockscaled_default_config(m: int, n: int) -> GemmConfig:
         tile_m, tile_n, cluster = 256, 128, (2, 1)
     else:
         tile_m, tile_n, cluster = 128, 128, (1, 1)
+    return _blockscaled_config(tile_m, tile_n, cluster)
+
+
+@lru_cache(maxsize=None)
+def _blockscaled_config(tile_m, tile_n, cluster):
     return GemmConfig(
         tile_m=tile_m,
         tile_n=tile_n,
@@ -720,7 +744,7 @@ def gemm(
     sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
     sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
     concat_str = ",".join(concat_layout) if concat_layout else None
-    gemm_out(
+    _launch(gemm_out)(
         A,
         B,
         out,
@@ -971,7 +995,7 @@ def gemm_add(
     beta_arg = _merge_tensor(beta, beta_tensor)
     concat_str = ",".join(concat_layout) if concat_layout else None
     if add_to_output:
-        gemm_add_inplace(
+        _launch(gemm_add_inplace)(
             A if SFA is None else (A, SFA),
             B if SFB is None else (B, SFB),
             out,
@@ -988,7 +1012,7 @@ def gemm_add(
             split_k_mode=split_k_mode,
         )
     else:
-        gemm_add_out(
+        _launch(gemm_add_out)(
             A,
             B,
             C,
@@ -1336,7 +1360,7 @@ def gemm_act(
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
     if is_gated:
-        gemm_gated_out(
+        _launch(gemm_gated_out)(
             A,
             B,
             preact_out,
@@ -1353,7 +1377,7 @@ def gemm_act(
             SFB=SFB,
         )
     else:
-        gemm_act_out(
+        _launch(gemm_act_out)(
             A,
             B,
             preact_out,
@@ -1501,7 +1525,7 @@ def gemm_dact(
             results.append(torch.zeros(colvec_shape, dtype=torch.float32, device=A.device))
         return tuple(results)
     if is_dgated:
-        colvec_reduce_final = gemm_dgated_out(
+        colvec_reduce_final = _launch(gemm_dgated_out)(
             A,
             B,
             PreAct,
@@ -1520,7 +1544,7 @@ def gemm_dact(
             results.append(colvec_reduce_final)
         return tuple(results)
     else:
-        gemm_dact_out(
+        _launch(gemm_dact_out)(
             A,
             B,
             PreAct,
@@ -1713,7 +1737,7 @@ def gemm_symmetric(
         _empty_k_matmul_into(out, C=C, beta=beta)
         return out
 
-    gemm_symmetric_out(
+    _launch(gemm_symmetric_out)(
         A,
         B,
         out,
@@ -2330,7 +2354,7 @@ def gemm_rms(
         else:
             rstd = torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
         return out, rstd
-    rstd = _gemm_rms_out(
+    rstd = _launch(_gemm_rms_out)(
         A,
         B,
         out,
@@ -2563,7 +2587,7 @@ def gemm_norm_act(
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
     if is_gated:
-        gemm_norm_gated_out(
+        _launch(gemm_norm_gated_out)(
             A,
             B,
             preact_out,
@@ -2575,7 +2599,7 @@ def gemm_norm_act(
             tuned,
         )
     else:
-        gemm_norm_act_out(
+        _launch(gemm_norm_act_out)(
             A,
             B,
             preact_out,
