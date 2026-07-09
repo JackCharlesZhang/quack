@@ -110,6 +110,41 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("N", [1024, 4096, 32768])
+@pytest.mark.parametrize("M", [1, 199, 8 * 1024])
+def test_rmsnorm_weight_offset(M, N, input_dtype, weight_dtype, use_compile):
+    """Gemma-style RMSNorm: out = x_hat * (1 + w) with zero-init weight, fwd + bwd."""
+    device = "cuda"
+    atol = TOLERANCES[input_dtype]
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    # Zero-init plus noise: the regime weight_offset=1.0 exists for. A plain
+    # w-multiply bug would show up as out ≈ 0 instead of out ≈ x_hat.
+    weight = (0.1 * torch.randn(N, device=device, dtype=weight_dtype)).requires_grad_()
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+
+    out = function(x, weight, weight_offset=1.0)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, weight_offset=1.0)
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    # dw is unaffected by the offset (d out/d w is x_hat either way); same
+    # summation-order tolerances as test_rmsnorm_forward_backward.
+    if weight_dtype == torch.float32:
+        weight_atol = 5e-6 * (M**0.5)
+    else:
+        weight_atol = 2 * torch.finfo(weight_dtype).eps * weight_ref.grad.abs().max()
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
     """Test RMSNorm with 3D input where backward produces non-contiguous gradients (issue #88)."""

@@ -67,10 +67,14 @@ class RMSNorm(ReductionBase):
         dtype: Type[cutlass.Numeric],
         N: int,
         is_layernorm: bool = False,
+        weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
+        # Constant added to the weight in fp32 before scaling (Gemma-style
+        # "out = x_hat * (1 + w)" uses weight_offset=1.0). Baked in at compile time.
+        self.weight_offset = weight_offset
         if config is None:
             config = RmsNormFwdConfig.from_analytical_heuristic(
                 N, dtype.width, is_layernorm=is_layernorm
@@ -344,7 +348,11 @@ class RMSNorm(ReductionBase):
         x_hat = (x - mean) * rstd if const_expr(self.is_layernorm) else x * rstd
         y = x_hat
         if const_expr(mW is not None):
-            y *= tXrW.load().to(cute.Float32)
+            w = tXrW.load().to(cute.Float32)
+            if const_expr(self.weight_offset != 0.0):
+                # fp32 add so e.g. (1 + w) doesn't round through the weight dtype
+                w += Float32(self.weight_offset)
+            y *= w
         if const_expr(mB is not None):
             y += tXrB.load().to(cute.Float32)
         tXrO.store(y.to(tXrO.element_type))
@@ -357,7 +365,7 @@ class RMSNorm(ReductionBase):
     mutates_args=("out", "rstd", "mean", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor(a5!)? mean, Tensor? residual, Tensor(a7!)? residual_out, float eps=1e-6, bool is_layernorm=False) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor(a5!)? mean, Tensor? residual, Tensor(a7!)? residual_out, float eps=1e-6, bool is_layernorm=False, float weight_offset=0.) -> ()",
 )
 def _rmsnorm_fwd(
     x: Tensor,
@@ -370,6 +378,7 @@ def _rmsnorm_fwd(
     residual_out: Optional[Tensor] = None,
     eps: float = 1e-6,
     is_layernorm: bool = False,
+    weight_offset: float = 0.0,
 ) -> None:
     """RMSNorm/LayerNorm forward pass.
     Args:
@@ -408,6 +417,7 @@ def _rmsnorm_fwd(
         mean is not None,
         is_layernorm,
         per_head,
+        weight_offset,
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
@@ -424,6 +434,7 @@ def _compile_rmsnorm_fwd(
     has_mean,
     is_layernorm,
     per_head,
+    weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
     batch_sym = cute.sym_int()
@@ -442,7 +453,7 @@ def _compile_rmsnorm_fwd(
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm, config=config),
+        RMSNorm(dtype, N, is_layernorm=is_layernorm, weight_offset=weight_offset, config=config),
         x_cute,
         weight_cute,
         bias_cute,
@@ -466,6 +477,7 @@ def rmsnorm_fwd(
     residual_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
     store_rstd: bool = False,
+    weight_offset: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     # Need to wrap to handle the case where residual_out is a alias of x, which makes torch.library
     # and torch.compile unhappy. Also allocate memory for out and residual_out if they are None
@@ -481,7 +493,11 @@ def rmsnorm_fwd(
         )
     else:
         residual_out = None
-    _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
+    if weight_offset != 0.0:
+        assert weight is not None, "weight_offset requires a weight"
+    _rmsnorm_fwd(
+        x, weight, out, bias, rstd, None, residual, residual_out, eps, False, weight_offset
+    )
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
@@ -505,6 +521,7 @@ def rmsnorm_fwd_tuned(
     eps: float = 1e-6,
     is_layernorm: bool = False,
     per_head: bool = False,
+    weight_offset: float = 0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ) -> None:
     """Autotuned RMSNorm/LayerNorm forward dispatch.
@@ -536,17 +553,18 @@ def rmsnorm_fwd_tuned(
         mean is not None,
         is_layernorm,
         per_head,
+        weight_offset,
         config=config,
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
-def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
+def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6, weight_offset=0.0):
     x_f32 = x.float()
     if residual is not None:
         residual_f32 = residual.float()
         x_f32 = x_f32 + residual_f32
     x_norm = x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps))
-    out = x_norm * w if w is not None else x_norm
+    out = x_norm * (w.float() + weight_offset) if w is not None else x_norm
     if bias is not None:
         out = out + bias.float()
     if residual is None:
@@ -555,12 +573,12 @@ def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
         return out.to(x.dtype), x_f32.to(residual.dtype)
 
 
-def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
+def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6, weight_offset=0.0):
     """Reference implementation for RMSNorm backward pass."""
     x_f32 = x.float()
     x_hat = x_f32 * rstd.unsqueeze(1)
     if w is not None:
-        wdy = dout * w
+        wdy = dout * (w.float() + weight_offset)
     else:
         wdy = dout
     c1 = (x_hat * wdy).mean(dim=-1, keepdim=True)
@@ -582,10 +600,12 @@ class RMSNormBackward(ReductionBase):
         dout_dtype: Optional[Type[cutlass.Numeric]] = None,
         T_hint: int = 0,
         per_head: bool = False,
+        weight_offset: float = 0.0,
         config: Optional["RmsNormBwdConfig"] = None,
     ):
         # 2 stages for double buffering when computing mean of x_hat * wdy
         super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
+        self.weight_offset = weight_offset
         dout_width = dout_dtype.width if dout_dtype is not None else dtype.width
         if config is None:
             config = RmsNormBwdConfig.from_analytical_heuristic(
@@ -998,7 +1018,10 @@ class RMSNormBackward(ReductionBase):
             x_hat = x * rstd
             wdy = dout
             if const_expr(mW is not None):
-                wdy *= tXrW.load().to(Float32)
+                w = tXrW.load().to(Float32)
+                if const_expr(self.weight_offset != 0.0):
+                    w += Float32(self.weight_offset)
+                wdy *= w
             if const_expr(self.cluster_n > 1):
                 cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
             mean_xhat_wdy = (
@@ -1031,7 +1054,10 @@ class RMSNormBackward(ReductionBase):
                 dout = tXrdO.load().to(cute.Float32)
                 wdy = dout
                 if const_expr(mW is not None):
-                    wdy *= tXrW.load().to(Float32)
+                    w = tXrW.load().to(Float32)
+                    if const_expr(self.weight_offset != 0.0):
+                        w += Float32(self.weight_offset)
+                    wdy *= w
 
             if const_expr(self.reload_x == "smem"):
                 cute.autovec_copy(tXsX[None, None, None, smem_stage], tXrX)
@@ -1128,7 +1154,7 @@ class RMSNormBackward(ReductionBase):
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count=None, float weight_offset=0.) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
@@ -1141,6 +1167,7 @@ def _rmsnorm_bwd(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    weight_offset: float = 0.0,
 ) -> None:
     """RMSNorm backward pass.
     Args:
@@ -1148,6 +1175,7 @@ def _rmsnorm_bwd(
         weight: Optional weight tensor of shape (N,) or (H, N) for per-head
         dout: Upstream gradients tensor of shape (M, N) or (M, H, N)
         rstd: Reciprocal standard deviation tensor of shape (M,) or (M, H)
+        weight_offset: Constant added to the weight in fp32 (Gemma-style 1+w)
     Returns:
         Tuple of (dx, dw) where:
         - dx: Input gradients tensor of same shape as x
@@ -1192,6 +1220,7 @@ def _rmsnorm_bwd(
         dw_partial is not None,
         per_head,
         T_hint=T_hint,
+        weight_offset=weight_offset,
     )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
 
 
@@ -1208,6 +1237,7 @@ def _compile_rmsnorm_bwd(
     has_dw_partial,
     per_head=False,
     T_hint=0,
+    weight_offset=0.0,
     config: Optional[RmsNormBwdConfig] = None,
 ):
     batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
@@ -1232,6 +1262,7 @@ def _compile_rmsnorm_bwd(
             dout_dtype=dout_dtype,
             T_hint=T_hint,
             per_head=per_head,
+            weight_offset=weight_offset,
             config=config,
         ),
         x_cute,
@@ -1257,6 +1288,7 @@ def rmsnorm_bwd(
     dresidual_out: Optional[Tensor] = None,  # grad wrt residual_out
     has_bias: bool = False,
     has_residual: bool = False,
+    weight_offset: float = 0.0,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     device = x.device
     N = x.size(-1)
@@ -1283,7 +1315,17 @@ def rmsnorm_bwd(
 
     if x.numel() > 0:
         _rmsnorm_bwd(
-            x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+            x,
+            weight,
+            dout,
+            rstd,
+            dx,
+            dw_partial,
+            db_partial,
+            dresidual_out,
+            dresidual,
+            sm_count,
+            weight_offset=weight_offset,
         )
         # we have summed the partial gradients in fp32, now we convert back to the weight dtype
         dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
@@ -1316,6 +1358,7 @@ def rmsnorm_bwd_tuned(
     per_head: bool = False,
     has_dw_partial: bool = False,
     has_db_partial: bool = False,
+    weight_offset: float = 0.0,
     config: Optional[RmsNormBwdConfig] = None,
 ) -> None:
     """Autotuned RMSNorm backward dispatch.
@@ -1361,6 +1404,7 @@ def rmsnorm_bwd_tuned(
         has_dw_partial,
         per_head,
         T_hint=0,
+        weight_offset=weight_offset,
         config=config,
     )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
 
@@ -1385,6 +1429,7 @@ class RMSNormFunction(torch.autograd.Function):
         residual_dtype=None,
         eps=1e-6,
         prenorm=False,
+        weight_offset=0.0,
     ):
         x = _ensure_contiguous(x)
         if residual is not None:
@@ -1399,11 +1444,13 @@ class RMSNormFunction(torch.autograd.Function):
             residual_dtype=residual_dtype,
             eps=eps,
             store_rstd=need_grad,
+            weight_offset=weight_offset,
         )
         ctx.save_for_backward(x if residual is None else residual_out, weight, rstd)
         ctx.has_bias = bias is not None
         ctx.has_residual = residual is not None
         ctx.prenorm = prenorm
+        ctx.weight_offset = weight_offset
         if residual_out is None or not prenorm:
             return out
         else:
@@ -1425,6 +1472,7 @@ class RMSNormFunction(torch.autograd.Function):
             dresidual_out,
             ctx.has_bias,
             has_residual=ctx.has_residual,
+            weight_offset=ctx.weight_offset,
         )
         return dx, dw, db, dresidual, *([None] * 4)
 
@@ -1438,6 +1486,7 @@ def rmsnorm(
     residual_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
     prenorm: bool = False,
+    weight_offset: float = 0.0,
 ) -> Tensor:
     """RMSNorm with automatic differentiation support.
 
@@ -1445,6 +1494,10 @@ def rmsnorm(
         x: Input tensor of shape (M, N) or (B, S, H, D) for per-head mode
         weight: Optional weight tensor of shape (N,) or (H, D) for per-head mode
         eps: Small value for numerical stability
+        weight_offset: Constant added to the weight in fp32 before scaling:
+            ``out = x_hat * (weight + weight_offset)``. Gemma-style RMSNorm
+            (zero-initialized weight, ``out = x_hat * (1 + w)``) uses 1.0.
+            Compile-time constant; the weight gradient is unaffected.
 
     Returns:
         Normalized output tensor of same shape as x
@@ -1460,7 +1513,7 @@ def rmsnorm(
     x_flat = x.reshape(-1, *last_shape)
     res_flat = residual.reshape(-1, *last_shape) if residual is not None else None
     result = RMSNormFunction.apply(
-        x_flat, weight, bias, res_flat, out_dtype, residual_dtype, eps, prenorm
+        x_flat, weight, bias, res_flat, out_dtype, residual_dtype, eps, prenorm, weight_offset
     )
     if isinstance(result, tuple):
         return tuple(r.reshape(x_shape_og) for r in result)
