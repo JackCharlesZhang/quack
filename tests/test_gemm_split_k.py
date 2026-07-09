@@ -525,6 +525,8 @@ def test_gemm_split_k_fp8(in_dtype, split_k, split_k_mode):
     """fp8 (e4m3fn / e5m2) GEMM with bf16 output: split-K matches the plain fp8 kernel at
     the baseline tolerance and stays deterministic for serial/staged. fp8 needs k-major
     A and B; the f32 partials workspace makes the finalizer dtype-agnostic."""
+    if get_device_capacity(torch.device("cuda"))[0] == 12:
+        pytest.skip("SM120 GEMM is warp-level MmaF16BF16Op: no fp8 support (fp16/bf16 only)")
     m, n, k, L = 256, 512, 8192, 2
     torch.manual_seed(0)
     # fp8 requires k-major A (m, k) and B (k, n): k contiguous in both.
