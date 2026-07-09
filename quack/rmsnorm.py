@@ -1474,7 +1474,7 @@ class RMSNormFunction(torch.autograd.Function):
             has_residual=ctx.has_residual,
             weight_offset=ctx.weight_offset,
         )
-        return dx, dw, db, dresidual, *([None] * 4)
+        return dx, dw, db, dresidual, *([None] * 5)
 
 
 def rmsnorm(
