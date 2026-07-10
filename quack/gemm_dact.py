@@ -240,6 +240,8 @@ def _compile_gemm_dact(
     device_capacity,
     gemm_cls_name,
     use_tma_gather=False,
+    batched=True,
+    b_kn=False,
 ):
     is_dgated = gemm_cls_name == "dgated"
     sm_to_cls = {
@@ -270,10 +272,13 @@ def _compile_gemm_dact(
         c_major,
         varlen_m=varlen_m,
         gather_A=gather_A,
+        batched=batched,
+        b_kn=b_kn,
     )
     div_pa = div_for_dtype(postact_dtype)
     pa_leading = 1 if postact_major == "n" else 0
-    mAuxOut = fake_batched(postact_dtype, m, n, None if varlen_m else l, pa_leading, div_pa)
+    pa_l = None if (varlen_m or not batched) else l
+    mAuxOut = fake_batched(postact_dtype, m, n, pa_l, pa_leading, div_pa)
 
     if is_dgated:
         act_fn = dgate_fn_map[activation]
@@ -338,6 +343,7 @@ def _compile_gemm_dact(
         varlen_args,
         post_init=post_init,
         use_tma_gather=use_tma_gather,
+        b_transposed=b_kn,
     )
 
 
@@ -388,7 +394,8 @@ def gemm_dact(
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     use_tma_gather: bool = False,
-) -> None:
+    b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
+) -> _GemmDActPlan:
     # The key captures every input the plan build reads (shapes and strides
     # subsume the majors, the validation asserts, and the dgated f32 view), so
     # a cache hit is exactly a replay of a previously validated call with
@@ -416,6 +423,7 @@ def gemm_dact(
         is_dynamic_persistent,
         max_swizzle_size,
         use_tma_gather,
+        b_kn,
     )
     plan = _gemm_dact_plan_cache.get(key)
     if plan is None:
@@ -441,9 +449,46 @@ def gemm_dact(
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
             use_tma_gather=use_tma_gather,
+            b_kn=b_kn,
         )
         _gemm_dact_plan_cache[key] = plan
+    run_gemm_dact_plan(
+        plan,
+        A,
+        B,
+        Out,
+        PreAct,
+        PostAct,
+        tile_count_semaphore=tile_count_semaphore,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+    )
+    return plan
 
+
+def run_gemm_dact_plan(
+    plan: _GemmDActPlan,
+    A: Tensor,
+    B: Tensor,
+    Out: Tensor,
+    PreAct: Tensor,
+    PostAct: Tensor,
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    colvec_scale: Optional[Tensor] = None,
+    colvec_reduce: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+) -> None:
+    """Launch a resolved plan: only per-call pointers (and the dgated f32
+    reinterpretation, which creates new tensor objects regardless) here.
+
+    The tensors must match the metadata the plan was built from (``gemm_dact``
+    guarantees that via its key; an outer layer holding the returned plan must
+    guarantee it with its own key).
+    """
     if plan.is_dgated:
         # Out/PreAct are 2 16-bit elements packed into 32 bits inside the kernel.
         if plan.dgated_view_mT:
@@ -495,6 +540,7 @@ def _build_gemm_dact_plan(
     cu_seqlens_m,
     A_idx,
     use_tma_gather,
+    b_kn=False,
 ) -> _GemmDActPlan:
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
@@ -531,8 +577,30 @@ def _build_gemm_dact_plan(
             Out = Out.mT.view(torch.float32).mT
             PreAct = PreAct.mT.view(torch.float32).mT
 
+    device_capacity = get_device_capacity(A.device)
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
+    batched = A.ndim == 3 or varlen_m
+    if not batched:
+        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        # dgated is excluded: its mColVecReduce epi output has varlen semantics
+        # in the rank-2 form, so a 2D reduce buffer would be misinterpreted.
+        assert not is_dgated, "dgated requires batched (3D) operands"
+        assert B.ndim == 2 and Out.ndim == 2 and PreAct.ndim == 2 and PostAct.ndim == 2, (
+            "2D (unbatched) A requires 2D B, Out, PreAct, and PostAct"
+        )
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands require SM90+"
+    if b_kn:
+        assert not varlen_m, "b_kn does not support varlen"
+        assert device_capacity[0] in [9, 10, 11, 12], "b_kn requires SM90+"
+
     a_major = get_major(A, "m", "k")
     b_major = get_major(B, "n", "k")
+    if b_kn:
+        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
+        # last dim means n-major.
+        b_major = "n" if B.stride(-1) == 1 else "k"
     d_major = get_major(Out, "m", "n")
     c_major = get_major(PreAct, "m", "n")
     postact_major = get_major(PostAct, "m", "n")
@@ -542,11 +610,6 @@ def _build_gemm_dact_plan(
     d_dtype = torch2cute_dtype_map[Out.dtype]
     c_dtype = torch2cute_dtype_map[PreAct.dtype]
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
-
-    device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [8, 9, 10, 11, 12], (
-        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
-    )
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
@@ -580,6 +643,8 @@ def _build_gemm_dact_plan(
         device_capacity,
         gemm_cls_name,
         use_tma_gather=use_tma_gather,
+        batched=batched,
+        b_kn=b_kn,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

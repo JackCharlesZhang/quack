@@ -36,6 +36,7 @@ from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     validate_blockscaled_sf,
     tensor_key,
+    scalar_mode,
     scalar_arg,
     plan_scheduler_args,
     launch_gemm,
@@ -77,6 +78,9 @@ def _compile_gemm(
     sf_vec_size=None,
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
+    batched=True,
+    b_kn=False,
+    sf_batched=True,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -98,6 +102,8 @@ def _compile_gemm(
         varlen_m=varlen_m,
         varlen_k=varlen_k,
         gather_A=gather_A,
+        batched=batched,
+        b_kn=b_kn,
     )
     if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
         # D is the f32 partials workspace; its batch extent is l * split_k, not l,
@@ -158,9 +164,11 @@ def _compile_gemm(
     if sf_dtype is not None:
         # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
         # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
-        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m.
-        mSFA = make_fake_sf_tensor(sf_dtype, 1 if (varlen_m or varlen_k) else l)
-        mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_k else l)
+        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m. Dense
+        # unbatched (5-D) SFs get the batch mode prepended at trace time.
+        dense_l = l if sf_batched else None
+        mSFA = make_fake_sf_tensor(sf_dtype, 1 if (varlen_m or varlen_k) else dense_l)
+        mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_k else dense_l)
     else:
         mSFA, mSFB = None, None
     return compile_gemm_kernel(
@@ -188,6 +196,7 @@ def _compile_gemm(
         sf_vec_size=sf_vec_size,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        b_transposed=b_kn,
     )
 
 
@@ -212,6 +221,15 @@ class _GemmPlan(NamedTuple):
     max_active_clusters: int
     max_swizzle_size: int
     scheduler_uses_semaphore: bool  # SM8x/SM90 dynamic scheduler consumes the semaphore
+    # Everything run_gemm_plan needs beyond the per-call tensors/scalars, so an
+    # outer layer holding a resolved plan can launch without re-keying here.
+    split_k: int
+    split_k_mode: object
+    add_to_output: bool  # staged split-K reduce routes it there, not into the GEMM
+    tile_M: int
+    tile_N: int
+    cluster_M: int
+    cluster_N: int
 
 
 # (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
@@ -317,11 +335,13 @@ def _reduce_staged_split_k(
 
 
 def gemm(
-    # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
+    # (l, m, k), or (m, k) unbatched dense (SM90+; B/D/C must be 2D too), or (total_m, k)
+    # if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or
+    # (m, whatever) if gather_A_varlen_k
     A: Tensor,
-    B: Tensor,  # (l, n, k) or (n, total_k) if varlen_k
-    D: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
-    C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
+    B: Tensor,  # (l, n, k) or (n, k) or (n, total_k) if varlen_k
+    D: Tensor,  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
+    C: Optional[Tensor],  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
     tile_count_semaphore: Optional[Tensor],  # (1,)
     tile_M: int,
     tile_N: int,
@@ -356,9 +376,12 @@ def gemm(
     SFB: Optional[Tensor] = None,
     split_k: int = 1,
     split_k_mode: int = SplitKMode.SERIAL,
-) -> None:
-    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
-    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
+    # B is passed (k, n) / (l, k, n) and relabeled to kernel order (n, k) at trace
+    # time — saves the caller a per-call .mT view. Dense SM90+ only.
+    b_kn: bool = False,
+) -> _GemmPlan:
+    alpha_mode = scalar_mode(alpha)
+    beta_mode = scalar_mode(beta)
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
@@ -402,6 +425,7 @@ def gemm(
         sr_seed_mode,
         split_k,
         split_k_mode,
+        b_kn,
     )
     plan = _gemm_plan_cache.get(key)
     if plan is None:
@@ -439,9 +463,57 @@ def gemm(
             sr_seed_mode=sr_seed_mode,
             split_k=split_k,
             split_k_mode=split_k_mode,
+            b_kn=b_kn,
         )
         _gemm_plan_cache[key] = plan
+    run_gemm_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        tile_count_semaphore=tile_count_semaphore,
+        rowvec_bias=rowvec_bias,
+        colvec_bias=colvec_bias,
+        alpha=alpha,
+        beta=beta,
+        sr_seed=sr_seed,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    return plan
 
+
+def run_gemm_plan(
+    plan: _GemmPlan,
+    A: Tensor,
+    B: Tensor,
+    D: Tensor,
+    C: Optional[Tensor],
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    rowvec_bias: Optional[Tensor] = None,
+    colvec_bias: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
+    sr_seed: int | Tensor = 0,
+    cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    batch_idx_permute: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+) -> None:
+    """Launch a resolved plan: only per-call pointers and scalar values here.
+
+    The tensors must match the metadata the plan was built from (``gemm``
+    guarantees that via its key; an outer layer holding the returned plan must
+    guarantee it with its own key).
+    """
     if plan.use_d_as_c:
         C = D
     # Split-K buffers are per-call allocations, never part of the cached plan:
@@ -451,20 +523,19 @@ def gemm(
     D_gemm, C_gemm = D, C
     split_k_semaphore, split_k_workspace = None, None
     staged_split_k = False
-    if split_k > 1:
-        split_k_mode = SplitKMode(split_k_mode)
-        staged_split_k = split_k_mode == SplitKMode.SEPARATE
+    if plan.split_k > 1:
+        staged_split_k = plan.split_k_mode == SplitKMode.SEPARATE
         if staged_split_k:
-            split_k_workspace = _staged_split_k_workspace(D, split_k)
+            split_k_workspace = _staged_split_k_workspace(D, plan.split_k)
             D_gemm, C_gemm = split_k_workspace, None
         else:
             split_k_semaphore, split_k_workspace = _split_k_buffers(
                 D,
-                split_k_mode,
-                tile_M,
-                tile_N,
-                cluster_M,
-                cluster_N,
+                plan.split_k_mode,
+                plan.tile_M,
+                plan.tile_N,
+                plan.cluster_M,
+                plan.cluster_N,
                 plan.is_sm100_family,
             )
     # No permutes here: the kernel was compiled batch-first and rotates
@@ -496,12 +567,12 @@ def gemm(
             split_k_workspace,
             D,
             C,
-            split_k,
+            plan.split_k,
             alpha=alpha,
             beta=beta,
             rowvec_bias=rowvec_bias,
             colvec_bias=colvec_bias,
-            add_to_output=add_to_output,
+            add_to_output=plan.add_to_output,
         )
 
 
@@ -540,6 +611,7 @@ def _build_gemm_plan(
     sr_seed_mode,
     split_k,
     split_k_mode,
+    b_kn=False,
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -591,7 +663,7 @@ def _build_gemm_plan(
         else:
             num_batches = None
         sf_dtype, sf_vec_size = validate_blockscaled_sf(
-            A, B, SFA, SFB, device_capacity, num_batches=num_batches, varlen_k=varlen_k
+            A, B, SFA, SFB, device_capacity, num_batches=num_batches, varlen_k=varlen_k, b_kn=b_kn
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
@@ -613,7 +685,31 @@ def _build_gemm_plan(
             add_to_output = False
             use_d_as_c = True
 
+    batched = A.ndim == 3 or varlen
+    if not batched:
+        # Dense 2D (unbatched) operands: the kernel appends a trivial batch mode
+        # at trace time (GemmBase.permute_batch_last), so hosts skip the
+        # .unsqueeze() views. Only the rotating SM90+ paths support this.
+        assert B.ndim == 2 and D.ndim == 2 and (C is None or C.ndim == 2), (
+            "2D (unbatched) A requires 2D B, D, and C"
+        )
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands require SM90+"
+        assert split_k == 1, "2D (unbatched) operands do not support split_k"
+        assert not concat_layout, "2D (unbatched) operands do not support concat_layout"
+        assert batch_idx_permute is None, "2D (unbatched) operands do not support batch_idx_permute"
+    if b_kn:
+        # B crosses the boundary as (k, n) / (l, k, n); the kernel transposes it
+        # to (n, k, l) at trace time (GemmBase.rotate_batch_last), saving the
+        # caller a per-call .mT view. Same support envelope as the batch append.
+        assert not varlen, "b_kn does not support varlen (pass B as (n, total_k))"
+        assert device_capacity[0] in [9, 10, 11, 12], "b_kn requires SM90+"
+        assert not concat_layout, "b_kn does not support concat_layout"
+
     a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
+    if b_kn:
+        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
+        # last dim means n-major.
+        b_major = "n" if B.stride(-1) == 1 else "k"
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
 
     # SEPARATE split-K routes every epi operand (alpha, beta*C, bias, add_to_output)
@@ -666,6 +762,9 @@ def _build_gemm_plan(
         sf_vec_size,
         split_k,
         split_k_mode,
+        batched,
+        b_kn,
+        SFA.ndim == 6 if blockscaled else True,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -711,4 +810,11 @@ def _build_gemm_plan(
         max_active_clusters=max_active_clusters,
         max_swizzle_size=max_swizzle_size,
         scheduler_uses_semaphore=scheduler_uses_semaphore,
+        split_k=split_k,
+        split_k_mode=split_k_mode,  # already SplitKMode-normalized above when split_k > 1
+        add_to_output=add_to_output,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=cluster_M,
+        cluster_N=cluster_N,
     )

@@ -381,6 +381,9 @@ def _compile_gemm_act(
     use_tma_gather=False,
     sf_dtype=None,
     sf_vec_size=None,
+    batched=True,
+    b_kn=False,
+    sf_batched=True,
 ):
     sm_to_cls = {
         "act": {
@@ -411,11 +414,14 @@ def _compile_gemm_act(
         c_major,
         varlen_m=varlen_m,
         gather_A=gather_A,
+        batched=batched,
+        b_kn=b_kn,
     )
     pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
     div_pa = div_for_dtype(postact_dtype)
     pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
-    mAuxOut = fake_batched(postact_dtype, m, pa_n, None if varlen_m else l, pa_leading_dim, div_pa)
+    pa_l = None if (varlen_m or not batched) else l
+    mAuxOut = fake_batched(postact_dtype, m, pa_n, pa_l, pa_leading_dim, div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -448,8 +454,8 @@ def _compile_gemm_act(
     )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     if sf_dtype is not None:
-        mSFA = make_fake_sf_tensor(sf_dtype, l)
-        mSFB = make_fake_sf_tensor(sf_dtype, l)
+        mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None)
+        mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None)
     else:
         mSFA, mSFB = None, None
     return compile_gemm_kernel(
@@ -474,6 +480,7 @@ def _compile_gemm_act(
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         sf_vec_size=sf_vec_size,
+        b_transposed=b_kn,
     )
 
 
@@ -522,9 +529,10 @@ def gemm_act(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: tuple | None = None,
-    SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors
+    SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors, or 5-D if 2D A
     SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
-) -> None:
+    b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
+) -> _GemmActPlan:
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
@@ -560,6 +568,7 @@ def gemm_act(
         use_tma_gather,
         concat_key,
         sr_seed_mode,
+        b_kn,
     )
     plan = _gemm_act_plan_cache.get(key)
     if plan is None:
@@ -590,9 +599,51 @@ def gemm_act(
             SFA=SFA,
             SFB=SFB,
             sr_seed_mode=sr_seed_mode,
+            b_kn=b_kn,
         )
         _gemm_act_plan_cache[key] = plan
+    run_gemm_act_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        PostAct,
+        tile_count_semaphore=tile_count_semaphore,
+        rowvec_bias=rowvec_bias,
+        colvec_bias=colvec_bias,
+        sr_seed=sr_seed,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    return plan
 
+
+def run_gemm_act_plan(
+    plan: _GemmActPlan,
+    A: Tensor,
+    B: Tensor,
+    D: Optional[Tensor],
+    C: Optional[Tensor],
+    PostAct: Tensor,
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    rowvec_bias: Optional[Tensor] = None,
+    colvec_bias: Optional[Tensor] = None,
+    sr_seed: int | Tensor = 0,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+) -> None:
+    """Launch a resolved plan: only per-call pointers and scalar values here.
+
+    The tensors must match the metadata the plan was built from (``gemm_act``
+    guarantees that via its key; an outer layer holding the returned plan must
+    guarantee it with its own key).
+    """
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct,
         None,  # act_fn is Constexpr, pass None at call time
@@ -634,6 +685,7 @@ def _build_gemm_act_plan(
     SFA,
     SFB,
     sr_seed_mode,
+    b_kn=False,
 ) -> _GemmActPlan:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -654,8 +706,34 @@ def _build_gemm_act_plan(
         assert cu_seqlens_m is not None, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
 
+    device_capacity = get_device_capacity(A.device)
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
+    batched = A.ndim == 3 or varlen_m
+    if not batched:
+        # Dense 2D (unbatched) operands: the kernel appends a trivial batch mode
+        # to the operands AND the tile-shaped epi outputs at trace time
+        # (GemmBase.rotate_batch_last), so hosts skip the .unsqueeze() views.
+        assert (
+            B.ndim == 2
+            and PostAct.ndim == 2
+            and (D is None or D.ndim == 2)
+            and (C is None or C.ndim == 2)
+        ), "2D (unbatched) A requires 2D B, D, C, and PostAct"
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands require SM90+"
+        assert not concat_layout, "2D (unbatched) operands do not support concat_layout"
+    if b_kn:
+        assert not varlen_m, "b_kn does not support varlen"
+        assert device_capacity[0] in [9, 10, 11, 12], "b_kn requires SM90+"
+        assert not concat_layout, "b_kn does not support concat_layout"
+
     a_major = get_major(A, "m", "k")
     b_major = get_major(B, "n", "k")
+    if b_kn:
+        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
+        # last dim means n-major.
+        b_major = "n" if B.stride(-1) == 1 else "k"
     d_major = get_major(D, "m", "n") if D is not None else None
     c_major = get_major(C, "m", "n") if C is not None else None
     postact_major = get_major(PostAct, "m", "n")
@@ -667,16 +745,12 @@ def _build_gemm_act_plan(
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
-    device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [8, 9, 10, 11, 12], (
-        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
-    )
     sf_dtype, sf_vec_size = None, None
     if blockscaled:
         assert not varlen_m and not gather_A, "Blockscaled GEMM does not support varlen/gather yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
-        sf_dtype, sf_vec_size = validate_blockscaled_sf(A, B, SFA, SFB, device_capacity)
+        sf_dtype, sf_vec_size = validate_blockscaled_sf(A, B, SFA, SFB, device_capacity, b_kn=b_kn)
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
 
@@ -715,6 +789,9 @@ def _build_gemm_act_plan(
         use_tma_gather=use_tma_gather,
         sf_dtype=sf_dtype,
         sf_vec_size=sf_vec_size,
+        batched=batched,
+        b_kn=b_kn,
+        sf_batched=SFA.ndim == 6 if blockscaled else True,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

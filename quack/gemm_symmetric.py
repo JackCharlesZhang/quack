@@ -24,6 +24,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     compile_gemm_kernel,
     tensor_key,
+    scalar_mode,
     scalar_arg,
     plan_scheduler_args,
     launch_gemm,
@@ -294,6 +295,7 @@ def _compile_gemm_symmetric(
     alpha_mode,
     beta_mode,
     device_capacity,
+    batched=True,
 ):
     sm_to_cls = {
         8: GemmSymmetricSm80,
@@ -304,7 +306,8 @@ def _compile_gemm_symmetric(
     }
     GemmCls = sm_to_cls[device_capacity[0]]
     # Symmetric GEMM: m == n, so reuse the same sym_int for shape checking
-    m, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    m, k = cute.sym_int(), cute.sym_int()
+    l = cute.sym_int() if batched else None
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
@@ -398,9 +401,9 @@ def gemm_symmetric(
     max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-) -> None:
-    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
-    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
+) -> _GemmSymmetricPlan:
+    alpha_mode = scalar_mode(alpha)
+    beta_mode = scalar_mode(beta)
     # The key captures every input the plan build reads (D's metadata subsumes
     # PostAct = D.mT), so a cache hit is exactly a replay of a previously
     # validated call with different data pointers.
@@ -444,7 +447,25 @@ def gemm_symmetric(
             beta_mode=beta_mode,
         )
         _gemm_symmetric_plan_cache[key] = plan
+    run_gemm_symmetric_plan(
+        plan, A, B, D, C, tile_count_semaphore=tile_count_semaphore, alpha=alpha, beta=beta
+    )
+    return plan
 
+
+def run_gemm_symmetric_plan(
+    plan: _GemmSymmetricPlan,
+    A: Tensor,
+    B: Tensor,
+    D: Tensor,
+    C: Optional[Tensor],
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
+) -> None:
+    """Launch a resolved plan: only per-call pointers and scalar values here.
+    The tensors must match the metadata the plan was built from."""
     # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
     epi_args = GemmActMixin.EpilogueArguments(
@@ -489,6 +510,14 @@ def _build_gemm_symmetric_plan(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    batched = A.ndim == 3
+    if not batched:
+        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        # No b_kn here — symmetric B is operand-shaped (m, k) like A, never (K, N).
+        assert B.ndim == 2 and D.ndim == 2 and (C is None or C.ndim == 2), (
+            "2D (unbatched) A requires 2D B, D, and C"
+        )
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands require SM90+"
 
     if is_dynamic_persistent and device_capacity[0] <= 9:
         assert tile_count_semaphore is not None, (
@@ -517,6 +546,7 @@ def _build_gemm_symmetric_plan(
         alpha_mode,
         beta_mode,
         device_capacity,
+        batched=batched,
     )
 
     cluster_size = cluster_M * cluster_N

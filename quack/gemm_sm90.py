@@ -394,7 +394,10 @@ class GemmSm90(GemmTmaBase):
         :type stream: cuda.CUstream
         """
         # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
-        mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(mA, mB, mD, mC, epilogue_args)
+        # Dense rank-2 operands get a trivial batch mode appended instead.
+        mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(
+            mA, mB, mD, mC, epilogue_args, append_batch_if_2d=const_expr(varlen_args is None)
+        )
 
         # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
         mA, mB, mD, mC = [

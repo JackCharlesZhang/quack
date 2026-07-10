@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao
 from dataclasses import replace
-from typing import Optional, Tuple, Literal
+from typing import NamedTuple, Optional, Tuple, Literal
 from functools import lru_cache, partial
 
 import torch
@@ -14,12 +14,16 @@ from quack.gemm_config import GemmConfig, SplitKMode, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as gemm_dispatch
-from quack.gemm_act import gemm_act as gemm_act_dispatch
-from quack.gemm_dact import gemm_dact as gemm_dact_dispatch
-from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_dispatch
-from quack.gemm_sq_reduce import gemm_sq_reduce as gemm_sq_reduce_dispatch
-from quack.gemm_norm_act import gemm_norm_act_fn as gemm_norm_act_dispatch
+from quack.gemm import gemm as gemm_dispatch, run_gemm_plan
+from quack.gemm_tvm_ffi_utils import tensor_key, scalar_mode
+from quack.gemm_act import gemm_act as gemm_act_dispatch, run_gemm_act_plan
+from quack.gemm_dact import gemm_dact as gemm_dact_dispatch, run_gemm_dact_plan
+from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_dispatch, run_gemm_symmetric_plan
+from quack.gemm_sq_reduce import gemm_sq_reduce as gemm_sq_reduce_dispatch, run_gemm_sq_reduce_plan
+from quack.gemm_norm_act import (
+    gemm_norm_act_fn as gemm_norm_act_dispatch,
+    run_gemm_norm_act_plan,
+)
 from quack.rms_final_reduce import rms_final_reduce
 from quack.rounding import RoundingMode
 
@@ -164,15 +168,15 @@ def _unpack_operand(X) -> Tuple[Tensor, Optional[Tensor]]:
     return X, None
 
 
-def _sf_normalize(SF: Tensor, name: str) -> Tensor:
-    """Validate a user scale-factor tensor and add the batch dim if missing.
+def _sf_validate(SF: Tensor, name: str) -> Tensor:
+    """Validate a user scale-factor tensor (rank-preserving).
 
     Requires ``(rm, rk, 32, 4, 4)`` or ``(L, rm, rk, 32, 4, 4)`` with the inner
     ``(32, 4, 4)`` block contiguous (strides ``(16, 4, 1)`` — one 512 B atom);
     outer strides are free, so slices of a larger scale buffer are accepted.
-    Returns a zero-copy ``(L, rm, rk, 32, 4, 4)`` view, which is what the
-    compiled kernel consumes directly (the kernel reads only the base pointer
-    and the outer strides; the inner atom layout is hardware-fixed).
+    The kernel consumes either rank directly for dense calls (it prepends the
+    trivial batch mode to 5-D SFs at trace time); varlen calls require the 6-D
+    padded-buffer form and get the batch dim added by the caller.
     """
     assert SF.ndim in (5, 6) and tuple(SF.shape[-3:]) == (32, 4, 4), (
         f"{name}: expected (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4) blocked scale factors, "
@@ -182,7 +186,17 @@ def _sf_normalize(SF: Tensor, name: str) -> Tensor:
         f"{name}: inner (32, 4, 4) block must be contiguous with strides (16, 4, 1), "
         f"got {SF.stride()[-3:]}"
     )
-    return SF.unsqueeze(0) if SF.ndim == 5 else SF
+    return SF
+
+
+def _sf_batch_canonicalize(SFA: Tensor, SFB: Tensor, batched: bool) -> Tuple[Tensor, Tensor]:
+    """Unbatched 5-D SFs only pair with 2D dense operands (the kernel prepends
+    the trivial batch mode at trace time); batched/varlen calls get the batch
+    dim added here."""
+    if batched:
+        SFA = SFA.unsqueeze(0) if SFA.ndim == 5 else SFA
+        SFB = SFB.unsqueeze(0) if SFB.ndim == 5 else SFB
+    return SFA, SFB
 
 
 def _logical_k(X: Tensor) -> int:
@@ -411,7 +425,7 @@ def gemm_tuned(
     SFB: Optional[Tensor] = None,  # (L, rn, rk, 32, 4, 4)
     split_k: Optional[int] = 1,  # None: let the autotuner choose the factor (config.split_k)
     split_k_mode: int = SplitKMode.SERIAL,
-) -> None:
+) -> Tuple[GemmConfig, int, bool, object]:  # (config, split_k, dynamic_scheduler, dispatch plan)
     blockscaled = SFA is not None
     if blockscaled:
         SFA, SFB = _sf_decode(SFA), _sf_decode(SFB)
@@ -450,29 +464,118 @@ def gemm_tuned(
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not varlen:
-        A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
-    if B.ndim == 2 and not varlen_k:
-        B = B.unsqueeze(0)  # (1, N, K)
-    if C is not None and C.ndim == 2 and not varlen_m:
-        C = C.unsqueeze(0)  # (1, M, N)
-    if out.ndim == 2 and not varlen_m:
-        out = out.unsqueeze(0)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    dispatch_plan = _gemm_execute(
+        A,
+        B,
+        out,
+        C,
+        bias=bias,
+        alpha=alpha,
+        beta=beta,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        add_to_output=add_to_output,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
+        concat_layout=concat_layout,
+        SFA=SFA,
+        SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
+    )
+    # Resolved decisions, so the eager `gemm` wrapper can record an interface
+    # plan (see _GemmIfacePlan). The custom-op route discards this.
+    return config, split_k, dynamic_scheduler, dispatch_plan
+
+
+def _gemm_execute(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor],
+    *,
+    bias: Optional[Tensor],
+    alpha: float | Tensor,
+    beta: float | Tensor,
+    cu_seqlens_m: Optional[Tensor],
+    cu_seqlens_k: Optional[Tensor],
+    A_idx: Optional[Tensor],
+    batch_idx_permute: Optional[Tensor],
+    add_to_output: bool,
+    dynamic_scheduler: bool,
+    config: GemmConfig,
+    rounding_mode: int,
+    sr_seed: int | Tensor,
+    concat_layout: tuple | None,
+    SFA: Optional[Tensor],
+    SFB: Optional[Tensor],
+    split_k: int,
+    split_k_mode: int,
+    dispatch_plan=None,
+):
+    """Transform operands (batch dims, swap_ab, concat) and launch the GEMM.
+
+    All metadata-derived decisions are already resolved here: ``config``,
+    ``split_k`` and ``dynamic_scheduler`` are final values and SFs are decoded.
+    The per-call work is only the argument routing the dispatch layer needs, so
+    a cached interface plan (see _GemmIfacePlan) can call this directly —
+    passing its captured ``dispatch_plan`` to also skip the dispatch layer's
+    key. Returns the dispatch plan for the interface plan to capture.
+    """
+    varlen_m = cu_seqlens_m is not None
+    varlen_k = cu_seqlens_k is not None
+    varlen = varlen_m or varlen_k
+    capacity = get_device_capacity(A.device)[0]
+    sm90_plus = capacity >= 9
+    # Trace-time relabels replace per-call torch views (~1.5us of dispatcher
+    # overhead each): b_kn passes B in its native (K, N) orientation and
+    # dense_2d keeps unbatched operands rank-2 — the kernel transposes /
+    # appends the trivial batch mode when it's compiled.
+    b_kn = sm90_plus and not varlen and not config.swap_ab and not concat_layout
+    if not b_kn:
+        B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and out.ndim == 2
+        and (C is None or C.ndim == 2)
+        and not varlen
+        and split_k == 1
+        and not concat_layout
+        and batch_idx_permute is None
+        and sm90_plus
+    )
+    if not dense_2d:
+        if A.ndim == 2 and not varlen:
+            A = A.unsqueeze(0)  # (1, M, K)
+        if B.ndim == 2 and not varlen_k:
+            B = B.unsqueeze(0)  # (1, N, K), or (1, K, N) if b_kn
+        if C is not None and C.ndim == 2 and not varlen_m:
+            C = C.unsqueeze(0)  # (1, M, N)
+        if out.ndim == 2 and not varlen_m:
+            out = out.unsqueeze(0)
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
     if varlen_m:
         # If gather_A (A_idx provided), use its length; otherwise use A.shape[0]
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
         out_shape = (total_m, B.shape[-2])
     else:
-        out_shape = (batch_size, A.shape[-2], B.shape[-2])
+        n_ext = B.shape[-1] if b_kn else B.shape[-2]
+        if dense_2d:
+            out_shape = (A.shape[0], n_ext)
+        else:
+            batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
+            out_shape = (batch_size, A.shape[-2], n_ext)
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
-    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
+        if dynamic_scheduler and capacity == 9
         else None
     )
     # Handle bias concat layout: transform "bias" key to kernel-level key or permute data.
@@ -487,17 +590,47 @@ def gemm_tuned(
                 bias = _concat_interleave_bias(bias)
     # When swap_ab, A↔B (out/C stay, but .mT flips their strides so the kernel
     # auto-detects the correct non-contiguous dim).
+    swap = config.swap_ab
+    A_d = A if not swap else B
+    B_d = B if not swap else A
+    out_d = out if not swap else out.mT
+    C_d = (C if not swap else C.mT) if C is not None else None
+    rowvec_d = bias if not swap else None
+    colvec_d = bias if swap else None
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata, so skip
+        # the dispatch layer's own mode derivation, key, and lookup.
+        run_gemm_plan(
+            dispatch_plan,
+            A_d,
+            B_d,
+            out_d,
+            C_d,
+            tile_count_semaphore=tile_count_semaphore,
+            rowvec_bias=rowvec_d,
+            colvec_bias=colvec_d,
+            alpha=alpha,
+            beta=beta,
+            sr_seed=sr_seed,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            SFA=SFA,
+            SFB=SFB,
+        )
+        return dispatch_plan
     _swap_map = {"A": "B", "B": "A", "out": "out", "C": "C", "mRowVecBroadcast": "mColVecBroadcast"}
     swapped_concat = (
         tuple(_swap_map.get(k, k) for k in concat_layout)
-        if config.swap_ab and concat_layout
+        if swap and concat_layout
         else concat_layout
     )
-    gemm_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        out if not config.swap_ab else out.mT,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
+    return gemm_dispatch(
+        A_d,
+        B_d,
+        out_d,
+        C_d,
         tile_count_semaphore,
         config.tile_m,
         config.tile_n,
@@ -508,8 +641,8 @@ def gemm_tuned(
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
-        rowvec_bias=bias if not config.swap_ab else None,
-        colvec_bias=bias if config.swap_ab else None,
+        rowvec_bias=rowvec_d,
+        colvec_bias=colvec_d,
         alpha=alpha,
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
@@ -527,6 +660,7 @@ def gemm_tuned(
         SFB=SFB,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        b_kn=b_kn,
     )
 
 
@@ -551,7 +685,7 @@ def gemm_act_tuned(
     config: Optional[GemmConfig] = None,
     SFA: Optional[Tensor] = None,  # (L, rm, rk, 32, 4, 4) blocked scale factors
     SFB: Optional[Tensor] = None,  # (L, rn, rk, 32, 4, 4)
-) -> None:
+) -> Tuple[GemmConfig, bool, object]:  # (config, dynamic_scheduler, dispatch plan)
     blockscaled = SFA is not None
     if blockscaled:
         SFA, SFB = _sf_decode(SFA), _sf_decode(SFB)
@@ -566,35 +700,128 @@ def gemm_act_tuned(
     if blockscaled:
         assert not varlen_m and A_idx is None, "Blockscaled GEMM does not support varlen/gather yet"
         assert not config.swap_ab, "Blockscaled GEMM does not support swap_ab yet"
-    if A.ndim == 2 and not varlen_m:
-        A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
-        B = B.unsqueeze(0)  # (1, N, K)
-    if C is not None and C.ndim == 2 and not varlen_m:
-        C = C.unsqueeze(0)  # (1, M, N)
-    if preact_out is not None and preact_out.ndim == 2 and not varlen_m:
-        D = preact_out.unsqueeze(0)
-    else:
-        D = preact_out
-    if postact_out.ndim == 2 and not varlen_m:
-        PostAct = postact_out.unsqueeze(0)
-    else:
-        PostAct = postact_out
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    dispatch_plan = _gemm_act_execute(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias=bias,
+        activation=activation,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
+        concat_layout=None,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    # Resolved decisions for the eager `gemm_act` wrapper's interface plan
+    # (see _GemmActIfacePlan). The custom-op route discards this.
+    return config, dynamic_scheduler, dispatch_plan
+
+
+def _gemm_act_execute(
+    A: Tensor,
+    B: Tensor,
+    preact_out: Optional[Tensor],
+    postact_out: Tensor,
+    C: Optional[Tensor],
+    *,
+    bias: Optional[Tensor],
+    activation,
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],
+    dynamic_scheduler: bool,
+    config: GemmConfig,
+    concat_layout: tuple | None,
+    SFA: Optional[Tensor],
+    SFB: Optional[Tensor],
+    dispatch_plan=None,
+):
+    """Transform operands and launch the act/gated GEMM; see _gemm_execute.
+
+    All metadata-derived decisions are already resolved; a cached interface
+    plan calls this directly with its captured ``dispatch_plan``. Returns the
+    dispatch plan for the interface plan to capture.
+    """
+    varlen_m = cu_seqlens_m is not None
+    capacity = get_device_capacity(A.device)[0]
+    sm90_plus = capacity >= 9
+    # Trace-time relabels replace per-call torch views; see _gemm_execute.
+    b_kn = sm90_plus and not varlen_m and not config.swap_ab and not concat_layout
+    if not b_kn:
+        B = B.mT  # (N, K) or (L, N, K)
+    D, PostAct = preact_out, postact_out
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and PostAct.ndim == 2
+        and (D is None or D.ndim == 2)
+        and (C is None or C.ndim == 2)
+        and not varlen_m
+        and not concat_layout
+        and sm90_plus
+    )
+    if not dense_2d:
+        if A.ndim == 2 and not varlen_m:
+            A = A.unsqueeze(0)  # (1, M, K)
+        if B.ndim == 2:
+            B = B.unsqueeze(0)  # (1, N, K), or (1, K, N) if b_kn
+        if C is not None and C.ndim == 2 and not varlen_m:
+            C = C.unsqueeze(0)  # (1, M, N)
+        if D is not None and D.ndim == 2 and not varlen_m:
+            D = D.unsqueeze(0)
+        if PostAct.ndim == 2 and not varlen_m:
+            PostAct = PostAct.unsqueeze(0)
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    if concat_layout and "bias" in concat_layout:
+        if bias is not None and bias.dtype.itemsize >= 4:
+            bias_key = "mColVecBroadcast" if config.swap_ab else "mRowVecBroadcast"
+            concat_layout = tuple(bias_key if k == "bias" else k for k in concat_layout)
+        else:
+            concat_layout = tuple(k for k in concat_layout if k != "bias")
+            if bias is not None:
+                bias = _concat_interleave_bias(bias)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
+        if dynamic_scheduler and capacity == 9
         else None
     )
-    gemm_act_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        (D if not config.swap_ab else D.mT) if D is not None else None,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
-        PostAct if not config.swap_ab else PostAct.mT,
+    swap = config.swap_ab
+    A_d = A if not swap else B
+    B_d = B if not swap else A
+    D_d = (D if not swap else D.mT) if D is not None else None
+    C_d = (C if not swap else C.mT) if C is not None else None
+    PostAct_d = PostAct if not swap else PostAct.mT
+    rowvec_d = bias if not swap else None
+    colvec_d = bias if swap else None
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata.
+        run_gemm_act_plan(
+            dispatch_plan,
+            A_d,
+            B_d,
+            D_d,
+            C_d,
+            PostAct_d,
+            tile_count_semaphore=tile_count_semaphore,
+            rowvec_bias=rowvec_d,
+            colvec_bias=colvec_d,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            SFA=SFA,
+            SFB=SFB,
+        )
+        return dispatch_plan
+    return gemm_act_dispatch(
+        A_d,
+        B_d,
+        D_d,
+        C_d,
+        PostAct_d,
         tile_count_semaphore,
         activation,
         config.tile_m,
@@ -606,13 +833,15 @@ def gemm_act_tuned(
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
-        rowvec_bias=bias if not config.swap_ab else None,
-        colvec_bias=bias if config.swap_ab else None,
+        rowvec_bias=rowvec_d,
+        colvec_bias=colvec_d,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
+        concat_layout=concat_layout,
         SFA=SFA,
         SFB=SFB,
+        b_kn=b_kn,
     )
 
 
@@ -633,39 +862,102 @@ def gemm_dact_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-) -> None:
+) -> Tuple[GemmConfig, bool, object]:  # (config, dynamic_scheduler, dispatch plan)
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
-    if A.ndim == 2 and not varlen_m:
-        A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
-        B = B.unsqueeze(0)  # (1, N, K)
-    if PreAct.ndim == 2 and not varlen_m:
-        PreAct = PreAct.unsqueeze(0)  # (1, M, N)
-    if dx_out.ndim == 2 and not varlen_m:
-        D = dx_out.unsqueeze(0)
-    else:
-        D = dx_out
-    if postact_out.ndim == 2 and not varlen_m:
-        PostAct = postact_out.unsqueeze(0)
-    else:
-        PostAct = postact_out
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    dispatch_plan = _gemm_dact_execute(
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        activation=activation,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
+    )
+    # Resolved decisions for the eager `gemm_dact` wrapper's interface plan.
+    return config, dynamic_scheduler, dispatch_plan
+
+
+def _gemm_dact_execute(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    dx_out: Tensor,
+    postact_out: Tensor,
+    *,
+    activation,
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],
+    dynamic_scheduler: bool,
+    config: GemmConfig,
+    dispatch_plan=None,
+):
+    """Transform operands and launch the dact GEMM; see _gemm_execute."""
+    varlen_m = cu_seqlens_m is not None
+    capacity = get_device_capacity(A.device)[0]
+    sm90_plus = capacity >= 9
+    b_kn = sm90_plus and not varlen_m and not config.swap_ab
+    if not b_kn:
+        B = B.mT  # (N, K) or (L, N, K)
+    D, PostAct = dx_out, postact_out
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and PreAct.ndim == 2
+        and D.ndim == 2
+        and PostAct.ndim == 2
+        and not varlen_m
+        and sm90_plus
+    )
+    if not dense_2d:
+        if A.ndim == 2 and not varlen_m:
+            A = A.unsqueeze(0)  # (1, M, K)
+        if B.ndim == 2:
+            B = B.unsqueeze(0)  # (1, N, K), or (1, K, N) if b_kn
+        if PreAct.ndim == 2 and not varlen_m:
+            PreAct = PreAct.unsqueeze(0)  # (1, M, N)
+        if D.ndim == 2 and not varlen_m:
+            D = D.unsqueeze(0)
+        if PostAct.ndim == 2 and not varlen_m:
+            PostAct = PostAct.unsqueeze(0)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
+        if dynamic_scheduler and capacity == 9
         else None
     )
-    gemm_dact_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        D if not config.swap_ab else D.mT,
-        PreAct if not config.swap_ab else PreAct.mT,
-        PostAct if not config.swap_ab else PostAct.mT,
+    swap = config.swap_ab
+    A_d = A if not swap else B
+    B_d = B if not swap else A
+    D_d = D if not swap else D.mT
+    PreAct_d = PreAct if not swap else PreAct.mT
+    PostAct_d = PostAct if not swap else PostAct.mT
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata.
+        run_gemm_dact_plan(
+            dispatch_plan,
+            A_d,
+            B_d,
+            D_d,
+            PreAct_d,
+            PostAct_d,
+            tile_count_semaphore=tile_count_semaphore,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+        )
+        return dispatch_plan
+    return gemm_dact_dispatch(
+        A_d,
+        B_d,
+        D_d,
+        PreAct_d,
+        PostAct_d,
         tile_count_semaphore,
         activation,
         config.tile_m,
@@ -680,7 +972,32 @@ def gemm_dact_tuned(
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
+        b_kn=b_kn,
     )
+
+
+class _GemmIfacePlan(NamedTuple):
+    """Interface-level launch plan: the metadata-derived decisions of a ``gemm``
+    call (validation, config resolution — including the autotuned winner — and
+    the output-allocation recipe).
+
+    Cached per metadata key so a warm eager call jumps straight to
+    :func:`_gemm_execute`, skipping the wrapper layers, the per-call asserts,
+    and the heuristic/autotuner lookup. It also captures the dispatch layer's
+    resolved plan (see ``_GemmPlan`` in gemm.py), so this key is the only one
+    on the warm path — which is exactly why it must subsume everything the
+    dispatch key covers (hence the alpha/sr modes in the key).
+    """
+
+    config: GemmConfig
+    split_k: int
+    dynamic_scheduler: bool
+    out_shape: tuple
+    out_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_iface_plan_cache: dict[tuple, _GemmIfacePlan] = {}
 
 
 def gemm(
@@ -710,8 +1027,75 @@ def gemm(
     B, SFB = _unpack_operand(B)
     assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
     if SFA is not None:
-        SFA = _sf_encode(_sf_normalize(SFA, "SFA"))
-        SFB = _sf_encode(_sf_normalize(SFB, "SFB"))
+        SFA, SFB = _sf_batch_canonicalize(
+            SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
+        )
+    # Eager plan fast path: replay of a previously validated call with different
+    # data pointers. The key covers everything the slow path's decisions read,
+    # including the alpha/sr modes: the captured dispatch plan depends on them,
+    # so this key must subsume the dispatch key. Varlen/gather/permute/concat
+    # calls always take the general path; compiled code takes the custom-op
+    # route below.
+    plan_key = None
+    if not torch.compiler.is_compiling() and (
+        cu_seqlens_m is None
+        and cu_seqlens_k is None
+        and A_idx is None
+        and batch_idx_permute is None
+        and not concat_layout
+    ):
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(out),
+            tensor_key(bias),
+            tensor_key(SFA),
+            tensor_key(SFB),
+            A.device,
+            out_dtype,
+            tuned,
+            dynamic_scheduler,
+            rounding_mode,
+            split_k,
+            split_k_mode,
+            scalar_mode(alpha),
+            isinstance(sr_seed, Tensor),
+        )
+        plan = _gemm_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if out is None:
+                out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            # No empty-input checks: empty calls return before plan recording below,
+            # so their metadata never produces a plan hit. SFs pass through in the
+            # rank the caller gave (5-D unbatched or 6-D), same as the slow path.
+            _gemm_execute(
+                A,
+                B,
+                out,
+                None,
+                bias=bias,
+                alpha=alpha,
+                beta=1.0,
+                cu_seqlens_m=None,
+                cu_seqlens_k=None,
+                A_idx=None,
+                batch_idx_permute=None,
+                add_to_output=False,
+                dynamic_scheduler=plan.dynamic_scheduler,
+                config=plan.config,
+                rounding_mode=rounding_mode,
+                sr_seed=sr_seed,
+                concat_layout=None,
+                SFA=SFA,
+                SFB=SFB,
+                split_k=plan.split_k,
+                split_k_mode=split_k_mode,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return out
+    if SFA is not None:
+        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
+        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     if out is None:
         if out_dtype is None:
             # Blockscaled inputs are fp8/fp4; default to bf16 output.
@@ -739,33 +1123,70 @@ def gemm(
     if A.numel() == 0:
         _empty_k_matmul_into(out, bias=bias)
         return out
-    alpha_tensor = alpha if not isinstance(alpha, float) else None
-    alpha = alpha if isinstance(alpha, float) else 1.0
-    sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
-    sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
-    concat_str = ",".join(concat_layout) if concat_layout else None
-    _launch(gemm_out)(
+    if torch.compiler.is_compiling():
+        # The torch-library boundary needs schema-typed args: alpha/sr_seed are
+        # split by type, concat_layout stringified, e8m0 SFs uint8-viewed
+        # (_sf_encode above).
+        alpha_tensor = alpha if not isinstance(alpha, float) else None
+        alpha = alpha if isinstance(alpha, float) else 1.0
+        sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
+        sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
+        concat_str = ",".join(concat_layout) if concat_layout else None
+        gemm_out(
+            A,
+            B,
+            out,
+            bias=bias,
+            alpha=alpha,
+            alpha_tensor=alpha_tensor,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+            rounding_mode=rounding_mode,
+            sr_seed=sr_seed_int,
+            sr_seed_tensor=sr_seed_tensor,
+            concat_layout=concat_str,
+            SFA=SFA,
+            SFB=SFB,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
+        return out
+    # Eager: skip the custom-op marshalling and call the tuner directly with
+    # natural argument types; it returns the resolved decisions for the plan.
+    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    config, split_k_resolved, dynamic_resolved, dispatch_plan = fn(
         A,
         B,
         out,
+        C=None,
         bias=bias,
         alpha=alpha,
-        alpha_tensor=alpha_tensor,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
-        tuned=tuned,
         rounding_mode=rounding_mode,
-        sr_seed=sr_seed_int,
-        sr_seed_tensor=sr_seed_tensor,
-        concat_layout=concat_str,
+        sr_seed=sr_seed,
+        concat_layout=concat_layout,
         SFA=SFA,
         SFB=SFB,
         split_k=split_k,
         split_k_mode=split_k_mode,
     )
+    if plan_key is not None:
+        _gemm_iface_plan_cache[plan_key] = _GemmIfacePlan(
+            config=config,
+            split_k=split_k_resolved,
+            dynamic_scheduler=dynamic_resolved,
+            out_shape=tuple(out.shape),
+            out_dtype=out.dtype,
+            dispatch_plan=dispatch_plan,
+        )
     return out
 
 
@@ -911,8 +1332,11 @@ def gemm_blockscaled_ref(
 
     A, SFA = _unpack_operand(A)
     B, SFB = _unpack_operand(B)
-    SFA = _sf_normalize(SFA, "SFA")
-    SFB = _sf_normalize(SFB, "SFB")
+    # unpack_scale_blocked_to_2d wants the batched 6-D form
+    SFA = _sf_validate(SFA, "SFA")
+    SFB = _sf_validate(SFB, "SFB")
+    SFA = SFA.unsqueeze(0) if SFA.ndim == 5 else SFA
+    SFB = SFB.unsqueeze(0) if SFB.ndim == 5 else SFB
     sf_vec = 32 if SFA.dtype == torch.float8_e8m0fnu else 16
     batched = A.ndim == 3
     a3 = A if batched else A.unsqueeze(0)  # (l, m, k_packed)
@@ -957,8 +1381,11 @@ def gemm_add(
     B, SFB = _unpack_operand(B)
     assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
     if SFA is not None:
-        SFA = _sf_encode(_sf_normalize(SFA, "SFA"))
-        SFB = _sf_encode(_sf_normalize(SFB, "SFB"))
+        SFA, SFB = _sf_batch_canonicalize(
+            SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
+        )
+        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
+        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     if out is None:
         if out_dtype is None:
             out_dtype = torch.bfloat16 if SFA is not None else A.dtype
@@ -1208,8 +1635,11 @@ def gemm_add_inplace(
     B, SFB = _unpack_operand(B)
     assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
     if SFA is not None:
-        SFA = _sf_encode(_sf_normalize(SFA, "SFA"))
-        SFB = _sf_encode(_sf_normalize(SFB, "SFB"))
+        SFA, SFB = _sf_batch_canonicalize(
+            SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
+        )
+        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
+        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
@@ -1301,6 +1731,22 @@ def gemm_add_inplace_op(
     )
 
 
+class _GemmActIfacePlan(NamedTuple):
+    """Interface plan for ``gemm_act``/``gemm_gated``; see _GemmIfacePlan.
+    The key must subsume everything the captured dispatch plan's key covers."""
+
+    config: GemmConfig
+    dynamic_scheduler: bool
+    out_shape: tuple
+    out_dtype: torch.dtype
+    postact_shape: tuple
+    postact_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_act_iface_plan_cache: dict[tuple, _GemmActIfacePlan] = {}
+
+
 def gemm_act(
     # For blockscaled: a tuple (A, SFA) — see gemm().
     A: Tensor
@@ -1330,8 +1776,59 @@ def gemm_act(
     B, SFB = _unpack_operand(B)
     assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
     if SFA is not None:
-        SFA = _sf_encode(_sf_normalize(SFA, "SFA"))
-        SFB = _sf_encode(_sf_normalize(SFB, "SFB"))
+        SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None)
+    # Eager plan fast path; see gemm(). The key subsumes the dispatch key.
+    plan_key = None
+    if not torch.compiler.is_compiling() and (
+        cu_seqlens_m is None and A_idx is None and not concat_layout
+    ):
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(C),
+            tensor_key(bias),
+            tensor_key(SFA),
+            tensor_key(SFB),
+            tensor_key(preact_out),
+            tensor_key(postact_out),
+            A.device,
+            activation,
+            out_dtype,
+            postact_dtype,
+            store_preact,
+            dynamic_scheduler,
+            tuned,
+        )
+        plan = _gemm_act_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if preact_out is None and store_preact:
+                preact_out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            if postact_out is None:
+                postact_out = torch.empty(
+                    plan.postact_shape, dtype=plan.postact_dtype, device=A.device
+                )
+            # No empty-input checks: empty calls return before recording below.
+            _gemm_act_execute(
+                A,
+                B,
+                preact_out,
+                postact_out,
+                C,
+                bias=bias,
+                activation=activation,
+                cu_seqlens_m=None,
+                A_idx=None,
+                dynamic_scheduler=plan.dynamic_scheduler,
+                config=plan.config,
+                concat_layout=None,
+                SFA=SFA,
+                SFB=SFB,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return preact_out, postact_out
+    if SFA is not None:
+        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
+        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     is_gated = activation in gated_to_pytorch_fn_map
     default_dtype = torch.bfloat16 if SFA is not None else A.dtype
     out_dtype = default_dtype if out_dtype is None else out_dtype
@@ -1358,9 +1855,11 @@ def gemm_act(
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
-    concat_str = ",".join(concat_layout) if concat_layout else None
-    if is_gated:
-        _launch(gemm_gated_out)(
+    if torch.compiler.is_compiling():
+        concat_str = ",".join(concat_layout) if concat_layout else None
+        op = gemm_gated_out if is_gated else gemm_act_out
+        kwargs = {"concat_layout": concat_str} if is_gated else {}
+        op(
             A,
             B,
             preact_out,
@@ -1372,30 +1871,59 @@ def gemm_act(
             A_idx,
             dynamic_scheduler,
             tuned,
-            concat_layout=concat_str,
             SFA=SFA,
             SFB=SFB,
+            **kwargs,
         )
-    else:
-        _launch(gemm_act_out)(
-            A,
-            B,
-            preact_out,
-            postact_out,
-            C,
-            bias,
-            activation,
-            cu_seqlens_m,
-            A_idx,
-            dynamic_scheduler,
-            tuned,
-            SFA=SFA,
-            SFB=SFB,
+        return preact_out, postact_out
+    # Eager: call the tuner directly (skipping the custom-op marshalling); it
+    # returns the resolved decisions for the plan.
+    tuned_fn = gemm_gated_tuned if is_gated else gemm_act_tuned
+    fn = tuned_fn if tuned else partial(tuned_fn.fn, config=None)
+    kwargs = {"concat_layout": concat_layout} if is_gated else {}
+    config, dynamic_resolved, dispatch_plan = fn(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias,
+        activation,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+        SFA=SFA,
+        SFB=SFB,
+        **kwargs,
+    )
+    if plan_key is not None:
+        _gemm_act_iface_plan_cache[plan_key] = _GemmActIfacePlan(
+            config=config,
+            dynamic_scheduler=dynamic_resolved,
+            out_shape=out_shape,
+            out_dtype=out_dtype,
+            postact_shape=postact_shape,
+            postact_dtype=postact_dtype,
+            dispatch_plan=dispatch_plan,
         )
     return preact_out, postact_out
 
 
 gemm_gated = gemm_act
+
+
+class _GemmDActIfacePlan(NamedTuple):
+    """Interface plan for ``gemm_dact`` (non-gated); see _GemmIfacePlan."""
+
+    config: GemmConfig
+    dynamic_scheduler: bool
+    out_shape: tuple
+    out_dtype: torch.dtype
+    postact_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_dact_iface_plan_cache: dict[tuple, _GemmDActIfacePlan] = {}
 
 
 @torch.library.custom_op(
@@ -1498,6 +2026,49 @@ def gemm_dact(
     """GEMM with activation (or gated activation) gradient and optional output tensors."""
     _check_split_k_unsupported("gemm_dact", split_k)
     is_dgated = activation in gated_to_pytorch_fn_map
+    # Eager plan fast path for the non-gated form; see gemm(). dgated keeps the
+    # classic route (its custom op returns the final colvec reduce).
+    plan_key = None
+    if (
+        not is_dgated
+        and not torch.compiler.is_compiling()
+        and cu_seqlens_m is None
+        and A_idx is None
+    ):
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(PreAct),
+            tensor_key(dx_out),
+            tensor_key(postact_out),
+            A.device,
+            activation,
+            out_dtype,
+            postact_dtype,
+            dynamic_scheduler,
+            tuned,
+        )
+        plan = _gemm_dact_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if dx_out is None:
+                dx_out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            if postact_out is None:
+                postact_out = torch.empty(plan.out_shape, dtype=plan.postact_dtype, device=A.device)
+            # No empty-input checks: empty calls return before recording below.
+            _gemm_dact_execute(
+                A,
+                B,
+                PreAct,
+                dx_out,
+                postact_out,
+                activation=activation,
+                cu_seqlens_m=None,
+                A_idx=None,
+                dynamic_scheduler=plan.dynamic_scheduler,
+                config=plan.config,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return dx_out, postact_out
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
@@ -1543,8 +2114,8 @@ def gemm_dact(
         if colvec_reduce:
             results.append(colvec_reduce_final)
         return tuple(results)
-    else:
-        _launch(gemm_dact_out)(
+    elif torch.compiler.is_compiling():
+        gemm_dact_out(
             A,
             B,
             PreAct,
@@ -1556,8 +2127,32 @@ def gemm_dact(
             dynamic_scheduler,
             tuned,
         )
-        results = [dx_out, postact_out]
-        return tuple(results)
+        return dx_out, postact_out
+    else:
+        # Eager: call the tuner directly (skipping the custom-op marshalling);
+        # it returns the resolved decisions for the plan.
+        fn = gemm_dact_tuned if tuned else partial(gemm_dact_tuned.fn, config=None)
+        config, dynamic_resolved, dispatch_plan = fn(
+            A,
+            B,
+            PreAct,
+            dx_out,
+            postact_out,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+        )
+        if plan_key is not None:
+            _gemm_dact_iface_plan_cache[plan_key] = _GemmDActIfacePlan(
+                config=config,
+                dynamic_scheduler=dynamic_resolved,
+                out_shape=out_shape,
+                out_dtype=out_dtype,
+                postact_dtype=postact_dtype,
+                dispatch_plan=dispatch_plan,
+            )
+        return dx_out, postact_out
 
 
 gemm_dgated = gemm_dact
@@ -1665,28 +2260,58 @@ def gemm_symmetric_out(
     """GEMM with guaranteed symmetric output."""
     alpha = _merge_tensor(alpha, alpha_tensor)
     beta = _merge_tensor(beta, beta_tensor)
-    if A.ndim == 2:
-        A = A.unsqueeze(0)  # (1, M, K)
+    _gemm_symmetric_execute(
+        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha, beta=beta
+    )
+
+
+def _gemm_symmetric_execute(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor],
+    *,
+    dynamic_scheduler: bool,
+    alpha: float | Tensor,
+    beta: float | Tensor,
+    dispatch_plan=None,
+):
+    """Transform operands and launch the symmetric GEMM; see _gemm_execute.
+    No b_kn here — the symmetric dispatch takes B operand-shaped (m, k)."""
+    capacity = get_device_capacity(A.device)[0]
     B = B.mT  # (M, K) or (L, M, K)
-    if B.ndim == 2:
-        B = B.unsqueeze(0)  # (1, M, K)
-    if C is not None and C.ndim == 2:
-        C = C.unsqueeze(0)  # (1, M, M)
-    if out.ndim == 2:
-        out = out.unsqueeze(0)
-    else:
-        out = out
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and out.ndim == 2
+        and (C is None or C.ndim == 2)
+        and capacity >= 9
+    )
+    if not dense_2d:
+        if A.ndim == 2:
+            A = A.unsqueeze(0)  # (1, M, K)
+        if B.ndim == 2:
+            B = B.unsqueeze(0)  # (1, M, K)
+        if C is not None and C.ndim == 2:
+            C = C.unsqueeze(0)  # (1, M, M)
+        if out.ndim == 2:
+            out = out.unsqueeze(0)
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata. The
+        # semaphore is never consumed here (is_dynamic_persistent implies
+        # SM100+, whose scheduler uses CLC), so pass None.
+        run_gemm_symmetric_plan(dispatch_plan, A, B, out, C, alpha=alpha, beta=beta)
+        return dispatch_plan
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    sm = get_device_capacity(A.device)[0]
     # We want square tile per cluster
-    tile_m, tile_n, cluster_m, pingpong = _symmetric_gemm_config(sm)
-    gemm_symmetric_dispatch(
+    tile_m, tile_n, cluster_m, pingpong = _symmetric_gemm_config(capacity)
+    return gemm_symmetric_dispatch(
         A,
         B,
-        out if out is not None else None,
-        C if C is not None else None,
+        out,
+        C,
         tile_count_semaphore,
         tile_M=tile_m,
         tile_N=tile_n,
@@ -1694,11 +2319,22 @@ def gemm_symmetric_out(
         cluster_N=1,
         pingpong=pingpong,
         persistent=True,
-        is_dynamic_persistent=sm >= 10,
+        is_dynamic_persistent=capacity >= 10,
         max_swizzle_size=8,
         alpha=alpha,
         beta=beta,
     )
+
+
+class _GemmSymmetricIfacePlan(NamedTuple):
+    """Interface plan for ``gemm_symmetric``; see _GemmIfacePlan."""
+
+    out_shape: tuple
+    out_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_symmetric_iface_plan_cache: dict[tuple, _GemmSymmetricIfacePlan] = {}
 
 
 def gemm_symmetric(
@@ -1715,19 +2351,44 @@ def gemm_symmetric(
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
     _check_split_k_unsupported("gemm_symmetric", split_k)
+    # Eager plan fast path; see gemm(). The key subsumes the dispatch key
+    # (alpha/beta modes select compiled epilogues).
+    plan_key = None
+    if not torch.compiler.is_compiling():
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(C),
+            tensor_key(out),
+            A.device,
+            out_dtype,
+            dynamic_scheduler,
+            scalar_mode(alpha),
+            scalar_mode(beta),
+        )
+        plan = _gemm_symmetric_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if out is None:
+                out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            # No empty-input checks: empty calls return before recording below.
+            _gemm_symmetric_execute(
+                A,
+                B,
+                out,
+                C,
+                dynamic_scheduler=dynamic_scheduler,
+                alpha=alpha,
+                beta=beta,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return out
     out_dtype = A.dtype if out_dtype is None else out_dtype
-    # Determine output shape based on gather_A
     if A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
     else:
         out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-
-    alpha_tensor = alpha if not isinstance(alpha, float) else None
-    alpha_val = alpha if isinstance(alpha, float) else 1.0
-    beta_tensor = beta if not isinstance(beta, float) else None
-    beta_val = beta if isinstance(beta, float) else 1.0
 
     # Empty-input fast path: out = alpha * A@A.T + beta * C reduces to beta * C
     # when K=0 (or just zeros / empty for M=0).
@@ -1737,17 +2398,32 @@ def gemm_symmetric(
         _empty_k_matmul_into(out, C=C, beta=beta)
         return out
 
-    _launch(gemm_symmetric_out)(
-        A,
-        B,
-        out,
-        C,
-        dynamic_scheduler=dynamic_scheduler,
-        alpha=alpha_val,
-        beta=beta_val,
-        alpha_tensor=alpha_tensor,
-        beta_tensor=beta_tensor,
+    if torch.compiler.is_compiling():
+        alpha_tensor = alpha if not isinstance(alpha, float) else None
+        alpha_val = alpha if isinstance(alpha, float) else 1.0
+        beta_tensor = beta if not isinstance(beta, float) else None
+        beta_val = beta if isinstance(beta, float) else 1.0
+        gemm_symmetric_out(
+            A,
+            B,
+            out,
+            C,
+            dynamic_scheduler=dynamic_scheduler,
+            alpha=alpha_val,
+            beta=beta_val,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+        )
+        return out
+    dispatch_plan = _gemm_symmetric_execute(
+        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha, beta=beta
     )
+    if plan_key is not None:
+        _gemm_symmetric_iface_plan_cache[plan_key] = _GemmSymmetricIfacePlan(
+            out_shape=out_shape,
+            out_dtype=out_dtype,
+            dispatch_plan=dispatch_plan,
+        )
     return out
 
 
@@ -1773,7 +2449,7 @@ def gemm_gated_tuned(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     SFA: Optional[Tensor] = None,  # (L, rm, rk, 32, 4, 4) blocked scale factors
     SFB: Optional[Tensor] = None,  # (L, rn, rk, 32, 4, 4)
-) -> None:
+) -> Tuple[GemmConfig, bool, object]:  # (config, dynamic_scheduler, dispatch plan)
     blockscaled = SFA is not None
     if blockscaled:
         SFA, SFB = _sf_decode(SFA), _sf_decode(SFB)
@@ -1789,63 +2465,25 @@ def gemm_gated_tuned(
         assert not varlen_m and A_idx is None, "Blockscaled GEMM does not support varlen/gather yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert not config.swap_ab, "Blockscaled GEMM does not support swap_ab yet"
-    if A.ndim == 2 and not varlen_m:
-        A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
-    if B.ndim == 2:
-        B = B.unsqueeze(0)  # (1, N, K)
-    if C is not None and C.ndim == 2 and not varlen_m:
-        C = C.unsqueeze(0)  # (1, M, N)
-    if preact_out is not None and preact_out.ndim == 2 and not varlen_m:
-        D = preact_out.unsqueeze(0)
-    else:
-        D = preact_out
-    if postact_out.ndim == 2 and not varlen_m:
-        PostAct = postact_out.unsqueeze(0)
-    else:
-        PostAct = postact_out
-    if bias is not None and bias.ndim == 1:
-        bias = bias.unsqueeze(0)  # (L, N)
-    if concat_layout and "bias" in concat_layout:
-        if bias is not None and bias.dtype.itemsize >= 4:
-            bias_key = "mColVecBroadcast" if config.swap_ab else "mRowVecBroadcast"
-            concat_layout = tuple(bias_key if k == "bias" else k for k in concat_layout)
-        else:
-            concat_layout = tuple(k for k in concat_layout if k != "bias")
-            if bias is not None:
-                bias = _concat_interleave_bias(bias)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
-        else None
-    )
-    gemm_act_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        (D if not config.swap_ab else D.mT) if D is not None else None,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
-        PostAct if not config.swap_ab else PostAct.mT,
-        tile_count_semaphore,
-        activation,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        tile_K=config.tile_k,
-        pingpong=config.pingpong,
-        persistent=True,
-        is_dynamic_persistent=dynamic_scheduler,
-        max_swizzle_size=config.max_swizzle_size,
-        rowvec_bias=bias if not config.swap_ab else None,
-        colvec_bias=bias if config.swap_ab else None,
+    dispatch_plan = _gemm_act_execute(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        bias=bias,
+        activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_tma_gather=config.use_tma_gather,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
         concat_layout=concat_layout,
         SFA=SFA,
         SFB=SFB,
     )
+    # Resolved decisions for the eager `gemm_act` wrapper's interface plan.
+    return config, dynamic_scheduler, dispatch_plan
 
 
 def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
@@ -2185,63 +2823,113 @@ def _gemm_rms_tuned(
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
-) -> Tensor:
+) -> tuple:  # (rstd, config, dynamic_scheduler, dispatch plan)
     if config is None:
         config = default_config(A.device)
-    og_ndim_2 = A.ndim == 2
-    N = B.shape[-1]
-    if A.ndim == 2:
-        A = A.unsqueeze(0)
-    B = B.mT
-    if B.ndim == 2:
-        B = B.unsqueeze(0)
-    if out.ndim == 2:
-        out = out.unsqueeze(0)
-    if C is not None and C.ndim == 2:
-        C = C.unsqueeze(0)
-    if norm_weight is not None and norm_weight.ndim == 1:
-        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
-    if premult_out is not None and premult_out.ndim == 2:
-        premult_out = premult_out.unsqueeze(0)
-    # Allocate partial reduction buffer
-    tile_n = config.tile_n
-    n_tiles = (N + tile_n - 1) // tile_n
-    colvec_reduce = torch.empty(
-        (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
-    )
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
-        else None
-    )
-    gemm_sq_reduce_dispatch(
+    rstd, dispatch_plan = _gemm_rms_execute(
         A,
         B,
         out,
         C,
-        colvec_reduce,
-        tile_count_semaphore,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        tile_K=config.tile_k,
-        pingpong=config.pingpong,
-        persistent=True,
-        is_dynamic_persistent=dynamic_scheduler,
-        max_swizzle_size=config.max_swizzle_size,
-        rowvec=norm_weight,
-        aux_out=premult_out,
+        norm_weight,
+        premult_out,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
     )
+    # Resolved decisions for the eager `gemm_rms` wrapper's interface plan.
+    return rstd, config, dynamic_scheduler, dispatch_plan
+
+
+def _gemm_rms_execute(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor],
+    norm_weight: Optional[Tensor],
+    premult_out: Optional[Tensor],
+    *,
+    eps: float,
+    dynamic_scheduler: bool,
+    config: GemmConfig,
+    dispatch_plan=None,
+):
+    """Transform operands, launch the sq_reduce GEMM and the final rstd
+    reduction; see _gemm_execute. Returns (rstd, dispatch plan)."""
+    rstd_shape = A.shape[:-1]
+    N = B.shape[-1]
+    capacity = get_device_capacity(A.device)[0]
+    sm90_plus = capacity >= 9
+    b_kn = sm90_plus
+    if not b_kn:
+        B = B.mT
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and out.ndim == 2
+        and (C is None or C.ndim == 2)
+        and (premult_out is None or premult_out.ndim == 2)
+        and sm90_plus
+    )
+    if not dense_2d:
+        if A.ndim == 2:
+            A = A.unsqueeze(0)
+        if B.ndim == 2:
+            B = B.unsqueeze(0)
+        if out.ndim == 2:
+            out = out.unsqueeze(0)
+        if C is not None and C.ndim == 2:
+            C = C.unsqueeze(0)
+        if premult_out is not None and premult_out.ndim == 2:
+            premult_out = premult_out.unsqueeze(0)
+    if norm_weight is not None and norm_weight.ndim == 1:
+        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
+    # Partial reduction buffer, rank-matched to the operands (2D when dense_2d).
+    n_tiles = (N + config.tile_n - 1) // config.tile_n
+    colvec_reduce = torch.empty((*A.shape[:-1], n_tiles), dtype=torch.float32, device=A.device)
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata.
+        run_gemm_sq_reduce_plan(
+            dispatch_plan,
+            A,
+            B,
+            out,
+            C,
+            colvec_reduce,
+            rowvec=norm_weight,
+            aux_out=premult_out,
+        )
+    else:
+        tile_count_semaphore = (
+            torch.zeros(1, dtype=torch.int32, device=A.device)
+            if dynamic_scheduler and capacity == 9
+            else None
+        )
+        dispatch_plan = gemm_sq_reduce_dispatch(
+            A,
+            B,
+            out,
+            C,
+            colvec_reduce,
+            tile_count_semaphore,
+            config.tile_m,
+            config.tile_n,
+            config.cluster_m,
+            config.cluster_n,
+            tile_K=config.tile_k,
+            pingpong=config.pingpong,
+            persistent=True,
+            is_dynamic_persistent=dynamic_scheduler,
+            max_swizzle_size=config.max_swizzle_size,
+            rowvec=norm_weight,
+            aux_out=premult_out,
+            b_kn=b_kn,
+        )
     # Final reduction: rstd = rsqrt(sum(partials) / N + eps)
-    scale = 1.0 / N
     flat_reduce = colvec_reduce.reshape(-1, n_tiles)
-    rstd_flat = rms_final_reduce(flat_reduce, scale=scale, eps=eps)
-    rstd = rstd_flat.reshape(A.shape[:-1])
-    if og_ndim_2:
-        rstd = rstd.squeeze(0)
-    return rstd
+    rstd_flat = rms_final_reduce(flat_reduce, scale=1.0 / N, eps=eps)
+    return rstd_flat.reshape(rstd_shape), dispatch_plan
 
 
 @torch.library.custom_op(
@@ -2267,7 +2955,7 @@ def _gemm_rms_out(
     If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     """
     fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
-    return fn(
+    rstd, _, _, _ = fn(
         A,
         B,
         out,
@@ -2277,6 +2965,7 @@ def _gemm_rms_out(
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
     )
+    return rstd
 
 
 @torch.library.register_fake("quack::gemm_rms_out")
@@ -2313,6 +3002,19 @@ def gemm_rms_ref(
     return D, rstd
 
 
+class _GemmRmsIfacePlan(NamedTuple):
+    """Interface plan for ``gemm_rms``; see _GemmIfacePlan."""
+
+    config: GemmConfig
+    dynamic_scheduler: bool
+    out_shape: tuple
+    out_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_rms_iface_plan_cache: dict[tuple, _GemmRmsIfacePlan] = {}
+
+
 def gemm_rms(
     A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
@@ -2334,6 +3036,40 @@ def gemm_rms(
     Returns (D_out, rstd).
     """
     _check_split_k_unsupported("gemm_rms", split_k)
+    # Eager plan fast path; see gemm(). eps only feeds the per-call final
+    # reduction, so it stays out of the key.
+    plan_key = None
+    if not torch.compiler.is_compiling():
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(C),
+            tensor_key(norm_weight),
+            tensor_key(out),
+            tensor_key(premult_out),
+            A.device,
+            out_dtype,
+            dynamic_scheduler,
+            tuned,
+        )
+        plan = _gemm_rms_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if out is None:
+                out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            # No empty-input checks: empty calls return before recording below.
+            rstd, _ = _gemm_rms_execute(
+                A,
+                B,
+                out,
+                C,
+                norm_weight,
+                premult_out,
+                eps=eps,
+                dynamic_scheduler=plan.dynamic_scheduler,
+                config=plan.config,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return out, rstd
     out_dtype = A.dtype if out_dtype is None else out_dtype
     N = B.shape[-1]
     if out is None:
@@ -2354,7 +3090,23 @@ def gemm_rms(
         else:
             rstd = torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
         return out, rstd
-    rstd = _launch(_gemm_rms_out)(
+    if torch.compiler.is_compiling():
+        rstd = _gemm_rms_out(
+            A,
+            B,
+            out,
+            C=C,
+            norm_weight=norm_weight,
+            premult_out=premult_out,
+            eps=eps,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+        )
+        return out, rstd
+    # Eager: call the tuner directly (skipping the custom-op marshalling); it
+    # returns the resolved decisions for the plan.
+    fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
+    rstd, config, dynamic_resolved, dispatch_plan = fn(
         A,
         B,
         out,
@@ -2363,8 +3115,15 @@ def gemm_rms(
         premult_out=premult_out,
         eps=eps,
         dynamic_scheduler=dynamic_scheduler,
-        tuned=tuned,
     )
+    if plan_key is not None:
+        _gemm_rms_iface_plan_cache[plan_key] = _GemmRmsIfacePlan(
+            config=config,
+            dynamic_scheduler=dynamic_resolved,
+            out_shape=tuple(out.shape),
+            out_dtype=out.dtype,
+            dispatch_plan=dispatch_plan,
+        )
     return out, rstd
 
 
@@ -2386,38 +3145,100 @@ def gemm_norm_act_tuned(
     activation: ActActivation = None,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
-) -> None:
+) -> Tuple[GemmConfig, bool, object]:  # (config, dynamic_scheduler, dispatch plan)
     if config is None:
         config = default_config(A.device)
-    if A.ndim == 2:
-        A = A.unsqueeze(0)
-    B = B.mT
-    if B.ndim == 2:
-        B = B.unsqueeze(0)
-    if C is not None and C.ndim == 2:
-        C = C.unsqueeze(0)
-    if preact_out is not None and preact_out.ndim == 2:
-        D = preact_out.unsqueeze(0)
-    else:
-        D = preact_out
-    if postact_out.ndim == 2:
-        PostAct = postact_out.unsqueeze(0)
-    else:
-        PostAct = postact_out
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    dispatch_plan = _gemm_norm_act_execute(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        rstd=rstd,
+        activation=activation,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
+    )
+    # Resolved decisions for the eager `gemm_norm_act` wrapper's interface plan.
+    return config, dynamic_scheduler, dispatch_plan
+
+
+def _gemm_norm_act_execute(
+    A: Tensor,
+    B: Tensor,
+    preact_out: Optional[Tensor],
+    postact_out: Tensor,
+    C: Optional[Tensor],
+    *,
+    rstd: Optional[Tensor],
+    activation,
+    dynamic_scheduler: bool,
+    config: GemmConfig,
+    dispatch_plan=None,
+):
+    """Transform operands and launch the norm_act/norm_gated GEMM; see
+    _gemm_execute. Returns the dispatch plan for the interface plan."""
+    capacity = get_device_capacity(A.device)[0]
+    sm90_plus = capacity >= 9
+    b_kn = sm90_plus and not config.swap_ab
+    if not b_kn:
+        B = B.mT
+    D, PostAct = preact_out, postact_out
+    dense_2d = (
+        A.ndim == 2
+        and B.ndim == 2
+        and PostAct.ndim == 2
+        and (D is None or D.ndim == 2)
+        and (C is None or C.ndim == 2)
+        and sm90_plus
+    )
+    if not dense_2d:
+        if A.ndim == 2:
+            A = A.unsqueeze(0)
+        if B.ndim == 2:
+            B = B.unsqueeze(0)
+        if C is not None and C.ndim == 2:
+            C = C.unsqueeze(0)
+        if D is not None and D.ndim == 2:
+            D = D.unsqueeze(0)
+        if PostAct.ndim == 2:
+            PostAct = PostAct.unsqueeze(0)
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
-    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
+        if dynamic_scheduler and capacity == 9
         else None
     )
-    gemm_norm_act_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        (D if not config.swap_ab else D.mT) if D is not None else None,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
-        PostAct if not config.swap_ab else PostAct.mT,
+    swap = config.swap_ab
+    A_d = A if not swap else B
+    B_d = B if not swap else A
+    D_d = (D if not swap else D.mT) if D is not None else None
+    C_d = (C if not swap else C.mT) if C is not None else None
+    PostAct_d = PostAct if not swap else PostAct.mT
+    colvec_d = rstd if not swap else None
+    rowvec_d = rstd if swap else None
+    if dispatch_plan is not None:
+        # Warm replay: the interface plan key vouches for the metadata.
+        run_gemm_norm_act_plan(
+            dispatch_plan,
+            A_d,
+            B_d,
+            D_d,
+            C_d,
+            PostAct_d,
+            tile_count_semaphore=tile_count_semaphore,
+            rowvec=rowvec_d,
+            colvec=colvec_d,
+        )
+        return dispatch_plan
+    return gemm_norm_act_dispatch(
+        A_d,
+        B_d,
+        D_d,
+        C_d,
+        PostAct_d,
         tile_count_semaphore,
         activation,
         config.tile_m,
@@ -2429,8 +3250,9 @@ def gemm_norm_act_tuned(
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
-        colvec=rstd if not config.swap_ab else None,
-        rowvec=rstd if config.swap_ab else None,
+        colvec=colvec_d,
+        rowvec=rowvec_d,
+        b_kn=b_kn,
     )
 
 
@@ -2449,52 +3271,23 @@ def gemm_norm_gated_tuned(
     activation: GatedActivation = "swiglu",
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
-) -> None:
+) -> Tuple[GemmConfig, bool, object]:  # (config, dynamic_scheduler, dispatch plan)
     if config is None:
         config = default_config(A.device)
-    if A.ndim == 2:
-        A = A.unsqueeze(0)
-    B = B.mT
-    if B.ndim == 2:
-        B = B.unsqueeze(0)
-    if C is not None and C.ndim == 2:
-        C = C.unsqueeze(0)
-    if preact_out is not None and preact_out.ndim == 2:
-        D = preact_out.unsqueeze(0)
-    else:
-        D = preact_out
-    if postact_out.ndim == 2:
-        PostAct = postact_out.unsqueeze(0)
-    else:
-        PostAct = postact_out
-    if rstd is not None and rstd.ndim == 1:
-        rstd = rstd.unsqueeze(0)  # (L, M)
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device)
-        if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
-        else None
+    dispatch_plan = _gemm_norm_act_execute(
+        A,
+        B,
+        preact_out,
+        postact_out,
+        C,
+        rstd=rstd,
+        activation=activation,
+        dynamic_scheduler=dynamic_scheduler,
+        config=config,
     )
-    gemm_norm_act_dispatch(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        (D if not config.swap_ab else D.mT) if D is not None else None,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
-        PostAct if not config.swap_ab else PostAct.mT,
-        tile_count_semaphore,
-        activation,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        tile_K=config.tile_k,
-        pingpong=config.pingpong,
-        persistent=True,
-        is_dynamic_persistent=dynamic_scheduler,
-        max_swizzle_size=config.max_swizzle_size,
-        colvec=rstd if not config.swap_ab else None,
-        rowvec=rstd if config.swap_ab else None,
-    )
+    # Resolved decisions for the eager `gemm_norm_act` wrapper's interface plan.
+    return config, dynamic_scheduler, dispatch_plan
 
 
 @torch.library.custom_op(
@@ -2545,6 +3338,21 @@ def gemm_norm_gated_out(
 _register_noop_fake(gemm_norm_gated_out)
 
 
+class _GemmNormActIfacePlan(NamedTuple):
+    """Interface plan for ``gemm_norm_act``/``gemm_norm_gated``; see _GemmIfacePlan."""
+
+    config: GemmConfig
+    dynamic_scheduler: bool
+    out_shape: tuple
+    out_dtype: torch.dtype
+    postact_shape: tuple
+    postact_dtype: torch.dtype
+    dispatch_plan: object
+
+
+_gemm_norm_act_iface_plan_cache: dict[tuple, _GemmNormActIfacePlan] = {}
+
+
 def gemm_norm_act(
     A: Tensor,  # (M, K) or (L, M, K)
     B: Tensor,  # (K, N) or (L, K, N)
@@ -2568,6 +3376,46 @@ def gemm_norm_act(
     """
     _check_split_k_unsupported("gemm_norm_act", split_k)
     is_gated = activation in gated_to_pytorch_fn_map
+    # Eager plan fast path; see gemm(). The key subsumes the dispatch key.
+    plan_key = None
+    if not torch.compiler.is_compiling():
+        plan_key = (
+            tensor_key(A),
+            tensor_key(B),
+            tensor_key(C),
+            tensor_key(rstd),
+            tensor_key(preact_out),
+            tensor_key(postact_out),
+            A.device,
+            activation,
+            out_dtype,
+            postact_dtype,
+            store_preact,
+            dynamic_scheduler,
+            tuned,
+        )
+        plan = _gemm_norm_act_iface_plan_cache.get(plan_key)
+        if plan is not None:
+            if preact_out is None and store_preact:
+                preact_out = torch.empty(plan.out_shape, dtype=plan.out_dtype, device=A.device)
+            if postact_out is None:
+                postact_out = torch.empty(
+                    plan.postact_shape, dtype=plan.postact_dtype, device=A.device
+                )
+            # No empty-input checks: empty calls return before recording below.
+            _gemm_norm_act_execute(
+                A,
+                B,
+                preact_out,
+                postact_out,
+                C,
+                rstd=rstd,
+                activation=activation,
+                dynamic_scheduler=plan.dynamic_scheduler,
+                config=plan.config,
+                dispatch_plan=plan.dispatch_plan,
+            )
+            return preact_out, postact_out
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if A.ndim == 2:
@@ -2586,29 +3434,26 @@ def gemm_norm_act(
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
-    if is_gated:
-        _launch(gemm_norm_gated_out)(
-            A,
-            B,
-            preact_out,
-            postact_out,
-            C,
-            rstd,
-            activation,
-            dynamic_scheduler,
-            tuned,
-        )
-    else:
-        _launch(gemm_norm_act_out)(
-            A,
-            B,
-            preact_out,
-            postact_out,
-            C,
-            rstd,
-            activation,
-            dynamic_scheduler,
-            tuned,
+    if torch.compiler.is_compiling():
+        op = gemm_norm_gated_out if is_gated else gemm_norm_act_out
+        op(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler, tuned)
+        return preact_out, postact_out
+    # Eager: call the tuner directly (skipping the custom-op marshalling); it
+    # returns the resolved decisions for the plan.
+    tuned_fn = gemm_norm_gated_tuned if is_gated else gemm_norm_act_tuned
+    fn = tuned_fn if tuned else partial(tuned_fn.fn, config=None)
+    config, dynamic_resolved, dispatch_plan = fn(
+        A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler
+    )
+    if plan_key is not None:
+        _gemm_norm_act_iface_plan_cache[plan_key] = _GemmNormActIfacePlan(
+            config=config,
+            dynamic_scheduler=dynamic_resolved,
+            out_shape=out_shape,
+            out_dtype=out_dtype,
+            postact_shape=postact_shape,
+            postact_dtype=postact_dtype,
+            dispatch_plan=dispatch_plan,
         )
     return preact_out, postact_out
 

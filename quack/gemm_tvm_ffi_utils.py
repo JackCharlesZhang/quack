@@ -23,7 +23,9 @@ SF_DTYPE_TO_VEC_SIZE = {
 }
 
 
-def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False):
+def validate_blockscaled_sf(
+    A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False
+):
     """Validate blockscaled scale factors against kernel-layout operands.
 
     A is (l, m, k[/2 if fp4]) and B is (l, n, k[/2]); SFA/SFB are
@@ -95,10 +97,20 @@ def validate_blockscaled_sf(A, B, SFA, SFB, device_capacity, num_batches=None, v
         )
         shapes = [("SFB", SFB, (num_batches, (B.shape[-2] + 127) // 128, rk, 32, 4, 4))]
     else:
-        shapes = [
-            (name, SF, (A.shape[0], (mn + 127) // 128, rk, 32, 4, 4))
-            for name, SF, mn in (("SFA", SFA, A.shape[-2]), ("SFB", SFB, B.shape[-2]))
-        ]
+        # Dense: 2D operands may carry unbatched 5-D SFs (the kernel prepends
+        # the trivial batch mode at trace time) or single-batch 6-D ones.
+        l = A.shape[0] if A.ndim == 3 else 1
+        n = B.shape[-1] if b_kn else B.shape[-2]
+        shapes = []
+        for name, SF, mn in (("SFA", SFA, A.shape[-2]), ("SFB", SFB, n)):
+            core = ((mn + 127) // 128, rk, 32, 4, 4)
+            if SF.ndim == 5:
+                assert A.ndim == 2, (
+                    f"{name}: unbatched 5-D scale factors require 2D operands, A is {A.ndim}D"
+                )
+                shapes.append((name, SF, core))
+            else:
+                shapes.append((name, SF, (l, *core)))
     for name, SF, expected in shapes:
         assert tuple(SF.shape) == expected, f"{name} shape {tuple(SF.shape)} != {expected}"
     for name, SF in (("SFA", SFA), ("SFB", SFB)):
@@ -211,15 +223,73 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
 
 
 # ---------------------------------------------------------------------------
-# Launch-plan helpers, shared by every gemm_* entry point.
+# Launch-overhead design: three binding tiers
+# ---------------------------------------------------------------------------
 #
-# Each entry point caches an immutable per-metadata-key "plan" NamedTuple
-# (see _GemmPlan in gemm.py for the template) so warm calls skip validation,
-# major/dtype derivation, and the compile-cache lookup. The helpers below only
-# rely on the common plan field names (compiled_fn, is_sm100_family,
-# max_active_clusters, max_swizzle_size, scheduler_uses_semaphore,
-# scheduler_static), so each variant defines its own plan NamedTuple with
-# whatever extra fields it needs.
+# Every fact about a GEMM call is handled at the EARLIEST tier that can know
+# it. That single rule generates the whole host-side architecture; deviations
+# below are deliberate and documented so they don't get "fixed" back and forth.
+#
+# 1. COMPILE TIME (cute.jit trace -> tvm-ffi function, cached by @jit_cache):
+#    dtypes, ranks, majors, tile/cluster config, epilogue structure — and
+#    every STATIC layout relabel. The FFI signature is the caller's natural
+#    tensor form; the trace rearranges it for the kernel:
+#      * batch-first (l, x, y) -> (x, y, l) rotation (GemmBase.rotate_batch_last)
+#      * dense rank-2 operands get a trivial (1, stride-0) batch mode appended
+#      * b_kn: B crosses as (k, n[, l]) and is transposed to (n, k, l)
+#      * unbatched 5-D scale factors get the batch mode prepended (SM100)
+#    Rule of thumb: NEVER add a torch view (.mT/.unsqueeze/.permute) to a warm
+#    path — each costs ~1-1.5us of dispatcher overhead per call. If the relabel
+#    is metadata-static, do it at trace time behind a compile flag instead.
+#    (Views that survive are semantic or fallbacks: swap_ab's out.mT, the
+#    non-2D rank promotion, varlen's flattened forms.)
+#
+# 2. PLAN TIME (first call per metadata signature; immutable NamedTuple in a
+#    per-entry-point dict): validation asserts, major/dtype derivation, config
+#    selection (heuristic or autotuner), workspace/output recipes, static arg
+#    templates, and WHICH compiled function. The plan key is built from
+#    tensor_key() of every tensor argument plus every scalar knob the build
+#    reads — shapes/strides subsume the majors and the validation, so a key
+#    hit is exactly a replay of a previously validated call with different
+#    data pointers. Scalar epilogue operands enter the key as their MODE
+#    (scalar_mode: absent / host constant / device pointer) because the modes
+#    select different compiled epilogues, while the VALUES stay per-call.
+#
+#    Plans COMPOSE BY REFERENCE: an outer layer (gemm_interface) holding a
+#    resolved plan also captures the dispatch layer's plan and calls the
+#    dispatch run_*_plan() directly, so a warm call pays exactly ONE key.
+#    THE INVARIANT: an outer key must subsume every input of the captured
+#    inner plan's key (that's why the interface key carries alpha/sr modes).
+#    Two plan LAYERS are correct, not residual: they cache decisions at
+#    different altitudes with different key spaces — during autotuning one
+#    interface signature legitimately exercises N dispatch plans (one per
+#    candidate config); collapsing the layers would re-resolve kernels on
+#    every config switch.
+#
+# 3. CALL TIME (every call): data pointers, scalar values, stream. The warm
+#    path is: one key -> dict hit -> cheap routing -> run_*_plan (epi scalars,
+#    static scheduler template, FFI). ~8us of that is the FFI + cudaLaunch
+#    floor; everything else is ~1-2us items.
+#
+# Deliberate deviations / rejected alternatives (do not revisit):
+#  * The execute helper re-derives routing flags (b_kn/dense_2d/swap) per call
+#    (~0.5us) instead of storing them in the plan: one routing body shared by
+#    the cold and warm paths means the two can never drift. Threading flags
+#    through return chains was tried on paper and costs more than it saves.
+#  * Views cannot be cached (they freeze data pointers) — don't try.
+#  * Per-call EpilogueArguments construction is REQUIRED (it carries pointers);
+#    only an all-absent epilogue may cache a static instance (epi_static).
+#  * Per-call torch.zeros/empty scratch (split-K, SM90 semaphore) is the
+#    stream-correct design for free (the caching allocator is stream-aware).
+#    Plan-owned scratch would need kernel self-reset protocols + per-stream
+#    slabs; that is the (deferred) CUDA-graphs prerequisite, not a cleanup.
+#  * An explicit zero-key handle API ("plan = gemm.plan(...); plan(...)") was
+#    rejected as user-hostile; implicit metadata keys are the contract.
+#
+# The helpers below rely only on the common plan field names (compiled_fn,
+# is_sm100_family, max_active_clusters, max_swizzle_size,
+# scheduler_uses_semaphore, scheduler_static), so each entry point defines its
+# own plan NamedTuple with whatever extra fields it needs.
 # ---------------------------------------------------------------------------
 
 
@@ -227,6 +297,13 @@ def tensor_key(t):
     """Metadata key of one tensor for the plan cache: everything a plan build
     reads from it except the data pointer."""
     return (t.dtype, tuple(t.shape), t.stride()) if t is not None else None
+
+
+def scalar_mode(scalar, neutral=1.0):
+    """Compile-time mode of an epilogue scalar: 0 = absent (neutral value, the
+    epilogue op is compiled out), 1 = host constant, 2 = device pointer. Part
+    of every plan key — the modes select different compiled epilogues."""
+    return 2 if isinstance(scalar, torch.Tensor) else (1 if scalar != neutral else 0)
 
 
 def scalar_arg(scalar, mode, dtype=Float32):
@@ -278,6 +355,8 @@ def make_fake_gemm_tensors(
     varlen_m=False,
     varlen_k=False,
     gather_A=False,
+    batched=True,
+    b_kn=False,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
@@ -285,7 +364,15 @@ def make_fake_gemm_tensors(
     When varlen_m, m is total_m (flattened M of D/C). When varlen_k, k is total_k.
 
     3D tensors are built batch-first (l, x, y); see :func:`fake_batched`.
+    ``batched=False`` (dense only) builds 2D (x, y) operand fakes: the kernel
+    appends a trivial batch mode at trace time (GemmBase.permute_batch_last),
+    so hosts pass unbatched torch tensors without .unsqueeze() views.
+    ``b_kn`` (dense only) builds mB as (l, k, n) / (k, n) — B crosses the
+    boundary in the caller's (K, N) orientation and the kernel transposes it to
+    (n, k, l) at trace time (GemmBase.rotate_batch_last), saving a .mT view.
     """
+    assert batched or not (varlen_m or varlen_k), "varlen operands are 2D already"
+    assert not (b_kn and (varlen_m or varlen_k)), "b_kn is dense-only"
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
@@ -316,10 +403,16 @@ def make_fake_gemm_tensors(
         mD = fake_batched(d_dtype, m, n, l, d_leading, div_d)
         mC = fake_batched(c_dtype, m, n, l, c_leading, div_c)
     else:
-        mA = fake_batched(a_dtype, m, k, l, a_leading, div_a)
-        mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
-        mD = fake_batched(d_dtype, m, n, l, d_leading, div_d)
-        mC = fake_batched(c_dtype, m, n, l, c_leading, div_c)
+        bl = l if batched else None
+        mA = fake_batched(a_dtype, m, k, bl, a_leading, div_a)
+        if b_kn:
+            # (k, n) orientation: b_major is still the logical (n, k) label, so
+            # "k"-major means dim 0 of (k, n) is contiguous.
+            mB = fake_batched(b_dtype, k, n, bl, 1 - b_leading, div_b)
+        else:
+            mB = fake_batched(b_dtype, n, k, bl, b_leading, div_b)
+        mD = fake_batched(d_dtype, m, n, bl, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, n, bl, c_leading, div_c)
     return mA, mB, mD, mC, m, n, k, l
 
 
@@ -332,19 +425,17 @@ def make_fake_sf_tensor(sf_dtype, l):
     (the atom layout is hardware-fixed); outer strides are dynamic but
     atom-granular, so slices of larger scale buffers are accepted without a
     copy.
+
+    Pass ``l=None`` for an unbatched 5-D (rm, rk, 32, 4, 4) fake (dense 2D
+    operands): the kernel prepends the trivial batch mode at trace time.
     """
     rm, rk = cute.sym_int(), cute.sym_int()
+    shape = (rm, rk, 32, 4, 4) if l is None else (l, rm, rk, 32, 4, 4)
+    outer_strides = tuple(cute.sym_int64(divisibility=512) for _ in range(2 if l is None else 3))
     return cute.runtime.make_fake_tensor(
         sf_dtype,
-        (l, rm, rk, 32, 4, 4),
-        stride=(
-            cute.sym_int64(divisibility=512),
-            cute.sym_int64(divisibility=512),
-            cute.sym_int64(divisibility=512),
-            16,
-            4,
-            1,
-        ),
+        shape,
+        stride=(*outer_strides, 16, 4, 1),
         assumed_align=16,
     )
 
@@ -375,6 +466,7 @@ def compile_gemm_kernel(
     sf_vec_size=None,
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
+    b_transposed=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -403,6 +495,9 @@ def compile_gemm_kernel(
         gather_A=gather_A,
         concat_layout=concat_layout,
     )
+    # mB crosses the boundary as (l, k, n); rotate_batch_last transposes it to
+    # kernel order (n, k, l) at trace time.
+    gemm_obj.b_transposed = b_transposed
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

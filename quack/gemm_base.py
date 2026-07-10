@@ -16,7 +16,7 @@ import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore
+from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
@@ -65,8 +65,11 @@ class GemmBase:
     #   and applies the full epilogue math.
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
+    # mB arrives (l, k, n) and is transposed to (n, k, l) at trace time when set
+    # (see rotate_batch_last); compile_gemm_kernel sets it per compiled variant.
+    b_transposed = False
 
-    def rotate_batch_last(self, mA, mB, mD, mC, epilogue_args):
+    def rotate_batch_last(self, mA, mB, mD, mC, epilogue_args, append_batch_if_2d=False):
         """Rotate all batched inputs from caller order (l, x, y) to kernel order (x, y, l).
 
         Batched tensors cross the FFI boundary in caller order; __call__ rotates
@@ -74,42 +77,66 @@ class GemmBase:
         .permute() host views (~0.7us each) with a free compile-time layout
         rewrite, so hosts pass torch tensors as-is. Fake tensors must be built
         batch-first to match (see gemm_tvm_ffi_utils.fake_batched).
-        """
-        return (
-            *(self.permute_batch_last(t) for t in (mA, mB, mD, mC)),
-            self.permute_batch_last_epi_args(epilogue_args),
-        )
 
-    def permute_batch_last(self, mT: Optional[cute.Tensor]) -> Optional[cute.Tensor]:
+        ``append_batch_if_2d`` (dense calls only, i.e. no varlen args): rank-2
+        operands are unbatched (m, k) etc. and get a static size-1 stride-0
+        batch mode appended, so hosts can pass 2D tensors without per-call
+        .unsqueeze() views. Varlen calls must leave it False — their rank-2
+        operands are flattened, not unbatched.
+
+        ``self.b_transposed`` (dense only): mB crossed the boundary in the
+        caller's (k, n[, l]) orientation and is transposed to kernel order
+        (n, k, l) here, saving the host a per-call .mT view.
+        """
+        mA, mB, mD, mC = (self.permute_batch_last(t, append_batch_if_2d) for t in (mA, mB, mD, mC))
+        if const_expr(self.b_transposed):
+            mB = layout_utils.select(mB, [1, 0, 2])
+        return mA, mB, mD, mC, self.permute_batch_last_epi_args(epilogue_args, append_batch_if_2d)
+
+    def permute_batch_last(
+        self, mT: Optional[cute.Tensor], append_batch_if_2d=False
+    ) -> Optional[cute.Tensor]:
         """Trace-time (l, x, y) -> (x, y, l) permute of a batched tensor.
 
         Rank-2 tensors (the varlen flattened operands, which are never
-        batch-permuted) and None pass through.
+        batch-permuted — or dense 2D operands when ``append_batch_if_2d``,
+        which get a trivial batch mode appended instead) and None pass through.
         """
         if const_expr(mT is not None and cute.rank(mT) == 3):
             return layout_utils.select(mT, [1, 2, 0])
+        if const_expr(mT is not None and append_batch_if_2d and cute.rank(mT) == 2):
+            return layout_utils.expand(mT, 2, 1)
         return mT
 
-    def permute_batch_last_epi_args(self, epilogue_args):
+    def permute_batch_last_epi_args(self, epilogue_args, append_batch_if_2d=False):
         """Rotate the tile-shaped epilogue tensors from (l, m, n) to (m, n, l).
 
         Exactly the TileStore/TileLoad fields of ``_epi_ops`` are GEMM-tile
         shaped and consumed in kernel order (m, n, l) — PostAct/PreAct/aux
         outputs and tile loads. Everything else keeps its host layout: vec
         broadcasts are rank 1/2, and reduce outputs (e.g. a (l, m, n_tiles)
-        mColVecReduce) are batch-first natively. Rank-2 (varlen-flattened)
-        tile fields pass through like the main operands.
+        mColVecReduce) are batch-first natively. Rank-2 tile fields pass
+        through like the main operands (varlen-flattened), or — for dense
+        ``append_batch_if_2d`` calls — get the trivial batch mode appended.
+        Unbatched rank-2 VecReduce outputs get it PREPENDED (they are
+        batch-first, and their rank-2 form otherwise means varlen).
         """
         if const_expr(epilogue_args is None):
             return epilogue_args
-        tile_fields = {
-            op.name for op in getattr(self, "_epi_ops", ()) if isinstance(op, (TileLoad, TileStore))
-        }
-        rotated = {
-            name: layout_utils.select(v, [1, 2, 0])
-            for name, v in zip(epilogue_args._fields, epilogue_args)
-            if name in tile_fields and isinstance(v, cute.Tensor) and cute.rank(v) == 3
-        }
+        epi_ops = getattr(self, "_epi_ops", ())
+        tile_fields = {op.name for op in epi_ops if isinstance(op, (TileLoad, TileStore))}
+        reduce_fields = {op.name for op in epi_ops if isinstance(op, VecReduce)}
+        rotated = {}
+        for name, v in zip(epilogue_args._fields, epilogue_args):
+            if not isinstance(v, cute.Tensor):
+                continue
+            if name in tile_fields:
+                if cute.rank(v) == 3:
+                    rotated[name] = layout_utils.select(v, [1, 2, 0])
+                elif append_batch_if_2d and cute.rank(v) == 2:
+                    rotated[name] = layout_utils.expand(v, 2, 1)
+            elif name in reduce_fields and append_batch_if_2d and cute.rank(v) == 2:
+                rotated[name] = layout_utils.expand(v, 0, 1)
         return epilogue_args._replace(**rotated) if rotated else epilogue_args
 
     @dataclass

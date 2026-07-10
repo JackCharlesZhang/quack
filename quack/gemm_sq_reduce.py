@@ -158,6 +158,8 @@ def _compile_gemm_sq_reduce(
     aux_out_dtype,
     aux_out_major,
     device_capacity,
+    batched=True,
+    b_kn=False,
 ):
     sm_to_cls = {
         8: GemmSqReduceSm80,
@@ -176,6 +178,8 @@ def _compile_gemm_sq_reduce(
         b_major,
         d_major,
         c_major,
+        batched=batched,
+        b_kn=b_kn,
     )
     n_tiles = cute.sym_int()
     if colvec_reduce_ndim == 3:
@@ -195,7 +199,9 @@ def _compile_gemm_sq_reduce(
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if aux_out_dtype is not None:
         aux_leading = 1 if aux_out_major == "n" else 0
-        mAuxOut = fake_batched(aux_out_dtype, m, n, l, aux_leading, div_for_dtype(aux_out_dtype))
+        mAuxOut = fake_batched(
+            aux_out_dtype, m, n, l if batched else None, aux_leading, div_for_dtype(aux_out_dtype)
+        )
     else:
         mAuxOut = None
     epi_args = GemmCls.EpilogueArguments(
@@ -224,6 +230,7 @@ def _compile_gemm_sq_reduce(
         epi_args,
         scheduler_args,
         varlen_args,
+        b_transposed=b_kn,
     )
 
 
@@ -264,7 +271,8 @@ def gemm_sq_reduce(
     max_swizzle_size: int = 8,
     rowvec: Optional[Tensor] = None,  # (l, n) — norm_weight
     aux_out: Optional[Tensor] = None,  # (l, m, n) — pre-rowvec output snapshot
-) -> None:
+    b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (SM90+)
+) -> _GemmSqReducePlan:
     """GEMM + sq_reduce + optional rowvec scaling.
 
     D_raw = A @ B (+ C), colvec_reduce[m] = sum_n(D_raw[m,n]^2), D_out = D_raw * rowvec.
@@ -293,6 +301,7 @@ def gemm_sq_reduce(
         persistent,
         is_dynamic_persistent,
         max_swizzle_size,
+        b_kn,
     )
     plan = _gemm_sq_reduce_plan_cache.get(key)
     if plan is None:
@@ -314,9 +323,37 @@ def gemm_sq_reduce(
             max_swizzle_size=max_swizzle_size,
             rowvec=rowvec,
             aux_out=aux_out,
+            b_kn=b_kn,
         )
         _gemm_sq_reduce_plan_cache[key] = plan
+    run_gemm_sq_reduce_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        colvec_reduce,
+        tile_count_semaphore=tile_count_semaphore,
+        rowvec=rowvec,
+        aux_out=aux_out,
+    )
+    return plan
 
+
+def run_gemm_sq_reduce_plan(
+    plan: _GemmSqReducePlan,
+    A: Tensor,
+    B: Tensor,
+    D: Tensor,
+    C: Optional[Tensor],
+    colvec_reduce: Tensor,
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    rowvec: Optional[Tensor] = None,
+    aux_out: Optional[Tensor] = None,
+) -> None:
+    """Launch a resolved plan: only per-call pointers here.
+    The tensors must match the metadata the plan was built from."""
     epi_args = GemmSqReduceMixin.EpilogueArguments(
         mRowVecBroadcast=rowvec,
         mColVecReduce=colvec_reduce,
@@ -348,13 +385,31 @@ def _build_gemm_sq_reduce_plan(
     max_swizzle_size,
     rowvec,
     aux_out,
+    b_kn=False,
 ) -> _GemmSqReducePlan:
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    batched = A.ndim == 3
+    if not batched:
+        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        # colvec_reduce must then be 2D (m, n_tiles) — its ndim keys the fake.
+        assert (
+            B.ndim == 2
+            and D.ndim == 2
+            and (C is None or C.ndim == 2)
+            and colvec_reduce.ndim == 2
+            and (aux_out is None or aux_out.ndim == 2)
+        ), "2D (unbatched) A requires 2D B, D, C, colvec_reduce, and aux_out"
+    if not batched or b_kn:
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands / b_kn require SM90+"
 
     a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
+    if b_kn:
+        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
+        # last dim means n-major.
+        b_major = "n" if B.stride(-1) == 1 else "k"
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
     if aux_out is not None:
         aux_out_dtype = torch2cute_dtype_map[aux_out.dtype]
@@ -388,6 +443,8 @@ def _build_gemm_sq_reduce_plan(
         aux_out_dtype,
         aux_out_major,
         device_capacity,
+        batched=batched,
+        b_kn=b_kn,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

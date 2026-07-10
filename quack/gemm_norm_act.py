@@ -190,6 +190,8 @@ def _compile_gemm_norm_act(
     gemm_cls_name,
     rounding_mode=RoundingMode.RN,
     sr_seed_mode=0,
+    batched=True,
+    b_kn=False,
 ):
     sm_to_cls = {
         "norm_act": {
@@ -220,11 +222,14 @@ def _compile_gemm_norm_act(
         c_major,
         varlen_m=varlen_m,
         gather_A=gather_A,
+        batched=batched,
+        b_kn=b_kn,
     )
     div_pa = div_for_dtype(postact_dtype)
     pa_n = cute.sym_int() if gemm_cls_name == "norm_gated" else n
     pa_leading_dim = 1 if gemm_cls_name == "norm_gated" else pa_leading
-    mAuxOut = fake_batched(postact_dtype, m, pa_n, None if varlen_m else l, pa_leading_dim, div_pa)
+    pa_l = None if (varlen_m or not batched) else l
+    mAuxOut = fake_batched(postact_dtype, m, pa_n, pa_l, pa_leading_dim, div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -273,6 +278,7 @@ def _compile_gemm_norm_act(
         epi_args,
         scheduler_args,
         varlen_args,
+        b_transposed=b_kn,
     )
 
 
@@ -319,7 +325,8 @@ def gemm_norm_act_fn(
     A_idx: Optional[Tensor] = None,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
-) -> None:
+    b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
+) -> _GemmNormActPlan:
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
@@ -350,6 +357,7 @@ def gemm_norm_act_fn(
         max_swizzle_size,
         rounding_mode,
         sr_seed_mode,
+        b_kn,
     )
     plan = _gemm_norm_act_plan_cache.get(key)
     if plan is None:
@@ -376,9 +384,43 @@ def gemm_norm_act_fn(
             A_idx=A_idx,
             rounding_mode=rounding_mode,
             sr_seed_mode=sr_seed_mode,
+            b_kn=b_kn,
         )
         _gemm_norm_act_plan_cache[key] = plan
+    run_gemm_norm_act_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        PostAct,
+        tile_count_semaphore=tile_count_semaphore,
+        rowvec=rowvec,
+        colvec=colvec,
+        sr_seed=sr_seed,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+    )
+    return plan
 
+
+def run_gemm_norm_act_plan(
+    plan: _GemmNormActPlan,
+    A: Tensor,
+    B: Tensor,
+    D: Optional[Tensor],
+    C: Optional[Tensor],
+    PostAct: Tensor,
+    *,
+    tile_count_semaphore: Optional[Tensor] = None,
+    rowvec: Optional[Tensor] = None,
+    colvec: Optional[Tensor] = None,
+    sr_seed: int | Tensor = 0,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+) -> None:
+    """Launch a resolved plan: only per-call pointers and scalar values here.
+    The tensors must match the metadata the plan was built from."""
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct,
         None,  # act_fn is Constexpr, pass None at call time
@@ -416,6 +458,7 @@ def _build_gemm_norm_act_plan(
     A_idx,
     rounding_mode,
     sr_seed_mode,
+    b_kn=False,
 ) -> _GemmNormActPlan:
     if activation in gate_fn_map:
         gemm_cls_name = "norm_gated"
@@ -435,8 +478,24 @@ def _build_gemm_norm_act_plan(
         assert cu_seqlens_m is not None, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
 
+    batched = A.ndim == 3 or varlen_m
+    if not batched:
+        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        assert (
+            B.ndim == 2
+            and PostAct.ndim == 2
+            and (D is None or D.ndim == 2)
+            and (C is None or C.ndim == 2)
+        ), "2D (unbatched) A requires 2D B, D, C, and PostAct"
+    if b_kn:
+        assert not varlen_m, "b_kn does not support varlen"
+
     a_major = get_major(A, "m", "k")
     b_major = get_major(B, "n", "k")
+    if b_kn:
+        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
+        # last dim means n-major.
+        b_major = "n" if B.stride(-1) == 1 else "k"
     d_major = get_major(D, "m", "n") if D is not None else None
     c_major = get_major(C, "m", "n") if C is not None else None
     postact_major = get_major(PostAct, "m", "n")
@@ -452,6 +511,8 @@ def _build_gemm_norm_act_plan(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    if not batched or b_kn:
+        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands / b_kn require SM90+"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding requires SM100"
 
@@ -486,6 +547,8 @@ def _build_gemm_norm_act_plan(
         gemm_cls_name,
         rounding_mode=rounding_mode,
         sr_seed_mode=sr_seed_mode,
+        batched=batched,
+        b_kn=b_kn,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
