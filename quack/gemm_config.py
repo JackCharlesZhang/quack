@@ -54,6 +54,23 @@ class GemmConfig:
     use_tma_gather: bool = False
 
 
+def config_supports(config: GemmConfig, *, gather_A: bool = False, varlen_m: bool = False) -> bool:
+    """Structural validity of a config for gather_A / varlen_m.
+
+    Single source of truth shared by the autotune pruner
+    (gemm_interface.prune_invalid_gemm_configs) and the analytic heuristic's
+    candidate spaces (gemm_heuristic; enforced by tests/test_gemm_heuristic.py).
+    """
+    if (gather_A or varlen_m) and config.swap_ab:
+        return False
+    if gather_A:
+        if config.cluster_n != 1:
+            return False
+        if config.device_capacity == 9 and (config.tile_n == 208 or config.is_dynamic_persistent):
+            return False
+    return True
+
+
 def _get_sm90_configs(
     epilogue: Optional[str] = None,
     tune_coop: bool = True,

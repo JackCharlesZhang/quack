@@ -10,7 +10,7 @@ from torch import Tensor
 # SplitKMode is re-exported here as its canonical public import path; it is *defined*
 # in the gemm_config leaf because the kernel layer needs it at import time and this
 # module sits above quack.gemm in the import graph (importing it from here would cycle).
-from quack.gemm_config import GemmConfig, SplitKMode, get_all_configs
+from quack.gemm_config import GemmConfig, SplitKMode, config_supports, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
@@ -358,13 +358,11 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
     varlen_k = kwargs.get("cu_seqlens_k", None) is not None
-    if varlen_m or gather_A:  # Doesn't support swap_ab
-        configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
-    if gather_A:
-        configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
-        if device_capacity == 9:
-            configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
-            configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
+    configs = [
+        conf
+        for conf in configs
+        if config_supports(conf.kwargs["config"], gather_A=gather_A, varlen_m=varlen_m)
+    ]
     # use_tma_gather only valid when gather_A is active on SM100/SM110
     if not gather_A or device_capacity not in [10, 11]:
         configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
@@ -559,6 +557,11 @@ def _gemm_execute(
             C = C.unsqueeze(0)  # (1, M, N)
         if out.ndim == 2 and not varlen_m:
             out = out.unsqueeze(0)
+        # Unbatched 5-D SFs must follow their rank-2 operands into batched form.
+        if SFA is not None and SFA.ndim == 5 and not varlen:
+            SFA = SFA.unsqueeze(0)
+        if SFB is not None and SFB.ndim == 5 and not varlen:
+            SFB = SFB.unsqueeze(0)
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
     if varlen_m:
