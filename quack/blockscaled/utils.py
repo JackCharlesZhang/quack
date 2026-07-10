@@ -80,7 +80,17 @@ def _make_fake_tensor_like(tensor: torch.Tensor, dtype: Type[cutlass.Numeric]) -
     )
 
 
+def _batch_first(tensor: torch.Tensor) -> torch.Tensor:
+    """Batch-last (x, y, l) -> batch-first (l, x, y) view; rank-2 passes through."""
+    return tensor.permute(2, 0, 1) if tensor.dim() == 3 else tensor
+
+
 def _leading_dim_from_stride(tensor: torch.Tensor) -> int:
+    # Size-1 dims carry an arbitrary (often 1) stride — e.g. the l=1 batch dim of a
+    # batch-first (1, m, k) view — and must not shadow the real contiguous dim.
+    for i, (size, stride) in enumerate(zip(tensor.shape, tensor.stride())):
+        if stride == 1 and size != 1:
+            return i
     for i, stride in enumerate(tensor.stride()):
         if stride == 1:
             return i
@@ -300,6 +310,14 @@ BLOCKSCALED_FORMATS = {
 }
 
 
+# compiled (static shapes) so the swizzle fuses into a couple of kernels instead
+# of an eager pad/permute/contiguous chain; see the dynamic=False and
+# recompile_limit notes in quantize.py (per-wrapper limit: config is thread-local)
+_pack_scale_compiled = torch.compile(
+    pack_scale_2d_to_blocked_contig, dynamic=False, recompile_limit=64
+)
+
+
 def blockscaled_quantize(
     x: torch.Tensor, format: str = "mxfp8", per_tensor_scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -329,8 +347,32 @@ def blockscaled_quantize(
         q, sc, _ = to_nvfp4_compiled(x_flat, sf_vec, per_tensor_scale)
     q = q.view(torch.uint8).view(q_dtype) if q_dtype == torch.float4_e2m1fn_x2 else q
     q = q.reshape(*x.shape[:-1], -1)
-    sf = pack_scale_2d_to_blocked_contig(sc.view(l, mn, k // sf_vec))
+    sf = _pack_scale_compiled(sc.view(l, mn, k // sf_vec))
     return q, sf if batched else sf.squeeze(0)
+
+
+def blockscaled_quantize_dim0(
+    x: torch.Tensor, format: str = "mxfp8"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a (M, K) bf16/fp32 tensor along M (dim 0) for a blockscaled GEMM
+    whose reduction dim is M — the dgrad/wgrad orientations of training linears.
+
+    Returns ``(q, sf)``:
+      q:  (M, K) fp8, same row-major layout as ``x``. Pass it directly as an
+          MN-major B operand (reduction dim first), or ``q.mT`` as an MN-major
+          A operand.
+      sf: blocked (rm, rk, 32, 4, 4) scale factors for the logical operand
+          (mn=K, sf_k=M/32) — the same tensor serves both usages above.
+    """
+    from quack.blockscaled.quantize import to_mx_dim0_compiled
+
+    assert format == "mxfp8", "dim0 quantization currently supports mxfp8 only"
+    assert x.ndim == 2, f"expected (M, K), got shape {tuple(x.shape)}"
+    sf_vec = BLOCKSCALED_FORMATS[format][2]
+    assert x.shape[0] % sf_vec == 0, f"M ({x.shape[0]}) must be divisible by {sf_vec}"
+    q, sc = to_mx_dim0_compiled(x, sf_vec)  # sc: (M/32, K)
+    sf = _pack_scale_compiled(sc.mT.contiguous().unsqueeze(0))
+    return q, sf.squeeze(0)
 
 
 def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int) -> torch.Tensor:
@@ -718,6 +760,14 @@ def compile_blockscaled_gemm_tvm_ffi(
 ) -> Callable:
     """Compile the SM100 blockscaled GEMM.
 
+    Caller convention is batch-LAST — mA (m, k, l), mB (n, k, l), mD (m, n, l) —
+    matching the reference-math einsums. The kernel itself expects batch-FIRST
+    tensors and rotates (l, x, y) -> (x, y, l) at trace time
+    (GemmBase.rotate_batch_last), so this wrapper converts at the boundary: the
+    compile-time fakes are built batch-first, and run(...) passes batch-first
+    views (a free .permute). Rank-2 (varlen-flattened) operands and the SF
+    tensors pass through untouched (the kernel does not rotate SFA/SFB).
+
     When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
     When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
@@ -800,8 +850,8 @@ def compile_blockscaled_gemm_tvm_ffi(
         )
         fake_mB = fake_tensor(
             ab_dtype,
-            (n_sym, k_sym, l_sym),
-            leading_dim=_leading_dim_from_stride(mB),
+            (l_sym, n_sym, k_sym),
+            leading_dim=_leading_dim_from_stride(_batch_first(mB)),
             divisibility=div_for_dtype(ab_dtype),
         )
         fake_mD = fake_tensor(
@@ -829,21 +879,23 @@ def compile_blockscaled_gemm_tvm_ffi(
         )
         fake_mD = fake_tensor(
             d_dtype,
-            (m_sym, n_sym, l_sym),
-            leading_dim=_leading_dim_from_stride(mD),
+            (l_sym, m_sym, n_sym),
+            leading_dim=_leading_dim_from_stride(_batch_first(mD)),
             divisibility=div_for_dtype(d_dtype),
         )
     else:
         # Detect each operand's leading (stride-1) dim so m-major A / n-major B
-        # are accepted along with the default k-major.
+        # are accepted along with the default k-major. Fakes are batch-first to
+        # match the kernel's calling convention (see docstring).
+        mA_bf, mB_bf, mD_bf = _batch_first(mA), _batch_first(mB), _batch_first(mD)
         fake_mA = _make_fake_compact_tensor(
-            mA.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA)
+            mA_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA_bf)
         )
         fake_mB = _make_fake_compact_tensor(
-            mB.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB)
+            mB_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB_bf)
         )
         fake_mD = _make_fake_compact_tensor(
-            mD.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD)
+            mD_bf.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD_bf)
         )
 
     if split_k_compile:
@@ -893,7 +945,16 @@ def compile_blockscaled_gemm_tvm_ffi(
                 device=d.device,
             )
             compiled(
-                a, b, d, sfa, sfb, sem.permute(1, 2, 0), ws.permute(3, 1, 2, 0), VarlenArguments()
+                _batch_first(a),
+                _batch_first(b),
+                _batch_first(d),
+                sfa,
+                sfb,
+                # sem/ws are not TileLoad/TileStore epi fields, so the kernel does
+                # not rotate them; pass kernel-order views (same as quack.gemm.gemm).
+                sem.permute(1, 2, 0),
+                ws.permute(3, 1, 2, 0),
+                VarlenArguments(),
             )
 
         return run
@@ -929,11 +990,11 @@ def compile_blockscaled_gemm_tvm_ffi(
                 mCuSeqlensM=cu_seqlens if varlen_m else None,
                 mCuSeqlensK=cu_seqlens if varlen_k else None,
             )
-            compiled(a, b, d, sfa, sfb, varlen_args)
+            compiled(_batch_first(a), _batch_first(b), _batch_first(d), sfa, sfb, varlen_args)
     else:
 
         def run(a, b, d, sfa, sfb):
-            compiled(a, b, d, sfa, sfb, VarlenArguments())
+            compiled(_batch_first(a), _batch_first(b), _batch_first(d), sfa, sfb, VarlenArguments())
 
     return run
 

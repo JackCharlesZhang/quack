@@ -44,6 +44,9 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_varlen_args,
     make_fake_gemm_tensors,
     compile_gemm_kernel,
+    tensor_key,
+    plan_scheduler_args,
+    launch_gemm,
 )
 import quack.utils as utils
 
@@ -224,6 +227,25 @@ def _compile_gemm_sq_reduce(
     )
 
 
+class _GemmSqReducePlan(NamedTuple):
+    """Launch plan derived purely from tensor metadata and config flags.
+
+    Cached per metadata key (see ``_gemm_sq_reduce_plan_cache``) so warm calls
+    skip major/dtype derivation and the compile-cache lookup. See ``_GemmPlan``
+    in gemm.py for the pattern.
+    """
+
+    compiled_fn: object
+    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    max_active_clusters: int
+    max_swizzle_size: int
+    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
+    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
+
+
+_gemm_sq_reduce_plan_cache: dict[tuple, _GemmSqReducePlan] = {}
+
+
 def gemm_sq_reduce(
     A: Tensor,  # (l, m, k)
     B: Tensor,  # (l, n, k)
@@ -249,6 +271,84 @@ def gemm_sq_reduce(
     If aux_out is provided, the pre-rowvec value (D_raw, after alpha/beta/C) is also
     written to it.
     """
+    # The key captures every input the plan build reads (shapes and strides
+    # subsume the majors and the validation asserts), so a cache hit is exactly
+    # a replay of a previously validated call with different data pointers.
+    key = (
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(D),
+        tensor_key(C),
+        tensor_key(colvec_reduce),
+        tensor_key(rowvec),
+        tensor_key(aux_out),
+        tile_count_semaphore is not None,
+        A.device,
+        tile_M,
+        tile_N,
+        tile_K,
+        cluster_M,
+        cluster_N,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
+        max_swizzle_size,
+    )
+    plan = _gemm_sq_reduce_plan_cache.get(key)
+    if plan is None:
+        plan = _build_gemm_sq_reduce_plan(
+            A,
+            B,
+            D,
+            C,
+            colvec_reduce,
+            tile_count_semaphore=tile_count_semaphore,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            rowvec=rowvec,
+            aux_out=aux_out,
+        )
+        _gemm_sq_reduce_plan_cache[key] = plan
+
+    epi_args = GemmSqReduceMixin.EpilogueArguments(
+        mRowVecBroadcast=rowvec,
+        mColVecReduce=colvec_reduce,
+        mAuxOut=aux_out,
+        add_to_output=None,  # Constexpr, pass None at runtime
+        rounding_mode=None,  # Constexpr, pass None at runtime
+    )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
+    varlen_args = make_varlen_args(None, None, None)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args)
+
+
+def _build_gemm_sq_reduce_plan(
+    A,
+    B,
+    D,
+    C,
+    colvec_reduce,
+    *,
+    tile_count_semaphore,
+    tile_M,
+    tile_N,
+    cluster_M,
+    cluster_N,
+    tile_K,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    max_swizzle_size,
+    rowvec,
+    aux_out,
+) -> _GemmSqReducePlan:
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
@@ -291,19 +391,19 @@ def gemm_sq_reduce(
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    epi_args = GemmSqReduceMixin.EpilogueArguments(
-        mRowVecBroadcast=rowvec,
-        mColVecReduce=colvec_reduce,
-        mAuxOut=aux_out,
-        add_to_output=None,  # Constexpr, pass None at runtime
-        rounding_mode=None,  # Constexpr, pass None at runtime
+    # Must mirror make_fake_scheduler_args in _compile_gemm_sq_reduce: only the
+    # SM90 dynamic scheduler consumes the semaphore, so it's the only non-static case.
+    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
+    scheduler_static = (
+        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+        if not scheduler_uses_semaphore
+        else None
     )
-    scheduler_args = make_scheduler_args(
-        max_active_clusters, max_swizzle_size, tile_count_semaphore
+    return _GemmSqReducePlan(
+        compiled_fn=compiled_fn,
+        is_sm100_family=device_capacity[0] in [10, 11],
+        max_active_clusters=max_active_clusters,
+        max_swizzle_size=max_swizzle_size,
+        scheduler_uses_semaphore=scheduler_uses_semaphore,
+        scheduler_static=scheduler_static,
     )
-    varlen_args = make_varlen_args(None, None, None)
-
-    if device_capacity[0] in [10, 11]:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, None, None)
-    else:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)

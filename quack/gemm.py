@@ -35,6 +35,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_sf_tensor,
     compile_gemm_kernel,
     validate_blockscaled_sf,
+    tensor_key,
+    scalar_arg,
+    plan_scheduler_args,
+    launch_gemm,
 )
 
 
@@ -216,19 +220,6 @@ class _GemmPlan(NamedTuple):
 _gemm_plan_cache: dict[tuple, _GemmPlan] = {}
 
 
-def _tensor_key(t: Optional[Tensor]):
-    return (t.dtype, tuple(t.shape), t.stride()) if t is not None else None
-
-
-def _scalar_arg(scalar, mode, dtype=Float32):
-    if mode == 0:
-        return None
-    elif mode == 1:
-        return dtype(scalar)
-    else:
-        return scalar.data_ptr()
-
-
 # Split-K: the full epilogue (alpha, beta*C, bias) runs exactly once per output tile,
 # on the entity that owns the completed f32 sum; non-finalizing splits emit raw f32
 # partials only. The buffers below are per-call allocations (the plan is cached and
@@ -377,16 +368,16 @@ def gemm(
     # checks), so a cache hit is exactly a replay of a previously validated
     # call with different data pointers.
     key = (
-        _tensor_key(A),
-        _tensor_key(B),
-        _tensor_key(D),
-        _tensor_key(C),
-        _tensor_key(SFA),
-        _tensor_key(SFB),
-        _tensor_key(rowvec_bias),
-        _tensor_key(colvec_bias),
-        _tensor_key(cu_seqlens_m),
-        _tensor_key(cu_seqlens_k),
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(D),
+        tensor_key(C),
+        tensor_key(SFA),
+        tensor_key(SFB),
+        tensor_key(rowvec_bias),
+        tensor_key(colvec_bias),
+        tensor_key(cu_seqlens_m),
+        tensor_key(cu_seqlens_k),
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -481,13 +472,13 @@ def gemm(
     epi_args = plan.epi_static
     if epi_args is None:
         epi_args = GemmDefaultEpiMixin.EpilogueArguments(
-            alpha=_scalar_arg(alpha, plan.alpha_mode),
-            beta=_scalar_arg(beta, plan.beta_mode),
+            alpha=scalar_arg(alpha, plan.alpha_mode),
+            beta=scalar_arg(beta, plan.beta_mode),
             mRowVecBroadcast=rowvec_bias,
             mColVecBroadcast=colvec_bias,
             add_to_output=None,
             rounding_mode=None,
-            sr_seed=_scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
+            sr_seed=scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
             split_k_semaphore=(
                 split_k_semaphore.permute(1, 2, 0) if split_k_semaphore is not None else None
             ),
@@ -495,23 +486,10 @@ def gemm(
                 split_k_workspace.permute(3, 1, 2, 0) if split_k_semaphore is not None else None
             ),
         )
-    scheduler_args = plan.scheduler_static
-    if scheduler_args is None:
-        scheduler_args = make_scheduler_args(
-            plan.max_active_clusters,
-            plan.max_swizzle_size,
-            # Must mirror make_fake_scheduler_args in _compile_gemm: only the
-            # SM8x/SM90 dynamic scheduler consumes the semaphore; SM100 uses
-            # CLC instead, and the compiled signature has None there.
-            tile_count_semaphore if plan.scheduler_uses_semaphore else None,
-            batch_idx_permute,
-        )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
-    if plan.is_sm100_family:
-        plan.compiled_fn(A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
-    else:
-        plan.compiled_fn(A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args)
+    launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
     if staged_split_k:
         _reduce_staged_split_k(

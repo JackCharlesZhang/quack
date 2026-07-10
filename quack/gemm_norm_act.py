@@ -3,7 +3,7 @@
 # PostAct = act((A @ B + C) * colvec * rowvec)
 # colvec is typically rstd (M,), rowvec is typically norm_weight (N,).
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 from torch import Tensor
 
@@ -37,6 +37,10 @@ from quack.gemm_tvm_ffi_utils import (
     fake_batched,
     make_fake_gemm_tensors,
     compile_gemm_kernel,
+    tensor_key,
+    scalar_arg,
+    plan_scheduler_args,
+    launch_gemm,
 )
 import quack.utils as utils
 
@@ -272,6 +276,26 @@ def _compile_gemm_norm_act(
     )
 
 
+class _GemmNormActPlan(NamedTuple):
+    """Launch plan derived purely from tensor metadata and config flags.
+
+    Cached per metadata key (see ``_gemm_norm_act_plan_cache``) so warm calls
+    skip validation, major/dtype derivation, and the compile-cache lookup. See
+    ``_GemmPlan`` in gemm.py for the pattern.
+    """
+
+    compiled_fn: object
+    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    sr_seed_mode: int
+    max_active_clusters: int
+    max_swizzle_size: int
+    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
+    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
+
+
+_gemm_norm_act_plan_cache: dict[tuple, _GemmNormActPlan] = {}
+
+
 def gemm_norm_act_fn(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m
     B: Tensor,  # (l, n, k)
@@ -296,6 +320,103 @@ def gemm_norm_act_fn(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
 ) -> None:
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+    )
+    # The key captures every input the plan build reads (shapes and strides
+    # subsume the majors and the validation asserts), so a cache hit is exactly
+    # a replay of a previously validated call with different data pointers.
+    key = (
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(D),
+        tensor_key(C),
+        tensor_key(PostAct),
+        tensor_key(rowvec),
+        tensor_key(colvec),
+        tensor_key(cu_seqlens_m),
+        A_idx is not None,
+        tile_count_semaphore is not None,
+        A.device,
+        activation,
+        tile_M,
+        tile_N,
+        tile_K,
+        cluster_M,
+        cluster_N,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
+        max_swizzle_size,
+        rounding_mode,
+        sr_seed_mode,
+    )
+    plan = _gemm_norm_act_plan_cache.get(key)
+    if plan is None:
+        plan = _build_gemm_norm_act_plan(
+            A,
+            B,
+            D,
+            C,
+            PostAct,
+            tile_count_semaphore=tile_count_semaphore,
+            activation=activation,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            rowvec=rowvec,
+            colvec=colvec,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            rounding_mode=rounding_mode,
+            sr_seed_mode=sr_seed_mode,
+        )
+        _gemm_norm_act_plan_cache[key] = plan
+
+    epi_args = GemmActMixin.EpilogueArguments(
+        PostAct,
+        None,  # act_fn is Constexpr, pass None at call time
+        mRowVecBroadcast=rowvec,
+        mColVecBroadcast=colvec,
+        rounding_mode=None,
+        sr_seed=scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
+    )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args)
+
+
+def _build_gemm_norm_act_plan(
+    A,
+    B,
+    D,
+    C,
+    PostAct,
+    *,
+    tile_count_semaphore,
+    activation,
+    tile_M,
+    tile_N,
+    cluster_M,
+    cluster_N,
+    tile_K,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    max_swizzle_size,
+    rowvec,
+    colvec,
+    cu_seqlens_m,
+    A_idx,
+    rounding_mode,
+    sr_seed_mode,
+) -> _GemmNormActPlan:
     if activation in gate_fn_map:
         gemm_cls_name = "norm_gated"
     else:
@@ -339,9 +460,6 @@ def gemm_norm_act_fn(
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
 
-    sr_seed_mode = (
-        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
-    )
     compiled_fn = _compile_gemm_norm_act(
         a_dtype,
         b_dtype,
@@ -371,29 +489,20 @@ def gemm_norm_act_fn(
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-
-    def scalar_arg(scalar, mode, dtype=Int32):
-        if mode == 0:
-            return None
-        elif mode == 1:
-            return dtype(scalar)
-        else:
-            return scalar.data_ptr()
-
-    epi_args = GemmActMixin.EpilogueArguments(
-        PostAct,
-        None,  # act_fn is Constexpr, pass None at call time
-        mRowVecBroadcast=rowvec,
-        mColVecBroadcast=colvec,
-        rounding_mode=None,
-        sr_seed=scalar_arg(sr_seed, sr_seed_mode),
+    # Must mirror make_fake_scheduler_args in _compile_gemm_norm_act: only the
+    # SM90 dynamic scheduler consumes the semaphore, so it's the only non-static case.
+    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
+    scheduler_static = (
+        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+        if not scheduler_uses_semaphore
+        else None
     )
-    scheduler_args = make_scheduler_args(
-        max_active_clusters, max_swizzle_size, tile_count_semaphore
+    return _GemmNormActPlan(
+        compiled_fn=compiled_fn,
+        is_sm100_family=device_capacity[0] in [10, 11],
+        sr_seed_mode=sr_seed_mode,
+        max_active_clusters=max_active_clusters,
+        max_swizzle_size=max_swizzle_size,
+        scheduler_uses_semaphore=scheduler_uses_semaphore,
+        scheduler_static=scheduler_static,
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
-
-    if device_capacity[0] in [10, 11]:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, None, None)
-    else:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)

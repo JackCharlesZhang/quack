@@ -210,6 +210,62 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
     )
 
 
+# ---------------------------------------------------------------------------
+# Launch-plan helpers, shared by every gemm_* entry point.
+#
+# Each entry point caches an immutable per-metadata-key "plan" NamedTuple
+# (see _GemmPlan in gemm.py for the template) so warm calls skip validation,
+# major/dtype derivation, and the compile-cache lookup. The helpers below only
+# rely on the common plan field names (compiled_fn, is_sm100_family,
+# max_active_clusters, max_swizzle_size, scheduler_uses_semaphore,
+# scheduler_static), so each variant defines its own plan NamedTuple with
+# whatever extra fields it needs.
+# ---------------------------------------------------------------------------
+
+
+def tensor_key(t):
+    """Metadata key of one tensor for the plan cache: everything a plan build
+    reads from it except the data pointer."""
+    return (t.dtype, tuple(t.shape), t.stride()) if t is not None else None
+
+
+def scalar_arg(scalar, mode, dtype=Float32):
+    """Per-call epilogue scalar matching the compiled signature: mode 0 = absent,
+    1 = host constant, 2 = device pointer."""
+    if mode == 0:
+        return None
+    elif mode == 1:
+        return dtype(scalar)
+    else:
+        return scalar.data_ptr()
+
+
+def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None):
+    """Per-call TileSchedulerOptions for a cached plan.
+
+    Must mirror make_fake_scheduler_args in the variant's _compile_* function:
+    only the SM8x/SM90 dynamic scheduler consumes the semaphore (SM100 uses CLC
+    instead), so when the compiled signature has None there the semaphore the
+    caller passed is dropped rather than forwarded.
+    """
+    if plan.scheduler_static is not None:
+        return plan.scheduler_static
+    return make_scheduler_args(
+        plan.max_active_clusters,
+        plan.max_swizzle_size,
+        tile_count_semaphore if plan.scheduler_uses_semaphore else None,
+        batch_idx_permute,
+    )
+
+
+def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
+    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB)."""
+    if plan.is_sm100_family:
+        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    else:
+        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
+
+
 def make_fake_gemm_tensors(
     a_dtype,
     b_dtype,

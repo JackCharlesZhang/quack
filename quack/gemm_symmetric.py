@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional, Callable
+from typing import Dict, NamedTuple, Tuple, Optional, Callable
 
 from torch import Tensor
 
@@ -23,6 +23,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_scheduler_args,
     make_fake_scheduler_args,
     compile_gemm_kernel,
+    tensor_key,
+    scalar_arg,
+    plan_scheduler_args,
+    launch_gemm,
 )
 from quack.cache import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
@@ -356,6 +360,27 @@ def _compile_gemm_symmetric(
     )
 
 
+class _GemmSymmetricPlan(NamedTuple):
+    """Launch plan derived purely from tensor metadata and config flags.
+
+    Cached per metadata key (see ``_gemm_symmetric_plan_cache``) so warm calls
+    skip major/dtype derivation and the compile-cache lookup. See ``_GemmPlan``
+    in gemm.py for the pattern.
+    """
+
+    compiled_fn: object
+    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    alpha_mode: int
+    beta_mode: int
+    max_active_clusters: int
+    max_swizzle_size: int
+    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
+    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
+
+
+_gemm_symmetric_plan_cache: dict[tuple, _GemmSymmetricPlan] = {}
+
+
 def gemm_symmetric(
     A: Tensor,  # (l, m, k)
     B: Tensor,  # (l, m, k)
@@ -374,9 +399,86 @@ def gemm_symmetric(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
+    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
+    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
+    # The key captures every input the plan build reads (D's metadata subsumes
+    # PostAct = D.mT), so a cache hit is exactly a replay of a previously
+    # validated call with different data pointers.
+    key = (
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(D),
+        tensor_key(C),
+        tile_count_semaphore is not None,
+        A.device,
+        tile_M,
+        tile_N,
+        tile_K,
+        cluster_M,
+        cluster_N,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
+        max_swizzle_size,
+        alpha_mode,
+        beta_mode,
+    )
+    plan = _gemm_symmetric_plan_cache.get(key)
+    if plan is None:
+        plan = _build_gemm_symmetric_plan(
+            A,
+            B,
+            D,
+            C,
+            tile_count_semaphore=tile_count_semaphore,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            alpha_mode=alpha_mode,
+            beta_mode=beta_mode,
+        )
+        _gemm_symmetric_plan_cache[key] = plan
+
     # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
+    epi_args = GemmActMixin.EpilogueArguments(
+        PostAct,
+        None,  # act_fn is Constexpr, baked in at compile time
+        alpha=scalar_arg(alpha, plan.alpha_mode),
+        beta=scalar_arg(beta, plan.beta_mode),
+        rounding_mode=None,
+        sr_seed=None,
+    )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, None)
 
+
+def _build_gemm_symmetric_plan(
+    A,
+    B,
+    D,
+    C,
+    *,
+    tile_count_semaphore,
+    tile_M,
+    tile_N,
+    cluster_M,
+    cluster_N,
+    tile_K,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    max_swizzle_size,
+    alpha_mode,
+    beta_mode,
+) -> _GemmSymmetricPlan:
+    PostAct = D.mT
     a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
@@ -395,8 +497,6 @@ def gemm_symmetric(
 
     tile_shape_mn = (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
-    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
 
     compiled_fn = _compile_gemm_symmetric(
         a_dtype,
@@ -423,31 +523,21 @@ def gemm_symmetric(
     max_active_clusters = (
         get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
     )
-
-    def scalar_arg(scalar, mode):
-        if mode == 0:
-            return None
-        elif mode == 1:
-            return Float32(scalar)
-        else:
-            return scalar.data_ptr()
-
-    epi_args = GemmActMixin.EpilogueArguments(
-        PostAct,
-        None,  # act_fn is Constexpr, baked in at compile time
-        alpha=scalar_arg(alpha, alpha_mode),
-        beta=scalar_arg(beta, beta_mode),
-        rounding_mode=None,
-        sr_seed=None,
+    # Must mirror make_fake_scheduler_args in _compile_gemm_symmetric: only the
+    # SM90 dynamic scheduler consumes the semaphore, so it's the only non-static case.
+    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
+    scheduler_static = (
+        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+        if not scheduler_uses_semaphore
+        else None
     )
-    scheduler_args = make_scheduler_args(
-        max_active_clusters,
-        max_swizzle_size,
-        tile_count_semaphore,
+    return _GemmSymmetricPlan(
+        compiled_fn=compiled_fn,
+        is_sm100_family=device_capacity[0] in [10, 11],
+        alpha_mode=alpha_mode,
+        beta_mode=beta_mode,
+        max_active_clusters=max_active_clusters,
+        max_swizzle_size=max_swizzle_size,
+        scheduler_uses_semaphore=scheduler_uses_semaphore,
+        scheduler_static=scheduler_static,
     )
-    varlen_args = None
-
-    if device_capacity[0] in [10, 11]:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, None, None)
-    else:
-        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)

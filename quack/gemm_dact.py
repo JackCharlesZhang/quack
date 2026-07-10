@@ -32,6 +32,9 @@ from quack.gemm_tvm_ffi_utils import (
     fake_batched,
     make_fake_gemm_tensors,
     compile_gemm_kernel,
+    tensor_key,
+    plan_scheduler_args,
+    launch_gemm,
 )
 from quack.cache import jit_cache
 from quack.rounding import RoundingMode
@@ -338,6 +341,30 @@ def _compile_gemm_dact(
     )
 
 
+class _GemmDActPlan(NamedTuple):
+    """Launch plan derived purely from tensor metadata and config flags.
+
+    Cached per metadata key (see ``_gemm_dact_plan_cache``) so warm calls skip
+    validation, major/dtype derivation, and the compile-cache lookup. See
+    ``_GemmPlan`` in gemm.py for the pattern. The key is computed on the
+    caller's original Out/PreAct (the dgated f32 reinterpretation is a
+    deterministic function of their metadata); the view itself is redone per
+    call since it creates new tensor objects anyway.
+    """
+
+    compiled_fn: object
+    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    is_dgated: bool
+    dgated_view_mT: bool  # AB-swapped dense dgated views Out/PreAct through .mT
+    max_active_clusters: int
+    max_swizzle_size: int
+    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
+    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
+
+
+_gemm_dact_plan_cache: dict[tuple, _GemmDActPlan] = {}
+
+
 def gemm_dact(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
@@ -362,6 +389,113 @@ def gemm_dact(
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     use_tma_gather: bool = False,
 ) -> None:
+    # The key captures every input the plan build reads (shapes and strides
+    # subsume the majors, the validation asserts, and the dgated f32 view), so
+    # a cache hit is exactly a replay of a previously validated call with
+    # different data pointers.
+    key = (
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(Out),
+        tensor_key(PreAct),
+        tensor_key(PostAct),
+        tensor_key(colvec_scale),
+        tensor_key(colvec_reduce),
+        tensor_key(cu_seqlens_m),
+        A_idx is not None,
+        tile_count_semaphore is not None,
+        A.device,
+        activation,
+        tile_M,
+        tile_N,
+        tile_K,
+        cluster_M,
+        cluster_N,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
+        max_swizzle_size,
+        use_tma_gather,
+    )
+    plan = _gemm_dact_plan_cache.get(key)
+    if plan is None:
+        plan = _build_gemm_dact_plan(
+            A,
+            B,
+            Out,
+            PreAct,
+            PostAct,
+            tile_count_semaphore=tile_count_semaphore,
+            activation=activation,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            colvec_scale=colvec_scale,
+            colvec_reduce=colvec_reduce,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            use_tma_gather=use_tma_gather,
+        )
+        _gemm_dact_plan_cache[key] = plan
+
+    if plan.is_dgated:
+        # Out/PreAct are 2 16-bit elements packed into 32 bits inside the kernel.
+        if plan.dgated_view_mT:
+            Out = Out.mT.view(torch.float32).mT
+            PreAct = PreAct.mT.view(torch.float32).mT
+        else:
+            Out = Out.view(torch.float32)
+            PreAct = PreAct.view(torch.float32)
+        epi_args = GemmDGatedMixin.EpilogueArguments(
+            PostAct,
+            None,  # act_bwd_fn is Constexpr
+            mColVecBroadcast=colvec_scale,
+            mColVecReduce=colvec_reduce,
+            rounding_mode=None,
+            sr_seed=None,
+        )
+    else:
+        epi_args = GemmDActMixin.EpilogueArguments(
+            PostAct,
+            None,
+            rounding_mode=None,
+            sr_seed=None,
+        )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+    launch_gemm(plan, A, B, Out, PreAct, epi_args, scheduler_args, varlen_args)
+
+
+def _build_gemm_dact_plan(
+    A,
+    B,
+    Out,
+    PreAct,
+    PostAct,
+    *,
+    tile_count_semaphore,
+    activation,
+    tile_M,
+    tile_N,
+    cluster_M,
+    cluster_N,
+    tile_K,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    max_swizzle_size,
+    colvec_scale,
+    colvec_reduce,
+    cu_seqlens_m,
+    A_idx,
+    use_tma_gather,
+) -> _GemmDActPlan:
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
         assert activation in dact_fn_map, f"Unsupported activation {activation}"
@@ -383,6 +517,7 @@ def gemm_dact(
 
     # For dgated, capture implicit_dtype before viewing Out/PreAct as f32
     implicit_dtype = None
+    dgated_view_mT = False
     if is_dgated:
         AB_swapped = Out.stride(-1) != 1
         implicit_dtype = torch2cute_dtype_map[Out.dtype]
@@ -392,6 +527,7 @@ def gemm_dact(
             Out = Out.view(torch.float32)
             PreAct = PreAct.view(torch.float32)
         else:
+            dgated_view_mT = True
             Out = Out.mT.view(torch.float32).mT
             PreAct = PreAct.mT.view(torch.float32).mT
 
@@ -447,33 +583,24 @@ def gemm_dact(
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    if is_dgated:
-        epi_args = GemmDGatedMixin.EpilogueArguments(
-            PostAct,
-            None,  # act_bwd_fn is Constexpr
-            mColVecBroadcast=colvec_scale,
-            mColVecReduce=colvec_reduce,
-            rounding_mode=None,
-            sr_seed=None,
-        )
-    else:
-        epi_args = GemmDActMixin.EpilogueArguments(
-            PostAct,
-            None,
-            rounding_mode=None,
-            sr_seed=None,
-        )
-    scheduler_args = make_scheduler_args(
-        max_active_clusters,
-        max_swizzle_size,
-        tile_count_semaphore,
+    # Must mirror make_fake_scheduler_args in _compile_gemm_dact: only the SM90
+    # dynamic scheduler consumes the semaphore, so it's the only non-static case.
+    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
+    scheduler_static = (
+        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+        if not scheduler_uses_semaphore
+        else None
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
-
-    if device_capacity[0] in [10, 11]:
-        compiled_fn(A, B, Out, PreAct, epi_args, scheduler_args, varlen_args, None, None)
-    else:
-        compiled_fn(A, B, Out, PreAct, epi_args, scheduler_args, varlen_args)
+    return _GemmDActPlan(
+        compiled_fn=compiled_fn,
+        is_sm100_family=device_capacity[0] in [10, 11],
+        is_dgated=is_dgated,
+        dgated_view_mT=dgated_view_mT,
+        max_active_clusters=max_active_clusters,
+        max_swizzle_size=max_swizzle_size,
+        scheduler_uses_semaphore=scheduler_uses_semaphore,
+        scheduler_static=scheduler_static,
+    )
 
 
 gemm_dgated = gemm_dact
