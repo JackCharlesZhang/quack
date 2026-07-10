@@ -114,34 +114,35 @@ def div_for_dtype(dtype):
     return 128 // dtype.width
 
 
-def perm3d_single(t, varlen_m=False):
-    """Permute a single 3D tensor from (L, *, *) to (*, *, L), skipping for varlen_m or 2D."""
-    return t.permute(1, 2, 0) if t is not None and t.ndim == 3 and not varlen_m else t
+def fake_batched(dtype, x, y, l, leading_dim, divisibility):
+    """Batch-first (l, x, y) fake tensor; ``leading_dim`` indexes into (x, y).
 
-
-def perm3d(A, B, D, C, varlen_m=False, varlen_k=False):
-    """Permute 3D tensors from (L, *, *) to (*, *, L)."""
-
-    def _perm(t):
-        return t.permute(1, 2, 0) if t is not None and t.ndim == 3 else t
-
-    if varlen_m:
-        return A, _perm(B), D, C
-    elif varlen_k:
-        return A, B, _perm(D), _perm(C)
-    else:
-        return _perm(A), _perm(B), _perm(D), _perm(C)
+    Batched tensors cross the FFI boundary in the caller's natural torch order
+    (l, x, y) and the kernel rotates them to (x, y, l) at trace time
+    (GemmBase.rotate_batch_last), so the batch dim always prepends — hence the
+    ``+ 1``. Pass ``l=None`` for a varlen-flattened 2D (x, y) tensor.
+    """
+    if l is None:
+        return fake_tensor(dtype, (x, y), leading_dim=leading_dim, divisibility=divisibility)
+    return fake_tensor(dtype, (l, x, y), leading_dim=leading_dim + 1, divisibility=divisibility)
 
 
 def get_major(t, dim0, dim1):
-    return dim1 if t.stride(1) == 1 else dim0
+    """Major of the trailing two logical dims: (l, x, y) or (x, y) — batch first.
+
+    Equivalent to the old ``stride(1) == 1`` check on a (x, y, l)-permuted
+    view: batched tensors now stay (l, x, y) on the host (the kernel rotates
+    them at trace time, see GemmBase.permute_batch_last), and for the 2D
+    varlen-flattened case ``stride(-1)`` is the same ``stride(1)``.
+    """
+    return dim1 if t.stride(-1) == 1 else dim0
 
 
-def get_majors(A_p, B_p, D_p, C_p):
-    a_major = get_major(A_p, "m", "k")
-    b_major = get_major(B_p, "n", "k")
-    d_major = get_major(D_p, "m", "n")
-    c_major = get_major(C_p, "m", "n") if C_p is not None else None
+def get_majors(A, B, D, C):
+    a_major = get_major(A, "m", "k")
+    b_major = get_major(B, "n", "k")
+    d_major = get_major(D, "m", "n")
+    c_major = get_major(C, "m", "n") if C is not None else None
     return a_major, b_major, d_major, c_major
 
 
@@ -226,6 +227,8 @@ def make_fake_gemm_tensors(
     Pass dtype=None to get None for that tensor (e.g. optional C).
     Returns (mA, mB, mD, mC, m, n, k, l).
     When varlen_m, m is total_m (flattened M of D/C). When varlen_k, k is total_k.
+
+    3D tensors are built batch-first (l, x, y); see :func:`fake_batched`.
     """
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
@@ -244,23 +247,23 @@ def make_fake_gemm_tensors(
         # m is total_m in this case: the flattened M dimension of D/C
         m = cute.sym_int()
         a_m = cute.sym_int() if gather_A else m
-        mA = fake_tensor(a_dtype, (a_m, k), leading_dim=a_leading, divisibility=div_a)
-        mB = fake_tensor(b_dtype, (n, k, l), leading_dim=b_leading, divisibility=div_b)
-        mD = fake_tensor(d_dtype, (m, n), leading_dim=d_leading, divisibility=div_d)
-        mC = fake_tensor(c_dtype, (m, n), leading_dim=c_leading, divisibility=div_c)
+        mA = fake_batched(a_dtype, a_m, k, None, a_leading, div_a)
+        mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
+        mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
     elif varlen_k:
         # k is total_k in this case: the flattened K dimension of A/B
         k = cute.sym_int()
         a_k = cute.sym_int() if gather_A else k
-        mA = fake_tensor(a_dtype, (m, a_k), leading_dim=a_leading, divisibility=div_a)
-        mB = fake_tensor(b_dtype, (n, k), leading_dim=b_leading, divisibility=div_b)
-        mD = fake_tensor(d_dtype, (m, n, l), leading_dim=d_leading, divisibility=div_d)
-        mC = fake_tensor(c_dtype, (m, n, l), leading_dim=c_leading, divisibility=div_c)
+        mA = fake_batched(a_dtype, m, a_k, None, a_leading, div_a)
+        mB = fake_batched(b_dtype, n, k, None, b_leading, div_b)
+        mD = fake_batched(d_dtype, m, n, l, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, n, l, c_leading, div_c)
     else:
-        mA = fake_tensor(a_dtype, (m, k, l), leading_dim=a_leading, divisibility=div_a)
-        mB = fake_tensor(b_dtype, (n, k, l), leading_dim=b_leading, divisibility=div_b)
-        mD = fake_tensor(d_dtype, (m, n, l), leading_dim=d_leading, divisibility=div_d)
-        mC = fake_tensor(c_dtype, (m, n, l), leading_dim=c_leading, divisibility=div_c)
+        mA = fake_batched(a_dtype, m, k, l, a_leading, div_a)
+        mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
+        mD = fake_batched(d_dtype, m, n, l, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, n, l, c_leading, div_c)
     return mA, mB, mD, mC, m, n, k, l
 
 

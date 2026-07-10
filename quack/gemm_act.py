@@ -28,12 +28,12 @@ from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_tvm_ffi_utils import (
     get_major,
-    perm3d_single,
     make_scheduler_args,
     make_varlen_args,
     make_fake_scheduler_args,
     make_fake_varlen_args,
     div_for_dtype,
+    fake_batched,
     make_fake_gemm_tensors,
     make_fake_sf_tensor,
     compile_gemm_kernel,
@@ -411,8 +411,7 @@ def _compile_gemm_act(
     pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
     div_pa = div_for_dtype(postact_dtype)
     pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
-    pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
-    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+    mAuxOut = fake_batched(postact_dtype, m, pa_n, None if varlen_m else l, pa_leading_dim, div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -521,17 +520,11 @@ def gemm_act(
         assert cu_seqlens_m is not None, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
 
-    A_p = perm3d_single(A, varlen_m)
-    B_p = perm3d_single(B)
-    D_p = perm3d_single(D, varlen_m)
-    C_p = perm3d_single(C, varlen_m)
-    PostAct_p = perm3d_single(PostAct, varlen_m)
-
-    a_major = get_major(A_p, "m", "k")
-    b_major = get_major(B_p, "n", "k")
-    d_major = get_major(D_p, "m", "n") if D_p is not None else None
-    c_major = get_major(C_p, "m", "n") if C_p is not None else None
-    postact_major = get_major(PostAct_p, "m", "n")
+    a_major = get_major(A, "m", "k")
+    b_major = get_major(B, "n", "k")
+    d_major = get_major(D, "m", "n") if D is not None else None
+    c_major = get_major(C, "m", "n") if C is not None else None
+    postact_major = get_major(PostAct, "m", "n")
 
     a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = torch2cute_dtype_map[B.dtype]
@@ -549,7 +542,6 @@ def gemm_act(
         assert not varlen_m and not gather_A, "Blockscaled GEMM does not support varlen/gather yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
-        # A / B are still (l, m, k) / (l, n, k) here (perm3d only made views).
         sf_dtype, sf_vec_size = validate_blockscaled_sf(A, B, SFA, SFB, device_capacity)
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
@@ -606,7 +598,7 @@ def gemm_act(
             return scalar.data_ptr()
 
     epi_args = GemmActMixin.EpilogueArguments(
-        PostAct_p,
+        PostAct,
         None,  # act_fn is Constexpr, pass None at call time
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
@@ -621,9 +613,9 @@ def gemm_act(
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, SFA, SFB)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
 
 
 gemm_gated = gemm_act

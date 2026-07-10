@@ -7,7 +7,6 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.runtime import make_ptr
 
-from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.activation import act_fn_map
 from quack.gemm_act import GemmActMixin
@@ -17,7 +16,8 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.gemm_tvm_ffi_utils import (
     div_for_dtype,
-    perm3d,
+    fake_batched,
+    get_major,
     get_majors,
     get_dtypes,
     make_scheduler_args,
@@ -307,16 +307,14 @@ def _compile_gemm_symmetric(
     c_leading = 1 if c_major == "n" else 0
     div_a, div_b = div_for_dtype(a_dtype), div_for_dtype(b_dtype)
     div_d, div_c = div_for_dtype(d_dtype), div_for_dtype(c_dtype) if c_dtype else 1
-    mA = fake_tensor(a_dtype, (m, k, l), leading_dim=a_leading, divisibility=div_a)
-    mB = fake_tensor(b_dtype, (m, k, l), leading_dim=b_leading, divisibility=div_b)
-    mD = fake_tensor(d_dtype, (m, m, l), leading_dim=d_leading, divisibility=div_d)
-    mC = fake_tensor(c_dtype, (m, m, l), leading_dim=c_leading, divisibility=div_c)
+    mA = fake_batched(a_dtype, m, k, l, a_leading, div_a)
+    mB = fake_batched(b_dtype, m, k, l, b_leading, div_b)
+    mD = fake_batched(d_dtype, m, m, l, d_leading, div_d)
+    mC = fake_batched(c_dtype, m, m, l, c_leading, div_c)
     # PostAct = D.mT, so it has the opposite major from D (m↔n swapped)
     div_pa = div_for_dtype(postact_dtype)
     postact_leading = 1 if postact_major == "n" else 0
-    mAuxOut = fake_tensor(
-        postact_dtype, (m, m, l), leading_dim=postact_leading, divisibility=div_pa
-    )
+    mAuxOut = fake_batched(postact_dtype, m, m, l, postact_leading, div_pa)
 
     def fake_scalar(mode):
         if mode == 0:
@@ -379,13 +377,11 @@ def gemm_symmetric(
     # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
 
-    A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
-    PostAct_p = PostAct.permute(1, 2, 0) if PostAct.ndim == 3 else PostAct
-    a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
+    a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
     # PostAct = D.mT has swapped major: if D is n-major, PostAct is m-major
-    postact_major = "n" if PostAct_p.stride(1) == 1 else "m"
+    postact_major = get_major(PostAct, "m", "n")
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
@@ -437,7 +433,7 @@ def gemm_symmetric(
             return scalar.data_ptr()
 
     epi_args = GemmActMixin.EpilogueArguments(
-        PostAct_p,
+        PostAct,
         None,  # act_fn is Constexpr, baked in at compile time
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
@@ -452,6 +448,6 @@ def gemm_symmetric(
     varlen_args = None
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)

@@ -573,6 +573,8 @@ class GemmSm100(GemmTmaBase):
         """
         if const_expr(self.blockscaled):
             assert mSFA is not None and mSFB is not None
+        # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
+        mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(mA, mB, mD, mC, epilogue_args)
         # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
         mA, mB, mD, mC = [
             layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)

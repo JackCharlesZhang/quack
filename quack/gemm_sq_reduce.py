@@ -34,11 +34,10 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cache import jit_cache
 from quack.gemm_tvm_ffi_utils import (
     div_for_dtype,
+    fake_batched,
     get_major,
     get_majors,
     get_dtypes,
-    perm3d,
-    perm3d_single,
     make_scheduler_args,
     make_varlen_args,
     make_fake_scheduler_args,
@@ -193,12 +192,7 @@ def _compile_gemm_sq_reduce(
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if aux_out_dtype is not None:
         aux_leading = 1 if aux_out_major == "n" else 0
-        mAuxOut = fake_tensor(
-            aux_out_dtype,
-            (m, n, l),
-            leading_dim=aux_leading,
-            divisibility=div_for_dtype(aux_out_dtype),
-        )
+        mAuxOut = fake_batched(aux_out_dtype, m, n, l, aux_leading, div_for_dtype(aux_out_dtype))
     else:
         mAuxOut = None
     epi_args = GemmCls.EpilogueArguments(
@@ -260,15 +254,12 @@ def gemm_sq_reduce(
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
 
-    A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
-    a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
+    a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
     if aux_out is not None:
-        AuxOut_p = perm3d_single(aux_out)
         aux_out_dtype = torch2cute_dtype_map[aux_out.dtype]
-        aux_out_major = get_major(AuxOut_p, "m", "n")
+        aux_out_major = get_major(aux_out, "m", "n")
     else:
-        AuxOut_p = None
         aux_out_dtype = None
         aux_out_major = None
 
@@ -303,7 +294,7 @@ def gemm_sq_reduce(
     epi_args = GemmSqReduceMixin.EpilogueArguments(
         mRowVecBroadcast=rowvec,
         mColVecReduce=colvec_reduce,
-        mAuxOut=AuxOut_p,
+        mAuxOut=aux_out,
         add_to_output=None,  # Constexpr, pass None at runtime
         rounding_mode=None,  # Constexpr, pass None at runtime
     )
@@ -313,6 +304,6 @@ def gemm_sq_reduce(
     varlen_args = make_varlen_args(None, None, None)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)

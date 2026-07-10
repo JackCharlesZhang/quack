@@ -13,10 +13,11 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import LayoutEnum
 
 import quack.copy_utils as copy_utils
+import quack.layout_utils as layout_utils
 import quack.utils as utils
 from quack.cute_dsl_utils import ParamsBase
+from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore
 from quack.gemm_config import SplitKMode
-from quack.epi_ops import EpiSmemBytes
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.tile_scheduler import (
@@ -64,6 +65,52 @@ class GemmBase:
     #   and applies the full epilogue math.
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
+
+    def rotate_batch_last(self, mA, mB, mD, mC, epilogue_args):
+        """Rotate all batched inputs from caller order (l, x, y) to kernel order (x, y, l).
+
+        Batched tensors cross the FFI boundary in caller order; __call__ rotates
+        them at trace time via this method. That replaces per-call torch
+        .permute() host views (~0.7us each) with a free compile-time layout
+        rewrite, so hosts pass torch tensors as-is. Fake tensors must be built
+        batch-first to match (see gemm_tvm_ffi_utils.fake_batched).
+        """
+        return (
+            *(self.permute_batch_last(t) for t in (mA, mB, mD, mC)),
+            self.permute_batch_last_epi_args(epilogue_args),
+        )
+
+    def permute_batch_last(self, mT: Optional[cute.Tensor]) -> Optional[cute.Tensor]:
+        """Trace-time (l, x, y) -> (x, y, l) permute of a batched tensor.
+
+        Rank-2 tensors (the varlen flattened operands, which are never
+        batch-permuted) and None pass through.
+        """
+        if const_expr(mT is not None and cute.rank(mT) == 3):
+            return layout_utils.select(mT, [1, 2, 0])
+        return mT
+
+    def permute_batch_last_epi_args(self, epilogue_args):
+        """Rotate the tile-shaped epilogue tensors from (l, m, n) to (m, n, l).
+
+        Exactly the TileStore/TileLoad fields of ``_epi_ops`` are GEMM-tile
+        shaped and consumed in kernel order (m, n, l) — PostAct/PreAct/aux
+        outputs and tile loads. Everything else keeps its host layout: vec
+        broadcasts are rank 1/2, and reduce outputs (e.g. a (l, m, n_tiles)
+        mColVecReduce) are batch-first natively. Rank-2 (varlen-flattened)
+        tile fields pass through like the main operands.
+        """
+        if const_expr(epilogue_args is None):
+            return epilogue_args
+        tile_fields = {
+            op.name for op in getattr(self, "_epi_ops", ()) if isinstance(op, (TileLoad, TileStore))
+        }
+        rotated = {
+            name: layout_utils.select(v, [1, 2, 0])
+            for name, v in zip(epilogue_args._fields, epilogue_args)
+            if name in tile_fields and isinstance(v, cute.Tensor) and cute.rank(v) == 3
+        }
+        return epilogue_args._replace(**rotated) if rotated else epilogue_args
 
     @dataclass
     class EpilogueArguments:
@@ -121,7 +168,7 @@ class GemmBase:
         use_stochastic_rounding = const_expr(
             self.rounding_mode == RoundingMode.RS
             and self.acc_dtype == cutlass.Float32
-            and self.d_dtype == cutlass.BFloat16
+            and self.d_dtype in (cutlass.BFloat16, cutlass.Float16)
         )
 
         # Setup aux outputs. Returns a tuple of ``(tiled_copy_r2s,
@@ -615,7 +662,6 @@ class GemmBase:
                     )
                 ),
                 cu_seqlens_m=varlen_args.mCuSeqlensM,
-                max_active_clusters=scheduler_args.max_active_clusters,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mn=self.cta_tile_shape_mnk[:2],

@@ -1,7 +1,7 @@
 # Copyright (c) 2025-2026, QuACK team.
 # GEMM compilation via TVM-FFI with fake tensors and NamedTuple args.
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch import Tensor
@@ -24,9 +24,9 @@ from quack.gemm_default_epi import (
 )
 from quack.rounding import RoundingMode
 from quack.gemm_tvm_ffi_utils import (
+    fake_batched,
     get_majors,
     get_dtypes,
-    perm3d,
     make_scheduler_args,
     make_varlen_args,
     make_fake_scheduler_args,
@@ -98,11 +98,8 @@ def _compile_gemm(
     if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
         # D is the f32 partials workspace; its batch extent is l * split_k, not l,
         # so it needs its own symbolic batch dim.
-        mD = fake_tensor(
-            d_dtype,
-            (m, n, cute.sym_int()),
-            leading_dim=1 if d_major == "n" else 0,
-            divisibility=128 // d_dtype.width,
+        mD = fake_batched(
+            d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
         )
 
     def fake_scalar(mode, dtype=Float32):
@@ -190,6 +187,144 @@ def _compile_gemm(
     )
 
 
+class _GemmPlan(NamedTuple):
+    """Launch plan derived purely from tensor metadata and config flags.
+
+    Cached per metadata key (see ``_gemm_plan_cache``) so warm calls skip
+    validation, major/dtype derivation, the compile-cache lookup, and the
+    construction of static argument templates. Everything here is immutable,
+    so reusing a plan (and its static NamedTuple arg templates) across calls
+    is safe.
+    """
+
+    compiled_fn: object
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA and take trailing (SFA, SFB) args
+    use_d_as_c: bool  # SM8x lowers add_to_output to C = D
+    alpha_mode: int
+    beta_mode: int
+    sr_seed_mode: int
+    epi_static: Optional[object]  # EpilogueArguments when it has no per-call values
+    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
+    max_active_clusters: int
+    max_swizzle_size: int
+    scheduler_uses_semaphore: bool  # SM8x/SM90 dynamic scheduler consumes the semaphore
+
+
+# (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
+# combinations, like the autotuner cache; the expensive compile is deduped one
+# level down by @jit_cache on _compile_gemm.
+_gemm_plan_cache: dict[tuple, _GemmPlan] = {}
+
+
+def _tensor_key(t: Optional[Tensor]):
+    return (t.dtype, tuple(t.shape), t.stride()) if t is not None else None
+
+
+def _scalar_arg(scalar, mode, dtype=Float32):
+    if mode == 0:
+        return None
+    elif mode == 1:
+        return dtype(scalar)
+    else:
+        return scalar.data_ptr()
+
+
+# Split-K: the full epilogue (alpha, beta*C, bias) runs exactly once per output tile,
+# on the entity that owns the completed f32 sum; non-finalizing splits emit raw f32
+# partials only. The buffers below are per-call allocations (the plan is cached and
+# immutable); the plan only bakes the redirected compile signature.
+
+
+def _staged_split_k_workspace(D, split_k):
+    """f32 partials workspace for SplitKMode.SEPARATE.
+
+    The GEMM stores raw f32 partials into a workspace whose batch mode is the
+    combined (l * split_k + split) index (majorness matches D, contiguous dim
+    padded to 16 bytes for TMA); the separate reduction kernel sums the splits
+    in fixed order and applies the epilogue — so all epi operands are routed
+    there, not into the GEMM.
+    """
+    num_l, len_m, len_n = D.shape
+    if D.stride(-1) == 1:  # n-major
+        n_pad = (len_n + 3) // 4 * 4
+        return torch.empty((num_l * split_k, len_m, n_pad), dtype=torch.float32, device=D.device)[
+            ..., :len_n
+        ]
+    else:  # m-major
+        m_pad = (len_m + 3) // 4 * 4
+        return torch.empty((num_l * split_k, len_n, m_pad), dtype=torch.float32, device=D.device)[
+            ..., :len_m
+        ].mT
+
+
+def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm100):
+    """Semaphore + partials workspace for SplitKMode.SERIAL / PARALLEL.
+
+    One Int32 completion flag per output tile (SERIAL: turnstile in split order,
+    deterministic; PARALLEL: arrival counter, not deterministic) plus a flat f32
+    region per tile holding the non-finalizing splits' raw accumulator fragments.
+    The scheduler's CTA tile ids are cluster-rounded (a boundary cluster can
+    contain CTAs whose tile is fully out of bounds but which still run the
+    protocol), so tile counts are rounded up to cluster multiples. The per-CTA
+    tile M must match the kernel exactly (the workspace region stride is
+    cta_tile_m * tile_N): SM100/110 2-CTA MMA (cluster_M even, tile_M 128/256)
+    halves it.
+    """
+    num_l, len_m, len_n = D.shape
+    use_2cta = sm100 and cluster_M % 2 == 0 and tile_M in (128, 256)
+    cta_tile_m = tile_M // 2 if use_2cta else tile_M
+    ntile_m = (len_m + cta_tile_m - 1) // cta_tile_m
+    ntile_n = (len_n + tile_N - 1) // tile_N
+    ntile_m = (ntile_m + cluster_M - 1) // cluster_M * cluster_M
+    ntile_n = (ntile_n + cluster_N - 1) // cluster_N * cluster_N
+    # Kernel-facing layouts are (ntile_m, ntile_n, L) and (E, ntile_m, ntile_n, L):
+    # the CuTe layouts own the address computation, so the kernel just slices them
+    # at (pid_m, pid_n, batch).
+    semaphore = torch.zeros((num_l, ntile_m, ntile_n), dtype=torch.int32, device=D.device)
+    tile_elems = cta_tile_m * tile_N
+    if split_k_mode == SplitKMode.SERIAL:
+        # Split 0's in-order plain store initializes each region.
+        workspace = torch.empty(
+            (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
+        )
+    else:
+        # PARALLEL: every split red.adds in arrival order; no initializing store.
+        workspace = torch.zeros(
+            (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
+        )
+    return semaphore, workspace
+
+
+def _reduce_staged_split_k(
+    split_k_workspace, D, C, split_k, alpha, beta, rowvec_bias, colvec_bias, add_to_output
+):
+    # The reduction kernel wants the contiguous dim last; transpose the views for
+    # m-major outputs (the kernel is elementwise in (m, n), so this is free; the
+    # row/col vector roles swap in the transposed space).
+    ws_v, out_v, c_v = split_k_workspace, D, C
+    rowvec_v, colvec_v = rowvec_bias, colvec_bias
+    if D.stride(-1) != 1:
+        ws_v, out_v = ws_v.transpose(1, 2), out_v.transpose(1, 2)
+        c_v = c_v.transpose(1, 2) if c_v is not None else None
+        rowvec_v, colvec_v = colvec_v, rowvec_v
+    if c_v is not None and c_v.stride(-1) != 1:
+        # The reduce kernel requires C contiguous along out's contiguous dim; a C
+        # whose majorness differs from D's (legal in the GEMM epilogue, which
+        # tracks c_major independently) is materialized once here.
+        c_v = c_v.contiguous()
+    split_k_reduce(
+        ws_v,
+        out_v,
+        split_k,
+        alpha=alpha,
+        beta=beta,
+        C=c_v,
+        rowvec_bias=rowvec_v,
+        colvec_bias=colvec_v,
+        add_to_output=add_to_output,
+    )
+
+
 def gemm(
     # (l, m, k) or (total_m, k) if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or (m, whatever) if gather_A_varlen_k
     A: Tensor,
@@ -231,6 +366,203 @@ def gemm(
     split_k: int = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
+    alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
+    beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+    )
+    concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
+    # The key captures every input the plan build below reads (shapes and
+    # strides subsume the majors, the validation asserts, and the fp4/SF shape
+    # checks), so a cache hit is exactly a replay of a previously validated
+    # call with different data pointers.
+    key = (
+        _tensor_key(A),
+        _tensor_key(B),
+        _tensor_key(D),
+        _tensor_key(C),
+        _tensor_key(SFA),
+        _tensor_key(SFB),
+        _tensor_key(rowvec_bias),
+        _tensor_key(colvec_bias),
+        _tensor_key(cu_seqlens_m),
+        _tensor_key(cu_seqlens_k),
+        A_idx is not None,
+        batch_idx_permute is not None,
+        tile_count_semaphore is not None,
+        A.device,
+        tile_M,
+        tile_N,
+        tile_K,
+        cluster_M,
+        cluster_N,
+        cluster_K,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
+        max_swizzle_size,
+        add_to_output,
+        rounding_mode,
+        use_tma_gather,
+        num_warps,
+        concat_key,
+        alpha_mode,
+        beta_mode,
+        sr_seed_mode,
+        split_k,
+        split_k_mode,
+    )
+    plan = _gemm_plan_cache.get(key)
+    if plan is None:
+        plan = _build_gemm_plan(
+            A,
+            B,
+            D,
+            C,
+            tile_count_semaphore=tile_count_semaphore,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            cluster_K=cluster_K,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            rowvec_bias=rowvec_bias,
+            colvec_bias=colvec_bias,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            add_to_output=add_to_output,
+            rounding_mode=rounding_mode,
+            use_tma_gather=use_tma_gather,
+            concat_layout=concat_key,
+            num_warps=num_warps,
+            SFA=SFA,
+            SFB=SFB,
+            alpha_mode=alpha_mode,
+            beta_mode=beta_mode,
+            sr_seed_mode=sr_seed_mode,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
+        _gemm_plan_cache[key] = plan
+
+    if plan.use_d_as_c:
+        C = D
+    # Split-K buffers are per-call allocations, never part of the cached plan:
+    # SEPARATE redirects the GEMM output to a fresh f32 partials workspace and runs
+    # the reduce kernel (which applies the full epilogue) afterwards; SERIAL/PARALLEL
+    # thread a per-tile semaphore and partials workspace through the epilogue args.
+    D_gemm, C_gemm = D, C
+    split_k_semaphore, split_k_workspace = None, None
+    staged_split_k = False
+    if split_k > 1:
+        split_k_mode = SplitKMode(split_k_mode)
+        staged_split_k = split_k_mode == SplitKMode.SEPARATE
+        if staged_split_k:
+            split_k_workspace = _staged_split_k_workspace(D, split_k)
+            D_gemm, C_gemm = split_k_workspace, None
+        else:
+            split_k_semaphore, split_k_workspace = _split_k_buffers(
+                D,
+                split_k_mode,
+                tile_M,
+                tile_N,
+                cluster_M,
+                cluster_N,
+                plan.is_sm100_family,
+            )
+    # No permutes here: the kernel was compiled batch-first and rotates
+    # (l, x, y) -> (x, y, l) at trace time (GemmBase.permute_batch_last).
+    epi_args = plan.epi_static
+    if epi_args is None:
+        epi_args = GemmDefaultEpiMixin.EpilogueArguments(
+            alpha=_scalar_arg(alpha, plan.alpha_mode),
+            beta=_scalar_arg(beta, plan.beta_mode),
+            mRowVecBroadcast=rowvec_bias,
+            mColVecBroadcast=colvec_bias,
+            add_to_output=None,
+            rounding_mode=None,
+            sr_seed=_scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
+            split_k_semaphore=(
+                split_k_semaphore.permute(1, 2, 0) if split_k_semaphore is not None else None
+            ),
+            split_k_workspace=(
+                split_k_workspace.permute(3, 1, 2, 0) if split_k_semaphore is not None else None
+            ),
+        )
+    scheduler_args = plan.scheduler_static
+    if scheduler_args is None:
+        scheduler_args = make_scheduler_args(
+            plan.max_active_clusters,
+            plan.max_swizzle_size,
+            # Must mirror make_fake_scheduler_args in _compile_gemm: only the
+            # SM8x/SM90 dynamic scheduler consumes the semaphore; SM100 uses
+            # CLC instead, and the compiled signature has None there.
+            tile_count_semaphore if plan.scheduler_uses_semaphore else None,
+            batch_idx_permute,
+        )
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+
+    if plan.is_sm100_family:
+        plan.compiled_fn(A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    else:
+        plan.compiled_fn(A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args)
+
+    if staged_split_k:
+        _reduce_staged_split_k(
+            split_k_workspace,
+            D,
+            C,
+            split_k,
+            alpha=alpha,
+            beta=beta,
+            rowvec_bias=rowvec_bias,
+            colvec_bias=colvec_bias,
+            add_to_output=add_to_output,
+        )
+
+
+def _build_gemm_plan(
+    A,
+    B,
+    D,
+    C,
+    *,
+    tile_count_semaphore,
+    tile_M,
+    tile_N,
+    cluster_M,
+    cluster_N,
+    cluster_K,
+    tile_K,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    max_swizzle_size,
+    rowvec_bias,
+    colvec_bias,
+    cu_seqlens_m,
+    cu_seqlens_k,
+    A_idx,
+    batch_idx_permute,
+    add_to_output,
+    rounding_mode,
+    use_tma_gather,
+    concat_layout,  # already normalized to a sorted tuple
+    num_warps,
+    SFA,
+    SFB,
+    alpha_mode,
+    beta_mode,
+    sr_seed_mode,
+    split_k,
+    split_k_mode,
+) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
@@ -285,98 +617,42 @@ def gemm(
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
+    if device_capacity[0] == 12 and A.dtype.itemsize == 1:
+        # SM120 GEMM is warp-level MmaF16BF16Op, which only accepts fp16/bf16 operands
+        # (see quack/gemm_sm120.py). Guard here so fp8 inputs fail with a clear message
+        # instead of a cryptic OpError deep inside MMA-atom construction.
+        raise ValueError("SM120 GEMM does not support fp8 (8-bit) inputs; use fp16/bf16")
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
-    if rounding_mode == RoundingMode.RS:
-        assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
     if is_dynamic_persistent and device_capacity[0] <= 9:
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler for SM8x and SM90 requires a semaphore in GMEM"
         )
+    use_d_as_c = False
     if device_capacity[0] == 8:
         if add_to_output:
             C = D
             add_to_output = False
+            use_d_as_c = True
 
-    # Split-K: the full epilogue (alpha, beta*C, bias) runs exactly once per output tile,
-    # on the entity that owns the completed f32 sum; non-finalizing splits emit raw f32
-    # partials only.
-    # SEPARATE: the GEMM stores raw f32 partials into a workspace whose batch mode is the
-    # combined (l * split_k + split) index (majorness matches D, contiguous dim padded to
-    # 16 bytes for TMA); the separate reduction kernel sums the splits in fixed order and
-    # applies the epilogue — so all epi operands are routed there, not into the GEMM.
-    D_gemm = D
-    C_gemm = C
-    alpha_gemm, beta_gemm = alpha, beta
+    a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
+    a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
+
+    # SEPARATE split-K routes every epi operand (alpha, beta*C, bias, add_to_output)
+    # to the reduce kernel; the GEMM itself writes raw f32 partials into a per-call
+    # workspace (see _staged_split_k_workspace) with D's majorness, so the compiled
+    # signature sees an f32 D and no epilogue extras.
+    staged_split_k = split_k > 1 and split_k_mode == SplitKMode.SEPARATE
     rowvec_gemm, colvec_gemm = rowvec_bias, colvec_bias
-    split_k_workspace = None
     gemm_add_to_output = add_to_output
-    if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
-        num_l, len_m, len_n = D.shape
-        if D.stride(-1) == 1:  # n-major
-            n_pad = (len_n + 3) // 4 * 4
-            split_k_workspace = torch.empty(
-                (num_l * split_k, len_m, n_pad), dtype=torch.float32, device=D.device
-            )[..., :len_n]
-        else:  # m-major
-            m_pad = (len_m + 3) // 4 * 4
-            split_k_workspace = torch.empty(
-                (num_l * split_k, len_n, m_pad), dtype=torch.float32, device=D.device
-            )[..., :len_m].mT
-        D_gemm = split_k_workspace
-        # The epilogue (and the prior value of D for add_to_output) is applied once by
-        # the reduction kernel instead.
-        C_gemm = None
-        alpha_gemm, beta_gemm = 1.0, 1.0
+    if staged_split_k:
+        d_dtype = Float32
+        c_dtype, c_major = None, None
+        alpha_mode, beta_mode, sr_seed_mode = 0, 0, 0
         rowvec_gemm, colvec_gemm = None, None
         gemm_add_to_output = False
-    # SERIAL/PARALLEL: one Int32 completion flag per output tile (SERIAL: turnstile in
-    # split order, deterministic; PARALLEL: arrival counter, not deterministic) plus a
-    # flat f32 region per tile holding the non-finalizing splits' raw accumulator
-    # fragments. The scheduler's CTA tile ids are cluster-rounded (a boundary cluster can
-    # contain CTAs whose tile is fully out of bounds but which still run the protocol),
-    # so tile counts are rounded up to cluster multiples. The per-CTA tile M must match
-    # the kernel exactly (the workspace region stride is cta_tile_m * tile_N): SM100/110
-    # 2-CTA MMA (cluster_M even, tile_M 128/256) halves it.
-    split_k_semaphore = None
-    if split_k > 1 and split_k_mode != SplitKMode.SEPARATE:
-        num_l, len_m, len_n = D.shape
-        use_2cta = device_capacity[0] in (10, 11) and cluster_M % 2 == 0 and tile_M in (128, 256)
-        cta_tile_m = tile_M // 2 if use_2cta else tile_M
-        ntile_m = (len_m + cta_tile_m - 1) // cta_tile_m
-        ntile_n = (len_n + tile_N - 1) // tile_N
-        ntile_m = (ntile_m + cluster_M - 1) // cluster_M * cluster_M
-        ntile_n = (ntile_n + cluster_N - 1) // cluster_N * cluster_N
-        # Kernel-facing layouts are (ntile_m, ntile_n, L) and (E, ntile_m, ntile_n, L):
-        # the CuTe layouts own the address computation, so the kernel just slices them
-        # at (pid_m, pid_n, batch).
-        split_k_semaphore = torch.zeros(
-            (num_l, ntile_m, ntile_n), dtype=torch.int32, device=D.device
-        )
-        tile_elems = cta_tile_m * tile_N
-        if split_k_mode == SplitKMode.SERIAL:
-            # Split 0's in-order plain store initializes each region.
-            split_k_workspace = torch.empty(
-                (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
-            )
-        else:
-            # PARALLEL: every split red.adds in arrival order; no initializing store.
-            split_k_workspace = torch.zeros(
-                (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
-            )
 
-    A_p, B_p, D_p, C_p = perm3d(A, B, D_gemm, C_gemm, varlen_m=varlen_m, varlen_k=varlen_k)
-    a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
-    a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D_gemm, C_gemm)
-
-    alpha_mode = 2 if isinstance(alpha_gemm, Tensor) else (1 if alpha_gemm != 1.0 else 0)
-    beta_mode = 2 if isinstance(beta_gemm, Tensor) else (1 if beta_gemm != 1.0 else 0)
     colvec_ndim = colvec_gemm.ndim if colvec_gemm is not None else 0
-    concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
-
-    sr_seed_mode = (
-        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
-    )
     tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
     compiled_fn = _compile_gemm(
         a_dtype,
@@ -414,80 +690,47 @@ def gemm(
         split_k_mode,
     )
 
-    def reduce_staged_split_k():
-        # The reduction kernel wants the contiguous dim last; transpose the views for
-        # m-major outputs (the kernel is elementwise in (m, n), so this is free; the
-        # row/col vector roles swap in the transposed space).
-        ws_v, out_v, c_v = split_k_workspace, D, C
-        rowvec_v, colvec_v = rowvec_bias, colvec_bias
-        if D.stride(-1) != 1:
-            ws_v, out_v = ws_v.transpose(1, 2), out_v.transpose(1, 2)
-            c_v = c_v.transpose(1, 2) if c_v is not None else None
-            rowvec_v, colvec_v = colvec_v, rowvec_v
-        if c_v is not None and c_v.stride(-1) != 1:
-            # The reduce kernel requires C contiguous along out's contiguous dim; a C
-            # whose majorness differs from D's (legal in the GEMM epilogue, which
-            # tracks c_major independently) is materialized once here.
-            c_v = c_v.contiguous()
-        split_k_reduce(
-            ws_v,
-            out_v,
-            split_k,
-            alpha=alpha,
-            beta=beta,
-            C=c_v,
-            rowvec_bias=rowvec_v,
-            colvec_bias=colvec_v,
-            add_to_output=add_to_output,
-        )
-
-    staged_split_k = split_k > 1 and split_k_mode == SplitKMode.SEPARATE
-
-    def scalar_arg(scalar, mode, dtype=Float32):
-        if mode == 0:
-            return None
-        elif mode == 1:
-            return dtype(scalar)
-        else:
-            return scalar.data_ptr()
-
     cluster_size = cluster_M * cluster_N * cluster_K
     max_active_clusters = (
         get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
     )
+    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9
 
-    epi_args = GemmDefaultEpiMixin.EpilogueArguments(
-        alpha=scalar_arg(alpha_gemm, alpha_mode),
-        beta=scalar_arg(beta_gemm, beta_mode),
-        mRowVecBroadcast=rowvec_gemm,
-        mColVecBroadcast=colvec_gemm,
-        add_to_output=None,
-        rounding_mode=None,
-        sr_seed=scalar_arg(sr_seed, sr_seed_mode, dtype=Int32),
-        split_k_semaphore=(
-            split_k_semaphore.permute(1, 2, 0) if split_k_semaphore is not None else None
-        ),
-        split_k_workspace=(
-            split_k_workspace.permute(3, 1, 2, 0)
-            if split_k_workspace is not None and split_k_mode != SplitKMode.SEPARATE
-            else None
-        ),
+    # SERIAL/PARALLEL split-K passes per-call semaphore/workspace tensors through the
+    # epilogue args, so those can never be static; SEPARATE always is (every epi
+    # operand is routed to the reduce kernel, the modes above were zeroed).
+    epi_static = None
+    if (
+        alpha_mode == 0
+        and beta_mode == 0
+        and sr_seed_mode == 0
+        and rowvec_gemm is None
+        and colvec_gemm is None
+        and (split_k == 1 or staged_split_k)
+    ):
+        epi_static = GemmDefaultEpiMixin.EpilogueArguments(
+            alpha=None,
+            beta=None,
+            mRowVecBroadcast=None,
+            mColVecBroadcast=None,
+            add_to_output=None,
+            rounding_mode=None,
+            sr_seed=None,
+        )
+    scheduler_static = None
+    if not scheduler_uses_semaphore and batch_idx_permute is None:
+        scheduler_static = make_scheduler_args(max_active_clusters, max_swizzle_size, None, None)
+
+    return _GemmPlan(
+        compiled_fn=compiled_fn,
+        is_sm100_family=device_capacity[0] in [10, 11],
+        use_d_as_c=use_d_as_c,
+        alpha_mode=alpha_mode,
+        beta_mode=beta_mode,
+        sr_seed_mode=sr_seed_mode,
+        epi_static=epi_static,
+        scheduler_static=scheduler_static,
+        max_active_clusters=max_active_clusters,
+        max_swizzle_size=max_swizzle_size,
+        scheduler_uses_semaphore=scheduler_uses_semaphore,
     )
-    scheduler_args = make_scheduler_args(
-        max_active_clusters,
-        max_swizzle_size,
-        # Must mirror make_fake_scheduler_args in _compile_gemm: only the SM8x/SM90
-        # dynamic scheduler consumes the semaphore; SM100 uses CLC instead, and the
-        # compiled signature has None there.
-        tile_count_semaphore if (is_dynamic_persistent and device_capacity[0] <= 9) else None,
-        batch_idx_permute,
-    )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
-
-    if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, SFA, SFB)
-    else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
-
-    if staged_split_k:
-        reduce_staged_split_k()

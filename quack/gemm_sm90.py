@@ -393,6 +393,8 @@ class GemmSm90(GemmTmaBase):
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
+        # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
+        mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(mA, mB, mD, mC, epilogue_args)
 
         # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
         mA, mB, mD, mC = [
@@ -619,6 +621,8 @@ class GemmSm90(GemmTmaBase):
             # Keep scheduler scratch out of SharedStorage. A small buffer before
             # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
             # responses also use i128 copies, so this stays 16-byte aligned.
+            # No drain-mailbox tail (+6 Int32, cf. gemm_sm100): this kernel never
+            # calls cancel_pending_tail — add the tail if that ever changes.
             sched_data = smem.allocate_tensor(
                 Int32,
                 cute.make_layout((4, self.sched_stage)),

@@ -24,12 +24,12 @@ from quack.cute_dsl_utils import (
 )
 from quack.gemm_tvm_ffi_utils import (
     get_major,
-    perm3d_single,
     make_scheduler_args,
     make_varlen_args,
     make_fake_scheduler_args,
     make_fake_varlen_args,
     div_for_dtype,
+    fake_batched,
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
@@ -270,8 +270,7 @@ def _compile_gemm_dact(
     )
     div_pa = div_for_dtype(postact_dtype)
     pa_leading = 1 if postact_major == "n" else 0
-    pa_shape = (m, n) if varlen_m else (m, n, l)
-    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading, divisibility=div_pa)
+    mAuxOut = fake_batched(postact_dtype, m, n, None if varlen_m else l, pa_leading, div_pa)
 
     if is_dgated:
         act_fn = dgate_fn_map[activation]
@@ -396,17 +395,11 @@ def gemm_dact(
             Out = Out.mT.view(torch.float32).mT
             PreAct = PreAct.mT.view(torch.float32).mT
 
-    A_p = perm3d_single(A, varlen_m)
-    B_p = perm3d_single(B)
-    Out_p = perm3d_single(Out, varlen_m)
-    PreAct_p = perm3d_single(PreAct, varlen_m)
-    PostAct_p = perm3d_single(PostAct, varlen_m)
-
-    a_major = get_major(A_p, "m", "k")
-    b_major = get_major(B_p, "n", "k")
-    d_major = get_major(Out_p, "m", "n")
-    c_major = get_major(PreAct_p, "m", "n")
-    postact_major = get_major(PostAct_p, "m", "n")
+    a_major = get_major(A, "m", "k")
+    b_major = get_major(B, "n", "k")
+    d_major = get_major(Out, "m", "n")
+    c_major = get_major(PreAct, "m", "n")
+    postact_major = get_major(PostAct, "m", "n")
 
     a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = torch2cute_dtype_map[B.dtype]
@@ -456,7 +449,7 @@ def gemm_dact(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     if is_dgated:
         epi_args = GemmDGatedMixin.EpilogueArguments(
-            PostAct_p,
+            PostAct,
             None,  # act_bwd_fn is Constexpr
             mColVecBroadcast=colvec_scale,
             mColVecReduce=colvec_reduce,
@@ -465,7 +458,7 @@ def gemm_dact(
         )
     else:
         epi_args = GemmDActMixin.EpilogueArguments(
-            PostAct_p,
+            PostAct,
             None,
             rounding_mode=None,
             sr_seed=None,
@@ -478,9 +471,9 @@ def gemm_dact(
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None)
+        compiled_fn(A, B, Out, PreAct, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args)
+        compiled_fn(A, B, Out, PreAct, epi_args, scheduler_args, varlen_args)
 
 
 gemm_dgated = gemm_dact
