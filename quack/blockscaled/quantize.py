@@ -9,7 +9,11 @@ All quantizers are pure-PyTorch. Use the `to_mx_compiled` / `to_mxfp4_compiled` 
 `to_nvfp4_compiled` module-level handles if you want torch.compile-generated
 Triton kernels (much faster on big tensors; one-time compile overhead).
 
-Only the FLOOR scaling mode is ported (torchao's default for MX formats).
+Scale modes: `to_mx` (MXFP8) supports "rceil" (default) and "floor". This is a
+deliberate departure from torchao, whose MX default is FLOOR: NVIDIA's MXFP8
+pretraining recipe (arXiv:2506.08027) requires round-up (RCEIL) scales for
+bf16 loss parity — FLOOR clips block maxima in (448, 512)·2^e, which hurts
+especially on gradient tensors. The FP4 quantizers remain FLOOR-only.
 """
 
 import torch
@@ -36,11 +40,18 @@ def _n_ones(n: int) -> int:
     return (1 << n) - 1
 
 
-def to_mx(data_hp: torch.Tensor, block_size: int = 32):
-    """MXFP8-e4m3 quantization with FLOOR scaling.
+def to_mx(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
+    """MXFP8-e4m3 quantization.
 
     Args:
         data_hp: (..., K) bf16 or fp32 tensor, contiguous, K % block_size == 0.
+        scaling_mode:
+            "rceil" (default): scale = 2^ceil(log2(max_abs / 448)), the OCP MX
+                hardware-conversion rule — the smallest power of two such that
+                the block max never saturates e4m3. NVIDIA's MXFP8 pretraining
+                recipe (arXiv:2506.08027) requires this for bf16 loss parity.
+            "floor": scale = 2^(floor(log2(max_abs)) - 8), torchao's MX default;
+                clips block maxima in (448, 512)·2^e. Kept for torchao parity.
     Returns:
         qdata: (..., K) float8_e4m3fn
         scale: (..., K // block_size) float8_e8m0fnu
@@ -48,6 +59,7 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32):
     assert data_hp.dtype in (torch.bfloat16, torch.float32)
     assert data_hp.shape[-1] % block_size == 0
     assert data_hp.is_contiguous()
+    assert scaling_mode in ("rceil", "floor")
 
     orig_shape = data_hp.shape
     data_hp = data_hp.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
@@ -56,16 +68,10 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32):
     data_hp = data_hp.to(torch.float32)
     max_abs = max_abs.to(torch.float32)
 
-    # FLOOR scaling: extract biased exponent of max_abs via bit-shift
-    max_abs_int32 = max_abs.view(torch.int32)
-    extracted_pow2 = ((torch.bitwise_right_shift(max_abs_int32, MBITS_F32)) & 0xFF) - F32_EXP_BIAS
-    scale_e8m0_unbiased = extracted_pow2 - F8E4M3_MAX_POW2
-    scale_e8m0_unbiased = torch.clamp(
-        scale_e8m0_unbiased, min=-E8M0_EXPONENT_BIAS, max=E8M0_EXPONENT_BIAS + 1
-    )
-    scale_e8m0_biased = (scale_e8m0_unbiased + E8M0_EXPONENT_BIAS).to(torch.uint8)
-    # restore NaN sentinel (uint8 cast drops NaN)
-    scale_e8m0_biased = torch.where(torch.isnan(max_abs), E8M0_EXPONENT_NAN_VAL, scale_e8m0_biased)
+    if scaling_mode == "rceil":
+        scale_e8m0_biased = _compute_e8m0_scale_rceil(max_abs, F8E4M3_MAX)
+    else:
+        scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, F8E4M3_MAX_POW2)
 
     # reconstruct fp32 scale from biased exponent
     scale_fp32 = (torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)).view(
@@ -81,6 +87,54 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32):
 
     qdata = data_lp.to(torch.float8_e4m3fn).reshape(orig_shape)
     scale = scale_e8m0_biased.view(torch.float8_e8m0fnu).squeeze(-1)
+    return qdata, scale
+
+
+def to_mx_dim0(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
+    """MXFP8-e4m3 quantization of a 2D tensor along dim 0 ("columnwise").
+
+    Same numerics as `to_mx` on the transposed input, but without materializing
+    a transposed high-precision copy: qdata keeps the input's (M, K) shape and
+    row-major layout; only the scale blocks run along M.
+
+    Training GEMMs whose reduction dim is the token axis (wgrad) or the
+    out-feature axis (dgrad) need this orientation: MX scale blocks must run
+    along the reduction dim, and since SM100 accepts MN-major operands the data
+    layout can stay row-major — rowwise and dim0 copies differ in fp8 *values*
+    (per-block scales differ), so each must be quantized from the hp source.
+
+    Args:
+        data_hp: (M, K) bf16 or fp32 tensor, contiguous, M % block_size == 0.
+    Returns:
+        qdata: (M, K) float8_e4m3fn, row-major
+        scale: (M // block_size, K) float8_e8m0fnu
+    """
+    assert data_hp.ndim == 2
+    assert data_hp.dtype in (torch.bfloat16, torch.float32)
+    assert data_hp.shape[0] % block_size == 0
+    assert data_hp.is_contiguous()
+    assert scaling_mode in ("rceil", "floor")
+
+    m, k = data_hp.shape
+    blocks = data_hp.view(m // block_size, block_size, k)
+    max_abs = torch.amax(torch.abs(blocks), 1, keepdim=True).to(torch.float32)
+
+    if scaling_mode == "rceil":
+        scale_e8m0_biased = _compute_e8m0_scale_rceil(max_abs, F8E4M3_MAX)
+    else:
+        scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, F8E4M3_MAX_POW2)
+
+    scale_fp32 = (torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)).view(
+        torch.float32
+    )
+    scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+
+    data_lp = blocks.to(torch.float32) / scale_fp32
+    if not torch._dynamo.is_compiling():
+        data_lp = torch.clamp(data_lp, min=-F8E4M3_MAX, max=F8E4M3_MAX)
+
+    qdata = data_lp.to(torch.float8_e4m3fn).view(m, k)
+    scale = scale_e8m0_biased.view(torch.float8_e8m0fnu).squeeze(1)
     return qdata, scale
 
 
@@ -146,6 +200,24 @@ def _compute_e8m0_scale_floor(max_abs: torch.Tensor, target_max_pow2: int) -> to
         scale_unbiased, min=-E8M0_EXPONENT_BIAS, max=E8M0_EXPONENT_BIAS + 1
     )
     scale_biased = (scale_unbiased + E8M0_EXPONENT_BIAS).to(torch.uint8)
+    scale_biased = torch.where(torch.isnan(max_abs), E8M0_EXPONENT_NAN_VAL, scale_biased)
+    return scale_biased
+
+
+def _compute_e8m0_scale_rceil(max_abs: torch.Tensor, target_max: float) -> torch.Tensor:
+    """Return biased E8M0 scale (uint8) for RCEIL-mode MX quantization.
+
+    2^ceil(log2(max_abs / target_max)): round the exact scale up to the next
+    power of two, so max_abs / scale <= target_max always (no saturation).
+    """
+    scale_int32 = (max_abs / target_max).view(torch.int32)
+    exp_biased = torch.bitwise_right_shift(scale_int32, MBITS_F32) & 0xFF
+    has_frac = (scale_int32 & _n_ones(MBITS_F32)) != 0
+    # +1 exponent unless already an exact power of two; a denormal ratio rounds
+    # up to 2^-126 (biased 1), keeping the no-saturation guarantee.
+    scale_biased = torch.clamp(exp_biased + has_frac.to(torch.int32), max=E8M0_EXPONENT_NAN_VAL)
+    scale_biased = scale_biased.to(torch.uint8)
+    # inf lands on the sentinel via exp 255; make NaN explicit like FLOOR does
     scale_biased = torch.where(torch.isnan(max_abs), E8M0_EXPONENT_NAN_VAL, scale_biased)
     return scale_biased
 
@@ -234,11 +306,23 @@ def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
 
 # ---------------------------------------------------------------------------
 # torch.compile-wrapped fast paths. Generates fused Triton quant kernels via
-# Inductor. dynamic=True avoids recompilation on shape changes.
+# Inductor. dynamic=False is load-bearing: with dynamic shapes Inductor emits a
+# ~24x slower kernel for this reduce-then-quantize pattern (measured on B300 at
+# (65536, 2048) bf16: 254 GB/s dynamic vs 6 TB/s static — near HBM speed).
+# Static shapes recompile per distinct shape; a transformer's quantize sites
+# see roughly a dozen (per-linear x/dy/w in two orientations), which exceeds
+# dynamo's default recompile_limit of 8 — past it, dynamo SILENTLY falls back
+# to eager (the 24x-slower path) for new shapes. The limit must be raised via
+# the per-wrapper torch.compile kwarg, NOT `torch._dynamo.config.recompile_limit
+# = 64`: config assignments are thread-local, and backward-pass shapes compile
+# on the autograd worker thread, which would still see the default 8.
 # ---------------------------------------------------------------------------
-to_mx_compiled = torch.compile(to_mx, dynamic=True)
-to_mxfp4_compiled = torch.compile(to_mxfp4, dynamic=True)
-to_nvfp4_compiled = torch.compile(to_nvfp4, dynamic=True)
+_COMPILE_KW = dict(dynamic=False, recompile_limit=64)
+
+to_mx_compiled = torch.compile(to_mx, **_COMPILE_KW)
+to_mx_dim0_compiled = torch.compile(to_mx_dim0, **_COMPILE_KW)
+to_mxfp4_compiled = torch.compile(to_mxfp4, **_COMPILE_KW)
+to_nvfp4_compiled = torch.compile(to_nvfp4, **_COMPILE_KW)
 
 
 def _ceil_div(a, b):

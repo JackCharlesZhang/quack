@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
+from quack.blockscaled.utils import blockscaled_quantize_dim0
 from quack.gemm_interface import (
     gemm,
     gemm_act,
@@ -318,3 +319,39 @@ def test_blockscaled_gemm_tuned(fmt):
     ref = gemm_blockscaled_ref(A, B)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"{fmt} tuned: rel_err={rel}"
+
+
+def test_blockscaled_gemm_training_orientations():
+    """The three GEMMs of a training linear (Y = X W^T), with the backward
+    operands quantized along their reduction dims via blockscaled_quantize_dim0
+    and consumed MN-major — data stays row-major throughout, only scales differ:
+      fwd:   Y  = X W^T   (X, W rowwise)
+      dgrad: dX = dY W    (dY rowwise, W dim0; B (N, K) n-major)
+      wgrad: dW = dY^T X  (dY, X dim0; A (N, M) m-major, B (M, K) n-major)
+    """
+    _skip_if_not_sm100()
+    torch.manual_seed(0)
+    m, n, k = 256, 320, 512  # tokens, out-features, in-features
+    X = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    W = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    dY = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+
+    def check(A, B, truth, label, quant_tol):
+        out = gemm(A, B, tuned=False)
+        ref = gemm_blockscaled_ref(A, B)  # exact dequant reference
+        rel_kernel = (out.float() - ref.float()).abs().max() / ref.float().abs().max()
+        assert rel_kernel < 5e-3, f"{label}: kernel vs dequant-ref rel={rel_kernel}"
+        rel_quant = (out.float() - truth).norm() / truth.norm()
+        assert rel_quant < quant_tol, f"{label}: vs bf16 truth rel={rel_quant}"
+
+    qw_row, sfw_row = blockscaled_quantize(W)
+    check(blockscaled_quantize(X), (qw_row.mT, sfw_row), X.float() @ W.float().T, "fwd", 0.04)
+    check(
+        blockscaled_quantize(dY),
+        blockscaled_quantize_dim0(W),
+        dY.float() @ W.float(),
+        "dgrad",
+        0.04,
+    )
+    qdy, sfdy = blockscaled_quantize_dim0(dY)
+    check((qdy.mT, sfdy), blockscaled_quantize_dim0(X), dY.float().T @ X.float(), "wgrad", 0.04)
