@@ -223,6 +223,8 @@ class GemmSm120(GemmSm90):
             # Keep scheduler scratch out of SharedStorage. A small buffer before
             # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
             # responses also use i128 copies, so this stays 16-byte aligned.
+            # No drain-mailbox tail (+6 Int32, cf. gemm_sm100): this kernel never
+            # calls cancel_pending_tail — add the tail if that ever changes.
             sched_data = smem.allocate_tensor(
                 Int32,
                 cute.make_layout((4, self.sched_stage)),

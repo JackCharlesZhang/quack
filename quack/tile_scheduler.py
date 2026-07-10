@@ -44,34 +44,11 @@ class PersistenceMode(IntEnum):
 # expect_tx count both producers arm on the full barrier.
 SCHED_SLOT_BYTES = 16
 
-# Cap on fire-and-forget try_cancels a retiring cluster sprays to drain the pending
-# pool tail (see TileScheduler.cancel_pending_tail). There is no loop: looping
-# "until the pool is empty" requires observing responses, which is the synchronous
-# drain this design replaces — a fixed blind count is the only non-observing option,
-# and the launched-straggler cascade acts as the loop across generations.
-#
-# Sizing rule: CLC_DRAIN_CANCELS * num_resident_clusters >= typical padding, so the
-# residents' first volley covers the pool in generation zero. Varlen padding is
-# bounded by (L - 1) M-slots * ncluster_n (~2k for L=512, N-tiles=8); 32 * ~74
-# residents = ~2.4k covers it (traced: only ~19 cancel/launch-race stragglers
-# launch, no generational waves). Bounded from above by three costs: (1) on
-# exact-grid kernels (dense/symmetric) the pool is already empty at retirement, so
-# ALL sprays fail — a per-kernel tax that must stay cheap (measured free at 32);
-# (2) the issuer stalls on async-proxy backpressure while enqueueing, holding its
-# SM slot and delaying kernel end when there is nothing left to cancel; (3) past
-# the pool size, extra cancels buy nothing.
-#
-# The budget is dynamic between these bounds (blog-style tiering, see
-# cancel_pending_tail): a retiring cluster estimates the remaining tail from the
-# phantom index it just decoded (tail <= grid_total - w) and sprays
-# ceil(tail / max_active_clusters), so block-aligned seqlens (maximal padding,
-# ~2x the random-length average) still drain in generation zero. The MIN keeps
-# the estimate-free fallback; the MAX bounds the enqueue-backpressure stall a
-# retiring cluster's SM slot endures (~256 * ~8ns = ~2us) — beyond it, extra
-# generations (~20us empty-cluster waves) are cheaper than deeper stalls, and the
-# batched-spray-plus-one-peek design is the real upgrade path.
-CLC_DRAIN_CANCELS_MIN = 32
-CLC_DRAIN_CANCELS_MAX = 256
+# Cap on serial observed cancels a retiring cluster issues in cancel_pending_tail.
+# The drain already stops at the first failed cancel; this only bounds the retiring
+# cluster's SM-slot stall (~cap x ~1us CLC round trip) when the pending tail is
+# huge. Phantoms past the cap just launch as cheap empty-cluster waves.
+CLC_DRAIN_MAX_CANCELS = 256
 
 
 @cute.jit
@@ -168,11 +145,9 @@ class TileSchedulerArguments:
 
 
 class TileScheduler:
-    # Whether the launched grid can exceed the real work, i.e. whether padding work
-    # indices exist. Exact-grid schedulers retire only on pool-empty (every granted
-    # steal is a real tile), so the retirement cancel spray is dead code for them;
-    # the varlen scheduler over-provisions (worst-case per-batch padding, see its
-    # get_grid_shape) and overrides this.
+    # Whether the launched grid can exceed the real work (padding work indices
+    # exist). Only the varlen scheduler over-provisions and overrides this;
+    # for exact-grid schedulers the retirement drain is dead code.
     grid_may_exceed_work: bool = False
 
     @dataclass
@@ -247,6 +222,7 @@ class TileScheduler:
         num_work_idx_before_cur_batch: Int32,
         cur_batch_end: Int32,
         cur_num_clusters_m: Int32,
+        phantom_retire: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -266,6 +242,7 @@ class TileScheduler:
         # cu_seqlens window scan entirely. Unused (constant 0) for dense schedulers.
         self._cur_batch_end = cur_batch_end
         self._cur_num_clusters_m = cur_num_clusters_m
+        self._phantom_retire = phantom_retire
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -335,6 +312,7 @@ class TileScheduler:
             Int32(0),  # num_work_idx_before_cur_batch
             Int32(0),  # cur_batch_end (empty window: first delinearize takes the scan)
             Int32(0),  # cur_num_clusters_m
+            Int32(0),  # phantom_retire (set on a decoded-phantom steal)
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -582,10 +560,20 @@ class TileScheduler:
             Int32(Uint32(bidz) // params.cluster_shape_mnk[2]),
         )
         work_idx, batch_idx = self._cluster_idx_to_work_idx_batch(params, cluster_idx)
-        # Remember the last decoded work index: at retirement it is the first phantom
-        # this cluster saw, giving cancel_pending_tail its remaining-tail estimate.
-        self._current_work_idx = work_idx
         ret = self._delinearize_work_idx(work_idx, batch_idx, Boolean(valid), loc=loc, ip=ip)
+        if Boolean(valid):
+            # Track the last GRANTED work index only (bidx of an invalid
+            # response is garbage; trusting it fed the drain a bogus
+            # baseline/budget — the July 2026 real-tile-cancel bug). At a
+            # phantom retirement this is the first phantom this cluster saw.
+            self._current_work_idx = work_idx
+            if not ret.is_valid_tile:
+                # A DECODED phantom: a real grant whose work idx is padding.
+                # Only this retirement type may drain the tail — grant
+                # monotonicity then guarantees no real work is pending. An
+                # INVALID response does NOT: try_cancel fails spuriously
+                # under contention long before the pool is empty.
+                self._phantom_retire = Int32(1)
         iket.range_pop()
         return ret
 
@@ -622,57 +610,108 @@ class TileScheduler:
 
     @cute.jit
     def cancel_pending_tail(self, *, loc=None, ip=None) -> None:
-        """Fire-and-forget drain of the pending-cluster tail, called by the scheduler
-        warp when its persistent loop exits (i.e. a steal decoded to an invalid tile).
+        """Drain the pending padding tail at retirement — gated and observed.
 
-        CORRECTNESS ASSUMPTION (grant monotonicity): once any fetch decodes into the
-        invalid/padding region, no pending cluster maps to real work — so canceling
-        arbitrary pending clusters without inspecting them is safe. PTX does not
-        document try_cancel grant order; this holds for the observed FIFO-ish drain
-        and is the same assumption made by the capped spray-and-pray drain in
-        https://drisspg.github.io/nuggets/A-Tale-of-Two-Schedulers (which hits this
-        problem at up to 64x padding in capacity-sized grouped GEMM). If it were
-        violated, a real tile could be canceled unprocessed.
+        Three invariants, each of which the original spray-and-pray drain
+        (afe2ef3) violated and each of which was implicated in the July 2026
+        silent-corruption / Xid hunt:
 
-        Fires CLC_DRAIN_CANCELS non-multicast try_cancels at issue rate with no
-        response waits (responses land in the dead stage-0 slot, tx pre-armed so the
-        barrier stays balanced; nobody observes either again). The cancel requests
-        outlive this cluster: their pool-removal effect happens at the work
-        distributor whether or not the issuer is still resident; only the (unread)
-        response write-back is orphaned by the exit.
+        1. PHANTOM GATE (the correctness linchpin). Drain ONLY when this
+           cluster retired on a DECODED phantom — a *valid* CLC grant whose
+           work index delinearized to padding. Grant order is monotone
+           (validated over 576M observed cancels), so a decoded phantom
+           proves every real work index has left the pool. An INVALID
+           response proves nothing: clusterlaunchcontrol.try_cancel fails
+           SPURIOUSLY under GPU contention long before the pool is empty
+           (standalone repro: AI/repro_clc_spurious_invalid.py), and the
+           original drain — triggered on such retirements, with a
+           budget/baseline read from the invalid response's garbage bidx —
+           canceled hundreds of REAL pending clusters (whole trailing
+           batches of output silently never computed).
+        2. SERIAL-OBSERVED. Each cancel is issued alone, its response waited
+           and decoded before the next issue or exit: no CLC state is ever
+           in flight at CTA exit (in-flight-at-exit fail-stops with Xid 43),
+           and the drain stops at the first failed cancel instead of
+           overspraying an empty pool.
+        3. PRIVATE MAILBOX. Responses land in a dedicated slot + mbarrier
+           right after the response ring (sched_smem_size in gemm_sm100), so
+           live ring slots and their barriers are never touched.
 
-        Pending clusters that launch anyway (cancel/launch races at retirement, or
-        padding beyond the residents' first volley) see an invalid initial tile,
-        skip their loop, and spray again on exit. Launches are gated by SM capacity
-        and the sprayers die near-simultaneously (shared CWD backlog), so
-        stragglers arrive in machine-width waves, each min(num_residents,
-        remaining pool) clusters and costing ~one empty-cluster lifetime — a
-        decaying cascade instead of the full launch stampede. See
-        CLC_DRAIN_CANCELS for the cap sizing and why there is no drain loop."""
+        WHY SERIAL, NOT A WAITED BURST (B300, 2026-07-09). BF16 benchmarks
+        used tile=(128,256), cluster=(2,1), a quiet GPU, fresh compilation,
+        and 500-sample medians. Times below are microseconds; ``unsafe`` is
+        the original unconditional fire-and-forget spray from afe2ef3:
+
+          varlen shape (L, per-group M, N, K)    unsafe   this serial
+          (256, 128, 2048,  512), 49.8% pad      123.75      122.59
+          (256, 128, 1024, 1024), gather-A       123.13      120.30
+          (256, 256, 1024, 1024), 33.2% pad      146.34      143.31
+          (256, 128, 1024, 8192), compute-heavy  769.37      770.45
+          (  5,8192, 2048, 8192),  1.2% pad      738.34      740.40
+
+        No drain took 239.9 us on the first shape: the drain is essential.
+        Waited fixed-width bursts on that shape took 221.7/203.2/167.0/
+        122.2 us for widths 4/8/16/32. Width 32 finally drains fast enough,
+        but was 1-1.5% slower than serial on several other tail-heavy shapes.
+        The reason is concurrency: many retiring clusters already issue serial
+        cancels in parallel, while each serial drainer stops after its first
+        failed cancel. A blind burst instead oversprays an empty pool and adds
+        CLC async-proxy queue pressure. Do not replace this with a burst based
+        only on single-issuer CLC latency.
+
+        Only ``valid`` is decoded from each response. An earlier version also
+        decoded the granted coordinate and flagged grants below the
+        first-phantom baseline as a monotonicity anomaly (printf + abort the
+        drain); dropping that check measured 120.79/119.87/142.27 us on the
+        first three shapes, 2.4-2.9% faster than the unsafe spray, and is
+        sound iff grant monotonicity holds (576M-sample validated). If
+        monotonicity is ever in doubt, restore that diagnostic first (git
+        history of this function).
+
+        Reproduce with ``python benchmarks/benchmark_clc_varlen_drain.py
+        --warmup 50 --rep 500``. See AI/clc_spurious_invalid_investigation.md
+        for the correctness investigation."""
         if const_expr(
             self.params.persistence_mode == PersistenceMode.CLC and self.grid_may_exceed_work
         ):
             params = self.params
-            # Remaining tail <= total work indices - the phantom index we just drew;
-            # split it across the resident clusters, which all retire around now.
             grid_total = Int32(Uint32(cute.arch.grid_dim()[0]) // params.cluster_shape_mnk[0])
-            tail = grid_total - self._current_work_idx
-            budget = cutlass.min(
-                Int32(CLC_DRAIN_CANCELS_MAX),
-                cutlass.max(
-                    Int32(CLC_DRAIN_CANCELS_MIN),
-                    (tail + params.max_active_clusters - 1) // params.max_active_clusters,
-                ),
-            )
-            state0 = PipelineStateWAdvance(
-                self._pipeline_state.stages, Int32(0), Int32(0), Int32(0)
-            )
-            mbar_ptr = self._scheduler_pipeline.producer_get_barrier(state0)
-            resp_ptr = self._sched_smem[None, 0].iterator
+            # Remaining tail <= total work indices - the phantom index we drew.
+            # Zero budget unless this cluster retired on a DECODED phantom:
+            # retiring on an invalid response says NOTHING about the pool
+            # (try_cancel fails spuriously under contention), and draining then
+            # cancels REAL pending clusters — the actual July 2026 corruption.
+            budget = cutlass.min(Int32(CLC_DRAIN_MAX_CANCELS), grid_total - self._current_work_idx)
+            if self._phantom_retire == 0:
+                budget = Int32(0)
+            # Private drain slot + mbarrier, laid out right after the response
+            # ring in the same reserved allocation (base is 16B-aligned; the
+            # ring is 16B/stage, so the slot is 16B-aligned, mbarrier 8B).
+            stages = const_expr(cute.size(self._sched_smem, mode=[1]))
+            slot_i32s = SCHED_SLOT_BYTES // 4  # sched_smem is an Int32 tensor
+            resp_ptr = self._sched_smem[None, 0].iterator + slot_i32s * stages
+            mbar_ptr = resp_ptr + slot_i32s
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, SCHED_SLOT_BYTES * budget)
-                for _ in cutlass.range(budget):
+                cute.arch.mbarrier_init(mbar_ptr, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.sync_warp()
+            phase = Int32(0)
+            k = Int32(0)
+            while k < budget:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_ptr, SCHED_SLOT_BYTES, loc=loc, ip=ip
+                    )
                     cute.arch.issue_clc_query(mbar_ptr, resp_ptr, multicast=False, loc=loc, ip=ip)
+                cute.arch.sync_warp()
+                cute.arch.mbarrier_wait(mbar_ptr, phase, loc=loc, ip=ip)
+                phase = phase ^ 1
+                _, _, _, valid = cute.arch.clc_response(resp_ptr, loc=loc, ip=ip)
+                cute.arch.fence_view_async_shared()
+                if valid != 0:
+                    k = k + 1
+                else:
+                    k = budget  # pool empty: done
 
     def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
         return self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
@@ -812,6 +851,7 @@ class TileScheduler:
             self._num_work_idx_before_cur_batch,
             self._cur_batch_end,
             self._cur_num_clusters_m,
+            self._phantom_retire,
             self._sched_smem,
             self._scheduler_pipeline,
             self._pipeline_state,
@@ -833,6 +873,7 @@ class TileScheduler:
                 self._num_work_idx_before_cur_batch,
                 self._cur_batch_end,
                 self._cur_num_clusters_m,
+                self._phantom_retire,
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
@@ -1038,7 +1079,6 @@ class VarlenMTileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
     cu_seqlens_m: cute.Tensor
-    max_active_clusters: Int32
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
     tile_shape_mn: cutlass.Constexpr[cute.Shape]
@@ -1056,7 +1096,6 @@ class VarlenMTileScheduler(TileScheduler):
         problem_shape_ncluster_mnl: cute.Shape
         total_m: Int32
         cu_seqlens_m: cute.Tensor
-        max_active_clusters: Int32
         raster_order: cutlass.Constexpr[RasterOrder]
         group_size: Int32
         group_size_fdd: Optional[FastDivmod]
@@ -1108,7 +1147,6 @@ class VarlenMTileScheduler(TileScheduler):
                 problem_shape_ncluster_mnl,
                 args.total_m,
                 args.cu_seqlens_m,
-                args.max_active_clusters,
                 raster_order,
                 group_size,
                 FastDivmod(group_size) if ncluster_fast is not None else None,

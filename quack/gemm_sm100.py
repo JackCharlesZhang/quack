@@ -813,7 +813,9 @@ class GemmSm100(GemmTmaBase):
         # 4 Int32 per stage, shared by the two (mode-exclusive) users: STATIC/DYNAMIC
         # store the STAS-broadcast (pid_m, pid_n, batch_idx, is_valid); CLC stores the
         # 16-byte try_cancel response (16B-aligned since each stage slot is 16 bytes).
-        sched_smem_size = 4 * self.sched_stage if self.is_persistent else 0
+        # +6 Int32 after the ring: the retirement drain's private response
+        # slot (16 B) + mbarrier (8 B); see TileScheduler.cancel_pending_tail.
+        sched_smem_size = 4 * self.sched_stage + 6 if self.is_persistent else 0
 
         @partitioned_struct
         class SharedStorage:
@@ -1313,9 +1315,12 @@ class GemmSm100(GemmTmaBase):
                     # End of persistent scheduler loop
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
-                    # Drain the pending-cluster tail (varlen padding) with unobserved
-                    # cancels so it never launches; see cancel_pending_tail for the
-                    # grant-monotonicity assumption this relies on.
+                    # Drain the pending padding tail with SERIAL-OBSERVED
+                    # cancels (issue -> wait -> decode, one at a time), gated
+                    # on a decoded-phantom retirement. The old fire-and-forget
+                    # burst spray caused the July 2026 varlen corruption; see
+                    # cancel_pending_tail and
+                    # AI/clc_spurious_invalid_investigation.md.
                     tile_scheduler.cancel_pending_tail()
 
         # Specialized A-index prefetch warp (gather_A only)
