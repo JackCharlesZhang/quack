@@ -134,15 +134,17 @@ def _install_getfuncargnames_cache() -> None:
             code.co_firstlineno,
         )
 
-    def _patched(function, *, name="", cls=None):
+    def _patched(function, *, name="", cls=None, **kw):
+        # **kw forwards keyword params added by newer pytest (8.1: is_method)
+        # and joins the cache key, since they can change the result
         try:
-            key = (_identity_key(function), name, cls)
+            key = (_identity_key(function), name, cls, tuple(sorted(kw.items())))
         except (AttributeError, TypeError):
-            return orig(function, name=name, cls=cls)
+            return orig(function, name=name, cls=cls, **kw)
         cached = cache.get(key)
         if cached is not None:
             return cached
-        result = orig(function, name=name, cls=cls)
+        result = orig(function, name=name, cls=cls, **kw)
         cache[key] = result
         return result
 
