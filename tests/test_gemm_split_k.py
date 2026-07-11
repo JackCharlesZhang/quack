@@ -171,19 +171,20 @@ def test_gemm_split_k_staged_grid_not_inflated():
     serial_z = max_kernel_grid_z(SplitKMode.SERIAL)
     staged_z = max_kernel_grid_z(SplitKMode.SEPARATE)
     if serial_z is None or staged_z is None:
-        pytest.skip("profiler does not expose kernel grids in this torch build")
+        pytest.skip("profiler did not expose the QuACK GEMM grid")
     # The GEMM dominates grid z in both modes (the reduce kernel's z is just L)
     assert staged_z <= serial_z, f"staged GEMM grid z inflated: {staged_z} vs serial {serial_z}"
 
 
 def _max_gemm_grid_z(fn):
-    """Largest kernel grid.z launched by fn() (the GEMM dominates; reduce z is just L).
+    """Grid.z of the QuACK GEMM launched by fn().
 
     grid.z is NOT split_k directly: the default config runs a persistent (pingpong)
     scheduler, so grid.z == num_persistent_clusters == n_clusters * split_k when the
     problem fits in one wave. Callers must normalize by the split_k=1 launch to recover
     the split factor (z(split_k) / z(1) == split_k)."""
     import json
+    import os
     import tempfile
 
     fn()  # warm compile
@@ -193,12 +194,21 @@ def _max_gemm_grid_z(fn):
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         trace_path = f.name
     prof.export_chrome_trace(trace_path)
-    with open(trace_path) as f:
-        events = json.load(f)["traceEvents"]
+    try:
+        with open(trace_path) as f:
+            events = json.load(f)["traceEvents"]
+    finally:
+        os.unlink(trace_path)
+    # Kineto can intermittently omit an individual CUDA launch under CI load. Do not
+    # substitute an unrelated reference/assertion kernel's grid for the GEMM in that
+    # case: report no observation and let the caller skip the profiler-only assertion.
     zs = [
         e["args"]["grid"][2]
         for e in events
-        if e.get("cat") == "kernel" and "grid" in e.get("args", {})
+        if e.get("cat") == "kernel"
+        and "grid" in e.get("args", {})
+        and "quack" in e.get("name", "").lower()
+        and "gemm" in e.get("name", "").lower()
     ]
     return max(zs) if zs else None
 
@@ -219,23 +229,17 @@ def test_gemm_split_k_config_autotuner_surface():
 
     def run(split_k):
         out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-        gemm_tuned.fn(A, B, out, config=cfg, split_k=split_k)
+        resolved_config, resolved_split_k, _, dispatch_plan = gemm_tuned.fn(
+            A, B, out, config=cfg, split_k=split_k
+        )
         _assert_close_double_baseline(out, out_ref, A @ B, mult=2)
-        return out
+        assert resolved_config == cfg
+        assert dispatch_plan.split_k == resolved_split_k
+        return resolved_split_k
 
-    # The persistent scheduler folds n_clusters and split_k into grid.z, so normalize by
-    # the split_k=1 launch: z(split_k) == split_k * z(1). z1 is the per-split cluster count.
-    z1 = _max_gemm_grid_z(lambda: run(split_k=1))
-    z_from_config = _max_gemm_grid_z(lambda: run(split_k=None))
-    z_override = _max_gemm_grid_z(lambda: run(split_k=2))
-    if z1 is None or z_from_config is None or z_override is None:
-        pytest.skip("profiler does not expose kernel grids in this torch build")
-    assert z_from_config == 4 * z1, (
-        f"config.split_k not honored: grid z = {z_from_config} (base {z1})"
-    )
-    assert z_override == 2 * z1, (
-        f"explicit split_k must override config: grid z = {z_override} (base {z1})"
-    )
+    assert run(split_k=1) == 1
+    assert run(split_k=None) == 4, "config.split_k not honored"
+    assert run(split_k=2) == 2, "explicit split_k must override config"
 
     # Prune-hook expansion: split_k=None on a starved shape adds split-k variants...
     base = [AutotuneConfig(config=default_config(A.device))]
