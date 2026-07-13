@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
 from __future__ import annotations
 import math
-from typing import NamedTuple, Tuple, Optional, Callable, Type
+from typing import Tuple, Optional, Callable, Type, NamedTuple
 
 from torch import Tensor
 
@@ -9,16 +9,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, const_expr
-from cutlass.cute.runtime import make_ptr
 from cutlass.cute.nvgpu import warp
 
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import (
-    mlir_namedtuple,
-    get_device_capacity,
-    get_max_active_clusters,
-    torch2cute_dtype_map,
-)
+from quack.cute_dsl_utils import mlir_namedtuple, get_device_capacity
 from quack.epi_composable import ComposableEpiMixin
 from quack.epi_ops import ColVecLoad, RowVecLoad, Scalar, TileStore
 from quack.gemm_sm80 import GemmSm80
@@ -26,24 +19,13 @@ from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
 from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.gemm_tvm_ffi_utils import (
-    get_major,
-    make_scheduler_args,
-    make_varlen_args,
-    make_fake_scheduler_args,
-    make_fake_varlen_args,
-    div_for_dtype,
-    fake_batched,
-    make_fake_gemm_tensors,
-    make_fake_sf_tensor,
-    compile_gemm_kernel,
-    validate_blockscaled_sf,
-    tensor_key,
-    scalar_arg,
-    plan_scheduler_args,
-    launch_gemm,
+from quack.gemm_host import (
+    GemmEpiPlan,
+    build_gemm_epi_plan,
+    gemm_epi_plan_key,
+    run_gemm_epi_plan,
 )
-from quack.cache import jit_cache
+from quack.gemm_tvm_ffi_utils import tensor_key, validate_blockscaled_sf
 import quack.layout_utils as layout_utils
 import quack.copy_utils as copy_utils
 from quack.layout_utils import permute_gated_Cregs_b16
@@ -74,6 +56,12 @@ class GemmActMixin(ComposableEpiMixin):
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
+
+    @classmethod
+    def epi_host_constexpr(cls, name, key):
+        if name == "act_fn":
+            return act_fn_map[key] if key is not None else None
+        return key
 
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
@@ -224,6 +212,12 @@ class GemmGatedMixin(GemmActMixin):
         TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
+    @classmethod
+    def epi_host_constexpr(cls, name, key):
+        if name == "act_fn":
+            return gate_fn_map[key] if key is not None else None
+        return key
+
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
@@ -350,158 +344,24 @@ class GemmGatedSm120(GemmGatedSm120Mixin, GemmGatedMixin, GemmSm120):
     pass
 
 
-@jit_cache
-def _compile_gemm_act(
-    a_dtype,
-    b_dtype,
-    d_dtype,
-    c_dtype,
-    postact_dtype,
-    a_major,
-    b_major,
-    d_major,
-    c_major,
-    postact_major,
-    tile_shape_mn,
-    cluster_shape_mnk,
-    pingpong,
-    persistent,
-    is_dynamic_persistent,
-    activation,
-    rowvec_dtype,
-    colvec_dtype,
-    colvec_ndim,
-    varlen_m,
-    gather_A,
-    concat_layout,
-    device_capacity,
-    gemm_cls_name,
-    rounding_mode=RoundingMode.RN,
-    sr_seed_mode=0,
-    use_tma_gather=False,
-    sf_dtype=None,
-    sf_vec_size=None,
-    batched=True,
-    b_kn=False,
-    sf_batched=True,
-):
-    sm_to_cls = {
-        "act": {
-            8: GemmActSm80,
-            9: GemmActSm90,
-            10: GemmActSm100,
-            11: GemmActSm100,
-            12: GemmActSm120,
-        },
-        "gated": {
-            8: GemmGatedSm80,
-            9: GemmGatedSm90,
-            10: GemmGatedSm100,
-            11: GemmGatedSm100,
-            12: GemmGatedSm120,
-        },
-    }
-    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
-    pa_leading = 1 if postact_major == "n" else 0
-    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        varlen_m=varlen_m,
-        gather_A=gather_A,
-        batched=batched,
-        b_kn=b_kn,
-    )
-    pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
-    div_pa = div_for_dtype(postact_dtype)
-    pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
-    pa_l = None if (varlen_m or not batched) else l
-    mAuxOut = fake_batched(postact_dtype, m, pa_n, pa_l, pa_leading_dim, div_pa)
+_gemm_act_sm_to_cls = {
+    "act": {
+        8: GemmActSm80,
+        9: GemmActSm90,
+        10: GemmActSm100,
+        11: GemmActSm100,
+        12: GemmActSm120,
+    },
+    "gated": {
+        8: GemmGatedSm80,
+        9: GemmGatedSm90,
+        10: GemmGatedSm100,
+        11: GemmGatedSm100,
+        12: GemmGatedSm120,
+    },
+}
 
-    mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
-    if colvec_ndim == 2:
-        mColVec = fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
-    elif colvec_ndim == 1:
-        mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4)
-    else:
-        mColVec = None
-
-    act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
-
-    def fake_scalar(mode, dtype=Int32):
-        if mode == 0:
-            return None
-        elif mode == 1:
-            return dtype(0)
-        else:
-            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
-
-    epi_args = GemmCls.EpilogueArguments(
-        mAuxOut,
-        act_fn,
-        mRowVecBroadcast=mRowVec,
-        mColVecBroadcast=mColVec,
-        rounding_mode=rounding_mode,
-        sr_seed=fake_scalar(sr_seed_mode),
-    )
-    scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l
-    )
-    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
-    if sf_dtype is not None:
-        mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None)
-        mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None)
-    else:
-        mSFA, mSFB = None, None
-    return compile_gemm_kernel(
-        GemmCls,
-        a_dtype,
-        tile_shape_mn,
-        cluster_shape_mnk,
-        pingpong,
-        persistent,
-        gather_A,
-        is_dynamic_persistent,
-        device_capacity,
-        mA,
-        mB,
-        mD,
-        mC,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        mSFA=mSFA,
-        mSFB=mSFB,
-        use_tma_gather=use_tma_gather,
-        concat_layout=concat_layout or None,
-        sf_vec_size=sf_vec_size,
-        b_transposed=b_kn,
-    )
-
-
-class _GemmActPlan(NamedTuple):
-    """Launch plan derived purely from tensor metadata and config flags.
-
-    Cached per metadata key (see ``_gemm_act_plan_cache``) so warm calls skip
-    validation, major/dtype derivation, and the compile-cache lookup. See
-    ``_GemmPlan`` in gemm.py for the pattern.
-    """
-
-    compiled_fn: object
-    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
-    sr_seed_mode: int
-    max_active_clusters: int
-    max_swizzle_size: int
-    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
-    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
-
-
-_gemm_act_plan_cache: dict[tuple, _GemmActPlan] = {}
+_gemm_act_plan_cache: dict[tuple, GemmEpiPlan] = {}
 
 
 def gemm_act(
@@ -532,24 +392,22 @@ def gemm_act(
     SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors, or 5-D if 2D A
     SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
-) -> _GemmActPlan:
+) -> GemmEpiPlan:
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
     concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
-    # The key captures every input the plan build reads (shapes and strides
-    # subsume the majors and the validation asserts), so a cache hit is exactly
-    # a replay of a previously validated call with different data pointers.
-    key = (
-        tensor_key(A),
-        tensor_key(B),
-        tensor_key(D),
-        tensor_key(C),
-        tensor_key(PostAct),
+    epi_values = dict(mAuxOut=PostAct, mRowVecBroadcast=rowvec_bias, mColVecBroadcast=colvec_bias)
+    epi_key_overrides = {"sr_seed": sr_seed_mode}
+    key = gemm_epi_plan_key(
+        A,
+        B,
+        D,
+        C,
+        epi_values,
+        epi_key_overrides,
         tensor_key(SFA),
         tensor_key(SFB),
-        tensor_key(rowvec_bias),
-        tensor_key(colvec_bias),
         tensor_key(cu_seqlens_m),
         A_idx is not None,
         tile_count_semaphore is not None,
@@ -567,7 +425,6 @@ def gemm_act(
         rounding_mode,
         use_tma_gather,
         concat_key,
-        sr_seed_mode,
         b_kn,
     )
     plan = _gemm_act_plan_cache.get(key)
@@ -594,11 +451,11 @@ def gemm_act(
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
             rounding_mode=rounding_mode,
+            sr_seed_mode=sr_seed_mode,
             use_tma_gather=use_tma_gather,
             concat_layout=concat_key,
             SFA=SFA,
             SFB=SFB,
-            sr_seed_mode=sr_seed_mode,
             b_kn=b_kn,
         )
         _gemm_act_plan_cache[key] = plan
@@ -622,7 +479,7 @@ def gemm_act(
 
 
 def run_gemm_act_plan(
-    plan: _GemmActPlan,
+    plan: GemmEpiPlan,
     A: Tensor,
     B: Tensor,
     D: Optional[Tensor],
@@ -644,17 +501,24 @@ def run_gemm_act_plan(
     guarantees that via its key; an outer layer holding the returned plan must
     guarantee it with its own key).
     """
-    epi_args = GemmActMixin.EpilogueArguments(
-        PostAct,
-        None,  # act_fn is Constexpr, pass None at call time
-        mRowVecBroadcast=rowvec_bias,
-        mColVecBroadcast=colvec_bias,
-        rounding_mode=None,  # Constexpr, pass None at call time
-        sr_seed=scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
+    run_gemm_epi_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        dict(
+            mAuxOut=PostAct,
+            mRowVecBroadcast=rowvec_bias,
+            mColVecBroadcast=colvec_bias,
+            sr_seed=sr_seed,
+        ),
+        tile_count_semaphore=tile_count_semaphore,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        SFA=SFA,
+        SFB=SFB,
     )
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
-    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
 
 def _build_gemm_act_plan(
@@ -680,13 +544,13 @@ def _build_gemm_act_plan(
     cu_seqlens_m,
     A_idx,
     rounding_mode,
+    sr_seed_mode,
     use_tma_gather,
     concat_layout,  # already normalized to a sorted tuple
     SFA,
     SFB,
-    sr_seed_mode,
     b_kn=False,
-) -> _GemmActPlan:
+) -> GemmEpiPlan:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
     else:
@@ -728,23 +592,6 @@ def _build_gemm_act_plan(
         assert device_capacity[0] in [9, 10, 11, 12], "b_kn requires SM90+"
         assert not concat_layout, "b_kn does not support concat_layout"
 
-    a_major = get_major(A, "m", "k")
-    b_major = get_major(B, "n", "k")
-    if b_kn:
-        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
-        # last dim means n-major.
-        b_major = "n" if B.stride(-1) == 1 else "k"
-    d_major = get_major(D, "m", "n") if D is not None else None
-    c_major = get_major(C, "m", "n") if C is not None else None
-    postact_major = get_major(PostAct, "m", "n")
-
-    a_dtype = torch2cute_dtype_map[A.dtype]
-    b_dtype = torch2cute_dtype_map[B.dtype]
-    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
-    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
-    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
-    colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
-
     sf_dtype, sf_vec_size = None, None
     if blockscaled:
         assert not varlen_m and not gather_A, "Blockscaled GEMM does not support varlen/gather yet"
@@ -759,58 +606,35 @@ def _build_gemm_act_plan(
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
 
-    compiled_fn = _compile_gemm_act(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        postact_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        postact_major,
-        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
-        (cluster_M, cluster_N, 1),
-        pingpong,
-        persistent,
-        is_dynamic_persistent,
-        activation,
-        torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
-        torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
-        colvec_ndim,
-        varlen_m,
-        gather_A,
-        concat_layout,
+    return build_gemm_epi_plan(
+        _gemm_act_sm_to_cls[gemm_cls_name][device_capacity[0]],
         device_capacity,
-        gemm_cls_name,
-        rounding_mode=rounding_mode,
-        sr_seed_mode=sr_seed_mode,
+        A,
+        B,
+        D,
+        C,
+        epi_values=dict(
+            mAuxOut=PostAct, mRowVecBroadcast=rowvec_bias, mColVecBroadcast=colvec_bias
+        ),
+        epi_key_overrides={"sr_seed": sr_seed_mode},
+        constexpr_keys=(("act_fn", activation), ("rounding_mode", rounding_mode)),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=cluster_M,
+        cluster_N=cluster_N,
+        tile_K=tile_K,
+        pingpong=pingpong,
+        persistent=persistent,
+        is_dynamic_persistent=is_dynamic_persistent,
+        max_swizzle_size=max_swizzle_size,
+        varlen_m=varlen_m,
+        gather_A=gather_A,
+        b_kn=b_kn,
         use_tma_gather=use_tma_gather,
+        concat_layout=concat_layout,
         sf_dtype=sf_dtype,
         sf_vec_size=sf_vec_size,
-        batched=batched,
-        b_kn=b_kn,
         sf_batched=SFA.ndim == 6 if blockscaled else True,
-    )
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    # Must mirror make_fake_scheduler_args in _compile_gemm_act: only the SM90
-    # dynamic scheduler consumes the semaphore, so it's the only non-static case.
-    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
-    scheduler_static = (
-        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore
-        else None
-    )
-    return _GemmActPlan(
-        compiled_fn=compiled_fn,
-        is_sm100_family=device_capacity[0] in [10, 11],
-        sr_seed_mode=sr_seed_mode,
-        max_active_clusters=max_active_clusters,
-        max_swizzle_size=max_swizzle_size,
-        scheduler_uses_semaphore=scheduler_uses_semaphore,
-        scheduler_static=scheduler_static,
     )
 
 

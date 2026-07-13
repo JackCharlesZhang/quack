@@ -1452,13 +1452,16 @@ class GemmSm100(GemmTmaBase):
                     if do_epi_load_barrier_wait:
                         epi_load_barrier.arrive_and_wait()
                         do_epi_load_barrier_wait = Boolean(False)
-                    epi_tile_num = const_expr(
-                        cute.size(
-                            cute.zipped_divide(
-                                cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-                            ),
-                            mode=[1],
-                        )
+                    epi_tile_shape = cute.zipped_divide(
+                        cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+                    ).shape[1]
+                    epi_tile_num = const_expr(cute.size(epi_tile_shape))
+                    # Hier subtile coords, ordered exactly as the epilogue store
+                    # loop consumes stages (gemm_base.epilogue): every copy fn
+                    # receives a subscriptable (epi_m, epi_n) coordinate — flat
+                    # indices only match consumption order for m-major epilogues.
+                    epi_load_layout = cute.make_ordered_layout(
+                        epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
                     )
                     # Split-K (serial/parallel): only the finalizing split runs the
                     # epilogue, so only its tiles consume C — skip the loads (and the
@@ -1469,14 +1472,20 @@ class GemmSm100(GemmTmaBase):
                         if split_idx == self.split_k - 1:
                             for epi_idx in cutlass.range(epi_tile_num, unroll=1):
                                 epi_pipeline.producer_acquire(epi_producer_state)
-                                copy_epi_load(src_idx=epi_idx, producer_state=epi_producer_state)
+                                copy_epi_load(
+                                    src_idx=epi_load_layout.get_hier_coord(epi_idx),
+                                    producer_state=epi_producer_state,
+                                )
                                 # Epi pipeline's producer commit is a NOP
                                 epi_pipeline.producer_commit(epi_producer_state)
                                 epi_producer_state.advance()
                     else:
                         for epi_idx in cutlass.range(epi_tile_num, unroll=1):
                             epi_pipeline.producer_acquire(epi_producer_state)
-                            copy_epi_load(src_idx=epi_idx, producer_state=epi_producer_state)
+                            copy_epi_load(
+                                src_idx=epi_load_layout.get_hier_coord(epi_idx),
+                                producer_state=epi_producer_state,
+                            )
                             # Epi pipeline's producer commit is a NOP
                             epi_pipeline.producer_commit(epi_producer_state)
                             epi_producer_state.advance()
@@ -2116,6 +2125,7 @@ class GemmSm100(GemmTmaBase):
         acc_consumer_state: pipeline.PipelineState,
         acc_release_idx: int,
         clear_acc: Boolean = False,
+        no_release: cutlass.Constexpr[bool] = False,
     ):
         if not clear_acc:
             # Load accumulator from tensor memory buffer to register
@@ -2125,9 +2135,12 @@ class GemmSm100(GemmTmaBase):
         else:
             tRS_rD.fill(0.0)
         assert epi_coord[0] == 0  # For Sm100, we assume epi_M = 1
-        if epi_coord[1] == acc_release_idx:
-            cute.arch.fence_view_async_tmem_load()
-            acc_pipeline.consumer_release(acc_consumer_state)
+        # no_release: the epilogue prepass (epi_needs_acc_prepass) re-reads the
+        # accumulator in the store pass, so it must stay valid.
+        if const_expr(not no_release):
+            if epi_coord[1] == acc_release_idx:
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
 
     def epilog_tmem_copy_and_partition(
         self,

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025-2026, Han Guo, Tri Dao.
 """Composable epilogue operations (EpiOps) for GEMM kernels.
 
 Each EpiOp encapsulates a single tensor kind's behavior across the epilogue lifecycle:
@@ -15,6 +15,8 @@ framework guarantees inactive ops are never iterated.
 
 import math
 import operator
+import hashlib
+import inspect
 from functools import partial
 from typing import NamedTuple
 
@@ -27,6 +29,22 @@ from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
+
+
+def _callable_config_key(fn):
+    """Stable, picklable identity for a callable stored in an EpiOp config."""
+    if fn is None:
+        return None
+    try:
+        source = inspect.getsource(fn).encode()
+    except (OSError, TypeError):
+        code = getattr(fn, "__code__", None)
+        source = code.co_code if code is not None else repr(fn).encode()
+    return (
+        getattr(fn, "__module__", ""),
+        getattr(fn, "__qualname__", repr(fn)),
+        hashlib.sha256(source).hexdigest(),
+    )
 
 
 class EpiContext:
@@ -160,8 +178,89 @@ class EpiSmemBytes(NamedTuple):
 class EpiOp:
     """Base class for composable epilogue operations."""
 
+    # --- Value-port protocol (quack.gemm_epilogue fn frontend). Ports are how
+    # an op joins the fn's per-element dataflow; the resource lifecycle below
+    # (begin/begin_loop/end_loop/end) stays the smem/TMA/flush protocol.
+    #   "value": the fn receives op.name as a per-element value (loads, scalars).
+    #   "apply": the fn receives op.name as a CALLABLE — `y = rope(acc)` — so the
+    #            op's math slots into the fn's dataflow at a user-chosen point.
+    #            fn_apply runs inside the (possibly vectorized) loop: index only
+    #            dense per-loop-index state prepared in fn_prepare, and speak the
+    #            scalar/F2/Pair value vocabulary.
+    #   "sink":  the fn returns op.name; the frontend collects the values into a
+    #            dense fragment and hands it to fn_sink_flush once per subtile
+    #            (fragment-level, so sinks can do numerically smart things like
+    #            one rescale per subtile instead of per element).
+    fn_port = None
+
+    def fn_prepare(self, gemm, state, paired):
+        """Per-subtile port state derived from this op's begin_loop result.
+        ``paired``: the fn loop runs per adjacent-N pair (values are Pairs)."""
+        return state
+
+    def fn_apply(self, gemm, pstate, i, value):
+        raise NotImplementedError
+
+    def fn_sink_flush(self, gemm, state, frag):
+        """Fold a fragment of fn-produced values into this op's accumulator.
+        ``state`` is the begin_loop result; ``frag`` is elementwise-congruent
+        with the accumulator tile fragment."""
+        raise NotImplementedError
+
     def __init__(self, name):
         self.name = name
+
+    def config_key(self):
+        """Picklable static configuration that affects generated code.
+
+        Stateless ops inherit the empty key. Stateful ops must opt in
+        explicitly: silently omitting an instance attribute would alias two
+        semantically different epilogues in the persistent JIT cache.
+        """
+        extra = tuple(sorted(set(vars(self)) - {"name"}))
+        if extra:
+            raise NotImplementedError(
+                f"{type(self).__name__} has static configuration {extra}; implement config_key()"
+            )
+        return ()
+
+    def cache_key(self):
+        return (
+            type(self).__module__,
+            type(self).__qualname__,
+            self.name,
+            self.config_key(),
+        )
+
+    def __quack_semantic_key__(self):
+        # Fail-closed semantic-key protocol (quack.gemm_epilogue): op instances
+        # captured by epilogue fns fingerprint as their cache identity.
+        return self.cache_key()
+
+    # --- Host-side: torch-arg schema (drives the generic plan/compile layer in
+    # quack.gemm_host). Each op describes its own argument in three steps:
+    # host_arg_key extracts a small picklable descriptor from the caller's torch
+    # value (part of the jit_cache disk key), host_fake_arg rebuilds the fake
+    # trace-time argument from that descriptor alone, and host_call_arg converts
+    # the per-call torch value into what the compiled signature expects. ---
+    def host_arg_key(self, value):
+        """Picklable compile-key descriptor of the caller's value; None = absent
+        (the op is filtered out of the compiled epilogue)."""
+        if value is None:
+            return None
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        return (torch2cute_dtype_map[value.dtype], value.ndim)
+
+    def host_fake_arg(self, key, fctx):
+        """Fake trace-time argument reconstructed from ``host_arg_key``'s
+        descriptor. ``fctx`` is a quack.gemm_host.FakeArgCtx with the shared
+        (m, n, k, l) sym ints and the batched/varlen_m flags."""
+        return None
+
+    def host_call_arg(self, value, key):
+        """Per-call runtime argument matching the compiled signature."""
+        return value
 
     # --- Host-side: args → params ---
     def param_fields(self):
@@ -271,6 +370,70 @@ class Scalar(EpiOp):
         super().__init__(name)
         self.dtype = dtype
 
+    def config_key(self):
+        return (self.dtype,)
+
+    def _target_dtype(self):
+        return self.dtype if self.dtype is not None else Float32
+
+    def _validate_pointer_value(self, value):
+        import torch
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"scalar '{self.name}' pointer value must be a torch.Tensor")
+        if value.numel() != 1:
+            raise ValueError(f"scalar '{self.name}' tensor must contain exactly one element")
+        if not value.is_cuda:
+            raise ValueError(f"scalar '{self.name}' tensor must be on CUDA")
+        if not value.is_contiguous():
+            raise ValueError(f"scalar '{self.name}' tensor must be contiguous")
+        actual = torch2cute_dtype_map.get(value.dtype)
+        target = self._target_dtype()
+        if actual != target:
+            raise TypeError(
+                f"scalar '{self.name}' tensor must have dtype {target}, got {value.dtype}"
+            )
+
+    def host_key_for_mode(self, mode):
+        return (("absent", "immediate", "pointer")[mode], self._target_dtype())
+
+    def _decode_host_key(self, key):
+        # Integer keys are accepted for the existing hand-written wrappers;
+        # new callers use the self-describing (mode, dtype) form.
+        return self.host_key_for_mode(key) if isinstance(key, int) else key
+
+    # Scalar keys are the compile-time *mode*: 0 = absent (op compiled out),
+    # 1 = host constant, 2 = device pointer. Variants with a non-trivial
+    # neutral-folding rule (e.g. alpha == 1.0 -> absent) pass the mode as an
+    # epi_key_overrides entry instead of relying on this default.
+    def host_arg_key(self, value):
+        if value is None:
+            return self.host_key_for_mode(0)
+        if hasattr(value, "data_ptr"):
+            self._validate_pointer_value(value)
+            return self.host_key_for_mode(2)
+        return self.host_key_for_mode(1)
+
+    def host_fake_arg(self, key, fctx):
+        mode, dtype = self._decode_host_key(key)
+        if mode == "absent":
+            return None
+        if mode == "immediate":
+            return dtype(0)
+        from cutlass.cute.runtime import make_ptr
+
+        return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
+
+    def host_call_arg(self, value, key):
+        mode, dtype = self._decode_host_key(key)
+        if mode == "absent":
+            return None
+        if mode == "immediate":
+            return dtype(value)
+        self._validate_pointer_value(value)
+        return value.data_ptr()
+
     def param_fields(self):
         return [(self.name, object, None)]
 
@@ -292,6 +455,14 @@ class VecLoad(EpiOp):
     """
 
     dim = None  # 0 for col (M), 1 for row (N)
+
+    def host_fake_arg(self, key, fctx):
+        from quack.compile_utils import make_fake_tensor
+
+        dtype, ndim = key
+        vec_dim = fctx.n if self.dim == 1 else fctx.m
+        shape = (fctx.l, vec_dim) if ndim == 2 else (vec_dim,)
+        return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=4)
 
     def param_fields(self):
         return [(self.name, object, None)]
@@ -468,6 +639,9 @@ class TileStore(EpiOp):
         super().__init__(name)
         self.epi_tile_fn = epi_tile_fn
 
+    def config_key(self):
+        return (_callable_config_key(self.epi_tile_fn),)
+
     def _tma_atom_key(self):
         return f"tma_atom_{self.name}"
 
@@ -476,6 +650,27 @@ class TileStore(EpiOp):
 
     def _epi_tile_key(self):
         return f"epi_tile_{self.name}"
+
+    def host_arg_key(self, value):
+        if value is None:
+            return None
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        major = "n" if value.stride(-1) == 1 else "m"
+        return (torch2cute_dtype_map[value.dtype], major)
+
+    def host_fake_arg(self, key, fctx):
+        from quack.gemm_tvm_ffi_utils import div_for_dtype, fake_batched
+
+        dtype, major = key
+        # A halved/reshaped tile (epi_tile_fn, e.g. gated postact) has an N
+        # extent unrelated to the GEMM's n: use a fresh sym. Such tiles are
+        # n-major by construction (asserted in the variant's
+        # epi_to_underlying_arguments).
+        n = cute.sym_int() if self.epi_tile_fn is not None else fctx.n
+        leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
+        batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
+        return fake_batched(dtype, fctx.m, n, batch, leading, div_for_dtype(dtype))
 
     def param_fields(self):
         # Defaults are None so EpilogueParams can be constructed when this op is
@@ -562,6 +757,9 @@ class TileLoad(EpiOp):
         super().__init__(name)
         self.epi_tile_fn = epi_tile_fn
 
+    def config_key(self):
+        return (_callable_config_key(self.epi_tile_fn),)
+
     def _tma_atom_key(self):
         return f"tma_atom_{self.name}"
 
@@ -584,6 +782,10 @@ class TileLoad(EpiOp):
 
     def _dtype_field(self):
         return f"{self.name}_dtype"
+
+    # Same host schema as TileStore: an (m, n[, l]) tile keyed by dtype + major.
+    host_arg_key = TileStore.host_arg_key
+    host_fake_arg = TileStore.host_fake_arg
 
     def param_fields(self):
         # Defaults are None so EpilogueParams can be constructed when this op is
@@ -722,13 +924,23 @@ def vec_multiply(gemm, tRS_rD, tDrColVec, tDrRowVec):
 
 
 @cute.jit
-def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
+def colvec_reduce_accumulate(
+    gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None, combine="add"
+):
     """Accumulate transform_fn(input) or input * rScale into a ColVecReduce buffer.
 
     If transform_fn is provided, accumulates transform_fn(input[i]).
     If rScale is provided, accumulates input[i] * rScale[i] (uses packed mul/fma for SM100).
     If neither, accumulates input directly (identity).
+    ``combine="max"`` folds with fmax instead of add (plain input only): the
+    aliased-lane assignment is order-free, so one scalar loop serves all archs.
     """
+    if const_expr(combine == "max"):
+        assert transform_fn is None and rScale is None, "max combine takes the input directly"
+        if const_expr(tDrReduce is not None):
+            for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+                tDrReduce[i] = cute.arch.fmax(tDrReduce[i], tRS_rInput[i])
+        return
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
             transform_fn = lambda x: x
@@ -761,12 +973,21 @@ def colvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
 
 
 @cute.jit
-def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None):
+def rowvec_reduce_accumulate(
+    gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None, combine="add"
+):
     """Accumulate transform_fn(input) or input * rScale into a RowVecReduce buffer.
 
     Reduces along M dimension, keeping N. The zero-stride layout on M ensures
     elements at different M positions but same N column accumulate correctly.
+    ``combine="max"`` folds with fmax instead of add (plain input only).
     """
+    if const_expr(combine == "max"):
+        assert transform_fn is None and rScale is None, "max combine takes the input directly"
+        if const_expr(tDrReduce is not None):
+            for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
+                tDrReduce[i] = cute.arch.fmax(tDrReduce[i], tRS_rInput[i])
+        return
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
             transform_fn = lambda x: x
@@ -798,10 +1019,46 @@ def rowvec_reduce_accumulate(gemm, tDrReduce, tRS_rInput, transform_fn=None, rSc
 
 
 class VecReduce(EpiOp):
-    """Base class for row/column vector reductions."""
+    """Base class for row/column vector reductions.
+
+    ``combine`` selects the reduction: "add" (default) or "max". Note on
+    ragged last tiles: out-of-bounds accumulator elements are zero (predicated
+    B loads), which is the identity for add but NOT for max — max reductions
+    on non-divisible N should reduce a non-negative quantity (e.g. |x|, the
+    amax case) or pad N.
+    """
 
     dim = 0  # 0 for colvec output along M, 1 for rowvec output along N
     epi_m_major_preference = 0
+    fn_port = "sink"
+
+    def __init__(self, name, combine="add"):
+        super().__init__(name)
+        if combine not in ("add", "max"):
+            raise ValueError(f"unsupported combine {combine!r}")
+        self.combine = combine
+
+    def config_key(self):
+        return (self.combine,)
+
+    @cute.jit
+    def fn_sink_flush(self, gemm, state, frag):
+        if const_expr(self.dim == 0):
+            colvec_reduce_accumulate(gemm, state, frag, combine=self.combine)
+        else:
+            rowvec_reduce_accumulate(gemm, state, frag, combine=self.combine)
+
+    def host_fake_arg(self, key, fctx):
+        from quack.compile_utils import make_fake_tensor
+
+        dtype, ndim = key
+        # Reduce outputs are partial per CTA tile along the reduced dim:
+        # ColVecReduce (l, m, n_tiles), RowVecReduce (l, m_tiles, n); rank 2
+        # drops the batch mode (varlen_m / dense-2D calls).
+        tiles = cute.sym_int()
+        inner = (fctx.m, tiles) if self.dim == 0 else (tiles, fctx.n)
+        shape = (fctx.l, *inner) if ndim == 3 else inner
+        return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
 
     def param_fields(self):
         return [(self.name, object, None)]
@@ -863,7 +1120,7 @@ class VecReduce(EpiOp):
         tDrReduce = state[0]
         result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
         if const_expr(epi_coord[self._reduce_dim()] == 0):
-            cute.filter_zeros(result).fill(0.0)
+            cute.filter_zeros(result).fill(0.0 if const_expr(self.combine == "add") else -math.inf)
         return result
 
 
@@ -914,6 +1171,7 @@ class ColVecReduce(VecReduce):
             )
 
             # Intra-warp shuffle reduction across N lanes
+            red_op = operator.add if const_expr(self.combine == "add") else cute.arch.fmax
             if const_expr(lanes_in_N > 1):
                 # Assumes threads for each M row are contiguous along N, so
                 # warp_reduction over groups of lanes_in_N matches lane_layout_MN.
@@ -921,7 +1179,7 @@ class ColVecReduce(VecReduce):
                 tDrReduce_flt = cute.filter_zeros(tDrReduce_cur)
                 for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
                     tDrReduce_flt[i] = cute.arch.warp_reduction(
-                        tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
+                        tDrReduce_flt[i], red_op, threads_in_group=lanes_in_N
                     )
 
             warp_N = warp_layout_MN[1]
@@ -956,7 +1214,7 @@ class ColVecReduce(VecReduce):
                     for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                         row_idx = tDcD_m[m][0]
                         for warp_n in cutlass.range_constexpr(1, warps_in_N):
-                            tDrReduce_m[m] += sDrReduce[row_idx, warp_n - 1]
+                            tDrReduce_m[m] = red_op(tDrReduce_m[m], sDrReduce[row_idx, warp_n - 1])
 
             # Write to gmem
             batch_idx = tile_coord_mnkl[3]
@@ -1033,6 +1291,7 @@ class RowVecReduce(VecReduce):
 
             # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
             # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
+            red_op = operator.add if const_expr(self.combine == "add") else cute.arch.fmax
             tDrReduce_n = layout_utils.convert_layout_zero_stride(
                 tDrReduce_cur, tDrReduce_cur.layout
             )[None, 0]
@@ -1040,9 +1299,12 @@ class RowVecReduce(VecReduce):
                 for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
                     reduction_rows = lanes_in_M // 2
                     while reduction_rows > 0:
-                        tDrReduce_n[n] += cute.arch.shuffle_sync_bfly(
+                        tDrReduce_n[n] = red_op(
                             tDrReduce_n[n],
-                            offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                            cute.arch.shuffle_sync_bfly(
+                                tDrReduce_n[n],
+                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                            ),
                         )
                         reduction_rows = reduction_rows // 2
 
@@ -1075,7 +1337,7 @@ class RowVecReduce(VecReduce):
                     for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                         col_idx = tDcD_n[n][1]
                         for warp_m in cutlass.range_constexpr(1, warps_in_M):
-                            tDrReduce_n[n] += sDrReduce[col_idx, warp_m - 1]
+                            tDrReduce_n[n] = red_op(tDrReduce_n[n], sDrReduce[col_idx, warp_m - 1])
 
             # Write to gmem
             batch_idx = tile_coord_mnkl[3]
@@ -1099,3 +1361,134 @@ class RowVecReduce(VecReduce):
                     col_idx = tDcD_n[n][1]
                     if col_idx < limit_n:
                         gRowVec[col_idx] = tDrReduce_n[n]
+
+
+class OnlineLSEReduce(ColVecReduce):
+    """Online log-sum-exp column reduction: out[m, n_tile] = log sum_n exp(v).
+
+    The coupled (running max, running sum) accumulator is what a plain
+    ``combine=`` cannot express: every new value may rescale the sum. The fn
+    just returns the logit under this op's name (sink port); numerical
+    stability is owned here. Output is per-N-tile partials like ColVecReduce
+    ((l, m, n_tiles)); the host finalizes with a (tiny, stable) logsumexp over
+    the n_tiles axis.
+    """
+
+    def __init__(self, name):
+        super().__init__(name)
+
+    # Finite "minus infinity": keeps fastmath exp out of inf-arithmetic
+    # (exp(-inf - v) paths) while exp(-1e30) still flushes to zero.
+    _NEG_INF = -1e30
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride())
+        acc_layout = ctx.partition_for_epilogue_fn(
+            cute.make_rmem_tensor(vec_mma_layout, Float32)
+        ).layout
+        tDrMax = cute.make_rmem_tensor(acc_layout, Float32)
+        tDrSum = cute.make_rmem_tensor(acc_layout, Float32)
+        return (tDrMax, tDrSum)
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        m_cur = state[0][None, None, None, epi_coord[0], epi_coord[1]]
+        s_cur = state[1][None, None, None, epi_coord[0], epi_coord[1]]
+        if const_expr(epi_coord[self._reduce_dim()] == 0):
+            cute.filter_zeros(m_cur).fill(self._NEG_INF)
+            cute.filter_zeros(s_cur).fill(0.0)
+        return (m_cur, s_cur)
+
+    @cute.jit
+    def fn_sink_flush(self, gemm, state, frag):
+        # Sequential aliased fold: same-row lanes alias through the zero-stride
+        # accumulator slice, which is exactly the online recurrence we want.
+        # Scalar setitem, unrolled, no vectorize (aliasing must stay ordered).
+        m_acc, s_acc = state[0], state[1]
+        for i in cutlass.range(cute.size(frag), unroll_full=True):
+            v = frag[i]
+            m_old = m_acc[i]
+            m_new = cute.arch.fmax(m_old, v)
+            s_acc[i] = s_acc[i] * cute.math.exp(m_old - m_new, fastmath=True) + cute.math.exp(
+                v - m_new, fastmath=True
+            )
+            m_acc[i] = m_new
+
+    @cute.jit
+    def end_loop(
+        self,
+        gemm,
+        param,
+        state,
+        epi_coord,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Merge (m, s) across N lanes and write log(s) + m per completed stripe."""
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
+            m_cur = state[0][None, None, None, epi_coord[0], epi_coord[1]]
+            s_cur = state[1][None, None, None, epi_coord[0], epi_coord[1]]
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
+            lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
+            lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+            warps_in_N = const_expr(cute.size(warp_layout_MN, mode=[1]))
+            assert warps_in_N == 1, (
+                "OnlineLSEReduce: inter-warp (m, s) smem merge not implemented yet "
+                "(needs the factored reduce engine); use an epi warp shape with warps_in_N == 1"
+            )
+            is_lane_n_leader = cute.arch.lane_idx() % lanes_in_N == 0
+            if const_expr(lanes_in_N > 1):
+                assert lane_layout_MN.stride[1] == 1
+                m_flt = cute.filter_zeros(m_cur)
+                s_flt = cute.filter_zeros(s_cur)
+                for i in cutlass.range(cute.size(m_flt), unroll_full=True):
+                    off = lanes_in_N // 2
+                    while off > 0:
+                        om = cute.arch.shuffle_sync_bfly(m_flt[i], offset=off)
+                        os = cute.arch.shuffle_sync_bfly(s_flt[i], offset=off)
+                        m_new = cute.arch.fmax(m_flt[i], om)
+                        s_flt[i] = s_flt[i] * cute.math.exp(
+                            m_flt[i] - m_new, fastmath=True
+                        ) + os * cute.math.exp(om - m_new, fastmath=True)
+                        m_flt[i] = m_new
+                        off = off // 2
+
+            partition_for_epilogue_fn = partial(
+                partition_for_epilogue,
+                epi_tile=epi_tile,
+                tiled_copy=tiled_copy,
+                tidx=tidx,
+                reference_src=reference_src,
+            )
+            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
+            m_m = layout_utils.convert_layout_zero_stride(m_cur, m_cur.layout)[None, 0]
+            s_m = layout_utils.convert_layout_zero_stride(s_cur, m_cur.layout)[None, 0]
+            tDcD_m = layout_utils.convert_layout_zero_stride(tDcD_cur, m_cur.layout)[None, 0]
+
+            batch_idx = tile_coord_mnkl[3]
+            limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
+            limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
+            if const_expr(not varlen_manager.varlen_m):
+                mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
+            else:
+                mColVec = cute.domain_offset(
+                    (varlen_manager.params.cu_seqlens_m[batch_idx],),
+                    param[None, tile_coord_mnkl[1]],
+                )
+            gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+            if tile_coord_mnkl[1] < limit_n_tiles and is_lane_n_leader:
+                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                    row_idx = tDcD_m[m][0]
+                    if row_idx < limit_m:
+                        gColVec[row_idx] = cute.math.log(s_m[m], fastmath=True) + m_m[m]

@@ -49,6 +49,13 @@ class GemmBase:
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
+    # Epilogue mixins that need a reduction over the full accumulator tile
+    # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
+    # set this in epi_to_underlying_arguments. The epilogue then runs a
+    # prepass over all epi subtiles (tmem loads only, accumulator NOT
+    # released) calling epi_prepass_subtile / epi_prepass_end, and the store
+    # pass re-reads the accumulator. SM100-only (repeatable tmem loads).
+    epi_needs_acc_prepass = False
     # Split-K along the contraction dim. Constexpr (lives on self): split_k == 1 compiles to
     # exactly the non-split kernel. The epilogue (the full epi mixin: alpha, beta*C, bias,
     # activations, aux outputs) runs exactly ONCE per output tile, on the entity that owns
@@ -234,6 +241,21 @@ class GemmBase:
             tidx,
             tRS_rD.layout,
         )
+
+        if const_expr(self.epi_needs_acc_prepass):
+            assert self.arch in (90, 100), (
+                "acc prepass needs a re-readable accumulator (SM90 registers / SM100 tmem)"
+            )
+            # Pingpong is safe: the two warpgroups' epilogues are strictly
+            # exclusive (the leaving WG drains its TMA stores via
+            # producer_tail before arriving the peer's epi barrier), so epi
+            # smem — including prepass statistics — is only temporally shared.
+            assert const_expr(self.split_k == 1), "acc prepass reads the raw accumulator"
+            for epi_idx in cutlass.range_constexpr(epi_tile_num):
+                epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                load_acc_subtile(tRS_rD, epi_coord, no_release=True)
+                self.epi_prepass_subtile(params, epi_tensors, tRS_rD, epi_coord, epi_idx)
+            self.epi_prepass_end(params, epi_tensors)
 
         if const_expr(inline_epi_load):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
@@ -704,7 +726,10 @@ class GemmBase:
         tRS_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
         epi_coord,  # (int, int)
+        no_release: cutlass.Constexpr[bool] = False,
     ):
+        # no_release is the prepass flag (epi_needs_acc_prepass); the register
+        # accumulator has nothing to release, so re-reads are always safe here.
         cute.autovec_copy(tRS_rAcc[None, None, None, epi_coord], tRS_rD)
 
     @cute.jit

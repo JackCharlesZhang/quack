@@ -75,6 +75,14 @@ class ComposableEpiMixin:
 
     # --- Host-side: args → params ---
 
+    @classmethod
+    def epi_host_constexpr(cls, name, key):
+        """Resolve a picklable constexpr key from the generic host layer
+        (quack.gemm_host) into the trace-time EpilogueArguments field value.
+        Default: the key IS the value (ints/enums like rounding_mode).
+        Override for fields resolved through a registry (e.g. act_fn names)."""
+        return key
+
     def _filter_epi_ops(self, args):
         """Shadow `_epi_ops` with an instance-level tuple of only the ops whose
         arg is non-None. Called automatically by `_epi_ops_to_params_dict`, so
