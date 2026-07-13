@@ -40,14 +40,24 @@ def apply_linear_epilogue(
         tRS_rD.store(rD)
     # Apply C with beta scaling
     if const_expr(tRS_rC is not None):
-        rD = tRS_rD.load()
-        if const_expr(beta is None):
-            # beta is None, default behavior: add C (beta=1.0)
-            rD += tRS_rC.load().to(tRS_rD.element_type)
+        if const_expr(
+            beta is None and tRS_rC.element_type.width == 16 and tRS_rD.element_type == Float32
+        ):
+            # Plain 16-bit C add: scalar adds so the widen folds into the add
+            # (PTX add.rn.f32.{f16,bf16} -> FHADD on SM100/SM120 — exact, so
+            # bitwise-identical to cvt+add; pre-Blackwell lowers to the same
+            # cvt+FADD the TensorSSA form produced).
+            for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] + tRS_rC[i].to(tRS_rD.element_type)
         else:
-            b = utils.load_scalar_or_pointer(beta)
-            rD += b * tRS_rC.load().to(tRS_rD.element_type)
-        tRS_rD.store(rD)
+            rD = tRS_rD.load()
+            if const_expr(beta is None):
+                # beta is None, default behavior: add C (beta=1.0)
+                rD += tRS_rC.load().to(tRS_rD.element_type)
+            else:
+                b = utils.load_scalar_or_pointer(beta)
+                rD += b * tRS_rC.load().to(tRS_rD.element_type)
+            tRS_rD.store(rD)
     if const_expr(tDrRowVec is not None):
         for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
             tRS_rD[i] += tDrRowVec[i]

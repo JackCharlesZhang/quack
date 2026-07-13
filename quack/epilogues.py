@@ -17,23 +17,31 @@ Sections:
     the rmsnorm-backward link.
   * paired mods (gated / RoPE) and packed-C/D mods (dgated), via unpack/pack.
 
-Numerics and perf of every mod here are pinned by tests/test_gemm_epilogue.py
-(bitwise or 1-ulp vs the hand-written kernels, <=1% perf deltas).
+Numerics of every mod here are pinned by tests/test_gemm_epilogue.py against
+torch references.
 """
 
 from __future__ import annotations
 
+import functools
+
 import cutlass.cute as cute
 
+from cutlass import Int32
+
 from quack.activation import (
+    act_fn_map,
+    dact_fn_map,
+    dgate_fn_map,
     dgelu_tanh_approx,
     dswiglu,
+    gate_fn_map,
     gelu_tanh_approx,
     relu,
     relu_sq,
     swiglu,
 )
-from quack.epi_ops import ColVecReduce
+from quack.epi_ops import ColVecLoad, ColVecReduce, RowVecLoad, Scalar
 from quack.epilogue.head_rmsnorm import HeadRMSNormStats
 from quack.epilogue.rotary import rotary_cos_sin_load
 from quack.gemm_epilogue import F2, gemm_epilogue, pack, unpack
@@ -79,10 +87,11 @@ def dgelu_mod(acc, c):
     return {"D": dx, "postact": out}
 
 
-@gemm_epilogue(outputs=("premult",), reduces={"sqsum": ColVecReduce("sqsum")})
+@gemm_epilogue(outputs=("premult",), reduces={"sqsum": ColVecReduce("sqsum", scaled=True)})
 def rms_fused(acc, weight):
-    """GemmSqReduce as a mod: sqsum accumulated on pre-scale x, D = x * weight."""
-    return {"D": acc * weight, "sqsum": acc * acc, "premult": acc}
+    """GemmSqReduce as a mod: sqsum accumulated on pre-scale acc, D = acc * weight.
+    The scaled reduce returns the factors so the fold is one fma(acc, acc, sum)."""
+    return {"D": acc * weight, "sqsum": (acc, acc), "premult": acc}
 
 
 @gemm_epilogue(outputs=("postact",), mode="packed_cd_b16x2")
@@ -96,14 +105,15 @@ def dswiglu_mod(acc, c):
 
 @gemm_epilogue(
     outputs=("postact",),
-    reduces={"dsum": ColVecReduce("dsum")},
+    reduces={"dsum": ColVecReduce("dsum", scaled=True)},
     mode="packed_cd_b16x2",
 )
 def dswiglu_norm_mod(acc, c, rstd):
-    """Full dgated: colvec-scaled dout, reduce on unscaled dout, scaled postact."""
+    """Full dgated: colvec-scaled dout, reduce on unscaled dout (folded as
+    fma(out, dout, acc) via the scaled reduce), scaled postact."""
     x, y = unpack(c)
     dx, dy, out = dswiglu(x, y, acc * rstd)
-    return {"D": pack(dx, dy), "postact": out * rstd, "dsum": out * acc}
+    return {"D": pack(dx, dy), "postact": out * rstd, "dsum": (out, acc)}
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
@@ -214,13 +224,13 @@ def qk_rope_ldg_epi(acc, cs, qk):
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
-@gemm_epilogue(outputs=("resid_out",), reduces={"sqsum": ColVecReduce("sqsum")})
+@gemm_epilogue(outputs=("resid_out",), reduces={"sqsum": ColVecReduce("sqsum", scaled=True)})
 def rms_partial_epi(acc, c, weight):
     """GEMM1 of a block: y = acc + residual(C); write the residual stream (aux),
     the weight-applied output (D — rstd deferred: row scaling commutes through
     the NEXT gemm), and the per-tile sq-sum partials for rstd finalization."""
     y = acc + c
-    return {"D": y * weight, "resid_out": y, "sqsum": y * y}
+    return {"D": y * weight, "resid_out": y, "sqsum": (y, y)}
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
@@ -230,11 +240,212 @@ def rstd_swiglu_epi(acc, rstd):
     return {"postact": swiglu(g, u)}
 
 
-@gemm_epilogue(reduces={"dots": ColVecReduce("dots")})
+@gemm_epilogue(reduces={"dots": ColVecReduce("dots", scaled=True)})
 def rms_bwd_partial_epi(acc, y, rstd, w):
     """RMSNorm backward around a dgrad GEMM: acc = dz @ W2^T (= d(norm out)).
     t = acc*w, xhat = saved_prenorm(TileLoad) * rstd; write D = rstd*t and the
     per-tile partials of the correction dot mean(t * xhat)."""
     t = acc * w
     xhat = y * rstd
-    return {"D": t * rstd, "dots": t * xhat}
+    return {"D": t * rstd, "dots": (t, xhat)}
+
+
+# --- Variant mod factories ----------------------------------------------------
+# The public gemm_act / gemm_dact / gemm_norm_act / gemm_sq_reduce wrappers
+# ride these. The operand names (mAuxOut, mRowVecBroadcast, mColVecBroadcast,
+# mColVecReduce, sr_seed) are the wire names shared with run_*_plan epi_values
+# and concat_layout keys.
+#
+# The frontend derives a fn's operands from its SIGNATURE, and an absent
+# operand must not exist in the signature at all (that is what compiles the
+# term out), so each present-operand combination is its own generated fn:
+# the factory assembles the source, exec-compiles it, and the fail-closed
+# semantic fingerprint keys on the code object (per-combination bytecode +
+# the referenced activation fn's own source through getclosurevars).
+#
+# Why generated source and not a closure over the flags: a closure would be
+# ONE function whose parameter list carries every possible operand — but the
+# signature IS the frontend's interface. A dead `bias_n` parameter would be
+# inferred as a real RowVecLoad operand (smem, cp.async, a loop input the
+# vectorizer must chew), and passing a neutral value instead (bias=0.0)
+# reaches the kernel as a live runtime term, not a compiled-out one. Faking
+# it via __signature__ doesn't help either: operand kinds, the trace-time
+# call, and the co_varnames-based fingerprint all read the real code object.
+# Generating the def is the only path where "operand absent" means "term
+# does not exist in the kernel".
+
+
+def _gen_epi_fn(fname, tag, params, body, ns):
+    lines = [f"def {fname}({', '.join(['acc', *params])}):"]
+    lines.append(f'    """generated epilogue [{tag}]"""')
+    lines += [f"    {ln}" for ln in body]
+    src = "\n".join(lines)
+    code = compile(src, f"<quack-epilogue:{tag}>", "exec")
+    ns = {**ns, "unpack": unpack, "pack": pack, "__name__": "quack.epilogues_generated"}
+    exec(code, ns)
+    return ns[fname]
+
+
+def _vec_pins(params):
+    pins = {}
+    if "mRowVecBroadcast" in params:
+        pins["mRowVecBroadcast"] = RowVecLoad("mRowVecBroadcast")
+    if "mColVecBroadcast" in params:
+        pins["mColVecBroadcast"] = ColVecLoad("mColVecBroadcast")
+    return pins
+
+
+_SR_OPS = (Scalar("sr_seed", dtype=Int32),)
+
+
+@functools.lru_cache(maxsize=None)
+def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
+    """gemm_act/gemm_gated as a mod: D = acc (+ C + rowvec + colvec), aux =
+    act(D). Math order matches apply_linear_epilogue: C, rowvec, colvec."""
+    fn_map = gate_fn_map if gated else act_fn_map
+    act = fn_map[activation]
+    params, body = [], []
+    if has_c:
+        params.append("c")
+    if has_rowvec:
+        params.append("mRowVecBroadcast")
+    if has_colvec:
+        params.append("mColVecBroadcast")
+    expr = "acc"
+    if has_c:
+        body.append("x = acc + c")
+        expr = "x"
+    if has_rowvec:
+        body.append(f"x = {expr} + mRowVecBroadcast")
+        expr = "x"
+    if has_colvec:
+        body.append(f"x = {expr} + mColVecBroadcast")
+        expr = "x"
+    if gated:
+        body.append(f"g, u = unpack({expr})")
+        body.append('return {"D": pack(g, u), "mAuxOut": act(g, u)}')
+    elif act is not None:
+        body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
+    else:
+        body.append(f'return {{"D": {expr}, "mAuxOut": {expr}}}')
+    tag = f"act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}v{int(has_colvec)}"
+    fn = _gen_epi_fn("linear_act_epi", tag, params, body, {"act": act})
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        mode="acc_pair" if gated else None,
+        extra_ops=_SR_OPS if sr else (),
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
+    """gemm_norm_act as a mod: x = (acc + C) * colvec * rowvec; D = x,
+    aux = act(x). Scale order: colvec then rowvec."""
+    fn_map = gate_fn_map if gated else act_fn_map
+    act = fn_map[activation]
+    params, body = [], []
+    if has_c:
+        params.append("c")
+    if has_rowvec:
+        params.append("mRowVecBroadcast")
+    if has_colvec:
+        params.append("mColVecBroadcast")
+    expr = "acc"
+    if has_c:
+        body.append("x = acc + c")
+        expr = "x"
+    if has_colvec:
+        body.append(f"x = {expr} * mColVecBroadcast")
+        expr = "x"
+    if has_rowvec:
+        body.append(f"x = {expr} * mRowVecBroadcast")
+        expr = "x"
+    if gated:
+        body.append(f"g, u = unpack({expr})")
+        body.append('return {"D": pack(g, u), "mAuxOut": act(g, u)}')
+    elif act is not None:
+        body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
+    else:
+        body.append(f'return {{"D": {expr}, "mAuxOut": {expr}}}')
+    tag = f"norm_act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}v{int(has_colvec)}"
+    fn = _gen_epi_fn("norm_act_epi", tag, params, body, {"act": act})
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        mode="acc_pair" if gated else None,
+        extra_ops=_SR_OPS if sr else (),
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def dact_mod(activation):
+    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c)."""
+    dact = dact_fn_map[activation]
+    if dact is None:
+        body = ['return {"D": acc, "mAuxOut": c}']
+    else:
+        body = ["dx, out = dact(c, acc)", 'return {"D": dx, "mAuxOut": out}']
+    fn = _gen_epi_fn("dact_epi", f"dact:{activation}", ["c"], body, {"dact": dact})
+    return gemm_epilogue(outputs=("mAuxOut",))(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def dgated_mod(activation, *, has_scale, has_reduce):
+    """gemm_dgated as a mod: acc = dout (per pair), c = packed (x, y) preact.
+    Reduce accumulates postact * unscaled dout; postact is scaled after."""
+    dgate = dgate_fn_map[activation]
+    params, body = ["c"], []
+    if has_scale:
+        params.append("mColVecBroadcast")
+    body.append("x, y = unpack(c)")
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
+    body.append(f"dx, dy, out = dgate(x, y, {dout})")
+    postact = "out * mColVecBroadcast" if has_scale else "out"
+    if has_reduce:
+        # Scaled reduce: return the factors so the fold is one
+        # fma(out, dout, acc) per pair.
+        body.append(
+            f'return {{"D": pack(dx, dy), "mAuxOut": {postact}, "mColVecReduce": (out, acc)}}'
+        )
+    else:
+        body.append(f'return {{"D": pack(dx, dy), "mAuxOut": {postact}}}')
+    tag = f"dgated:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dgated_epi", tag, params, body, {"dgate": dgate})
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+        mode="packed_cd_b16x2",
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
+    """gemm_sq_reduce as a mod: x = acc (+ C); reduce[m] += sum_n x^2 (before
+    the rowvec scale); optional aux = x; D = x * rowvec."""
+    params, body = [], []
+    if has_c:
+        params.append("c")
+    if has_rowvec:
+        params.append("mRowVecBroadcast")
+    expr = "acc"
+    if has_c:
+        body.append("x = acc + c")
+        expr = "x"
+    d = f"{expr} * mRowVecBroadcast" if has_rowvec else expr
+    # Scaled reduce: (x, x) folds as one fma(x, x, acc) per pair instead of
+    # FMUL+FADD.
+    ret = f'"D": {d}, "mColVecReduce": ({expr}, {expr})'
+    if has_aux:
+        ret += f', "mAuxOut": {expr}'
+    body.append(f"return {{{ret}}}")
+    tag = f"sq_reduce:c{int(has_c)}r{int(has_rowvec)}a{int(has_aux)}"
+    fn = _gen_epi_fn("sq_reduce_epi", tag, params, body, {})
+    return gemm_epilogue(
+        outputs=("mAuxOut",) if has_aux else (),
+        ops=_vec_pins(params),
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)},
+    )(fn)

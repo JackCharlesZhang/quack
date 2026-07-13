@@ -9,9 +9,6 @@ generic implementation driven by the variant's EpiOp schema:
 * each EpiOp describes its own host argument via ``host_arg_key`` (torch value
   -> picklable descriptor), ``host_fake_arg`` (descriptor -> fake trace-time
   tensor/scalar), and ``host_call_arg`` (torch value -> runtime argument);
-* constexpr EpilogueArguments fields (act_fn, rounding_mode, ...) travel as
-  picklable ``(name, key)`` pairs resolved by the mixin's classmethod
-  ``epi_host_constexpr`` at compile time;
 * a reconstructable ``GemmClassRef`` is the jit_cache key component — static
   classes resolve by module+qualname, while dynamic epilogue classes resolve
   through a module-global EpiMod and mint locally in async workers.
@@ -181,7 +178,6 @@ def _compile_gemm_epi(
     batched,
     b_kn,
     epi_keys,  # ((op_name, op.host_arg_key(value)), ...) — name-sorted
-    constexpr_keys=(),  # ((field_name, key), ...) resolved via GemmCls.epi_host_constexpr
     use_tma_gather=False,
     concat_layout=(),
     sf_dtype=None,
@@ -216,8 +212,6 @@ def _compile_gemm_epi(
         fake = ops[name].host_fake_arg(key, fctx)
         if fake is not None:
             fields[name] = fake
-    for name, key in constexpr_keys:
-        fields[name] = GemmCls.epi_host_constexpr(name, key)
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
@@ -299,7 +293,6 @@ def build_gemm_epi_plan(
     *,
     epi_values,  # {op_name: torch value or scalar}; missing/None = op inactive
     epi_key_overrides=None,  # {op_name: key} when the wrapper owns the key rule (scalar modes)
-    constexpr_keys=(),
     tile_M,
     tile_N,
     cluster_M,
@@ -368,7 +361,6 @@ def build_gemm_epi_plan(
         batched,
         b_kn,
         epi_keys,
-        constexpr_keys=constexpr_keys,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout,
         sf_dtype=sf_dtype,

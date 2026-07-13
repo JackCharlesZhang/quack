@@ -63,8 +63,10 @@ _cache_max_mod = gemm_epilogue(reduces={"stat": ColVecReduce("stat", combine="ma
 
 def test_epi_mod_semantic_cache_key_and_resolver():
     """Static op config changes identity; a pickled class recipe remints locally."""
+    from quack.rounding import RoundingMode
+
     assert _cache_add_mod.semantic_digest != _cache_max_mod.semantic_digest
-    mint_key = ((), 10, False, False, ())
+    mint_key = ((), 10, False, False, (), RoundingMode.RN)
     ref = pickle.loads(pickle.dumps(_cache_add_mod._class_ref(mint_key)))
     cls = resolve_gemm_class(ref)
     assert cls._epi_mod_class_semantic_key == (_cache_add_mod.semantic_digest, mint_key)
@@ -866,6 +868,13 @@ def lse_epi(acc, scale):
     return {"D": acc, "lse": acc * scale}
 
 
+@gemm_epilogue(outs={"lse": OnlineLSEReduce("lse", check_oob=False)})
+def lse_nocheck_epi(acc, scale):
+    """check_oob=False variant: OOB predicate compiled out (CUTLASS
+    VisitCheckOOB=false); the host rejects N not divisible by tile_N."""
+    return {"D": acc, "lse": acc * scale}
+
+
 def test_epi_mod_rope_apply_rowsum():
     device = "cuda"
     torch.random.manual_seed(14)
@@ -904,24 +913,49 @@ def test_epi_mod_rope_apply_rowsum():
     _rel_check(rowsum, y.unflatten(-1, (n_tiles, tile_N)).sum(dim=-1), "rowsum", tol=1e-3)
 
 
-def test_epi_mod_online_lse():
-    """Logits far beyond f32 exp range: naive sum-exp is inf, online LSE exact."""
-    if _quack_capability() == 12:
-        # SM120's epilogue warp layout splits warps along N at this config;
-        # OnlineLSEReduce's inter-warp (m, s) smem merge is not implemented
-        # (the op asserts warps_in_N == 1 at trace time).
-        pytest.skip("OnlineLSEReduce inter-warp merge not implemented for SM120 epi layouts")
+# overflow: logits ~ +-1300, exp overflows f32 without the online max.
+# ragged: last N tile is partial (1160 = 4*256 + 136; N stride must stay 8-divisible
+# for TMA) with all logits pushed negative, so an unpredicated fold of the OOB
+# accumulator zeros would dominate both the max (0 > all logits) and the sum.
+# 1040 = 4*256 + 16: the boundary tile masks ENTIRE slots at init time on
+# warp-split-N epi layouts (SM120: warp 1's first chunk starts at n=16), so
+# the -inf fold identity meets itself — regression for the _guard_neg_inf
+# subtrahend (unguarded, (-inf) - (-inf) = NaN poisons the row's sum).
+@pytest.mark.parametrize(
+    "n,regime,check_oob",
+    [
+        (1024, "overflow", True),
+        (1160, "negative", True),
+        (1160, "overflow", True),
+        (1040, "negative", True),
+        (1024, "overflow", False),  # divisible N: predicate compiled out, same math
+    ],
+)
+def test_epi_mod_online_lse(n, regime, check_oob):
+    """Logits far beyond f32 exp range: naive sum-exp is inf, online LSE exact.
+
+    Ragged n exercises the OOB predication: the accumulator zeros in the last
+    tile's OOB columns must not enter the (max, sum) fold. The negative regime
+    is the sharp regression for that — with logits ~ -10, a single unpredicated
+    zero shifts the tile LSE to ~log(#oob).
+    """
     device = "cuda"
     torch.random.manual_seed(15)
-    l, m, n, k = 2, 512, 1024, 512
-    tile_N, scale = 256, 64.0  # logits ~ +-1300: exp overflows f32 without the online max
+    l, m, k = 2, 512, 512
+    tile_N = 256
     A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
     B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    if regime == "overflow":
+        scale = 64.0  # logits ~ +-1300
+    else:
+        # Anti-correlated signs: acc = -sum |a||b| ~ -10, strictly negative.
+        A, B, scale = A.abs(), -B.abs(), 1.0
     D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
-    n_tiles = n // tile_N  # divisible: OOB accumulator zeros are NOT an LSE identity
+    n_tiles = (n + tile_N - 1) // tile_N
     lse = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
 
-    lse_epi.gemm(
+    mod = lse_epi if check_oob else lse_nocheck_epi
+    mod.gemm(
         A,
         B,
         D,
@@ -933,13 +967,80 @@ def test_epi_mod_online_lse():
     )
 
     logits = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) * scale
-    assert torch.isinf(logits.exp().sum(dim=-1)).any(), "test regime should overflow naive sumexp"
-    ref_tiles = torch.logsumexp(logits.unflatten(-1, (n_tiles, tile_N)), dim=-1)
+    if regime == "overflow":
+        assert torch.isinf(logits.exp().sum(dim=-1)).any(), (
+            "test regime should overflow naive sumexp"
+        )
+    else:
+        assert logits.max().item() < 0, "test regime should make OOB zeros the (wrong) max"
+    pad = n_tiles * tile_N - n
+    logits_p = torch.nn.functional.pad(logits, (0, pad), value=-math.inf) if pad else logits
+    ref_tiles = torch.logsumexp(logits_p.unflatten(-1, (n_tiles, tile_N)), dim=-1)
     err = (lse - ref_tiles).abs().max().item()
     assert err < 1e-2, f"per-tile lse err {err}"
     final = torch.logsumexp(lse, dim=-1)
     ref = torch.logsumexp(logits, dim=-1)
     assert (final - ref).abs().max().item() < 1e-2
+
+
+@gemm_epilogue(ops={"sr_seed": Scalar("sr_seed", dtype=Int32)})
+def sr_epi(acc, sr_seed):
+    """Plain D store; the sr_seed scalar feeds the stochastic-rounding D
+    conversion when the kernel is minted with rounding_mode=RS."""
+    return {"D": acc}
+
+
+def test_epi_mod_stochastic_rounding():
+    """RS through the fn frontend: hw cvt.rs on SM100/SM103, sw emulation on
+    SM90/SM120. Checks RS engages (differs from RN), stays within the usual
+    SR error envelope, and is reproducible per seed."""
+    from quack.rounding import RoundingMode
+
+    device = "cuda"
+    torch.random.manual_seed(19)
+    l, m, n, k = 1, 512, 1024, 512
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    cfg = dict(tile_M=128, tile_N=256, cluster_M=1, cluster_N=1)
+
+    def run(mode, seed):
+        D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+        sr_epi.gemm(A, B, D, epi_args=dict(sr_seed=seed), rounding_mode=mode, **cfg)
+        return D
+
+    D_rn = run(RoundingMode.RN, 42)
+    D_rs = run(RoundingMode.RS, 42)
+    D_rs_same = run(RoundingMode.RS, 42)
+    D_rs_other = run(RoundingMode.RS, 43)
+    assert not torch.equal(D_rs, D_rn), "RS should differ from RN somewhere"
+    assert torch.equal(D_rs, D_rs_same), "same seed must reproduce bitwise"
+    assert not torch.equal(D_rs, D_rs_other), "different seeds should differ"
+    err_rs = (D_rs.float() - ref).abs().max().item()
+    err_rn = (D_rn.float() - ref).abs().max().item()
+    assert err_rs < 3 * err_rn + 5e-3, f"RS err {err_rs} vs RN err {err_rn}"
+
+
+def test_epi_mod_online_lse_nocheck_rejects_ragged():
+    """check_oob=False compiles the OOB predicate out, so the host must
+    reject N not divisible by tile_N instead of silently corrupting the LSE."""
+    device = "cuda"
+    l, m, n, k, tile_N = 2, 512, 1160, 512, 256
+    A = torch.empty((l, m, k), device=device, dtype=torch.bfloat16)
+    B = torch.empty((l, n, k), device=device, dtype=torch.bfloat16)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    lse = torch.empty((l, m, (n + tile_N - 1) // tile_N), device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="check_oob=False"):
+        lse_nocheck_epi.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(scale=1.0, lse=lse),
+            tile_M=128,
+            tile_N=tile_N,
+            cluster_M=1,
+            cluster_N=1,
+        )
 
 
 @pytest.mark.parametrize("tma", [False, True])  # gmem->rmem op vs TMA-staged op
@@ -998,8 +1099,8 @@ def _quack_capability():
 
 
 def _skip_unless_acc_prepass():
-    if _quack_capability() not in (9, 10, 11):
-        pytest.skip("acc prepass needs a re-readable accumulator (SM90/SM100/SM110)")
+    if _quack_capability() not in (9, 10, 11, 12):
+        pytest.skip("acc prepass needs a re-readable accumulator (SM90/SM100/SM110/SM120)")
 
 
 # (tile_N, head_dim): one head per tile, several heads per tile, and a
@@ -1013,8 +1114,8 @@ def _skip_unless_acc_prepass():
 )
 def test_epi_mod_qknorm_prepass(tile_N, head_dim, pingpong):
     _skip_unless_acc_prepass()
-    if pingpong and _quack_capability() != 9:
-        pytest.skip("pingpong is an SM90 schedule")
+    if pingpong and _quack_capability() not in (9, 12):
+        pytest.skip("pingpong is an SM90/SM120 schedule")
     device = "cuda"
     torch.random.manual_seed(17)
     l, m, k, heads = 2, 384, 736, 512 // head_dim
@@ -1044,8 +1145,8 @@ def test_epi_mod_qknorm_prepass(tile_N, head_dim, pingpong):
 @pytest.mark.parametrize("pingpong", [False, True])
 def test_epi_mod_qknorm_rope_prepass(pingpong, tma):
     _skip_unless_acc_prepass()
-    if pingpong and _quack_capability() != 9:
-        pytest.skip("pingpong is an SM90 schedule")
+    if pingpong and _quack_capability() not in (9, 12):
+        pytest.skip("pingpong is an SM90/SM120 schedule")
     device = "cuda"
     torch.random.manual_seed(18)
     l, m, k, head_dim, heads = 2, 384, 736, 128, 4
@@ -1364,3 +1465,30 @@ def test_semantic_key_fail_closed_and_protocol():
     # 5. EpiOps implement the protocol as their cache identity.
     op = ColVecReduce("s", combine="max")
     assert op.__quack_semantic_key__() == op.cache_key()
+
+
+def test_epi_mod_multi_output_mixed_dtype():
+    """Tier-1 unlock: several TileStores from one epilogue, mixed dtypes —
+    each op derives its own dtype/copy-atom (no singular aux_out_dtype)."""
+    from quack.activation import gelu_tanh_approx, relu
+
+    device = "cuda"
+    torch.random.manual_seed(11)
+
+    @gemm_epilogue(outputs=("y1", "y2"))
+    def dual_out(acc):
+        return {"D": acc, "y1": gelu_tanh_approx(acc), "y2": relu(acc)}
+
+    l, m, n, k = 2, 512, 1024, 736
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    y1 = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    y2 = torch.empty((l, m, n), device=device, dtype=torch.float32)  # mixed dtype
+    dual_out.gemm(
+        A, B, D, epi_args=dict(y1=y1, y2=y2), tile_M=128, tile_N=256, cluster_M=2, cluster_N=1
+    )
+    ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    _rel_check(D, ref, "D")
+    _rel_check(y1, torch.nn.functional.gelu(ref, approximate="tanh"), "y1")
+    _rel_check(y2, torch.relu(ref), "y2")

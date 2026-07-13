@@ -206,10 +206,10 @@ class GemmBase:
         )
 
         # Setup aux outputs. Returns a tuple of ``(tiled_copy_r2s,
-        # tRS_sAuxOut, copy_aux_out)`` triples — empty for the default
-        # epilogue, one entry for the standard ``GemmAct``/``GemmGated``
-        # single-output mixins, multiple entries for multi-output mixins
-        # (e.g. ``T*tanh`` + ``1-tanh^2`` from one GEMM).
+        # tRS_sAuxOut, copy_aux_out, store_pred)`` quadruples — one per active
+        # TileStore op (empty for the default epilogue). ``store_pred`` is
+        # None for an unconditional store, else a per-CTA-tile Boolean (e.g.
+        # GemmSymmetric skips the mirrored write on diagonal tiles).
         aux_out_ctxs = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
@@ -243,13 +243,14 @@ class GemmBase:
         )
 
         if const_expr(self.epi_needs_acc_prepass):
-            assert self.arch in (90, 100), (
-                "acc prepass needs a re-readable accumulator (SM90 registers / SM100 tmem)"
+            assert self.arch in (90, 100, 120), (
+                "acc prepass needs a re-readable accumulator (SM90/SM120 registers / SM100 tmem)"
             )
-            # Pingpong is safe: the two warpgroups' epilogues are strictly
-            # exclusive (the leaving WG drains its TMA stores via
-            # producer_tail before arriving the peer's epi barrier), so epi
-            # smem — including prepass statistics — is only temporally shared.
+            # Pingpong is safe (SM90 and SM120 share the protocol): the two
+            # warpgroups' epilogues are strictly exclusive (the leaving WG
+            # drains its TMA stores via producer_tail before arriving the
+            # peer's epi barrier), so epi smem — including prepass
+            # statistics — is only temporally shared.
             assert const_expr(self.split_k == 1), "acc prepass reads the raw accumulator"
             for epi_idx in cutlass.range_constexpr(epi_tile_num):
                 epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
@@ -373,7 +374,7 @@ class GemmBase:
             # the same ``epi_buffer`` index so the s2g TMA stores below happen
             # in lockstep after the fence.
             for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                tiled_copy_aux_out_r2s, tRS_sAuxOut, _ = aux_out_ctxs[i]
+                tiled_copy_aux_out_r2s, tRS_sAuxOut, _, _ = aux_out_ctxs[i]
                 cute.copy(
                     tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
@@ -387,16 +388,24 @@ class GemmBase:
                     if const_expr(has_D):
                         copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
                     for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                        _, _, copy_aux_out = aux_out_ctxs[i]
-                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        _, _, copy_aux_out, store_pred = aux_out_ctxs[i]
+                        if const_expr(store_pred is None):
+                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        else:
+                            if store_pred:
+                                copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
             else:
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
                     copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
                 for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                    _, _, copy_aux_out = aux_out_ctxs[i]
-                    copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                    _, _, copy_aux_out, store_pred = aux_out_ctxs[i]
+                    if const_expr(store_pred is None):
+                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                    else:
+                        if store_pred:
+                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
 
         self.epi_end(
@@ -693,7 +702,12 @@ class GemmBase:
             )
         else:
             assert self.split_k == 1, "split_k does not support varlen_m"
-            assert (mD is not None) or (epilogue_args.mAuxOut is not None) or (not self.gather_A)
+            has_epi_tile_store = any(
+                getattr(epilogue_args, op.name, None) is not None
+                for op in getattr(type(self), "_epi_ops", ())
+                if op.is_tile_store()
+            )
+            assert (mD is not None) or has_epi_tile_store or (not self.gather_A)
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
@@ -851,9 +865,11 @@ class GemmBase:
         varlen_manager,
         tidx,
     ):
-        """Return a tuple of ``(tiled_copy_r2s, tRS_sAuxOut, copy_aux_out)``
-        triples — one per aux output. The default epilogue has no aux output,
-        so the tuple is empty.
+        """Return a tuple of ``(tiled_copy_r2s, tRS_sAuxOut, copy_aux_out,
+        store_pred)`` quadruples — one per aux output (see
+        TileStore.store_setup; ComposableEpiMixin provides the generic op-driven
+        implementation). The default epilogue has no aux output, so the tuple
+        is empty.
         """
         return ()
 

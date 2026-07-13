@@ -4,7 +4,6 @@ import math
 from typing import Tuple
 from functools import partial
 
-import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
@@ -86,8 +85,14 @@ def dsigmoid_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> F
 
 @dsl_user_op
 def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # nvvm.fmax (one FMNMX), NOT cutlass.max: the latter lowers to
+    # setp+selp, which ptxas (CUDA 13.3, sm_100+) fuses into a following
+    # cvt.rs stochastic-rounding convert as F2FP.RELU..RS while REPLACING the
+    # live rbits operand with RZ — silently turning SR into truncation, even
+    # through inline asm. fmax also saves an instruction. NaN corner: max.f32
+    # returns the non-NaN operand, so relu(NaN) = 0 here (selp gave NaN).
     if const_expr(not isinstance(x, tuple)):
-        return cutlass.max(x, Float32(0.0), loc=loc, ip=ip)
+        return cute.arch.fmax(x, Float32(0.0), loc=loc, ip=ip)
     else:
         return relu(x[0], loc=loc, ip=ip), relu(x[1], loc=loc, ip=ip)
 

@@ -1,305 +1,14 @@
 # Copyright (c) 2025-2026, Tri Dao.
-# GEMM + normalize (multiply by colvec and rowvec) + activation:
-# PostAct = act((A @ B + C) * colvec * rowvec)
-# colvec is typically rstd (M,), rowvec is typically norm_weight (N,).
+"""GEMM + normalize (colvec/rowvec multiply) + activation: thin wrappers over
+the epilogue-mod path (quack.epilogues.norm_act_mod)."""
 
-from typing import NamedTuple, Optional, Tuple
+from __future__ import annotations
+from typing import Optional
 
 from torch import Tensor
 
-import cutlass
-import cutlass.cute as cute
-from cutlass import Int32, const_expr
-from cutlass.cute.runtime import make_ptr
-
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import (
-    torch2cute_dtype_map,
-    get_device_capacity,
-    get_max_active_clusters,
-)
-from quack.gemm_sm80 import GemmSm80
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.gemm_sm120 import GemmSm120
-from quack.gemm_act import GemmActMixin, GemmGatedMixin, GemmGatedSm120Mixin
-from quack.epi_ops import vec_multiply
 from quack.activation import act_fn_map, gate_fn_map
-from quack.cache import jit_cache
 from quack.rounding import RoundingMode
-from quack.gemm_tvm_ffi_utils import (
-    get_major,
-    make_scheduler_args,
-    make_varlen_args,
-    make_fake_scheduler_args,
-    make_fake_varlen_args,
-    div_for_dtype,
-    fake_batched,
-    make_fake_gemm_tensors,
-    compile_gemm_kernel,
-    tensor_key,
-    scalar_arg,
-    plan_scheduler_args,
-    launch_gemm,
-)
-import quack.utils as utils
-
-
-class GemmNormActMixin(GemmActMixin):
-    """GEMM + normalize + activation: PostAct = act((A @ B + C) * colvec * rowvec).
-
-    colvec is typically rstd (M,), rowvec is typically norm_weight (N,).
-    D stores the normalized (pre-activation) value, PostAct stores act(D).
-    """
-
-    @cute.jit
-    def epi_visit_subtile(
-        self,
-        params: GemmActMixin.EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Tuple[cute.Tensor, ...]:
-        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
-        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
-        # Load accumulator and apply alpha/beta/C
-        rD = tRS_rD.load()
-        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            alpha = utils.load_scalar_or_pointer(params.alpha)
-            rD *= alpha
-        if const_expr(tRS_rC is not None):
-            if const_expr(not hasattr(params, "beta") or params.beta is None):
-                rD += tRS_rC.load().to(tRS_rD.element_type)
-            else:
-                beta = utils.load_scalar_or_pointer(params.beta)
-                rD += beta * tRS_rC.load().to(tRS_rD.element_type)
-        tRS_rD.store(rD)
-        # Multiply by colvec (rstd) and rowvec (norm_weight)
-        vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
-        # Apply activation
-        if const_expr(params.act_fn is not None):
-            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
-                    tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
-            else:
-                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
-                    tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
-                        (tRS_rD[2 * i], tRS_rD[2 * i + 1])
-                    )
-        else:
-            tRS_rAuxOut = tRS_rD
-        return (tRS_rAuxOut,)
-
-
-class GemmNormActSm90(GemmNormActMixin, GemmSm90):
-    pass
-
-
-class GemmNormActSm80(GemmNormActMixin, GemmSm80):
-    pass
-
-
-class GemmNormActSm100(GemmNormActMixin, GemmSm100):
-    pass
-
-
-class GemmNormActSm120(GemmNormActMixin, GemmSm120):
-    pass
-
-
-class GemmNormGatedMixin(GemmGatedMixin):
-    """GEMM + normalize + gated activation: PostAct = gated_act((A @ B + C) * colvec * rowvec)."""
-
-    @cute.jit
-    def epi_visit_subtile(
-        self,
-        params: GemmActMixin.EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Tuple[cute.Tensor, ...]:
-        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
-        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
-        # Load accumulator and apply alpha/beta/C
-        rD = tRS_rD.load()
-        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            alpha = utils.load_scalar_or_pointer(params.alpha)
-            rD *= alpha
-        if const_expr(tRS_rC is not None):
-            if const_expr(not hasattr(params, "beta") or params.beta is None):
-                rD += tRS_rC.load().to(tRS_rD.element_type)
-            else:
-                beta = utils.load_scalar_or_pointer(params.beta)
-                rD += beta * tRS_rC.load().to(tRS_rD.element_type)
-        tRS_rD.store(rD)
-        # Multiply by colvec (rstd) and rowvec (norm_weight)
-        vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
-        # Gated activation on normalized D
-        tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
-        tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
-        tRS_rD_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
-        tRS_rGate = tRS_rD_pair[0, ...]
-        tRS_rUp = tRS_rD_pair[1, ...]
-        vectorize = const_expr(self.arch == 100)
-        for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
-            tRS_rAuxOut[i] = params.act_fn(tRS_rGate[i], tRS_rUp[i])
-        return (tRS_rAuxOut,)
-
-
-class GemmNormGatedSm90(GemmNormGatedMixin, GemmSm90):
-    pass
-
-
-class GemmNormGatedSm80(GemmNormGatedMixin, GemmSm80):
-    pass
-
-
-class GemmNormGatedSm100(GemmNormGatedMixin, GemmSm100):
-    pass
-
-
-class GemmNormGatedSm120(GemmGatedSm120Mixin, GemmNormGatedMixin, GemmSm120):
-    pass
-
-
-@jit_cache
-def _compile_gemm_norm_act(
-    a_dtype,
-    b_dtype,
-    d_dtype,
-    c_dtype,
-    postact_dtype,
-    a_major,
-    b_major,
-    d_major,
-    c_major,
-    postact_major,
-    tile_shape_mn,
-    cluster_shape_mnk,
-    pingpong,
-    persistent,
-    is_dynamic_persistent,
-    activation,
-    rowvec_dtype,
-    colvec_dtype,
-    colvec_ndim,
-    varlen_m,
-    gather_A,
-    device_capacity,
-    gemm_cls_name,
-    rounding_mode=RoundingMode.RN,
-    sr_seed_mode=0,
-    batched=True,
-    b_kn=False,
-):
-    sm_to_cls = {
-        "norm_act": {
-            8: GemmNormActSm80,
-            9: GemmNormActSm90,
-            10: GemmNormActSm100,
-            11: GemmNormActSm100,
-            12: GemmNormActSm120,
-        },
-        "norm_gated": {
-            8: GemmNormGatedSm80,
-            9: GemmNormGatedSm90,
-            10: GemmNormGatedSm100,
-            11: GemmNormGatedSm100,
-            12: GemmNormGatedSm120,
-        },
-    }
-    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
-    pa_leading = 1 if postact_major == "n" else 0
-    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        varlen_m=varlen_m,
-        gather_A=gather_A,
-        batched=batched,
-        b_kn=b_kn,
-    )
-    div_pa = div_for_dtype(postact_dtype)
-    pa_n = cute.sym_int() if gemm_cls_name == "norm_gated" else n
-    pa_leading_dim = 1 if gemm_cls_name == "norm_gated" else pa_leading
-    pa_l = None if (varlen_m or not batched) else l
-    mAuxOut = fake_batched(postact_dtype, m, pa_n, pa_l, pa_leading_dim, div_pa)
-
-    mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
-    if colvec_ndim == 2:
-        mColVec = fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
-    elif colvec_ndim == 1:
-        mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4)
-    else:
-        mColVec = None
-
-    act_fn = act_fn_map[activation] if gemm_cls_name == "norm_act" else gate_fn_map[activation]
-
-    def fake_scalar(mode, dtype=Int32):
-        if mode == 0:
-            return None
-        elif mode == 1:
-            return dtype(0)
-        else:
-            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
-
-    epi_args = GemmCls.EpilogueArguments(
-        mAuxOut,
-        act_fn,
-        mRowVecBroadcast=mRowVec,
-        mColVecBroadcast=mColVec,
-        rounding_mode=rounding_mode,
-        sr_seed=fake_scalar(sr_seed_mode),
-    )
-    scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l
-    )
-    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
-    return compile_gemm_kernel(
-        GemmCls,
-        a_dtype,
-        tile_shape_mn,
-        cluster_shape_mnk,
-        pingpong,
-        persistent,
-        gather_A,
-        is_dynamic_persistent,
-        device_capacity,
-        mA,
-        mB,
-        mD,
-        mC,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        b_transposed=b_kn,
-    )
-
-
-class _GemmNormActPlan(NamedTuple):
-    """Launch plan derived purely from tensor metadata and config flags.
-
-    Cached per metadata key (see ``_gemm_norm_act_plan_cache``) so warm calls
-    skip validation, major/dtype derivation, and the compile-cache lookup. See
-    ``_GemmPlan`` in gemm.py for the pattern.
-    """
-
-    compiled_fn: object
-    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
-    sr_seed_mode: int
-    max_active_clusters: int
-    max_swizzle_size: int
-    scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
-    scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
-
-
-_gemm_norm_act_plan_cache: dict[tuple, _GemmNormActPlan] = {}
 
 
 def gemm_norm_act_fn(
@@ -326,86 +35,58 @@ def gemm_norm_act_fn(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
-) -> _GemmNormActPlan:
+):
+    """GEMM + normalize + activation, on the epilogue-mod path (quack.epilogues)."""
+    from quack.epilogues import norm_act_mod
+
+    gated = activation in gate_fn_map
+    if not gated:
+        assert activation in act_fn_map, f"Unsupported activation {activation}"
+    sr = rounding_mode == RoundingMode.RS or isinstance(sr_seed, Tensor)
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
-    # The key captures every input the plan build reads (shapes and strides
-    # subsume the majors and the validation asserts), so a cache hit is exactly
-    # a replay of a previously validated call with different data pointers.
-    key = (
-        tensor_key(A),
-        tensor_key(B),
-        tensor_key(D),
-        tensor_key(C),
-        tensor_key(PostAct),
-        tensor_key(rowvec),
-        tensor_key(colvec),
-        tensor_key(cu_seqlens_m),
-        A_idx is not None,
-        tile_count_semaphore is not None,
-        A.device,
+    mod = norm_act_mod(
         activation,
-        tile_M,
-        tile_N,
-        tile_K,
-        cluster_M,
-        cluster_N,
-        pingpong,
-        persistent,
-        is_dynamic_persistent,
-        max_swizzle_size,
-        rounding_mode,
-        sr_seed_mode,
-        b_kn,
+        gated=gated,
+        has_c=C is not None,
+        has_rowvec=rowvec is not None,
+        has_colvec=colvec is not None,
+        sr=sr,
     )
-    plan = _gemm_norm_act_plan_cache.get(key)
-    if plan is None:
-        plan = _build_gemm_norm_act_plan(
-            A,
-            B,
-            D,
-            C,
-            PostAct,
-            tile_count_semaphore=tile_count_semaphore,
-            activation=activation,
-            tile_M=tile_M,
-            tile_N=tile_N,
-            cluster_M=cluster_M,
-            cluster_N=cluster_N,
-            tile_K=tile_K,
-            pingpong=pingpong,
-            persistent=persistent,
-            is_dynamic_persistent=is_dynamic_persistent,
-            max_swizzle_size=max_swizzle_size,
-            rowvec=rowvec,
-            colvec=colvec,
-            cu_seqlens_m=cu_seqlens_m,
-            A_idx=A_idx,
-            rounding_mode=rounding_mode,
-            sr_seed_mode=sr_seed_mode,
-            b_kn=b_kn,
-        )
-        _gemm_norm_act_plan_cache[key] = plan
-    run_gemm_norm_act_plan(
-        plan,
+    epi_args = dict(mAuxOut=PostAct)
+    if rowvec is not None:
+        epi_args["mRowVecBroadcast"] = rowvec
+    if colvec is not None:
+        epi_args["mColVecBroadcast"] = colvec
+    if sr:
+        epi_args["sr_seed"] = sr_seed
+    return mod.gemm(
         A,
         B,
         D,
         C,
-        PostAct,
+        epi_args=epi_args,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=cluster_M,
+        cluster_N=cluster_N,
+        tile_K=tile_K,
+        pingpong=pingpong,
+        persistent=persistent,
+        is_dynamic_persistent=is_dynamic_persistent,
+        max_swizzle_size=max_swizzle_size,
         tile_count_semaphore=tile_count_semaphore,
-        rowvec=rowvec,
-        colvec=colvec,
-        sr_seed=sr_seed,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        rounding_mode=rounding_mode,
+        epi_key_overrides={"sr_seed": sr_seed_mode} if sr else None,
+        b_kn=b_kn,
     )
-    return plan
 
 
 def run_gemm_norm_act_plan(
-    plan: _GemmNormActPlan,
+    plan,
     A: Tensor,
     B: Tensor,
     D: Optional[Tensor],
@@ -419,153 +100,22 @@ def run_gemm_norm_act_plan(
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
 ) -> None:
-    """Launch a resolved plan: only per-call pointers and scalar values here.
-    The tensors must match the metadata the plan was built from."""
-    epi_args = GemmActMixin.EpilogueArguments(
-        PostAct,
-        None,  # act_fn is Constexpr, pass None at call time
-        mRowVecBroadcast=rowvec,
-        mColVecBroadcast=colvec,
-        rounding_mode=None,
-        sr_seed=scalar_arg(sr_seed, plan.sr_seed_mode, dtype=Int32),
-    )
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
-    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args)
+    """Launch a resolved mod plan: only per-call pointers and scalar values."""
+    from quack.gemm_host import run_gemm_epi_plan
 
-
-def _build_gemm_norm_act_plan(
-    A,
-    B,
-    D,
-    C,
-    PostAct,
-    *,
-    tile_count_semaphore,
-    activation,
-    tile_M,
-    tile_N,
-    cluster_M,
-    cluster_N,
-    tile_K,
-    pingpong,
-    persistent,
-    is_dynamic_persistent,
-    max_swizzle_size,
-    rowvec,
-    colvec,
-    cu_seqlens_m,
-    A_idx,
-    rounding_mode,
-    sr_seed_mode,
-    b_kn=False,
-) -> _GemmNormActPlan:
-    if activation in gate_fn_map:
-        gemm_cls_name = "norm_gated"
-    else:
-        assert activation in act_fn_map, f"Unsupported activation {activation}"
-        gemm_cls_name = "norm_act"
-
-    varlen_m = cu_seqlens_m is not None
-    gather_A = A_idx is not None
-    if varlen_m:
-        assert persistent, "varlen_m requires persistent=True"
-        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
-        if D is not None:
-            assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
-        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen"
-        assert cluster_N == 1, "gather_A requires cluster_N=1"
-
-    batched = A.ndim == 3 or varlen_m
-    if not batched:
-        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
-        assert (
-            B.ndim == 2
-            and PostAct.ndim == 2
-            and (D is None or D.ndim == 2)
-            and (C is None or C.ndim == 2)
-        ), "2D (unbatched) A requires 2D B, D, C, and PostAct"
-    if b_kn:
-        assert not varlen_m, "b_kn does not support varlen"
-
-    a_major = get_major(A, "m", "k")
-    b_major = get_major(B, "n", "k")
-    if b_kn:
-        # Majors are logical (n, k) labels: with B stored (k, n), a contiguous
-        # last dim means n-major.
-        b_major = "n" if B.stride(-1) == 1 else "k"
-    d_major = get_major(D, "m", "n") if D is not None else None
-    c_major = get_major(C, "m", "n") if C is not None else None
-    postact_major = get_major(PostAct, "m", "n")
-
-    a_dtype = torch2cute_dtype_map[A.dtype]
-    b_dtype = torch2cute_dtype_map[B.dtype]
-    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
-    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
-    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
-    colvec_ndim = colvec.ndim if colvec is not None else 0
-
-    device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [8, 9, 10, 11, 12], (
-        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
-    )
-    if not batched or b_kn:
-        assert device_capacity[0] in [9, 10, 11, 12], "2D (unbatched) operands / b_kn require SM90+"
-    if rounding_mode == RoundingMode.RS:
-        assert device_capacity[0] == 10, "Stochastic rounding requires SM100"
-
-    if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, (
-            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
-        )
-
-    compiled_fn = _compile_gemm_norm_act(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        postact_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        postact_major,
-        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
-        (cluster_M, cluster_N, 1),
-        pingpong,
-        persistent,
-        is_dynamic_persistent,
-        activation,
-        torch2cute_dtype_map[rowvec.dtype] if rowvec is not None else None,
-        torch2cute_dtype_map[colvec.dtype] if colvec is not None else None,
-        colvec_ndim,
-        varlen_m,
-        gather_A,
-        device_capacity,
-        gemm_cls_name,
-        rounding_mode=rounding_mode,
-        sr_seed_mode=sr_seed_mode,
-        batched=batched,
-        b_kn=b_kn,
-    )
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    # Must mirror make_fake_scheduler_args in _compile_gemm_norm_act: only the
-    # SM90 dynamic scheduler consumes the semaphore, so it's the only non-static case.
-    scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
-    scheduler_static = (
-        make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore
-        else None
-    )
-    return _GemmNormActPlan(
-        compiled_fn=compiled_fn,
-        is_sm100_family=device_capacity[0] in [10, 11],
-        sr_seed_mode=sr_seed_mode,
-        max_active_clusters=max_active_clusters,
-        max_swizzle_size=max_swizzle_size,
-        scheduler_uses_semaphore=scheduler_uses_semaphore,
-        scheduler_static=scheduler_static,
+    run_gemm_epi_plan(
+        plan,
+        A,
+        B,
+        D,
+        C,
+        dict(
+            mAuxOut=PostAct,
+            mRowVecBroadcast=rowvec,
+            mColVecBroadcast=colvec,
+            sr_seed=sr_seed,
+        ),
+        tile_count_semaphore=tile_count_semaphore,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
     )

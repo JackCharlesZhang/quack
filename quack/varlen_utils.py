@@ -40,6 +40,7 @@ class VarlenManager:
         params: Params,
         len_m_static: Int32,
         len_k_static: Int32,
+        len_n_static: Int32,
         last_batch_idx: Int32 = Int32(-1),
         is_group_changed: Boolean = Boolean(True),
         *,
@@ -49,6 +50,7 @@ class VarlenManager:
         self.params = params
         self._len_m_static = len_m_static
         self._len_k_static = len_k_static
+        self._len_n_static = len_n_static
         self._last_batch_idx = last_batch_idx
         self._is_group_changed = is_group_changed
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
@@ -70,11 +72,17 @@ class VarlenManager:
         params: Params,
         len_m_static: Int32,
         len_k_static: Int32,
+        len_n_static: Int32,
         *,
         loc=None,
         ip=None,
     ) -> "VarlenManager":
-        return VarlenManager(params, len_m_static=len_m_static, len_k_static=len_k_static)
+        return VarlenManager(
+            params,
+            len_m_static=len_m_static,
+            len_k_static=len_k_static,
+            len_n_static=len_n_static,
+        )
 
     def len_m(self, batch_idx: Int32) -> Int32:
         if const_expr(self.varlen_m):
@@ -87,6 +95,11 @@ class VarlenManager:
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
+
+    def len_n(self) -> Int32:
+        # N is never variable-length (no varlen_n), so this is always the
+        # static problem N (from mB) the kernel passed at construction.
+        return self._len_n_static
 
     def offset_batch_A(self, mA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
@@ -207,6 +220,7 @@ class VarlenManager:
             self.params,
             self._len_m_static,
             self._len_k_static,
+            self._len_n_static,
             self._last_batch_idx,
             self._is_group_changed,
         ]:
@@ -222,6 +236,7 @@ class VarlenManager:
                 self.params,
                 self._len_m_static,
                 self._len_k_static,
+                self._len_n_static,
                 self._last_batch_idx,
                 self._is_group_changed,
             ],
