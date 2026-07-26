@@ -1498,6 +1498,108 @@ def gemm_add_ref(
     return out
 
 
+# ── functional façades (graph-insertable ops) ────────────────────────────────
+# The canonical functional/out-variant pairing: the *_out ops mutate a caller
+# buffer (allocation lives in the python wrappers), which is right for eager
+# dispatch but means an FX pass cannot insert them directly — the graph would
+# need the alloc plus post-functionalization mutation bookkeeping. These ops
+# allocate inside and carry real fakes, so compiler passes (and dynamo traces)
+# get one clean node per call. Plain dense tensors only: varlen / blockscale /
+# out= callers use the python wrappers. No autograd formula — these are
+# compiler-facing building blocks; training goes through the autograd
+# Functions (or post-grad graphs, which are already differentiated).
+
+
+@torch.library.custom_op("quack::gemm_add", mutates_args=(), device_types="cuda")
+def _gemm_add_functional(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Tensor,  # (M, N) or (L, M, N)
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    beta_tensor: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    """Functional D = alpha * A @ B + beta * C [+ bias]."""
+    if A.stride(-1) != 1:
+        A = A.contiguous()
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    return gemm_add(
+        A,
+        B,
+        C,
+        bias=bias,
+        alpha=_merge_tensor(alpha, alpha_tensor),
+        beta=_merge_tensor(beta, beta_tensor),
+        out_dtype=out_dtype,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
+
+
+@_gemm_add_functional.register_fake
+def _(
+    A,
+    B,
+    C,
+    bias=None,
+    alpha=1.0,
+    beta=1.0,
+    alpha_tensor=None,
+    beta_tensor=None,
+    out_dtype=None,
+    dynamic_scheduler=False,
+    tuned=True,
+):
+    return torch.empty_like(C, dtype=out_dtype if out_dtype is not None else A.dtype)
+
+
+@torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
+def _gemm_functional(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
+    alpha: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    """Functional D = alpha * A @ B [+ bias]."""
+    if A.stride(-1) != 1:
+        A = A.contiguous()
+    return gemm(
+        A,
+        B,
+        bias=bias,
+        alpha=_merge_tensor(alpha, alpha_tensor),
+        out_dtype=out_dtype,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
+
+
+@_gemm_functional.register_fake
+def _(
+    A,
+    B,
+    bias=None,
+    alpha=1.0,
+    alpha_tensor=None,
+    out_dtype=None,
+    dynamic_scheduler=False,
+    tuned=True,
+):
+    return A.new_empty(
+        (*A.shape[:-1], B.shape[-1]), dtype=out_dtype if out_dtype is not None else A.dtype
+    )
+
+
 def gemm_add_inplace(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
     # For blockscaled: a BlockScaledOperand container - see gemm().

@@ -117,6 +117,46 @@ def _gemm_epi_fake(digest, ins, outs, meta) -> None:
     return
 
 
+def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
+    """Allocate the graph-owned outs list ([D?] + declared outputs + reduce
+    partials) from meta + ins alone. Shared by the functional op body and its
+    fake: under FakeTensorMode the same torch.empty calls yield fakes, so the
+    two sides cannot drift."""
+    m = ast.literal_eval(meta)
+    mod = _resolve(digest, m["locator"])
+    named = dict(zip(m["ins_names"], ins))
+    A, B, C = named["A"], named["B"], named.get("C")
+    cu, A_idx = named.get("cu_seqlens_m"), named.get("A_idx")
+    dt = getattr(torch, m["out_dtype"]) if m.get("out_dtype") else None
+    out = mod._alloc_outputs(None, A, B, C, m["store_d"], dt, cu, A_idx)
+    outs = ([out["D"]] if m["store_d"] else []) + [out[name] for name in m["out_names"]]
+    if m["sink_names"]:
+        cfg, lead, n = m["config"], mod._lead_shape(A, cu, A_idx), B.shape[-1]
+        for name in m["sink_names"]:
+            op = mod.sinks[name]
+            if op.dim == 0:
+                shape = (*lead, -(-n // cfg["tile_n"]))
+            else:
+                shape = (*lead[:-1], -(-lead[-1] // cfg["tile_m"]), n)
+            outs.append(torch.empty(shape, dtype=torch.float32, device=A.device))
+    return outs
+
+
+@torch.library.custom_op("quack::gemm_epi_f", mutates_args=(), device_types="cuda")
+def _gemm_epi_f(digest: str, ins: list[torch.Tensor], meta: str) -> list[torch.Tensor]:
+    """Functional form of ``quack::gemm_epi``: outputs allocated inside, real
+    fake — one graph-insertable node per epilogue-GEMM call. Graph-owned
+    buffers only; caller-provided out=/partial buffers take the mutating op."""
+    outs = _alloc_outs_from_meta(digest, ins, meta)
+    torch.ops.quack.gemm_epi(digest, ins, outs, meta)
+    return outs
+
+
+@_gemm_epi_f.register_fake
+def _gemm_epi_f_fake(digest, ins, meta):
+    return _alloc_outs_from_meta(digest, ins, meta)
+
+
 def compile_call(
     mod,
     A,
@@ -137,27 +177,19 @@ def compile_call(
     rounding_mode,
     operands,
 ):
-    """torch.compile-path body of ``EpiMod.__call__``: allocate graph-owned
-    outputs + exact-shape reduce partials, record one ``quack::gemm_epi`` call,
-    finalize reduces with traced ops. Returns the same dict as eager."""
-    out = mod._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
-    lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
-    n = B.shape[-1]
+    """torch.compile-path body of ``EpiMod.__call__``: record one functional
+    ``quack::gemm_epi_f`` call (allocation inside the op, so the graph gets a
+    single node) and finalize reduces with traced ops. Caller-provided out=/
+    partial buffers cannot be graph-owned, so that case keeps the mutating
+    ``quack::gemm_epi`` form. Returns the same dict as eager."""
     cfg: Optional[GemmConfig] = config
     if mod.sinks and cfg is None:
         # Partials are graph-allocated before the op runs, so the tiling must
         # be fixed here — no runtime autotune under compile with sinks.
         cfg = default_config(A.device)
         tuned = False
-    partials = {}
-    for name, op in mod.sinks.items():
-        if operands.get(name) is not None:
-            continue  # caller-provided partial buffer: returned raw
-        if op.dim == 0:
-            shape = (*lead, -(-n // cfg.tile_n))
-        else:
-            shape = (*lead[:-1], -(-lead[-1] // cfg.tile_m), n)
-        partials[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
+    caller_owned = bool(out) or any(operands.get(name) is not None for name in mod.sinks)
+    sink_names = tuple(name for name in mod.sinks if operands.get(name) is None)
 
     ins_names, ins = [], []
     for name, t in (
@@ -174,16 +206,11 @@ def compile_call(
             ins_names.append(name)
             ins.append(t)
     scalar_ops = {k: v for k, v in operands.items() if not isinstance(v, torch.Tensor)}
-    outs = []
-    if store_d:
-        outs.append(out["D"])
-    outs.extend(out[name] for name in mod.outputs)
-    outs.extend(partials.values())
     meta = repr(
         dict(
             ins_names=tuple(ins_names),
             out_names=tuple(mod.outputs),
-            sink_names=tuple(partials),
+            sink_names=sink_names,
             store_d=bool(store_d),
             tuned=bool(tuned),
             config=None if cfg is None else cfg.__dict__,
@@ -191,11 +218,37 @@ def compile_call(
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
             scalar_ops=scalar_ops,
+            out_dtype=None if out_dtype is None else str(out_dtype).split(".")[-1],
             locator=mod._module_locator(),
         )
     )
     _EPI_REGISTRY[mod.semantic_digest] = mod
-    torch.ops.quack.gemm_epi(mod.semantic_digest, ins, outs, meta)
+    if caller_owned:
+        out = mod._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
+        lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
+        n = B.shape[-1]
+        partials = {}
+        for name in sink_names:
+            op = mod.sinks[name]
+            if op.dim == 0:
+                shape = (*lead, -(-n // cfg.tile_n))
+            else:
+                shape = (*lead[:-1], -(-lead[-1] // cfg.tile_m), n)
+            partials[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
+        outs = []
+        if store_d:
+            outs.append(out["D"])
+        outs.extend(out[name] for name in mod.outputs)
+        outs.extend(partials.values())
+        torch.ops.quack.gemm_epi(mod.semantic_digest, ins, outs, meta)
+    else:
+        outs = torch.ops.quack.gemm_epi_f(mod.semantic_digest, ins, meta)
+        i = 1 if store_d else 0
+        out = {"D": outs[0]} if store_d else {}
+        for j, name in enumerate(mod.outputs):
+            out[name] = outs[i + j]
+        i += len(mod.outputs)
+        partials = {name: outs[i + j] for j, name in enumerate(sink_names)}
     result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
     for name, buf in partials.items():
         finalize = getattr(mod.sinks[name], "host_finalize", None)
