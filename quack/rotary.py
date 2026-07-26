@@ -627,7 +627,20 @@ def _apply_rotary_qkv_inplace(
     conjugate: bool,
     cu_seqlens: Optional[Tensor] = None,
     max_seqlen: Optional[int] = None,
+    headdim: Optional[int] = None,
 ) -> None:
+    if headdim is not None and qkv.shape[-1] != headdim:
+        # flat packed layout (..., nheads * headdim): the head view happens
+        # here, inside the custom op, so callers can pass the projection
+        # output itself — mark_dirty on a non-view input keeps autograd's
+        # rebase free (a dirtied *view* routes gradients through CopySlices:
+        # clone + copy-back around every backward call)
+        assert qkv.shape[-1] % headdim == 0
+        qkv = qkv.view(*qkv.shape[:-1], qkv.shape[-1] // headdim, headdim)
+    if cu_seqlens is not None and qkv.dim() == 4:
+        # dense-shaped (batch, seqlen, nheads, headdim) with cu_seqlens:
+        # varlen over the flattened batch (contiguous input, so a view)
+        qkv = qkv.view(-1, qkv.shape[2], qkv.shape[3])
     if qkv.dim() == 3:
         # varlen: (total_seqlen, nheads, headdim) with per-sequence boundaries
         # from cu_seqlens (GQA packed layout, like the 4-dim path)
@@ -703,7 +716,7 @@ def _apply_rotary_qkv_inplace(
     "quack::_rotary_qkv_inplace",
     mutates_args=("qkv",),
     device_types="cuda",
-    schema="(Tensor(a!) qkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, bool conjugate, Tensor? cu_seqlens, int? max_seqlen) -> ()",
+    schema="(Tensor(a!) qkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, bool conjugate, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
 )
 def _rotary_qkv_inplace(
     qkv: Tensor,
@@ -715,6 +728,7 @@ def _rotary_qkv_inplace(
     conjugate: bool,
     cu_seqlens: Optional[Tensor],
     max_seqlen: Optional[int],
+    headdim: Optional[int],
 ) -> None:
     _apply_rotary_qkv_inplace(
         qkv,
@@ -726,6 +740,7 @@ def _rotary_qkv_inplace(
         conjugate,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        headdim=headdim,
     )
 
 
@@ -733,7 +748,7 @@ def _rotary_qkv_inplace(
     "quack::_rotary_qkv_inplace_bwd",
     mutates_args=(),
     device_types="cuda",
-    schema="(Tensor dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, Tensor? cu_seqlens, int? max_seqlen) -> ()",
+    schema="(Tensor dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
 )
 def _rotary_qkv_inplace_bwd(
     dqkv: Tensor,
@@ -744,6 +759,7 @@ def _rotary_qkv_inplace_bwd(
     interleaved: bool,
     cu_seqlens: Optional[Tensor],
     max_seqlen: Optional[int],
+    headdim: Optional[int],
 ) -> None:
     _apply_rotary_qkv_inplace(
         dqkv,
@@ -755,6 +771,7 @@ def _rotary_qkv_inplace_bwd(
         conjugate=True,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
+        headdim=headdim,
     )
 
 
@@ -777,6 +794,7 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         num_heads_q=0,
         cu_seqlens=None,
         max_seqlen=None,
+        headdim=None,
     ):
         num_heads_q = int(num_heads_q)
         _rotary_qkv_inplace(
@@ -789,11 +807,13 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             conjugate=False,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            headdim=headdim,
         )
         ctx.save_for_backward(cos, sin, seqlen_offsets, cu_seqlens)
         ctx.interleaved = interleaved
         ctx.num_heads_q = num_heads_q
         ctx.max_seqlen = max_seqlen
+        ctx.headdim = headdim
         _mark_dirty(ctx, qkv)
         return qkv
 
@@ -809,8 +829,9 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             ctx.interleaved,
             cu_seqlens=cu_seqlens,
             max_seqlen=ctx.max_seqlen,
+            headdim=ctx.headdim,
         )
-        return dqkv, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None
 
 
 def apply_rotary_emb_qkv_(
@@ -822,7 +843,30 @@ def apply_rotary_emb_qkv_(
     num_heads_q: Optional[int] = None,
     cu_seqlens: Optional[Tensor] = None,
     max_seqlen: Optional[int] = None,
+    headdim: Optional[int] = None,
 ) -> Tensor:
+    if headdim is not None:
+        # flat packed layout: (batch, seqlen, nheads * headdim) or
+        # (total_seqlen, nheads * headdim) — the head view (and, with
+        # cu_seqlens, the batch flatten) happens inside the custom op, so the
+        # projection output can be passed directly. mark_dirty then sees a
+        # non-view input, keeping autograd's rebase free of the CopySlices
+        # clone + copy-back that a dirtied view pays in backward.
+        assert num_heads_q is not None
+        assert qkv.shape[-1] % headdim == 0
+        assert cu_seqlens is None or max_seqlen is not None
+        return ApplyRotaryEmbQKV_.apply(
+            qkv,
+            cos,
+            sin,
+            interleaved,
+            seqlen_offsets,
+            int(num_heads_q),
+            cu_seqlens,
+            max_seqlen,
+            headdim,
+        )
+
     if qkv.dim() == 5:
         return ApplyRotaryEmbQKV_.apply(qkv, cos, sin, interleaved, seqlen_offsets, 0)
 
