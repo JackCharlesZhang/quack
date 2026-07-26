@@ -1235,6 +1235,7 @@ def gemm_add(
     B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N); rides the epilogue alongside C
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype | BlockScaledFormat | str] = None,  # format: see gemm()
@@ -1248,7 +1249,10 @@ def gemm_add(
     split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
     split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> Tensor:
-    """GEMM with addition and optional output tensor."""
+    """GEMM with addition and optional output tensor:
+    D = alpha * A @ B + beta * C [+ bias]. C and bias are independent epilogue
+    terms (the kernel entry takes both), so a residual add and a bias can fuse
+    into one launch."""
     _reserve_blockscaled_out(out_dtype)
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
@@ -1278,13 +1282,15 @@ def gemm_add(
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     add_to_output = C is out and isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
     # Empty-input fast path: skip kernel launch (see gemm() for rationale).
-    # K=0 reduces D = alpha*A@B + beta*C to D = beta*C.
+    # K=0 reduces D = alpha*A@B + beta*C [+ bias] to D = beta*C [+ bias].
     if out.numel() == 0:
         return out
     if A.numel() == 0:
         if add_to_output:
             return out  # out IS C, and out += alpha * 0 is a no-op
         _empty_k_matmul_into(out, C=C, beta=beta)
+        if bias is not None:
+            out += bias if bias.ndim == 1 else bias.unsqueeze(-2)
         return out
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
@@ -1300,6 +1306,7 @@ def gemm_add(
             A,
             B,
             out,
+            bias=bias,
             SFA=SFA,
             SFB=SFB,
             bs_format_a=bs_format_a,
@@ -1322,6 +1329,7 @@ def gemm_add(
             B,
             C,
             out,
+            bias,
             alpha,
             beta,
             alpha_tensor,
@@ -1358,6 +1366,7 @@ def gemm_add_out(
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
@@ -1386,6 +1395,7 @@ def gemm_add_out(
         B,
         out,
         C,
+        bias=bias,
         alpha=alpha,
         beta=beta,
         SFA=SFA,
@@ -1430,8 +1440,11 @@ def gemm_add_ref(
         if "C" in concat_layout:
             C = _concat_interleave(C)
     if cu_seqlens_m is None and cu_seqlens_k is None:
-        if isinstance(alpha, float) and isinstance(beta, float):
-            out = torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
+        if isinstance(alpha, float) and isinstance(beta, float) and A.ndim == 2:
+            # addmm rejects out_dtype=None (omit the kwarg) and is 2D-only;
+            # batched inputs take the generic branch below
+            dt_kw = {"out_dtype": out_dtype} if out_dtype is not None else {}
+            out = torch.addmm(C, A, B, alpha=alpha, beta=beta, out=out, **dt_kw)
         else:
             out_dtype = (
                 out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
@@ -1491,6 +1504,7 @@ def gemm_add_inplace(
     A: Tensor | BlockScaledOperand,
     B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,
@@ -1503,7 +1517,7 @@ def gemm_add_inplace(
     split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
     split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> None:
-    """In-place GEMM with addition: out = alpha * A @ B + beta * out.
+    """In-place GEMM with addition: out = alpha * A @ B + beta * out [+ bias].
     Args:
         A: (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k - input tensor
         B: (K, N) or (L, K, N) or (total_K, N) if varlen_k - input tensor
@@ -1527,6 +1541,7 @@ def gemm_add_inplace(
         opA.data,
         opB.data,
         out,
+        bias=bias,
         SFA=SFA,
         SFB=SFB,
         bs_format_a=bs_format_a,
@@ -1552,6 +1567,7 @@ def _gemm_add_inplace_parts(
     B: Tensor,
     out: Tensor,
     *,
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
@@ -1582,11 +1598,14 @@ def _gemm_add_inplace_parts(
     if A.numel() == 0:
         if beta != 1.0 or beta_tensor is not None:
             out.mul_(_merge_tensor(beta, beta_tensor))
+        if bias is not None:
+            out += bias if bias.ndim == 1 else bias.unsqueeze(-2)
         return
     gemm_add_inplace_op(
         A,
         B,
         out,
+        bias,
         alpha,
         beta,
         alpha_tensor,
@@ -1620,6 +1639,7 @@ def gemm_add_inplace_op(
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
+    bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
@@ -1648,6 +1668,7 @@ def gemm_add_inplace_op(
         B,
         out,
         out if not add_to_output else None,
+        bias=bias,
         alpha=alpha,
         beta=beta,
         bs_format_a=bs_format_a,
@@ -2384,6 +2405,7 @@ def gemm_add_inplace_fake(
     A: Tensor,
     B: Tensor,
     out: Tensor,
+    bias: Optional[Tensor] = None,
     alpha: float = 1.0,
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
