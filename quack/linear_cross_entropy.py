@@ -46,17 +46,24 @@ def chunked_linear_cross_entropy_fwd(
     chunk_size: int = 4096,
     ignore_index: int = -100,
     tuned: bool = True,
-) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    need_dx: bool = True,
+    need_dw: bool = True,
+) -> tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
     Chunked forward pass for linear cross entropy.
 
     Splits input along batch dimension, computes matmul and cross_entropy_fwd
-    for each chunk, stores dx for each chunk, and accumulates dw.
+    for each chunk, stores dx for each chunk, and accumulates dw. The dw
+    accumulator is fp32 regardless of input dtype: each chunk's GEMM writes /
+    adds into it in fp32, so precision is lost only at the single downcast to
+    the weight's dtype in the backward pass. need_dx/need_dw skip the
+    corresponding GEMMs and buffers entirely (loss-only when both are False).
 
     Returns:
         loss: (B*L,) loss values
-        dx: (B*L, d) gradient w.r.t. input
-        dw: (V, d) gradient w.r.t. weight (accumulated across chunks except last)
+        dx: (B*L, d) gradient w.r.t. input, or None if not need_dx
+        dw: (V, d) fp32 gradient w.r.t. weight (accumulated across chunks
+            except last), or None if not need_dw or single-chunk
         last_dlogits_chunk: (chunk_len, V) gradient of last chunk's logits (for deferred dw computation)
         last_x_chunk: (chunk_len, d) last chunk's input (for deferred dw computation)
     """
@@ -69,22 +76,22 @@ def chunked_linear_cross_entropy_fwd(
     assert B_L % 8 == 0
     # Pre-allocate outputs
     loss = torch.empty(B_L, device=device, dtype=torch.float32)
-    logits_chunk_preallocated = torch.empty((chunk_size, V), device=device, dtype=x.dtype)
-    dx = torch.empty_like(x)
+    logits_chunk_preallocated = torch.empty((min(chunk_size, B_L), V), device=device, dtype=x.dtype)
+    dx = torch.empty_like(x) if need_dx else None
     # Last chunk of dw will be deferred to the backward pass
-    dw = torch.empty_like(weight, dtype=torch.float32) if num_chunks > 1 else None
+    dw = torch.empty_like(weight, dtype=torch.float32) if need_dw and num_chunks > 1 else None
     last_dlogits_chunk = None
     last_x_chunk = None
 
     # Process in chunks
-    for i, (x_chunk, target_chunk, loss_chunk, dx_chunk) in enumerate(
-        zip(*(t.split(chunk_size) for t in (x, target, loss, dx)))
+    for i, (x_chunk, target_chunk, loss_chunk) in enumerate(
+        zip(*(t.split(chunk_size) for t in (x, target, loss)))
     ):
         chunk_len = x_chunk.shape[0]
         logits_chunk = logits_chunk_preallocated[:chunk_len]  # (chunk_len, V)
         torch.mm(x_chunk, weight.mT, out=logits_chunk)
-        # Compute cross entropy forward with gradients
-        dlogits_chunk = logits_chunk  # inplace_backward
+        # dlogits overwrite the logits in place; skipped entirely for loss-only
+        dlogits_chunk = logits_chunk if need_dx or need_dw else None
         cross_entropy_fwd_out(
             logits_chunk,
             target_chunk,
@@ -95,8 +102,12 @@ def chunked_linear_cross_entropy_fwd(
             weight=None,
             ignore_index=ignore_index,
         )
-        # Compute dx for this chunk: dlogits @ weight
-        torch.mm(dlogits_chunk, weight, out=dx_chunk)  # (chunk_len, d)
+        if need_dx:
+            # Compute dx for this chunk: dlogits @ weight
+            start = i * chunk_size
+            torch.mm(dlogits_chunk, weight, out=dx[start : start + chunk_len])
+        if not need_dw:
+            continue
         # Compute dw for all chunks except the last
         if i == num_chunks - 1:
             # Last chunk: save for backward pass
@@ -128,12 +139,20 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         Forward pass computes loss and stores dx and dw for backward.
         """
         ctx.weight_dtype = weight.dtype
+        # read before the autocast convert: the converted tensors are non-leaves
+        need_dx, need_dw = x.requires_grad, weight.requires_grad
         x, weight = linear_fwd_convert_type(x, weight)
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
-        # TODO: don't need to compute bwd if neither x nor weight requires grad, or not training
         loss, dx, dw, last_dlogits_chunk, last_x_chunk = chunked_linear_cross_entropy_fwd(
-            x, weight, target, chunk_size, ignore_index, tuned=tuned
+            x,
+            weight,
+            target.reshape(-1),
+            chunk_size,
+            ignore_index,
+            tuned=tuned,
+            need_dx=need_dx,
+            need_dw=need_dw,
         )
         loss_sum = loss.sum()
         loss_scale = None if reduction == "sum" else 1.0 / (target != ignore_index).sum().float()
@@ -149,18 +168,21 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
     def backward(ctx, dloss):
         """
         Backward pass scales pre-computed gradients by dloss and completes
-        the last chunk's dw computation.
+        the last chunk's dw computation (single downcast from the fp32
+        accumulator to the weight's original dtype).
         dloss is a scalar.
         """
         dx, dw, last_dlogits_chunk, last_x_chunk, loss_scale = ctx.saved_tensors
         tuned = ctx.tuned
         if loss_scale is not None:
             dloss = dloss * loss_scale
-        # TODO: the case where x or weight doesn't require grad
-        dx.mul_(dloss)
-        dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
+        if dx is not None:
+            dx.mul_(dloss)
+            dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
         # Complete dw computation: dw = dloss * dw + dloss * (last_dlogits_chunk.T @ last_x_chunk)
-        if dw is None:
+        if last_dlogits_chunk is None:
+            pass  # weight didn't require grad; dw stays None
+        elif dw is None:
             # Only had one chunk, compute dw directly with dloss scaling
             dw = gemm(
                 last_dlogits_chunk.T,
@@ -216,6 +238,23 @@ def chunked_linear_cross_entropy(
     """
     if reduction not in ["mean", "sum"]:
         raise ValueError(f"Invalid reduction: {reduction}")
+    if not torch.is_grad_enabled() or not (x.requires_grad or weight.requires_grad):
+        # eval / inference: loss only — no dx/dw GEMMs, no fp32 (V, d) accumulator
+        x, weight = linear_fwd_convert_type(x, weight)
+        loss, *_ = chunked_linear_cross_entropy_fwd(
+            x.reshape(-1, x.shape[-1]),
+            weight,
+            target.reshape(-1),
+            chunk_size,
+            ignore_index,
+            tuned=tuned,
+            need_dx=False,
+            need_dw=False,
+        )
+        loss_sum = loss.sum()
+        if reduction == "sum":
+            return loss_sum
+        return loss_sum / (target != ignore_index).sum().float()
     loss = ChunkedLinearCrossEntropyFunction.apply(
         x, weight, target, ignore_index, reduction, chunk_size, tuned
     )

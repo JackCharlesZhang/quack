@@ -83,3 +83,53 @@ def test_chunked_linear_cross_entropy_ignore_index(input_dtype, reduction, chunk
     assert (weight.grad - weight_ref.grad).abs().max() < 2 * (
         weight_pt.grad - weight_ref.grad
     ).abs().max() + 1e-4
+
+
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("chunk_size", [256, 1024])
+def test_chunked_linear_cross_entropy_no_grad(reduction, chunk_size):
+    """Loss-only path (no_grad / nothing requires grad): must match the
+    training-path loss while skipping the dx/dw GEMMs and fp32 accumulator."""
+    device = "cuda"
+    B_L, d, V = 1024, 512, 2048
+    torch.random.manual_seed(0)
+    x = (torch.randn(B_L, d, device=device, dtype=torch.bfloat16) * 0.1).requires_grad_()
+    weight = (torch.randn(V, d, device=device, dtype=torch.bfloat16) / (d**0.5)).requires_grad_()
+    target = torch.randint(0, V, (B_L,), device=device, dtype=torch.int64)
+    loss_train = chunked_linear_cross_entropy(
+        x, weight, target, chunk_size=chunk_size, reduction=reduction, tuned=False
+    )
+    with torch.no_grad():
+        loss_eval = chunked_linear_cross_entropy(
+            x, weight, target, chunk_size=chunk_size, reduction=reduction, tuned=False
+        )
+    assert not loss_eval.requires_grad
+    assert torch.allclose(loss_eval, loss_train.detach(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("frozen", ["x", "weight"])
+@pytest.mark.parametrize("chunk_size", [256, 1024])  # 1024 = single chunk (deferred-dw edge)
+def test_chunked_linear_cross_entropy_partial_grad(frozen, chunk_size):
+    """One input frozen: its gradient GEMMs are skipped, the other's gradient
+    is unchanged vs the both-require-grad run."""
+    device = "cuda"
+    B_L, d, V = 1024, 512, 2048
+    torch.random.manual_seed(0)
+    x0 = torch.randn(B_L, d, device=device, dtype=torch.bfloat16) * 0.1
+    w0 = torch.randn(V, d, device=device, dtype=torch.bfloat16) / (d**0.5)
+    target = torch.randint(0, V, (B_L,), device=device, dtype=torch.int64)
+
+    x_full, w_full = x0.clone().requires_grad_(), w0.clone().requires_grad_()
+    chunked_linear_cross_entropy(
+        x_full, w_full, target, chunk_size=chunk_size, tuned=False
+    ).backward()
+
+    x = x0.clone().requires_grad_(frozen != "x")
+    w = w0.clone().requires_grad_(frozen != "weight")
+    chunked_linear_cross_entropy(x, w, target, chunk_size=chunk_size, tuned=False).backward()
+    if frozen == "x":
+        assert x.grad is None
+        assert torch.allclose(w.grad, w_full.grad, atol=1e-5, rtol=1e-3)
+    else:
+        assert w.grad is None
+        assert torch.allclose(x.grad, x_full.grad, atol=1e-5, rtol=1e-3)
