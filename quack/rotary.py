@@ -845,6 +845,29 @@ def apply_rotary_emb_qkv_(
     max_seqlen: Optional[int] = None,
     headdim: Optional[int] = None,
 ) -> Tensor:
+    if not torch.is_grad_enabled():
+        # No-grad fast path: skip the autograd.Function entirely — no ctx to
+        # build (save_for_backward would pin cos/sin for nothing) and no
+        # mark_dirty. The latter also matters under torch.compile: Dynamo's
+        # no_grad trace inlines Function.forward without the apply machinery,
+        # and ctx.mark_dirty there is an unrecoverable graph break — inside a
+        # module loop it makes Dynamo skip the CALLING frame's code object
+        # process-wide, so one eval pass permanently shatters the compiled
+        # training graph too.
+        _rotary_qkv_inplace(
+            qkv,
+            cos,
+            sin,
+            seqlen_offsets,
+            int(num_heads_q or 0),
+            interleaved,
+            conjugate=False,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            headdim=headdim,
+        )
+        return qkv
+
     if headdim is not None:
         # flat packed layout: (batch, seqlen, nheads * headdim) or
         # (total_seqlen, nheads * headdim) — the head view (and, with
