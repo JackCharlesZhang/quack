@@ -10,6 +10,8 @@ from cutlass.cutlass_dsl import Numeric, dsl_user_op
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack import copy_utils
+
 
 @dsl_user_op
 def make_smem_layout(
@@ -243,3 +245,34 @@ def partition_fragment_ABC(
         assert sA is not None
         tCrA = thr_mma.make_fragment_B(thr_mma.partition_B(sA))
     return acc, tCrA, tCrB
+
+
+def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False):
+    """The canonical A-operand produce for the RS mainloop: an ldmatrix tiled
+    copy derived from the MMA (LDSM for k-major A, LDSM.T for m-major — one
+    code path, 16-bit only). Returns ``copy_block(stage_idx, b)``, which s2r
+    loads k16 block b (a static Python int) of pipeline stage stage_idx into
+    the fragment. This is the produce seam: transforms substitute their own
+    copy_block (e.g. LDS + dequant) while the mainloop keeps owning the WGMMA
+    issue and commit-group discipline."""
+    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
+    atom = copy_utils.get_smem_load_atom(sA.element_type, transpose)
+    smem_tiled_copy_A = cute.make_tiled_copy_A(atom, tiled_mma)
+    thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
+    # (CPY, CPY_M, CPY_K, STAGE); position-independent partition absorbs the
+    # swizzle into the pointer, so per-block addresses are linear (plain IMAD
+    # chains ptxas can hoist) instead of a SHF+LOP3 XOR per LDSM
+    if const_expr(position_independent):
+        tCsA_copy_view = copy_utils.partition_S_position_independent(thr_copy_A, sA)
+    else:
+        tCsA_copy_view = thr_copy_A.partition_S(sA)
+    tCrA_copy_view = thr_copy_A.retile(tCrA)
+
+    def copy_block(stage_idx, b):
+        cute.copy(
+            smem_tiled_copy_A,
+            tCsA_copy_view[None, None, b, stage_idx],
+            tCrA_copy_view[None, None, b],
+        )
+
+    return copy_block

@@ -126,6 +126,7 @@ class GemmSm90(GemmTmaBase):
         use_pdl: bool = True,
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
+        mma_is_rs: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -151,6 +152,13 @@ class GemmSm90(GemmTmaBase):
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
+        # RS mainloop: A comes from registers (canonical ldmatrix s2r load from smem) instead
+        # of the SS descriptor, CUTLASS rs_warpspecialized style — one tile-wide fragment, s2r
+        # load of k16 block b+1 interleaved between WGMMA(b) and WGMMA(b+1), one commit group per
+        # block, wait_group(mma_k - 2).
+        self.mma_is_rs = mma_is_rs
+        if mma_is_rs:
+            assert not self.fp8_slow_accum, "mma_is_rs requires 16-bit A for now"
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         if gather_A:
@@ -234,6 +242,17 @@ class GemmSm90(GemmTmaBase):
         )
         if self.fp8_slow_accum:
             regs_per_thread *= 2
+        if self.mma_is_rs:
+            # A fragment registers: per-warpgroup M extent x tile_K 16-bit
+            # elements across 128 threads. tile_K may still be 0 here
+            # (defaulted in _setup_tiled_mma); estimate with 64.
+            tile_k_est = self.cta_tile_shape_mnk[2] or 64
+            regs_per_thread += (
+                (self.cta_tile_shape_mnk[0] // self.atom_layout_mnk[0])
+                * tile_k_est
+                * 2
+                // (self.num_threads_per_warp_group * 4)
+            )
         if not self.gather_A:
             if self.mma_warp_groups == 3:
                 self.num_regs_load, self.num_regs_mma = 32, 160
@@ -274,6 +293,9 @@ class GemmSm90(GemmTmaBase):
             self.acc_dtype,
             self.atom_layout_mnk,
             tiler_mn=(64, self.cta_tile_shape_mnk[1] // self.atom_layout_mnk[1]),
+            a_source=(
+                warpgroup.OperandSource.RMEM if self.mma_is_rs else warpgroup.OperandSource.SMEM
+            ),
         )
         if const_expr(self.atom_layout_mnk[1] > 1):
             # If N dimension is split among 2 WGs, we need to permute the N dimension so
@@ -298,11 +320,14 @@ class GemmSm90(GemmTmaBase):
         assert tile_k % mma_inst_shape_k == 0, (
             f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({mma_inst_shape_k})"
         )
-        self.cta_tile_shape_mnk = (
-            self.cta_tile_shape_mnk[0],
-            self.cta_tile_shape_mnk[1],
-            tile_k,
-        )
+        if self.mma_is_rs:
+            # Slot 0 is reloaded while later blocks' WGMMAs are in flight;
+            # wait_group(mma_k - 2) guarantees its reader retired only with
+            # >= 4 blocks per tile (same floor as CUTLASS rs mixed-input).
+            assert tile_k // mma_inst_shape_k >= 4, (
+                f"mma_is_rs needs >= 4 k16 blocks per tile, got tile_k={tile_k}"
+            )
+        self.cta_tile_shape_mnk = (*self.cta_tile_shape_mnk[:2], tile_k)
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
         """Set up configurations that are dependent on GEMM inputs
@@ -423,6 +448,10 @@ class GemmSm90(GemmTmaBase):
             raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
         if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
+        if const_expr(self.mma_is_rs and self.a_dtype.width != 16):
+            # The canonical RS s2r load is ldmatrix (trans for m-major A), which
+            # is 16-bit only.
+            raise TypeError("mma_is_rs requires a 16-bit A dtype")
 
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
@@ -816,7 +845,13 @@ class GemmSm90(GemmTmaBase):
             acc_slow = None
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
-            mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
+            if const_expr(not self.mma_is_rs):
+                mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
+            else:
+                # tCrA is the (unstaged, tile-wide) RS fragment
+                copy_block = quack_sm90_utils.canonical_a_load_s2r(
+                    tiled_mma, sA, tidx, tCrA, position_independent=True
+                )
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -881,9 +916,28 @@ class GemmSm90(GemmTmaBase):
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 iket.range_push("mma")
-                ab_read_state = self.mma(
-                    ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
-                )
+                if const_expr(not self.mma_is_rs):
+                    ab_read_state = self.mma(
+                        ab_pipeline,
+                        ab_read_state,
+                        mma_fn,
+                        acc,
+                        acc_slow,
+                        k_tile_cnt,
+                        warp_group_idx,
+                    )
+                else:
+                    ab_read_state = self.mma_rs_interleaved(
+                        ab_pipeline,
+                        ab_read_state,
+                        tiled_mma,
+                        acc,
+                        k_tile_cnt,
+                        warp_group_idx,
+                        copy_block,
+                        tCrA,
+                        tCrB,
+                    )
                 if const_expr(varlen_k or self.split_k > 1):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
@@ -1218,6 +1272,122 @@ class GemmSm90(GemmTmaBase):
             ab_release_state.advance()
         if const_expr(self.fp8_slow_accum):
             acc.store(acc_slow.load())
+        return ab_read_state
+
+    @cute.jit
+    def _rs_wgmma_block(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        stage_idx: Int32,
+        b: cutlass.Constexpr[int],
+        zero_init: cutlass.Constexpr[bool] = False,
+    ):
+        """One k16 block's WGMMAs as their own commit group (b is a static
+        Python int: register indexing)."""
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
+        cute.gemm(mma_atom, acc, tCrA[None, None, b], tCrB[None, None, b, stage_idx], acc)
+        warpgroup.commit_group()
+
+    @cute.jit
+    def mma_rs_interleaved(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_read_state: cutlass.pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        k_tile_cnt: Int32,
+        warp_group_idx: Int32,
+        copy_block: Callable,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+    ) -> cutlass.pipeline.PipelineState:
+        """RS mainloop, CUTLASS sm90 rs_warpspecialized scheme: one tile-wide
+        fragment, produce of block k+1 (``copy_block(stage, k)`` — the
+        canonical ldmatrix s2r load, or a transform's decode) issued between
+        WGMMA(k) and WGMMA(k+1), one commit group per k16 block,
+        wait_group(mma_k - 2) after each — the deepest safe wait: producing a
+        slot overwrites registers whose previous reader is mma_k - 2 commit
+        groups back. The produce is the caller's; the WGMMA issue and
+        commit-group discipline stay here — the wait/reload safety argument
+        counts THESE groups. Slot 0 is reloaded from the NEXT stage during
+        the current tile's last block under the same bound. A stage is
+        released at block mma_k - 3 of the following tile, the first point
+        where the wait guarantees all of its WGMMAs retired (mma_k >= 4
+        asserted at setup; for the canonical 4-block tile this is CUTLASS's
+        wait<2> / release-at-block-1)."""
+        mma_k = const_expr(cute.size(tCrA.shape[2]))
+        wgmma_block = partial(self._rs_wgmma_block, tiled_mma, acc, tCrA, tCrB)
+        ab_release_state = ab_read_state.clone()
+        peek = Boolean(True)
+        # ---- first k-tile: the produces run ahead of the WGMMAs, no reload
+        # hazard, so no waits inside the block loop ----
+        if 0 < k_tile_cnt:
+            ab_pipeline.consumer_wait(ab_read_state, ab_pipeline.consumer_try_wait(ab_read_state))
+            stage = ab_read_state.index
+            ab_read_state.advance()
+            if 1 < k_tile_cnt:
+                peek = ab_pipeline.consumer_try_wait(ab_read_state)
+            copy_block(stage, 0)
+            for k in cutlass.range_constexpr(mma_k - 1):
+                copy_block(stage, k + 1)
+                wgmma_block(stage, k, zero_init=k == 0)
+            wgmma_block(stage, mma_k - 1, zero_init=False)
+        # Preload slot 0 of the second tile: wait(mma_k - 1) retires exactly its reader (this
+        # tile's block-0 group); the steady loop's first produce additionally needs block 1's
+        # group retired, hence the post-copy wait(mma_k - 2)
+        if 1 < k_tile_cnt:
+            ab_pipeline.consumer_wait(ab_read_state, peek)
+            warpgroup.wait_group(mma_k - 1)
+            copy_block(ab_read_state.index, 0)
+            warpgroup.wait_group(mma_k - 2)
+        # ---- steady tiles (all but the first and last) ----
+        for _ in cutlass.range(max(k_tile_cnt - 2, 0), unroll=1):
+            stage = ab_read_state.index
+            ab_read_state.advance()
+            for k in cutlass.range_constexpr(mma_k):
+                if const_expr(k == 0):
+                    peek = ab_pipeline.consumer_try_wait(ab_read_state)
+                if const_expr(k == mma_k - 1):
+                    # ab_read_state advanced at tile start: its index is the
+                    # NEXT tile's stage, used only for this slot-0 preload
+                    ab_pipeline.consumer_wait(ab_read_state, peek)
+                    copy_block(ab_read_state.index, 0)
+                else:
+                    copy_block(stage, k + 1)
+                wgmma_block(stage, k, zero_init=False)
+                warpgroup.wait_group(mma_k - 2)
+                if const_expr(k == mma_k - 3):
+                    # earliest block whose wait leaves only THIS tile's groups pending. Eg for
+                    # mma_k = 4, at k == 1, we have called wait_group(2), so the only
+                    # outstanding MMAs are the current k_tile with k=0, 1, which means that the
+                    # previous k_tile has retired and its stage can be released.
+                    ab_pipeline.consumer_release(ab_release_state)
+                    ab_release_state.advance()
+        # ---- last tile (slot 0 already loaded; nothing to prefetch) ----
+        if 1 < k_tile_cnt:
+            stage = ab_read_state.index
+            ab_read_state.advance()
+            for k in cutlass.range_constexpr(mma_k - 1):
+                copy_block(stage, k + 1)
+                wgmma_block(stage, k, zero_init=False)
+                warpgroup.wait_group(mma_k - 2)
+                if const_expr(k == mma_k - 3):
+                    ab_pipeline.consumer_release(ab_release_state)
+                    ab_release_state.advance()
+            wgmma_block(stage, mma_k - 1, zero_init=False)
+        if const_expr(self.pingpong):
+            # Cue for next WG's MMA to start
+            self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
+        # Drain all WGMMAs and release the final stage
+        warpgroup.wait_group(0)
+        if 0 < k_tile_cnt:
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
         return ab_read_state
 
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
