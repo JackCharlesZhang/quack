@@ -3,7 +3,7 @@
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
-from typing import Tuple, Type, Callable, Optional
+from typing import Tuple, Type, Callable, Optional, Union
 from functools import partial
 import math
 
@@ -127,6 +127,7 @@ class GemmSm90(GemmTmaBase):
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
         mma_is_rs: bool = False,
+        transform_a: Optional[Callable] = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -143,6 +144,11 @@ class GemmSm90(GemmTmaBase):
         """
 
         self.acc_dtype = acc_dtype
+        # The MMA compute dtype for A. Without a transform, mA must arrive
+        # typed exactly this; a layout-owning transform decouples storage
+        # (self.a_dtype, from the tensor) from compute and must produce
+        # mma_a_dtype fragments.
+        self.mma_a_dtype = a_dtype
         self.pingpong = pingpong
         self.is_persistent = is_persistent
         self.use_clc_persistence = use_clc_persistence
@@ -151,6 +157,16 @@ class GemmSm90(GemmTmaBase):
         self.use_pdl = use_pdl
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
+        # A-operand transform (quack/operand_transform/): a factory gemm ->
+        # TransformA, instantiated below after the default register budgets so
+        # it can override them. The kernel is agnostic to what the transform
+        # computes — it consumes only the declarative contract (A layout
+        # ownership, tile_k, the in-kernel copy_block hook). A transform
+        # implies the RS mainloop; for layout-owning transforms mA crosses the
+        # boundary in its own storage format.
+        self._transform_a_factory = transform_a
+        if transform_a is not None:
+            mma_is_rs = True
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
         # RS mainloop: A comes from registers (canonical ldmatrix s2r load from smem) instead
         # of the SS descriptor, CUTLASS rs_warpspecialized style — one tile-wide fragment, s2r
@@ -267,6 +283,12 @@ class GemmSm90(GemmTmaBase):
             else:
                 self.num_regs_load, self.num_regs_mma = (56, 224)
 
+        # TransformA: created after the default register budgets above so it
+        # can override them (and occupancy) per its config.
+        self.transform_a = None
+        if transform_a is not None:
+            self.transform_a = transform_a(self)
+
         self.ab_stage = None
         self.epi_stage = None
         self.epi_m_major = True
@@ -285,10 +307,20 @@ class GemmSm90(GemmTmaBase):
 
     def _setup_tiled_mma(self):
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
+        # The MMA computes A in the constructor-declared a_dtype (self.
+        # mma_a_dtype) — a transform never changes that; a layout-owning
+        # transform only decouples it from A's STORAGE dtype (self.a_dtype,
+        # from the tensor), producing mma_a_dtype fragments from whatever mA
+        # holds. The fragment major likewise comes from the tensor layout,
+        # except for layout-owning transforms (a blob has no natural major;
+        # the transform declares the fragment's).
+        a_major_mode = self.a_layout.sm90_mma_major_mode()
+        if self.transform_a is not None and self.transform_a.owns_a_layout:
+            a_major_mode = self.transform_a.a_major_mode
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
-            self.a_dtype,
+            self.mma_a_dtype,
             self.b_dtype,
-            self.a_layout.sm90_mma_major_mode(),
+            a_major_mode,
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
@@ -320,6 +352,10 @@ class GemmSm90(GemmTmaBase):
         assert tile_k % mma_inst_shape_k == 0, (
             f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({mma_inst_shape_k})"
         )
+        if self.transform_a is not None and self.transform_a.tile_k is not None:
+            assert tile_k == self.transform_a.tile_k, (
+                f"transform_a requires tile_K == {self.transform_a.tile_k}, got {tile_k}"
+            )
         if self.mma_is_rs:
             # Slot 0 is reloaded while later blocks' WGMMAs are in flight;
             # wait_group(mma_k - 2) guarantees its reader retired only with
@@ -366,6 +402,13 @@ class GemmSm90(GemmTmaBase):
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
+            # layout-owning transform_a: A's smem bytes come from the
+            # transform, not the (tile_M, tile_K) shape
+            a_bytes_per_stage_override=(
+                self.transform_a.a_bytes_per_stage()
+                if self.transform_a is not None and self.transform_a.owns_a_layout
+                else None
+            ),
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -389,6 +432,10 @@ class GemmSm90(GemmTmaBase):
             self.c_layout,
             self.epi_c_stage,
         )
+        if const_expr(self.transform_a is not None and self.transform_a.owns_a_layout):
+            # the transform owns A's smem layout (its storage format, not
+            # the (tile_M, tile_K) shape)
+            self.a_smem_layout_staged = self.transform_a.make_a_smem_layout_staged(self.ab_stage)
 
     @cute.jit
     def __call__(
@@ -418,19 +465,29 @@ class GemmSm90(GemmTmaBase):
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
-        # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
-        # Dense rank-2 operands get a trivial batch mode appended instead.
-        mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(
-            mA, mB, mD, mC, epilogue_args, append_batch_if_2d=const_expr(varlen_args is None)
-        )
+        a_owned = const_expr(self.transform_a is not None and self.transform_a.owns_a_layout)
+        if const_expr(not a_owned):
+            # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
+            # Dense rank-2 operands get a trivial batch mode appended instead.
+            mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(
+                mA, mB, mD, mC, epilogue_args, append_batch_if_2d=const_expr(varlen_args is None)
+            )
 
-        # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
-        mA, mB, mD, mC = [
-            layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)
-            if const_expr(name in self.concat_layout and mT is not None)
-            else mT
-            for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
-        ]
+            # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
+            mA, mB, mD, mC = [
+                layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)
+                if const_expr(name in self.concat_layout and mT is not None)
+                else mT
+                for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
+            ]
+        else:
+            # Layout-owning transform: mA (the storage blob) crosses
+            # kernel-native and untouched; B/D/C are ordinary operands and
+            # rotate as usual (2-D callers get the trivial batch appended).
+            assert mD is not None, "a layout-owning transform_a requires an output tensor D"
+            _, mB, mD, mC, epilogue_args = self.rotate_batch_last(
+                None, mB, mD, mC, epilogue_args, append_batch_if_2d=const_expr(varlen_args is None)
+            )
 
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
@@ -442,16 +499,27 @@ class GemmSm90(GemmTmaBase):
         self.d_layout = LayoutEnum.from_tensor(mD) if mD is not None else None
         self.c_layout = LayoutEnum.from_tensor(mC) if mC is not None else None
 
-        if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-        if const_expr(self.a_dtype.width != self.b_dtype.width):
-            raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
-        if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
-            raise TypeError("a_dtype should be float16 or float8")
-        if const_expr(self.mma_is_rs and self.a_dtype.width != 16):
-            # The canonical RS s2r load is ldmatrix (trans for m-major A), which
-            # is 16-bit only.
-            raise TypeError("mma_is_rs requires a 16-bit A dtype")
+        if const_expr(not a_owned):
+            # (For layout-owning transforms, self.a_dtype is the storage
+            # format's dtype — e.g. a uint8 blob — and only the transform
+            # relates it to the mma_a_dtype fragments it produces.)
+            if const_expr(self.a_dtype != self.mma_a_dtype):
+                raise TypeError(
+                    f"A arrived as {self.a_dtype} but the GEMM was built for {self.mma_a_dtype}"
+                )
+            if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
+                raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
+            if const_expr(self.a_dtype.width != self.b_dtype.width):
+                raise TypeError(
+                    f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
+                )
+            if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
+                raise TypeError("a_dtype should be float16 or float8")
+            if const_expr(self.mma_is_rs and self.a_dtype.width != 16):
+                # The canonical RS s2r load is ldmatrix (trans for m-major A),
+                # which is 16-bit only; other-width RS variants bring their own
+                # produce (TransformA).
+                raise TypeError("mma_is_rs requires a 16-bit A dtype")
 
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
@@ -461,11 +529,22 @@ class GemmSm90(GemmTmaBase):
 
         self._setup_attributes(epilogue_args)
 
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
-        tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = self.make_tma_load_atoms_and_tensors(
-            mA, mB, a_smem_layout, b_smem_layout, varlen_k
-        )
+        if const_expr(not a_owned):
+            a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
+            tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = (
+                self.make_tma_load_atoms_and_tensors(mA, mB, a_smem_layout, b_smem_layout, varlen_k)
+            )
+        else:
+            # packed-weight A: the transform owns A's TMA (blob boxes)
+            a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+            tma_atom_a, tma_tensor_a = self.transform_a.make_a_tma(mA)
+            tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
+                mB,
+                b_smem_layout,
+                (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
+                self.cluster_shape_mnk[0],
+            )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         if const_expr(not self.gather_A):
@@ -556,7 +635,9 @@ class GemmSm90(GemmTmaBase):
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
-            min_blocks_per_mp=1,
+            # occupancy > 1 (e.g. W4 decode shapes) needs the launch bound so
+            # ptxas caps registers for 2 resident CTAs
+            min_blocks_per_mp=self.occupancy,
             use_pdl=self.use_pdl,
         )
         return
@@ -577,7 +658,8 @@ class GemmSm90(GemmTmaBase):
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_mnk: cute.Layout,
-        a_smem_layout: cute.ComposedLayout,
+        # plain Layout for layout-owning transforms (unswizzled blob smem)
+        a_smem_layout: Union[cute.ComposedLayout, cute.Layout],
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
@@ -666,7 +748,14 @@ class GemmSm90(GemmTmaBase):
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
 
         # Generate smem tensor A/B
-        sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        a_owned = const_expr(self.transform_a is not None and self.transform_a.owns_a_layout)
+        if const_expr(not a_owned):
+            sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        else:
+            # TMA-facing staged blob view (plain layout, no swizzle); the
+            # transform's per-thread math view recasts the same bytes inside
+            # make_copy_block
+            sA = storage.sA.get_tensor(a_smem_layout)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sD = None
         if const_expr(has_D):
@@ -680,11 +769,15 @@ class GemmSm90(GemmTmaBase):
             varlen_params,
             # Only used if not varlen_m
             len_m_static=Int32(
-                cute.size(mA_mkl, mode=[0])
+                (
+                    cute.size(mA_mkl, mode=[0])
+                    if const_expr(not a_owned)
+                    else cute.size(mD_mnl, mode=[0])
+                )
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
+            len_k_static=Int32(cute.size(mB_nkl, mode=[1])),
             len_n_static=Int32(cute.size(mB_nkl, mode=[0])),
         )
 
@@ -750,7 +843,16 @@ class GemmSm90(GemmTmaBase):
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
-                    if const_expr(not self.gather_A):
+                    if const_expr(a_owned):
+                        # the transform owns A's gmem interpretation
+                        gA_owned = self.transform_a.a_gmem_slice(mA_mkl, tile_coord_mnkl, batch_idx)
+                        copy_A = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_a,
+                            src_tensor=gA_owned,
+                            dst_tensor=sA,
+                            tma_multicast=a_tma_multicast,
+                        )
+                    elif const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
                         # (bM, bK, RestK)
                         gA_mk = cute.local_tile(
@@ -848,10 +950,17 @@ class GemmSm90(GemmTmaBase):
             if const_expr(not self.mma_is_rs):
                 mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
             else:
-                # tCrA is the (unstaged, tile-wide) RS fragment
-                copy_block = quack_sm90_utils.canonical_a_load_s2r(
-                    tiled_mma, sA, tidx, tCrA, position_independent=True
-                )
+                # tCrA is the (unstaged, tile-wide) RS fragment; copy_block is
+                # the mainloop's produce seam — canonical ldmatrix s2r load, or
+                # a transform's own produce (e.g. blob LDS + dequant)
+                if const_expr(self.transform_a is not None):
+                    copy_block = self.transform_a.make_copy_block(
+                        tiled_mma, sA, tCrA, tidx, warp_group_idx
+                    )
+                else:
+                    copy_block = quack_sm90_utils.canonical_a_load_s2r(
+                        tiled_mma, sA, tidx, tCrA, position_independent=True
+                    )
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -1514,6 +1623,7 @@ class GemmSm90(GemmTmaBase):
         smem_capacity: int,
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
+        a_bytes_per_stage_override: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1552,9 +1662,12 @@ class GemmSm90(GemmTmaBase):
 
         a_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))
-        ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8 + cute.size(b_shape) * b_dtype.width // 8
+        a_bytes = (
+            cute.size(a_shape) * a_dtype.width // 8
+            if a_bytes_per_stage_override is None
+            else a_bytes_per_stage_override
         )
+        ab_bytes_per_stage = a_bytes + cute.size(b_shape) * b_dtype.width // 8
         mbar_helpers_bytes = 1024
 
         remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes

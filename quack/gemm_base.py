@@ -727,8 +727,14 @@ class GemmBase:
                 # scheduler needs the true L (it scales the work-id space by num_split_k
                 # itself). B always carries the true L here (varlen is rejected).
                 num_problems = mB.shape[2]
+            # Layout-owning transform_a: mA is not an (M, K) operand (e.g. a
+            # repacked blob), so the M extent comes from D instead.
+            a_owned = (
+                getattr(self, "transform_a", None) is not None and self.transform_a.owns_a_layout
+            )
+            m_size = cute.size(mA, mode=[0]) if const_expr(not a_owned) else cute.size(mD, mode=[0])
             problem_shape_ntile_mnl = (
-                cute.ceil_div(cute.size(mA, mode=[0]), self.cta_tile_shape_mnk[0]),
+                cute.ceil_div(m_size, self.cta_tile_shape_mnk[0]),
                 cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
                 num_problems,
             )
