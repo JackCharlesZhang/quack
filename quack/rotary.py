@@ -428,9 +428,9 @@ def _register_ordered_effect(op) -> None:
 
 @cute_op(
     "quack::_rotary_inplace_bwd",
-    mutates_args=(),
+    mutates_args=("dout",),
     device_types="cuda",
-    schema="(Tensor dout, Tensor cos, Tensor sin, Tensor? seqlen_offsets, Tensor? cu_seqlens, int? max_seqlen, bool interleaved) -> ()",
+    schema="(Tensor(a!) dout, Tensor cos, Tensor sin, Tensor? seqlen_offsets, Tensor? cu_seqlens, int? max_seqlen, bool interleaved) -> ()",
 )
 def _rotary_inplace_bwd(
     dout: Tensor,
@@ -459,7 +459,7 @@ def _rotary_inplace_bwd(
     )
 
 
-_register_ordered_effect(_rotary_inplace_bwd)
+# mutation declared in the schema (see _rotary_qkv_inplace_bwd note)
 
 
 def apply_rotary(
@@ -746,9 +746,9 @@ def _rotary_qkv_inplace(
 
 @cute_op(
     "quack::_rotary_qkv_inplace_bwd",
-    mutates_args=(),
+    mutates_args=("dqkv",),
     device_types="cuda",
-    schema="(Tensor dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
+    schema="(Tensor(a!) dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
 )
 def _rotary_qkv_inplace_bwd(
     dqkv: Tensor,
@@ -775,11 +775,17 @@ def _rotary_qkv_inplace_bwd(
     )
 
 
-# The backward consumes and mutates grad_output in place. If this op is declared
-# as a normal mutating custom op, AOTAutograd functionalizes it by cloning dqkv
-# first. Mark it as an ordered effect instead so Dynamo keeps the call without
-# inserting that clone; the returned grad input is the same mutated dqkv tensor.
-_register_ordered_effect(_rotary_qkv_inplace_bwd)
+# The backward consumes and mutates grad_output in place, declared as a normal
+# mutating custom op (Tensor(a!) + mutates_args) so functionalization gives it
+# auto_functionalized_v2 form: downstream reads become getitem DATAFLOW edges.
+# The earlier ordered-effect registration (chosen to dodge functionalization's
+# clone) hid the mutation from graph transforms entirely — any pass that
+# reorders by data deps (inductor's fx comm-overlap movers, the legacy comm
+# scheduler passes) could hoist consumers of dqkv above the in-place rotation,
+# silently corrupting the wqkv gradient chain (bisected at 180m/8xH100,
+# 2026-07-27). The clone the effect route avoided is eliminated by inductor's
+# reinplacing when the pre-rotation dqkv has no other readers — the normal
+# case (attention-bwd output feeds only this op).
 
 
 class ApplyRotaryEmbQKV_(torch.autograd.Function):
