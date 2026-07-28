@@ -21,8 +21,32 @@ Two families, one decorator:
   belongs to the framework, never the fn. Compile-time constants may be closed
   over — they are part of the semantic key. ``consts=callable`` is called once
   per kernel (hoisted — LUTs, packed constants); its result is the fn's LAST
-  parameter. Runtime operands (scalars, colvecs, RNG seeds) are not ported
-  from the transformA branch yet.
+  parameter.
+
+  Runtime operands are declared per fn parameter with ``args={param: kind}``,
+  a kind taxonomy over the transform's (M, K) index space — the mainloop
+  mirror of EpiOps' operand kinds over (M, N). Each kind owns its indexing,
+  delivery and register staging; the fn just receives a same-length TensorSSA
+  vector of values aligned with x. Kinds (transform_a.A_TRANSFORM_ARG_KINDS):
+
+  * the ``colvec_*`` strip family — one MMA-dtype value per (A row, k-group),
+    delivered via the aux A-side TMA slot (per-stage smem under the AB
+    mbarrier): ``"colvec_ktile"`` (per k-tile, g = 1), ``"colvec_k64"`` /
+    ``"colvec_k32"`` / ``"colvec_k16"`` (per 64 / 32 / 16 elements — dense
+    blockscaled-SF granularities). E.g. the linear-CE dx pow2 rescale::
+
+        @a_transform(vec_size=8, args={"u": "colvec_ktile"})
+        def dx_scale(x, u):
+            return x * u
+
+    The host passes A as the bundle
+    ``host.transform_a_operand(mod, A, {"u": strip}, tile_m, tile_k)`` with
+    ``strip`` a contiguous (ceil(K / tile_K) * g, M) tensor in A's dtype
+    (one row per k-group; ragged K padded to whole k-tiles).
+
+  Planned kinds (not ported from the transformA branch yet): ``colvec``
+  (per-row, k-invariant — needs the per-work-tile prologue hook), ``kvec``
+  (per-k-element, the LCE dw strip), scalars / RNG seeds.
 
 * PACKED decodes (``packed=PackedInput(...)``): the fn IS the decode — the
   :meth:`~quack.blockscaled.decode_formats.DecodeFormat.decode_k16` body,
@@ -41,6 +65,7 @@ mods compose with the jit-cache machinery.
 """
 
 import hashlib
+import inspect
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -75,13 +100,14 @@ class ATransformMod:
     """A fn-authored A-operand transform; callable as the ``transform_a=``
     factory. See module docstring for the fn contracts."""
 
-    def __init__(self, fn, vec_size, packed, consts=None, regs=None):
+    def __init__(self, fn, vec_size, packed, consts=None, regs=None, args=None):
         self.fn = fn
         self.name = getattr(fn, "__name__", "a_transform")
         self.packed = packed
         if packed is not None:
             assert vec_size in (None, 8), "packed fn transforms decode whole k16 blocks"
             assert consts is None, "packed fns take consts via PackedInput.make_consts"
+            assert not args, "runtime operands are value-fn only (packed decodes own A)"
             vec_size = 8
         else:
             vec_size = 2 if vec_size is None else vec_size
@@ -89,6 +115,7 @@ class ATransformMod:
         self.vec_size = vec_size
         self.consts = consts
         self.regs = regs
+        self.args = _normalize_args(fn, args)
         self._fmt = None
         self.semantic_digest = _digest(self.__quack_semantic_key__())
 
@@ -149,7 +176,24 @@ class ATransformMod:
             _function_semantic_key(self.consts) if self.consts is not None else None,
             self.regs,
             packed_key,
+            self.args,
         )
+
+
+def _normalize_args(fn, args) -> tuple:
+    """Validate an ``args`` declaration ({fn param name: kind name}) against
+    the fn signature and the kind registry; normalize to ((name, kind), ...)
+    in fn-parameter order (the staging order in the kernel)."""
+    if not args:
+        return ()
+    from quack.operand_transform.transform_a import A_TRANSFORM_ARG_KINDS
+
+    unknown = set(args.values()) - set(A_TRANSFORM_ARG_KINDS)
+    assert not unknown, f"unknown operand kind(s) {unknown}; have {set(A_TRANSFORM_ARG_KINDS)}"
+    params = list(inspect.signature(fn).parameters)
+    missing = set(args) - set(params[1:])
+    assert not missing, f"args {missing} are not parameters of {fn.__name__} (after x)"
+    return tuple((name, args[name]) for name in params[1:] if name in args)
 
 
 def _digest(key) -> str:
@@ -192,16 +236,24 @@ def a_transform(
     packed=None,
     consts: Optional[Callable] = None,
     regs: Optional[tuple] = None,
+    args: Optional[dict] = None,
 ):
     """Decorator: turn a plain fn into an A-operand transform mod. See the
     module docstring for the two fn contracts.
 
     ``consts=callable`` (value fns): called once per kernel (hoisted — LUTs,
     packed constants); its result is the fn's LAST parameter.
+    ``args={param: kind}`` (value fns): runtime operands — each named fn
+    parameter (between x and consts) receives its per-element values as a
+    TensorSSA vector, staged by its kind (transform_a.A_TRANSFORM_ARG_KINDS;
+    the (M, K) mirror of EpiOps' operand kinds). A crosses as the
+    ``host.transform_a_operand(mod, A, {param: tensor}, tile_m)`` bundle.
     ``regs=(load, mma)`` overrides the register budget split (multiples of 8,
     see setmaxnreg constraints in TransformAW4)."""
 
     def wrap(fn):
-        return ATransformMod(fn, vec_size=vec_size, packed=packed, consts=consts, regs=regs)
+        return ATransformMod(
+            fn, vec_size=vec_size, packed=packed, consts=consts, regs=regs, args=args
+        )
 
     return wrap

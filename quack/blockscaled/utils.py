@@ -14,7 +14,6 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_config import SplitKMode
-from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
@@ -743,6 +742,11 @@ def compile_blockscaled_gemm_tvm_ffi(
             raise NotImplementedError(
                 "block-scaled split_k does not support SEPARATE yet; use SERIAL or PARALLEL"
             )
+
+    # Lazy: this SM100 compile helper must not force the kernel-class import
+    # chain (gemm_default_epi -> gemm_sm90) onto every consumer of the
+    # blockscaled package (e.g. decode_formats, imported by kernel-side code).
+    from quack.gemm_default_epi import GemmDefaultSm100
 
     gemm = partial(
         GemmDefaultSm100,

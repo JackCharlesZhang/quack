@@ -18,7 +18,9 @@ consistency is pinned for free.
 
 import torch
 
+import cutlass
 import cutlass.cute as cute
+from cutlass import const_expr
 
 from quack.blockscaled import nvfp4_utils as U
 from quack.blockscaled import qtip as Q
@@ -80,6 +82,9 @@ class DecodeFormat:
     w8 = False
     tile_k = 64
     sf_words = 0
+    # the MMA compute dtype decode_k16 produces (the gemm ctor a_dtype);
+    # bf16 for the whole W4A16 family, e4m3 for a future w4a8
+    mma_dtype = cutlass.BFloat16
 
     @property
     def sf_bytes(self):
@@ -128,10 +133,18 @@ class Nvfp4(DecodeFormat):
 
 
 class Int4(DecodeFormat):
-    """u4b8 nibbles + bf16 scale per group of 128 k."""
+    """u4b8 nibbles + bf16 scale per group of `group` k columns. group is a
+    format parameter (registered as int4 / int4_g64 / int4_g32): 32, 64, or
+    any multiple of 64. Groups of >= 64 ride one strip word per k-tile
+    (duplicated across the group's tiles); group 32 rides two words and the
+    decode selects by k16 block — no kernel changes, only the strip repack
+    and this class."""
 
-    name = "int4"
-    sf_words = 1
+    def __init__(self, group: int = 128):
+        assert group == 32 or group % 64 == 0, f"group {group} must be 32 or a multiple of 64"
+        self.group = group
+        self.name = "int4" if group == 128 else f"int4_g{group}"
+        self.sf_words = 2 if group == 32 else 1
 
     def make_consts(self):
         return U.make_i4_decode_consts()
@@ -139,47 +152,48 @@ class Int4(DecodeFormat):
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
         r0, r1, r2, r3 = U.decode_u4b8x8_to_bf16x8(xw[b], consts)
-        h = sfw[0]  # already a (sf_r, sf_r8) bf16 pair
+        if const_expr(self.group == 32):
+            h = sfw[b // 2]  # word per 32-column group (b is a static int)
+        else:
+            h = sfw[0]  # already a (sf_r, sf_r8) bf16 pair
         return _mul4(r0, r1, r2, r3, h)
 
     def quantize_reference(self, w):
-        return U.quantize_int4_reference(w)
+        return U.quantize_int4_reference(w, group=self.group)
 
     def dequant_reference(self, q, sf):
-        return U.dequant_int4_reference(q, sf)
+        return U.dequant_int4_reference(q, sf, group=self.group)
 
     def prepare(self, q, sf):
         q, sf = _pad_n128(q, sf)
-        return U.repack_int4_weight(q), U.repack_int4_sf(sf, q.shape[1] * 2)
+        return U.repack_int4_weight(q), U.repack_int4_sf(sf, q.shape[1] * 2, group=self.group)
 
 
 class Int4Awq(DecodeFormat):
-    """AWQ asymmetric int4: (q - z) * s computed as (q - 8) * s + b with
-    b = -s * (z - 8) — one HFMA2 per register; sf is (scales, zeros).
-
-    NOTE(sfa port): HFMA2 directly on the magic-form value with
-    b' = -s * (z + 128) would drop decode's -136 HADD2 (15 -> 11 ops per 8
-    incl. scale+zero) but |b'| ~ 136s pre-rounds at ~0.5s vs ~s/32 today —
-    a 16x coarser systematic per-group zero offset. Only sound as a
-    quantizer-aware format where b' is optimized directly on the bf16 grid
-    (spacing ~ s = the integer-z granularity); see memory
-    project_transform_a for the full analysis + dead ends."""
+    """AWQ asymmetric int4: (q - z) * s computed as HADD2(magic, c) * s with
+    c = -(128 + z) — magic + c = q - z is an EXACT small integer, so the
+    result rounds ONCE (no pre-rounded bias constant); sf is (scales, zeros).
+    Same op count as symmetric int4 (the zero rides the bias-add's addend),
+    and HMUL2 issues at ~2x the rate of the HFMA2 it replaced (which
+    occupied both fma-pipe halves). The rejected alternative — folding
+    everything into one HFMA2 with b' = -s*(z + 128) — pre-rounds b' at
+    ~0.5s: see memory project_transform_a."""
 
     name = "int4awq"
     sf_words = 2
 
     def make_consts(self):
-        return U.make_i4_decode_consts()
+        return U.pin_b32_vreg(0x43004300)  # magic only; the bias rides the strip
 
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
-        r0, r1, r2, r3 = U.decode_u4b8x8_to_bf16x8(xw[b], consts)
-        sp, bp = sfw[0], sfw[1]
+        t0, t1, t2, t3 = U.decode_u4x8_to_magicx8(xw[b], consts)
+        sp, cp = sfw[0], sfw[1]
         return (
-            U.fma_bf16x2_bcast(r0, sp, bp, False),
-            U.fma_bf16x2_bcast(r1, sp, bp, True),
-            U.fma_bf16x2_bcast(r2, sp, bp, False),
-            U.fma_bf16x2_bcast(r3, sp, bp, True),
+            U.mul_bf16x2_bcast(U.add_bf16x2_bcast(t0, cp, False), sp, False),
+            U.mul_bf16x2_bcast(U.add_bf16x2_bcast(t1, cp, True), sp, True),
+            U.mul_bf16x2_bcast(U.add_bf16x2_bcast(t2, cp, False), sp, False),
+            U.mul_bf16x2_bcast(U.add_bf16x2_bcast(t3, cp, True), sp, True),
         )
 
     def quantize_reference(self, w):
@@ -383,6 +397,8 @@ W4_FORMATS = {
     for f in (
         Nvfp4(),
         Int4(),
+        Int4(group=64),
+        Int4(group=32),
         Int4Awq(),
         Mxfp4(),
         Int8(),

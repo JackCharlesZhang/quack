@@ -23,6 +23,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 from quack import layout_utils
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
+from quack.operand_transform.transform_a import TransformAOperand
 from quack.tile_scheduler import TileSchedulerOptions, ag_wait_m_tile
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
@@ -284,10 +285,14 @@ class GemmSm90(GemmTmaBase):
                 self.num_regs_load, self.num_regs_mma = (56, 224)
 
         # TransformA: created after the default register budgets above so it
-        # can override them (and occupancy) per its config.
+        # can override them (and occupancy) per its config. The transform may
+        # install an aux A-side operand (per-stage strip riding the AB
+        # pipeline); the aux facility itself is transform-agnostic.
         self.transform_a = None
+        self.aux_a = None
         if transform_a is not None:
             self.transform_a = transform_a(self)
+            self.aux_a = self.transform_a.aux
 
         self.ab_stage = None
         self.epi_stage = None
@@ -409,6 +414,10 @@ class GemmSm90(GemmTmaBase):
                 if self.transform_a is not None and self.transform_a.owns_a_layout
                 else None
             ),
+            # aux A-side operand (e.g. a scale strip): rides the AB stages
+            ab_extra_bytes_per_stage=(
+                self.aux_a.bytes_per_stage() if self.aux_a is not None else 0
+            ),
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -436,11 +445,16 @@ class GemmSm90(GemmTmaBase):
             # the transform owns A's smem layout (its storage format, not
             # the (tile_M, tile_K) shape)
             self.a_smem_layout_staged = self.transform_a.make_a_smem_layout_staged(self.ab_stage)
+        self.aux_a_smem_layout_staged = (
+            self.aux_a.make_smem_layout_staged(self.ab_stage) if self.aux_a is not None else None
+        )
 
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,
+        # a plain (M, K) tensor, or the TransformAOperand bundle (blob +
+        # optional aux strip) of a layout-owning transform
+        mA: Union[cute.Tensor, TransformAOperand],
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
@@ -466,6 +480,18 @@ class GemmSm90(GemmTmaBase):
         :type stream: cuda.CUstream
         """
         a_owned = const_expr(self.transform_a is not None and self.transform_a.owns_a_layout)
+        # Transforms with runtime operands bundle A and the optional aux strip
+        # into ONE mA argument (TransformAOperand) — the host layer never
+        # learns the bundle's anatomy, and the signature arity stays fixed for
+        # plain GEMMs. For layout-owning transforms blob is the repacked
+        # storage; for value transforms it is the plain (M, K) operand and
+        # continues down the standard path below.
+        mAuxA = None
+        if const_expr(isinstance(mA, TransformAOperand)):
+            assert self.transform_a is not None, "TransformAOperand requires a transform_a"
+            mA, mAuxA = mA.blob, mA.sf
+        if const_expr(self.aux_a is not None):
+            assert mAuxA is not None, "the transform's aux operand needs mA.sf"
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
             # Dense rank-2 operands get a trivial batch mode appended instead.
@@ -481,7 +507,7 @@ class GemmSm90(GemmTmaBase):
                 for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
             ]
         else:
-            # Layout-owning transform: mA (the storage blob) crosses
+            # Layout-owning transform: mA (the storage blob) and mAuxA cross
             # kernel-native and untouched; B/D/C are ordinary operands and
             # rotate as usual (2-D callers get the trivial batch appended).
             assert mD is not None, "a layout-owning transform_a requires an output tensor D"
@@ -536,7 +562,8 @@ class GemmSm90(GemmTmaBase):
                 self.make_tma_load_atoms_and_tensors(mA, mB, a_smem_layout, b_smem_layout, varlen_k)
             )
         else:
-            # packed-weight A: the transform owns A's TMA (blob boxes)
+            # packed-weight A: the transform owns A's TMA (blob boxes); its
+            # scale-factor strip rides the SFA slots below
             a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
             tma_atom_a, tma_tensor_a = self.transform_a.make_a_tma(mA)
             tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
@@ -549,6 +576,11 @@ class GemmSm90(GemmTmaBase):
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         if const_expr(not self.gather_A):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+
+        tma_atom_aux_a, tma_tensor_aux_a = None, None
+        if const_expr(self.aux_a is not None):
+            tma_atom_aux_a, tma_tensor_aux_a = self.aux_a.make_tma(mAuxA)
+            self.num_tma_load_bytes += self.aux_a.bytes_per_stage()
 
         if const_expr(self.split_k > 1):
             assert mD is not None, "split_k requires an output tensor D"
@@ -583,6 +615,9 @@ class GemmSm90(GemmTmaBase):
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
+        aux_a_smem_size = 0
+        if const_expr(self.aux_a is not None):
+            aux_a_smem_size = cute.cosize(self.aux_a_smem_layout_staged)
 
         @cute.struct
         class SharedStorage:
@@ -607,6 +642,12 @@ class GemmSm90(GemmTmaBase):
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            sAuxA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.aux_a.dtype if self.aux_a is not None else Int32, aux_a_smem_size
+                ],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -628,6 +669,9 @@ class GemmSm90(GemmTmaBase):
             self.b_smem_layout_staged,
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
+            tma_atom_aux_a,
+            tma_tensor_aux_a,
+            self.aux_a_smem_layout_staged,
             tile_sched_params,
             TileSchedulerCls,
         ).launch(
@@ -663,6 +707,9 @@ class GemmSm90(GemmTmaBase):
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
+        tma_atom_aux_a: Optional[cute.CopyAtom],
+        mAuxA_mkl: Optional[cute.Tensor],
+        aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
@@ -708,7 +755,7 @@ class GemmSm90(GemmTmaBase):
 
         # Prefetch Tma desc
         if warp_idx == self.ab_load_warp_id:
-            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c):
+            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c, tma_atom_aux_a):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
@@ -757,6 +804,9 @@ class GemmSm90(GemmTmaBase):
             # make_copy_block
             sA = storage.sA.get_tensor(a_smem_layout)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sAuxA = None
+        if const_expr(self.aux_a is not None):
+            sAuxA = storage.sAuxA.get_tensor(aux_a_smem_layout)
         sD = None
         if const_expr(has_D):
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -871,6 +921,21 @@ class GemmSm90(GemmTmaBase):
                         copy_A, prefetch_A = self._make_gather_A_copy(
                             mA_mkl, sA, varlen_manager, tile_coord_mnkl, batch_idx
                         )
+                    copy_AuxA = None
+                    if const_expr(self.aux_a is not None):
+                        # aux A-side operand: one box per k-tile alongside A/B
+                        gAux = self.aux_a.gmem_slice(mAuxA_mkl, tile_coord_mnkl, batch_idx)
+                        copy_AuxA = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_aux_a,
+                            src_tensor=gAux,
+                            dst_tensor=sAuxA,
+                            # small-box aux operands (e.g. 128 B scale strips)
+                            # may opt out of the A-side multicast: each CTA
+                            # loads its own copy instead of splitting the box
+                            tma_multicast=a_tma_multicast
+                            if const_expr(getattr(self.aux_a, "multicast", True))
+                            else None,
+                        )
                     # (bN, bK, RestK)
                     gB_nk = cute.local_tile(
                         varlen_manager.offset_batch_B(mB_nkl, batch_idx),
@@ -893,7 +958,7 @@ class GemmSm90(GemmTmaBase):
                         ab_producer_state = self.load_tma(
                             ab_pipeline,
                             ab_producer_state,
-                            [copy_A, copy_B],
+                            [copy_A, copy_B, copy_AuxA],
                             k_tile_cnt,
                             k_tile_start=k_tile_start,
                         )
@@ -955,7 +1020,7 @@ class GemmSm90(GemmTmaBase):
                 # a transform's own produce (e.g. blob LDS + dequant)
                 if const_expr(self.transform_a is not None):
                     copy_block = self.transform_a.make_copy_block(
-                        tiled_mma, sA, tCrA, tidx, warp_group_idx
+                        tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=sAuxA
                     )
                 else:
                     copy_block = quack_sm90_utils.canonical_a_load_s2r(
@@ -1624,6 +1689,7 @@ class GemmSm90(GemmTmaBase):
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
         a_bytes_per_stage_override: Optional[int] = None,
+        ab_extra_bytes_per_stage: int = 0,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1667,7 +1733,9 @@ class GemmSm90(GemmTmaBase):
             if a_bytes_per_stage_override is None
             else a_bytes_per_stage_override
         )
-        ab_bytes_per_stage = a_bytes + cute.size(b_shape) * b_dtype.width // 8
+        ab_bytes_per_stage = (
+            a_bytes + cute.size(b_shape) * b_dtype.width // 8 + ab_extra_bytes_per_stage
+        )
         mbar_helpers_bytes = 1024
 
         remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes

@@ -181,7 +181,7 @@ from quack.gemm_host import (
     register_local_epi_mod,
     run_gemm_epi_plan,
 )
-from quack.gemm_config import SplitKMode, blockscaled_default_config, default_config
+from quack.gemm_config import GemmConfig, SplitKMode, blockscaled_default_config, default_config
 from quack.gemm_tvm_ffi_utils import tensor_key
 from quack.gemm_sm80 import GemmSm80
 import quack.layout_utils as layout_utils
@@ -1259,12 +1259,59 @@ class EpiMod:
         split_k: int = 1,  # K-dim split factor (SERIAL/PARALLEL only; see quack.gemm)
         split_k_mode: int = SplitKMode.SERIAL,
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
+        # A-operand transform (SM90 RS mainloop). Value transforms leave the
+        # call contract unchanged. Layout-owning (packed-weight) transforms
+        # flip the slots: caller A = ACTIVATIONS (m, k), caller B = the
+        # repacked BLOB from fmt.prepare (+ its SF strip via transform_sf);
+        # D and tile-shaped epi operands stay caller-oriented (m, n_full) —
+        # kernel m is the weight/output-channel dim, so caller row/col vec
+        # labels flip exactly like swap_ab.
+        transform_a=None,
+        transform_sf=None,
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
         blockscaled = SFA is not None
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
+        owned_fmt = None
+        transform_key = None
+        if transform_a is not None:
+            from quack.operand_transform.host import (
+                transform_handle_fmt,
+                transform_handle_key,
+                w4_operand_views,
+            )
+
+            owned_fmt = transform_handle_fmt(transform_a)
+            transform_key = transform_handle_key(transform_a)
+            if varlen_m or gather_A or blockscaled or concat_key or ag_args is not None:
+                raise ValueError("transform_a: plain dense GEMM only")
+            if swap_ab:
+                raise ValueError("transform_a + swap_ab: not supported")
+        A_bundle = None
+        if owned_fmt is not None:
+            if pingpong:
+                raise ValueError("layout-owning transform_a does not support pingpong")
+            if self.mode != "element" or self.sinks or self.prepass is not None:
+                raise ValueError(
+                    "layout-owning transform_a supports element-mode sink-less epilogues only"
+                )
+            if C is not None:
+                raise ValueError("layout-owning transform_a + C operand: not supported yet")
+            if A.ndim != 2 or A.stride(-1) != 1:
+                raise ValueError("layout-owning transform_a: activations are (m, k), k-major")
+            if tile_K is not None and tile_K != owned_fmt.tile_k:
+                raise ValueError(f"format {owned_fmt.name!r} requires tile_K={owned_fmt.tile_k}")
+            tile_K = owned_fmt.tile_k
+            if B.shape[1] * owned_fmt.tile_k != A.shape[-1]:
+                raise ValueError(
+                    f"K mismatch: activations K={A.shape[-1]}, "
+                    f"blob K={B.shape[1] * owned_fmt.tile_k}"
+                )
+            A_bundle = w4_operand_views(owned_fmt, B, transform_sf, tile_M)
+        elif transform_sf is not None:
+            raise ValueError("transform_sf without a layout-owning transform_a")
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
         if split_k > 1:
@@ -1328,6 +1375,8 @@ class EpiMod:
             split_k,
             int(split_k_mode),
             ag_args is not None,
+            transform_key,
+            tensor_key(transform_sf),
             # Per-op host arg keys: dtypes/ranks/static widths that the
             # compiled kernel specializes on (host_arg_key's documented
             # role). Without these, a same-shape call with e.g. a different
@@ -1350,8 +1399,8 @@ class EpiMod:
             if _launch:
                 run_gemm_epi_plan(
                     plan,
-                    B if swap_ab else A,
-                    A if swap_ab else B,
+                    A_bundle if owned_fmt is not None else (B if swap_ab else A),
+                    A if (swap_ab or owned_fmt is not None) else B,
                     D,
                     C,
                     epi_args,
@@ -1391,11 +1440,15 @@ class EpiMod:
                 raise ValueError("gather_A requires varlen")
             if cluster_N != 1:
                 raise ValueError("gather_A requires cluster_N=1")
-        n_gemm = B.shape[-1] if b_kn else B.shape[-2]
-        # Kernel coords under swap-at-trace: kernel m = caller n, kernel n =
-        # caller m. Shape checks on D/C/outputs stay caller-oriented (the
-        # tensors cross natively; the trace transposes); operand-kind
-        # inference and vec shape checks use kernel coords.
+        if owned_fmt is not None:
+            n_gemm = B.shape[0] * 64  # blob (N/64, K/tile_k, ...): padded weight N
+        else:
+            n_gemm = B.shape[-1] if b_kn else B.shape[-2]
+        # Kernel coords under swap-at-trace (and layout-owning transforms):
+        # kernel m = caller n, kernel n = caller m. Shape checks on
+        # D/C/outputs stay caller-oriented (the tensors cross natively; the
+        # trace transposes); operand-kind inference and vec shape checks use
+        # kernel coords.
         paired_acc = self.mode == "acc_pair"
         packed_c = self.mode == "packed_cd_b16x2"
         if paired_acc and (n_gemm % 2 or tile_N % 2):
@@ -1432,7 +1485,7 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        m_i, n_i = (n_gemm, m) if swap_ab else (m, n_gemm)
+        m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         if packed_c:
@@ -1477,13 +1530,14 @@ class EpiMod:
         # caller colvec is the swapped kernel's rowvec (and vice versa), so the
         # pin's class flips for this call. Other orientation-sensitive vec pins
         # (varlen subclasses, reduces) have no swapped form and fail loudly.
+        flipped = swap_ab or owned_fmt is not None
         pins = {}
         for name, op in self.ops.items():
-            if swap_ab and type(op) in (ColVecLoad, RowVecLoad):
+            if flipped and type(op) in (ColVecLoad, RowVecLoad):
                 pins[name] = (RowVecLoad if type(op) is ColVecLoad else ColVecLoad)(name)
-            elif swap_ab and isinstance(op, (VecLoad, VecReduce)):
+            elif flipped and isinstance(op, (VecLoad, VecReduce)):
                 raise ValueError(
-                    f"swap_ab: pinned vec op {name!r} of type {type(op).__name__} "
+                    f"swap_ab/transform_a: pinned vec op {name!r} of type {type(op).__name__} "
                     "has no swapped orientation"
                 )
             else:
@@ -1629,7 +1683,10 @@ class EpiMod:
             arg_forms,
         )
         GemmCls = self._mint(*mint_key)
-        A_s, B_s = (B, A) if swap_ab else (A, B)
+        if owned_fmt is not None:
+            A_s, B_s = A_bundle, A
+        else:
+            A_s, B_s = (B, A) if swap_ab else (A, B)
         plan = build_gemm_epi_plan(
             GemmCls,
             device_capacity,
@@ -1650,8 +1707,11 @@ class EpiMod:
             max_swizzle_size=max_swizzle_size,
             varlen_m=varlen_m,
             gather_A=gather_A,
-            b_kn=b_kn and not swap_ab,  # slot-A relabels via a_transposed instead
+            # slot-A relabels via a_transposed (swap_ab); owned transforms
+            # pass B (= caller A activations) natively (n, k)
+            b_kn=b_kn and not swap_ab and owned_fmt is None,
             swap_ab=swap_ab,
+            transform_a=transform_a,
             use_tma_gather=use_tma_gather,
             concat_layout=concat_key,
             sf_dtype=sf_dtype,
@@ -1670,8 +1730,8 @@ class EpiMod:
         if _launch:
             run_gemm_epi_plan(
                 plan,
-                B if swap_ab else A,
-                A if swap_ab else B,
+                A_bundle if owned_fmt is not None else (B if swap_ab else A),
+                A if (swap_ab or owned_fmt is not None) else B,
                 D,
                 C,
                 epi_values,
@@ -1696,12 +1756,37 @@ class EpiMod:
             return ((A_idx.shape[0] if A_idx is not None else A.shape[0]),)
         return tuple(A.shape[:-1])
 
-    def _alloc_outputs(self, out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx):
+    def _default_config(self, A, B, transform_a):
+        """Per-arch default config; layout-owning transforms get the measured
+        W4 coverage rule (quack.gemm_w4._pick_w4_cfg) instead. split_k is not
+        threaded through the eager/plan surface yet — pass it explicitly via
+        mod.gemm for the starved-grid decode-shape win."""
+        if transform_a is not None:
+            from quack.operand_transform.host import transform_handle_fmt
+
+            fmt = transform_handle_fmt(transform_a)
+            if fmt is not None:
+                from quack.gemm_w4 import _pick_w4_cfg
+
+                tm, tn, _sk = _pick_w4_cfg(A.shape[-2], B.shape[0] * 64, A.shape[-1] // fmt.tile_k)
+                return GemmConfig(
+                    tile_m=tm,
+                    tile_n=tn,
+                    cluster_m=1,
+                    cluster_n=1,
+                    pingpong=False,
+                    is_dynamic_persistent=False,
+                )
+        return default_config(A.device)
+
+    def _alloc_outputs(
+        self, out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx, n_override=None
+    ):
         """Fill in the outputs the caller left out; out= buffers win."""
         import torch
 
         out = dict(out) if out else {}
-        n = B.shape[-1]
+        n = B.shape[-1] if n_override is None else n_override
         lead = self._lead_shape(A, cu_seqlens_m, A_idx)
         dt = out_dtype if out_dtype is not None else A.dtype
         if store_d and out.get("D") is None:
@@ -1777,6 +1862,8 @@ class EpiMod:
             swap_ab=config.swap_ab,
             use_tma_gather=config.use_tma_gather,
             concat_layout=ctx.get("concat_layout"),
+            transform_a=ctx.get("transform_a"),
+            transform_sf=ctx.get("transform_sf"),
             _launch=_launch,
         )
         return config, dyn, plan, sink_bufs
@@ -1802,6 +1889,8 @@ class EpiMod:
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
         concat_layout=None,  # tensors whose non-contiguous dim is concat [gate; up]
+        transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
+        transform_sf=None,  # layout-owning transform, B is the repacked blob
         **operands,  # epilogue operand tensors/scalars by fn-parameter name
     ):
         """Eager torch-facing call: resolve config (autotune via
@@ -1821,11 +1910,21 @@ class EpiMod:
         pinned there (partials must be graph-allocated at exact shapes)."""
         import torch
 
+        owned_fmt = None
+        transform_key = None
+        if transform_a is not None:
+            from quack.operand_transform.host import transform_handle_fmt, transform_handle_key
+
+            owned_fmt = transform_handle_fmt(transform_a)
+            transform_key = transform_handle_key(transform_a)
+
         if torch.compiler.is_compiling():
             if dynamic_scheduler or epi_key_overrides is not None:
                 raise NotImplementedError(
                     "dynamic_scheduler/epi_key_overrides under torch.compile: not supported yet"
                 )
+            if transform_a is not None:
+                raise NotImplementedError("transform_a under torch.compile: not supported yet")
             from quack.epi_torch_op import compile_call
 
             return compile_call(
@@ -1856,7 +1955,7 @@ class EpiMod:
         # concat and transforms are excluded (their per-call views live in
         # mod.gemm, whose own plan cache is the warm path).
         ck = None
-        if concat_layout is None:
+        if concat_layout is None and transform_a is None:
             ck = (
                 tensor_key(A),
                 tensor_key(B),
@@ -1886,6 +1985,8 @@ class EpiMod:
                 bs_format_b,
                 rounding_mode,
                 None if epi_key_overrides is None else tuple(sorted(epi_key_overrides.items())),
+                transform_key,
+                tensor_key(transform_sf),
             )
             entry = self._call_cache.get(ck)
             if entry is not None:
@@ -1929,17 +2030,21 @@ class EpiMod:
         # concat reads B (k, n) through per-call views, so it vetoes the b_kn
         # trace-time relabel (the interleave lives in mod.gemm).
         b_kn = get_device_capacity(A.device)[0] >= 9 and not concat_layout
-        B_d = B if b_kn else B.mT
+        B_d = B if (b_kn or owned_fmt is not None) else B.mT
+        n_override = B.shape[0] * 64 if owned_fmt is not None else None  # blob: padded N
         provided_out = frozenset(k for k, v in (out or {}).items() if v is not None)
-        out = self._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
+        out = self._alloc_outputs(
+            out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx, n_override=n_override
+        )
         D = out.get("D") if store_d else None
         lead = self._lead_shape(A, cu_seqlens_m, A_idx)
-        n = B.shape[-1]
+        n = B.shape[-1] if n_override is None else n_override
         use_tuner = (
             tuned
             and config is None
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
+            and transform_a is None  # transform-aware autotune: not wired yet
         )
         if use_tuner:
             from quack.epi_autotune import sink_arg_shapes, tuned_mod_gemm
@@ -2001,13 +2106,15 @@ class EpiMod:
                 rounding_mode=rounding_mode,
                 epi_key_overrides=epi_key_overrides,
                 concat_layout=concat_layout,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
             )
             if config is not None:
                 cfg = config
             elif SFA is not None:
                 cfg = blockscaled_default_config(A.shape[-2], n)
             else:
-                cfg = default_config(A.device)
+                cfg = self._default_config(A, B, transform_a)
             _, _, plan_used, sink_bufs = self._iface_execute(cfg, dynamic_scheduler, ctx)
             cfg_used = cfg
         if ck is not None:
@@ -2056,6 +2163,8 @@ class EpiMod:
         bs_format_b=None,
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
+        transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
+        transform_sf=None,  # layout-owning transform, B is the repacked blob
         **operands,
     ):
         """Resolve (and compile on a cold cache) WITHOUT launching; returns an
@@ -2065,13 +2174,20 @@ class EpiMod:
         varlen_m = cu_seqlens_m is not None
         b_kn = get_device_capacity(A.device)[0] >= 9
         B_d = B if b_kn else B.mT
-        cfg = config if config is not None else default_config(A.device)
+        cfg = config if config is not None else self._default_config(A, B, transform_a)
         dyn = dynamic_scheduler or cfg.is_dynamic_persistent
         out = dict(out)
         D = out.get("D")
         for name in self.outputs:
             if out.get(name) is None:
                 raise ValueError(f"plan() requires a buffer for output {name!r}")
+        n = B.shape[-1]
+        if transform_a is not None:
+            from quack.operand_transform.host import transform_handle_fmt
+
+            if transform_handle_fmt(transform_a) is not None:
+                B_d = B  # the blob crosses kernel-native
+                n = B.shape[0] * 64
         ctx = dict(
             A=A,
             B_d=B_d,
@@ -2079,7 +2195,7 @@ class EpiMod:
             D=D,
             out=out,
             operands=dict(operands),
-            n=B.shape[-1],
+            n=n,
             lead=self._lead_shape(A, cu_seqlens_m, A_idx),
             b_kn=b_kn,
             cu_seqlens_m=cu_seqlens_m,
@@ -2090,6 +2206,8 @@ class EpiMod:
             bs_format_b=bs_format_b,
             rounding_mode=rounding_mode,
             epi_key_overrides=epi_key_overrides,
+            transform_a=transform_a,
+            transform_sf=transform_sf,
         )
         _, _, gemm_plan, sink_bufs = self._iface_execute(cfg, dyn, ctx, _launch=False)
         return EpiPlan(

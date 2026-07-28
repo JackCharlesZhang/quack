@@ -169,7 +169,8 @@ def _ops_by_name(GemmCls):
 def _compile_gemm_epi(
     gemm_cls_ref,
     device_capacity,
-    a_dtype,
+    a_dtype,  # the gemm ctor a_dtype: the MMA dtype (= A's dtype except for
+    # layout-owning transforms, where A crosses as a storage blob)
     b_dtype,
     d_dtype,
     c_dtype,
@@ -202,6 +203,13 @@ def _compile_gemm_epi(
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
+    # A-operand transform (SM90 RS mainloop, quack.operand_transform): a
+    # picklable TransformARef. Layout-owning (packed W4) transforms replace
+    # the standard fake operands: A is the repacked blob (static geometry
+    # from transform_dims = (n_full, k)), the SF strip rides a trailing AuxA
+    # arg, kernel-N (the activation M) is the only symbolic dim.
+    transform_a_ref=None,
+    transform_dims=None,
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -209,25 +217,73 @@ def _compile_gemm_epi(
     the disk key and to ship cold misses to async-compile workers).
     """
     GemmCls = resolve_gemm_class(gemm_cls_ref)
-    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        varlen_m=varlen_m,
-        gather_A=gather_A,
-        batched=batched,
-        b_kn=b_kn,
-        swap_ab=swap_ab,
-        packed_cd=packed_cd,
-        a_mma_dtype=a_mma_dtype,
-        b_mma_dtype=b_mma_dtype,
-    )
-    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
+    transform_mod = None
+    owned_fmt = None
+    if transform_a_ref is not None:
+        from quack.operand_transform.host import (
+            resolve_transform_a,
+            transform_decode_format,
+            w4_fake_operands,
+        )
+
+        transform_mod = resolve_transform_a(transform_a_ref)
+        owned_fmt = transform_decode_format(transform_mod)
+    if owned_fmt is not None:
+        assert not (varlen_m or gather_A or batched or b_kn or swap_ab or concat_layout), (
+            "layout-owning transforms support the plain dense path only"
+        )
+        n_full, k_static = transform_dims
+        # mA is the TransformAOperand bundle (blob + optional strip): ONE
+        # argument slot, the same shape as the runtime views
+        mA = w4_fake_operands(owned_fmt, n_full, k_static, tile_shape_mn[0])
+        n_sym = cute.sym_int()
+        # activations: (m_act, k) k-major with a STATIC compact stride
+        # (mark_compact_shape_dynamic(mode=0)). D crosses CALLER-oriented
+        # (m_act, n_full) row-major and is relabeled at trace via
+        # cd_transposed (kernel D = (n_full, m_act) m-major) — the swap-at-
+        # trace convention, so tile-shaped epi operands stay caller-oriented
+        # too (fctx.swapped below).
+        mB = cute.runtime.make_fake_tensor(
+            b_dtype, (n_sym, k_static), stride=(k_static, 1), assumed_align=16
+        )
+        mD = cute.runtime.make_fake_tensor(
+            d_dtype, (n_sym, n_full), stride=(n_full, 1), assumed_align=16
+        )
+        mC = None
+        m, n, k, l = n_full, n_sym, k_static, 1
+    else:
+        mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+            a_dtype,
+            b_dtype,
+            d_dtype,
+            c_dtype,
+            a_major,
+            b_major,
+            d_major,
+            c_major,
+            varlen_m=varlen_m,
+            gather_A=gather_A,
+            batched=batched,
+            b_kn=b_kn,
+            swap_ab=swap_ab,
+            packed_cd=packed_cd,
+            a_mma_dtype=a_mma_dtype,
+            b_mma_dtype=b_mma_dtype,
+        )
+        if transform_mod is not None and getattr(transform_mod, "args", ()):
+            # value transform with runtime operands: A crosses as a (plain A,
+            # operand view) bundle in the one mA slot (same-arity trick as W4)
+            from quack.operand_transform.host import transform_a_fake_operand
+
+            assert not (varlen_m or gather_A or batched or swap_ab or concat_layout), (
+                "transform runtime operands support the plain dense path only"
+            )
+            # tile_K falls back to the kernel default for 16-bit operands
+            # (value transforms are 16-bit only); a mismatch fails at trace
+            # (the kind's smem box shape is derived from the real tile_K).
+            tile_k = tile_shape_mn[2] if len(tile_shape_mn) == 3 else 64
+            mA = transform_a_fake_operand(transform_mod, mA, a_dtype, tile_shape_mn[0], tile_k)
+    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab or owned_fmt is not None)
     ops = _ops_by_name(GemmCls)
     fields = {}
     for name, key in epi_keys:
@@ -279,6 +335,7 @@ def _compile_gemm_epi(
         scheduler_args,
         varlen_args,
         post_init=post_init,
+        transform_a=transform_mod,
         mSFA=mSFA,
         mSFB=mSFB,
         use_tma_gather=use_tma_gather,
@@ -288,7 +345,7 @@ def _compile_gemm_epi(
         b_mma_dtype=b_mma_dtype,
         b_transposed=b_kn,
         a_transposed=swap_ab,
-        cd_transposed=swap_ab,
+        cd_transposed=swap_ab or owned_fmt is not None,
         cd_packed=packed_cd,
         split_k=split_k,
         split_k_mode=split_k_mode,
@@ -329,6 +386,9 @@ class GemmEpiPlan(NamedTuple):
     split_k_mode: object = SplitKMode.SERIAL
     tile_N: int = 0
     cluster_N: int = 1
+    # D crosses caller-oriented and is transposed at trace (layout-owning
+    # transforms): split-k buffer sizing must use kernel orientation (D.mT).
+    d_transposed: bool = False
 
 
 def _get_major(t, m_label, n_label):
@@ -371,9 +431,41 @@ def build_gemm_epi_plan(
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
+    # A-operand transform handle (format name / DecodeFormat / a_transform
+    # mod). Layout-owning transforms: A is the TransformAOperand bundle from
+    # operand_transform.host.w4_operand_views (blob view + optional strip);
+    # the ctor a_dtype comes from the format's mma_dtype.
+    transform_a=None,
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
+    transform_ref, owned_fmt, transform_dims = None, None, None
+    if transform_a is not None:
+        from quack.operand_transform.host import transform_a_ref, transform_decode_format
+
+        transform_ref, transform_mod = transform_a_ref(transform_a)
+        owned_fmt = transform_decode_format(transform_mod)
+        if owned_fmt is not None:
+            # A.blob is the view (256, wpt, tm64, Gt, Kt, 1): recover the
+            # static problem geometry for the fake construction. Metadata
+            # derivation below reads the blob; the bundle itself never
+            # crosses into the picklable compile args.
+            blob = A.blob
+            n_full = blob.shape[2] * blob.shape[3] * 64
+            k_full = blob.shape[4] * owned_fmt.tile_k
+            transform_dims = (n_full, k_full)
+            A = blob
+        elif getattr(transform_mod, "args", ()):
+            # value transform with runtime operands: A arrives bundled with
+            # the operand view (transform_a_operand); metadata derivation
+            # reads the plain operand, the bundle itself crosses at launch.
+            from quack.operand_transform.host import TransformAOperand
+
+            assert isinstance(A, TransformAOperand), (
+                "a transform with runtime operands takes A as "
+                "transform_a_operand(mod, A, values, tile_M)"
+            )
+            A = A.blob
     batched = A.ndim == 3 or varlen_m
     a_major = _get_major(A, "m", "k")
     b_major = _get_major(B, "n", "k")
@@ -392,7 +484,13 @@ def build_gemm_epi_plan(
         a_major = "m" if A.stride(-1) == 1 else "k"
         d_major = ("m" if D.stride(-1) == 1 else "n") if D is not None else None
         c_major = ("m" if C.stride(-1) == 1 else "n") if C is not None else None
-    a_dtype = torch2cute_dtype_map[A.dtype]
+    if owned_fmt is not None:
+        # the ctor a_dtype is the MMA compute dtype the format decodes to,
+        # decoupled from the blob's storage dtype
+        a_dtype = owned_fmt.mma_dtype
+        batched = False
+    else:
+        a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = torch2cute_dtype_map[B.dtype]
     d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
     c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
@@ -442,6 +540,8 @@ def build_gemm_epi_plan(
         has_ag=has_ag,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        transform_a_ref=transform_ref,
+        transform_dims=transform_dims,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -485,6 +585,7 @@ def build_gemm_epi_plan(
         split_k_mode=split_k_mode,
         tile_N=tile_N,
         cluster_N=cluster_N,
+        d_transposed=owned_fmt is not None,
     )
 
 
@@ -503,6 +604,8 @@ def run_gemm_epi_plan(
     A_idx=None,
     SFA=None,
     SFB=None,
+    split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
+    # calls when the kernel leaves them reusable (serial self-resets)
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -520,19 +623,22 @@ def run_gemm_epi_plan(
         if value is not None:
             fields[name] = value
     if plan.split_k > 1:
-        # Fresh per-call buffers (mirrors quack.gemm.run_gemm_plan); lazy import —
-        # quack.gemm sits above this module in the import graph.
-        from quack.gemm import _split_k_buffers
+        if split_k_buffers is None:
+            # Fresh per-call buffers (mirrors quack.gemm.run_gemm_plan); lazy import —
+            # quack.gemm sits above this module in the import graph.
+            from quack.gemm import _split_k_buffers
 
-        sem, ws = _split_k_buffers(
-            D if D.ndim == 3 else D[None],
-            plan.split_k_mode,
-            plan.tile_M,
-            plan.tile_N,
-            plan.cluster_M,
-            plan.cluster_N,
-            plan.is_sm100_family,
-        )
+            Dk = D.mT if plan.d_transposed else D  # size in KERNEL orientation
+            split_k_buffers = _split_k_buffers(
+                Dk if Dk.ndim == 3 else Dk[None],
+                plan.split_k_mode,
+                plan.tile_M,
+                plan.tile_N,
+                plan.cluster_M,
+                plan.cluster_N,
+                plan.is_sm100_family,
+            )
+        sem, ws = split_k_buffers
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())

@@ -485,7 +485,9 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
 
 
 def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
-    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB)."""
+    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB).
+    A layout-owning transform's A is a TransformAOperand bundle — one slot,
+    the host never unpacks it."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
     if plan.is_sm100_family:
@@ -669,6 +671,8 @@ def compile_gemm_kernel(
     scheduler_args,
     varlen_args,
     post_init=None,
+    transform_a=None,  # A-operand transform factory (SM90 RS mainloop);
+    # layout-owning transforms take mA as a TransformAOperand bundle
     mSFA=None,
     mSFB=None,
     use_tma_gather=False,
@@ -689,6 +693,9 @@ def compile_gemm_kernel(
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
         split_k_kwargs = {"split_k": split_k, "split_k_mode": split_k_mode}
+    if transform_a is not None:
+        assert device_capacity[0] == 9, "A-operand transforms are SM90 only"
+        split_k_kwargs["transform_a"] = transform_a
     if device_capacity[0] == 8:
         sm8x_kwargs = {"is_persistent": persistent, "num_warps": num_warps}
         sm8x_kwargs["arch"] = device_capacity[0] * 10 + device_capacity[1]

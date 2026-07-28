@@ -62,6 +62,12 @@ class GemmSm120(GemmSm90):
         self.use_clc_persistence = False
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
+        # no RS-transform / aux-operand support on the warp-MMA path; the
+        # inherited __call__/_setup_attributes still read these
+        self.mma_is_rs = False
+        self.transform_a = None
+        self.aux_a = None
+        self.mma_a_dtype = a_dtype
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         if self.pingpong:
@@ -180,6 +186,11 @@ class GemmSm120(GemmSm90):
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
+        # aux A-side operand slots (GemmSm90.__call__ passes them; SM120 has
+        # no transform/aux support, so they are always None here)
+        tma_atom_aux_a: Optional[cute.CopyAtom],
+        mAuxA_mkl: Optional[cute.Tensor],
+        aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):

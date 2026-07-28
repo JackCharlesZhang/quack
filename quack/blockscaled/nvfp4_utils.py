@@ -149,22 +149,40 @@ def repack_int4_weight(w_packed: torch.Tensor) -> torch.Tensor:
     return b.to(torch.uint8).view(blob.shape).contiguous()
 
 
-def repack_int4_sf(scales: torch.Tensor, k: int) -> torch.Tensor:
-    """(N, K/128) bf16 group scales -> (N/64, K/64, 32, 2) bf16 strip: slot
-    s = 8*(r//16) + r%16 holds (sf[r], sf[r+8]) for the k-tile's group."""
+def repack_int4_sf(scales: torch.Tensor, k: int, group: int = 128) -> torch.Tensor:
+    """(N, K/group) bf16 group scales -> per-k-tile bf16 strip; slot
+    s = 8*(r//16) + r%16 holds (sf[r], sf[r+8]) pairs.
+
+    group % 64 == 0: one word per slot, (N/64, K/64, 32, 2), the k-tile's
+    (single) group scale — tiles within a group carry duplicates.
+    group == 32: two words per slot, (N/64, K/64, 32, 2, 2), word j = the
+    scales of the tile's j-th 32-column group (decode selects sfw[b // 2],
+    the mxfp4 word layout with bf16 pairs instead of e8m0 bytes)."""
     assert scales.dtype == torch.bfloat16
+    assert group == 32 or group % 64 == 0, f"group {group} must be 32 or a multiple of 64"
     m, ng = scales.shape
-    assert m % 64 == 0 and k % 128 == 0 and ng == k // 128
+    assert m % 64 == 0 and k % 64 == 0 and ng == k // group
     g, kt = m // 64, k // 64
     dev = scales.device
     ss = torch.arange(32, device=dev)
     r = 16 * (ss >> 3) + (ss & 7)
+    if group == 32:
+        rows = (
+            64 * torch.arange(g, device=dev)[:, None, None, None, None]
+            + r[None, None, :, None, None]
+            + 8 * torch.arange(2, device=dev)[None, None, None, None, :]
+        )
+        cols = (
+            2 * torch.arange(kt, device=dev)[None, :, None, None, None]
+            + torch.arange(2, device=dev)[None, None, None, :, None]
+        )
+        return scales[rows, cols].contiguous()
     rows = (
         64 * torch.arange(g, device=dev)[:, None, None, None]
         + r[None, None, :, None]
         + 8 * torch.arange(2, device=dev)[None, None, None, :]
     )
-    cols = (torch.arange(kt, device=dev) // 2)[None, :, None, None]
+    cols = (torch.arange(kt, device=dev) * 64 // group)[None, :, None, None]
     return scales[rows, cols].contiguous()
 
 
@@ -317,13 +335,16 @@ def dequant_int4_awq_reference(packed, scales, zeros, group: int = 128):
 
 def repack_int4_awq_sf(scales, zeros, k: int):
     """-> (N/64, K/64, 32, 2, 2) bf16 strip: slot s holds words
-    ((s_r, s_r8), (b_r, b_r8)) with b = -s*z, so the kernel decode is a
-    single bf16x2 FMA per fragment register ((q-8)*s + b), reusing the
-    uint4b8 decode (pack the weights with ^0x88)."""
+    ((s_r, s_r8), (c_r, c_r8)) with c = -(128 + z) — an EXACT small-integer
+    bf16 constant. The kernel decode is HADD2(magic, c) = q - z exact, then
+    one HMUL2 by s (single rounding). The older b = -s*(z-8) HFMA2 form
+    pre-rounded b at ~ulp(8s) AND occupied both fma-pipe halves per
+    instruction; the add+mul pair is exact and HMUL2 runs at ~2x HFMA2's
+    issue rate."""
     assert scales.dtype == torch.bfloat16
     m, ng = scales.shape
     assert m % 64 == 0 and k % 128 == 0 and ng == k // 128
-    b = (-scales.float() * (zeros.float() - 8.0)).to(torch.bfloat16)
+    b = (-(zeros.float() + 128.0)).to(torch.bfloat16)  # exact: integer in [-143, -128]
     g, kt = m // 64, k // 64
     dev = scales.device
     ss = torch.arange(32, device=dev)
@@ -476,6 +497,27 @@ def mul_bf16x2_bcast(
 
 
 @dsl_user_op
+def add_bf16x2_bcast(
+    a: Int32, pair: Int32, hi: cutlass.Constexpr[bool], *, loc=None, ip=None
+) -> Int32:
+    """a (bf16x2) plus a single bf16 lane of `pair` broadcast to both lanes
+    (single HADD2 with a source swizzle, like mul_bf16x2_bcast)."""
+    lane = "h" if hi else "l"
+    asm = (
+        "{.reg .b16 l, h; .reg .b32 bb; mov.b32 {l, h}, $2; "
+        f"mov.b32 bb, {{{lane}, {lane}}}; add.rn.bf16x2 $0, $1, bb;}}"
+    )
+    res = _asm_i32(
+        [Int32(a).ir_value(loc=loc, ip=ip), Int32(pair).ir_value(loc=loc, ip=ip)],
+        asm,
+        "=r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(res)
+
+
+@dsl_user_op
 def fma_bf16x2_bcast(
     a: Int32, s_pair: Int32, b_pair: Int32, hi: cutlass.Constexpr[bool], *, loc=None, ip=None
 ) -> Int32:
@@ -504,9 +546,12 @@ def fma_bf16x2_bcast(
 
 @dsl_user_op
 def mov_b32_vreg(v: int, *, loc=None, ip=None) -> Int32:
-    """Materialize a constant in a vector register via inline asm, so ptxas
-    cannot keep it uniform and re-copy it UR->R inside hot loops (observed:
-    ~12 IMAD.U32 R,RZ,RZ,UR per k-tile without this)."""
+    """Materialize a constant in a vector register via inline asm, so LLVM
+    cannot fold it into consumers (observed: ~12 IMAD.U32 R,RZ,RZ,UR per
+    k-tile without this). ptxas still sees a plain mov-immediate, so under
+    register pressure it may STILL demote the value to a uniform register
+    and remat it UR->R at each vector consumer — when that happens (dump the
+    SASS), use pin_b32_vreg instead."""
     res = llvm.inline_asm(
         T.i32(),
         [],
@@ -519,12 +564,40 @@ def mov_b32_vreg(v: int, *, loc=None, ip=None) -> Int32:
     return Int32(res)
 
 
+@dsl_user_op
+def pin_b32_vreg(v: int, *, loc=None, ip=None) -> Int32:
+    """Materialize a constant in a vector register laundered through %tid.x
+    ((tid & 0x80000000) | v in one LOP3 — tid bit 31 is always 0, so the
+    value is exact). The formal tid dependence makes the value non-uniform
+    and non-rematerializable to ptxas: unlike mov_b32_vreg it survives
+    register pressure (observed: 4-6 IMAD.U32 UR->R remats per decode block
+    of the e2m1 LUT A-halves at the (128, 16) occupancy-2 budget). Do NOT
+    use for constants that can ride an instruction's immediate slot (e.g.
+    the LUT B-halves): laundering forces them into a live register."""
+    res = llvm.inline_asm(
+        T.i32(),
+        [],
+        "{.reg .b32 t; mov.u32 t, %tid.x; "
+        f"lop3.b32 $0, t, 0x80000000, {v & 0xFFFFFFFF:#x}, 0xEA;}}",
+        "=r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(res)
+
+
 def make_decode_luts():
-    """Loop-invariant vector-register LUTs for decode_e2m1x8_to_bf16x8."""
+    """Loop-invariant vector-register LUTs for decode_e2m1x8_to_bf16x8.
+    The A-halves are tid-pinned: each prmt has ONE immediate slot and ptxas
+    reliably gives it to the B-half, so an unpinned A-half gets demoted to a
+    uniform reg and remat-copied into the decode under tight budgets. The
+    B-halves stay plain movs so ptxas CAN immediate-ize them (pinning them
+    would force two extra live registers)."""
     return (
-        mov_b32_vreg(LUT_LO_A),
+        pin_b32_vreg(LUT_LO_A),
         mov_b32_vreg(LUT_LO_B),
-        mov_b32_vreg(LUT_HI_A),
+        pin_b32_vreg(LUT_HI_A),
         mov_b32_vreg(LUT_HI_B),
     )
 
@@ -568,22 +641,36 @@ def decode_e2m1x8_to_bf16x8(x: Int32, luts) -> Tuple[Int32, Int32, Int32, Int32]
 def make_i4_decode_consts():
     """Loop-invariant vector-register constants for decode_u4b8x8_to_bf16x8:
     (0x43004300 = bf16x2 (128, 128) exponent magic, 0xC308C308 = bf16x2
-    (-136, -136) bias)."""
-    return (mov_b32_vreg(0x43004300), mov_b32_vreg(0xC308C308))
+    (-136, -136) bias). tid-pinned: the magic LOP3's immediate slot is taken
+    by the 0x000F000F mask and HADD2 has no bf16x2 immediate form, so both
+    must be stable registers."""
+    return (pin_b32_vreg(0x43004300), pin_b32_vreg(0xC308C308))
+
+
+@cute.jit
+def decode_u4x8_to_magicx8(x: Int32, magic) -> Tuple[Int32, Int32, Int32, Int32]:
+    """8 raw nibbles in repack_int4_weight order -> 4 bf16x2 registers in
+    MAGIC form: (x >> 4j) & 0x000F000F | 0x43004300 puts pair j's nibbles in
+    bf16 lanes as the exact integer 128 + nibble. 1 LOP3 (+1 SHF for j>0)
+    per pair; the caller renormalizes (subtract a bias, or fold the bias
+    into a per-group HADD2)."""
+    return (
+        lop3_and_imm_or(x, 0x000F000F, magic),
+        lop3_and_imm_or(x >> 4, 0x000F000F, magic),
+        lop3_and_imm_or(x >> 8, 0x000F000F, magic),
+        lop3_and_imm_or(x >> 12, 0x000F000F, magic),
+    )
 
 
 @cute.jit
 def decode_u4b8x8_to_bf16x8(x: Int32, consts) -> Tuple[Int32, Int32, Int32, Int32]:
     """8 raw uint4b8 nibbles in repack_int4_weight order -> 4 bf16x2 registers
-    R_j = pair j, exact. Magic-mantissa: (x >> 4j) & 0x000F000F | 0x43004300
-    puts pair j's nibbles in bf16 lanes as 128 + (q+8); HADD2 -136 yields the
-    exact integer q. 1 LOP3 (+1 SHF for j>0) + 1 HADD2 per pair — shallower
-    and lighter on the ALU pipe than the prmt/sign-extend cvt sequence."""
+    R_j = pair j, exact. Magic-mantissa 128 + nibble (see
+    decode_u4x8_to_magicx8); HADD2 -136 yields the exact integer q = nibble-8.
+    1 LOP3 (+1 SHF for j>0) + 1 HADD2 per pair — shallower and lighter on the
+    ALU pipe than the prmt/sign-extend cvt sequence."""
     magic, bias = consts
-    t0 = lop3_and_imm_or(x, 0x000F000F, magic)
-    t1 = lop3_and_imm_or(x >> 4, 0x000F000F, magic)
-    t2 = lop3_and_imm_or(x >> 8, 0x000F000F, magic)
-    t3 = lop3_and_imm_or(x >> 12, 0x000F000F, magic)
+    t0, t1, t2, t3 = decode_u4x8_to_magicx8(x, magic)
     return (
         add_bf16x2(t0, bias),
         add_bf16x2(t1, bias),
@@ -633,13 +720,19 @@ def decode_i8x4_to_bf16x4_dp4a(x: Int32) -> Tuple[Int32, Int32]:
 
 
 @dsl_user_op
-def _e4m3x2_to_bf16x2(pair: Int32, *, loc=None, ip=None) -> Int32:
-    """(e4m3 b0, e4m3 b1) in the low 16 bits -> (bf16 b0, bf16 b1). Uses the
-    sm_89+ hw cvt via f16/f32 (exact for all e4m3 incl. zero/denormals)."""
+def _e4m3x2_to_bf16x2(
+    pair: Int32, hi: cutlass.Constexpr[bool] = False, *, loc=None, ip=None
+) -> Int32:
+    """(e4m3 b0, e4m3 b1) in the low (hi=False) or high (hi=True) 16 bits ->
+    (bf16 b0, bf16 b1). Uses the sm_89+ hw cvt via f16/f32 (exact for all
+    e4m3 incl. zero/denormals; 4 SASS: F2FP.F16.E4M3 + 2 HADD2.F32 +
+    F2FP.BF16.F32). The half select folds into the cvt's operand unpack
+    (F2FP ...UNPACK_B) — no SHF, so hi=True beats converting `x >> 16`."""
+    sel = "{_, p}" if hi else "{p, _}"
     res = _asm_i32(
         [Int32(pair).ir_value(loc=loc, ip=ip)],
         "{.reg .b16 lo, hi, p; .reg .b32 h2; .reg .f32 f0, f1; "
-        "mov.b32 {p, _}, $1; cvt.rn.f16x2.e4m3x2 h2, p; "
+        f"mov.b32 {sel}, $1; cvt.rn.f16x2.e4m3x2 h2, p; "
         "mov.b32 {lo, hi}, h2; cvt.f32.f16 f0, lo; cvt.f32.f16 f1, hi; "
         "cvt.rn.bf16x2.f32 $0, f1, f0;}",
         "=r,r",
@@ -652,7 +745,7 @@ def _e4m3x2_to_bf16x2(pair: Int32, *, loc=None, ip=None) -> Int32:
 @cute.jit
 def decode_e4m3x4_to_bf16x4(x: Int32) -> Tuple[Int32, Int32]:
     """4 e4m3 bytes -> 2 bf16x2 registers (R0 = bytes 0,1; R1 = bytes 2,3)."""
-    return _e4m3x2_to_bf16x2(x), _e4m3x2_to_bf16x2(x >> 16)
+    return _e4m3x2_to_bf16x2(x), _e4m3x2_to_bf16x2(x, hi=True)
 
 
 @cute.jit
