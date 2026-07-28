@@ -492,6 +492,8 @@ class GemmSm90(GemmTmaBase):
             mA, mAuxA = mA.blob, mA.sf
         if const_expr(self.aux_a is not None):
             assert mAuxA is not None, "the transform's aux operand needs mA.sf"
+        elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
+            assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
             # Dense rank-2 operands get a trivial batch mode appended instead.
@@ -581,6 +583,10 @@ class GemmSm90(GemmTmaBase):
         if const_expr(self.aux_a is not None):
             tma_atom_aux_a, tma_tensor_aux_a = self.aux_a.make_tma(mAuxA)
             self.num_tma_load_bytes += self.aux_a.bytes_per_stage()
+        elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
+            # raw aux operand (e.g. a dropout seed): crosses to the kernel in
+            # the mAuxA slot untouched — no TMA atom, no smem, no pipeline
+            tma_tensor_aux_a = mAuxA
 
         if const_expr(self.split_k > 1):
             assert mD is not None, "split_k requires an output tensor D"
@@ -1020,7 +1026,13 @@ class GemmSm90(GemmTmaBase):
                 # a transform's own produce (e.g. blob LDS + dequant)
                 if const_expr(self.transform_a is not None):
                     copy_block = self.transform_a.make_copy_block(
-                        tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=sAuxA
+                        tiled_mma,
+                        sA,
+                        tCrA,
+                        tidx,
+                        warp_group_idx,
+                        sAux=sAuxA,
+                        mAux=mAuxA_mkl if const_expr(self.transform_a.aux_raw) else None,
                     )
                 else:
                     copy_block = quack_sm90_utils.canonical_a_load_s2r(
@@ -1086,7 +1098,15 @@ class GemmSm90(GemmTmaBase):
                 batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(k_tile_total, split_idx)
+                k_tile_start_mma, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                    k_tile_total, split_idx
+                )
+                if const_expr(self.mma_is_rs and self.transform_a is not None):
+                    if const_expr(self.transform_a.uses_work_tile):
+                        # per-work-tile register state (e.g. dropout's per-row
+                        # RNG coordinates); every copy_block until the next
+                        # hook — incl. the slot-0 preloads — is this tile's
+                        self.transform_a.on_work_tile(tile_coord_mnkl)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 iket.range_push("mma")
@@ -1111,6 +1131,7 @@ class GemmSm90(GemmTmaBase):
                         copy_block,
                         tCrA,
                         tCrB,
+                        k_tile_start=k_tile_start_mma,
                     )
                 if const_expr(varlen_k or self.split_k > 1):
                     if k_tile_cnt == 0:
@@ -1479,10 +1500,13 @@ class GemmSm90(GemmTmaBase):
         copy_block: Callable,
         tCrA: cute.Tensor,
         tCrB: cute.Tensor,
+        k_tile_start: Int32 = 0,
     ) -> cutlass.pipeline.PipelineState:
         """RS mainloop, CUTLASS sm90 rs_warpspecialized scheme: one tile-wide
-        fragment, produce of block k+1 (``copy_block(stage, k)`` — the
-        canonical ldmatrix s2r load, or a transform's decode) issued between
+        fragment, produce of block k+1 (``copy_block(stage, k, k_tile)`` — the
+        canonical ldmatrix s2r load, or a transform's decode; ``k_tile`` the
+        GLOBAL k-tile index of the produced block, split-k correct via
+        ``k_tile_start``) issued between
         WGMMA(k) and WGMMA(k+1), one commit group per k16 block,
         wait_group(mma_k - 2) after each — the deepest safe wait: producing a
         slot overwrites registers whose previous reader is mma_k - 2 commit
@@ -1498,6 +1522,7 @@ class GemmSm90(GemmTmaBase):
         wgmma_block = partial(self._rs_wgmma_block, tiled_mma, acc, tCrA, tCrB)
         ab_release_state = ab_read_state.clone()
         peek = Boolean(True)
+        kt = Int32(k_tile_start)  # global k-tile index of the tile being produced
         # ---- first k-tile: the produces run ahead of the WGMMAs, no reload
         # hazard, so no waits inside the block loop ----
         if 0 < k_tile_cnt:
@@ -1506,9 +1531,9 @@ class GemmSm90(GemmTmaBase):
             ab_read_state.advance()
             if 1 < k_tile_cnt:
                 peek = ab_pipeline.consumer_try_wait(ab_read_state)
-            copy_block(stage, 0)
+            copy_block(stage, 0, kt)
             for k in cutlass.range_constexpr(mma_k - 1):
-                copy_block(stage, k + 1)
+                copy_block(stage, k + 1, kt)
                 wgmma_block(stage, k, zero_init=k == 0)
             wgmma_block(stage, mma_k - 1, zero_init=False)
         # Preload slot 0 of the second tile: wait(mma_k - 1) retires exactly its reader (this
@@ -1517,10 +1542,11 @@ class GemmSm90(GemmTmaBase):
         if 1 < k_tile_cnt:
             ab_pipeline.consumer_wait(ab_read_state, peek)
             warpgroup.wait_group(mma_k - 1)
-            copy_block(ab_read_state.index, 0)
+            copy_block(ab_read_state.index, 0, kt + 1)
             warpgroup.wait_group(mma_k - 2)
         # ---- steady tiles (all but the first and last) ----
         for _ in cutlass.range(max(k_tile_cnt - 2, 0), unroll=1):
+            kt += 1
             stage = ab_read_state.index
             ab_read_state.advance()
             for k in cutlass.range_constexpr(mma_k):
@@ -1530,9 +1556,9 @@ class GemmSm90(GemmTmaBase):
                     # ab_read_state advanced at tile start: its index is the
                     # NEXT tile's stage, used only for this slot-0 preload
                     ab_pipeline.consumer_wait(ab_read_state, peek)
-                    copy_block(ab_read_state.index, 0)
+                    copy_block(ab_read_state.index, 0, kt + 1)
                 else:
-                    copy_block(stage, k + 1)
+                    copy_block(stage, k + 1, kt)
                 wgmma_block(stage, k, zero_init=False)
                 warpgroup.wait_group(mma_k - 2)
                 if const_expr(k == mma_k - 3):
@@ -1544,10 +1570,11 @@ class GemmSm90(GemmTmaBase):
                     ab_release_state.advance()
         # ---- last tile (slot 0 already loaded; nothing to prefetch) ----
         if 1 < k_tile_cnt:
+            kt += 1
             stage = ab_read_state.index
             ab_read_state.advance()
             for k in cutlass.range_constexpr(mma_k - 1):
-                copy_block(stage, k + 1)
+                copy_block(stage, k + 1, kt)
                 wgmma_block(stage, k, zero_init=False)
                 warpgroup.wait_group(mma_k - 2)
                 if const_expr(k == mma_k - 3):
@@ -1737,8 +1764,27 @@ class GemmSm90(GemmTmaBase):
             a_bytes + cute.size(b_shape) * b_dtype.width // 8 + ab_extra_bytes_per_stage
         )
         mbar_helpers_bytes = 1024
+        # SharedStorage packs [sD|sC|epi op smem][sA|sB][sAuxA] with sA/sB
+        # Align[1024] and the struct size rounded up to its 1024 alignment.
+        # The byte-packed sums here can't see two alignment pads (≤1KB each):
+        # the epi op-smem member pads up to sA's alignment, and a non-empty
+        # sAuxA (128B-granular strip/SF boxes) leaves the struct end
+        # unaligned so the total rounds up. Reserve a quantum for each
+        # exactly when it can be nonzero — plain kernels (no op smem, no
+        # aux) keep identical stage picks. Otherwise the epi-stage
+        # refinement below can fill smem to the exact byte and the real
+        # struct overflows at launch.
+        # (op-smem member total varies with the refined stage counts, so any
+        # op smem at all reserves; the aux total is per_stage * ab_stage, so
+        # a 1024-multiple per_stage provably never pads.)
+        op_smem_bytes = epi_smem_bytes.unstaged + epi_smem_bytes.d_stage + epi_smem_bytes.c_stage
+        align_pad_bytes = (1024 if op_smem_bytes else 0) + (
+            1024 if ab_extra_bytes_per_stage % 1024 else 0
+        )
 
-        remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
+        remaining_bytes = (
+            smem_capacity // occupancy - mbar_helpers_bytes - align_pad_bytes - epi_bytes
+        )
         ab_stage = remaining_bytes // ab_bytes_per_stage
 
         # Refine epilogue stages:

@@ -24,18 +24,20 @@ from quack.operand_transform.transform_a import (  # noqa: F401
     AuxKTileStrip,
     AuxOperandA,
     TransformA,
+    TransformADropout,
     TransformAOperand,
     TransformAValue,
     TransformAW4,
 )
 
-_FRONTEND = ("ATransformMod", "PackedInput", "a_transform", "w4_transform")
+_FRONTEND = ("ATransformMod", "PackedInput", "a_transform", "dropout_a", "w4_transform")
 _HOST = ("transform_a_operand",)
 
 __all__ = [
     "AuxKTileStrip",
     "AuxOperandA",
     "TransformA",
+    "TransformADropout",
     "TransformAOperand",
     "TransformAValue",
     "TransformAW4",

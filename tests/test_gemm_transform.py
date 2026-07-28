@@ -519,6 +519,40 @@ def test_a_transform_via_host_plan():
     assert torch.equal(D_t, D_ref)
 
 
+def test_a_transform_args_epi_mod_gemm():
+    """Runtime-operand transforms compose with @gemm_epilogue fns through
+    mod.gemm: A crosses as the transform_a_operand bundle and the epilogue
+    runs on the strip-rescaled accumulator — the LCE dx pattern (colvec_ktile
+    strip + fused per-row fp32 v multiply). Bitwise vs the same epi mod on
+    host-prescaled A. The eager __call__ surface rejects the bundle."""
+    from quack.gemm_epilogue import gemm_epilogue
+    from quack.operand_transform.host import transform_a_operand
+
+    @gemm_epilogue()
+    def _vscale(acc, v):
+        return {"D": acc * v}
+
+    m, n, k = 384, 256, 512
+    A, B, strip, A_pre = _make_colvec_strip_case(m, n, k, tile_k=64, seed=13)
+    v = torch.rand(1, m, device="cuda", dtype=torch.float32) + 0.5
+    bundle = transform_a_operand(_colvec_ktile_scale_a, A, {"u": strip}, 128, 64)
+    kw = dict(epi_args=dict(v=v), tile_M=128, tile_N=128, cluster_M=1, cluster_N=1)
+    D_t = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    _vscale.gemm(bundle, B, D_t, transform_a=_colvec_ktile_scale_a, **kw)
+    # warm path replays the plan cache with the bundle A slot
+    _vscale.gemm(bundle, B, D_t, transform_a=_colvec_ktile_scale_a, **kw)
+    D_ref = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    _vscale.gemm(A_pre.contiguous(), B, D_ref, **kw)
+    torch.cuda.synchronize()
+    ref = ((A_pre.float() @ B.float().mT) * v.mT.float()).to(torch.bfloat16)
+    torch.testing.assert_close(D_t.float(), ref.float(), atol=3e-2, rtol=1e-3)
+    assert torch.equal(D_t, D_ref), "strip transform + colvec epi not bitwise vs prescaled A"
+    with pytest.raises(ValueError, match="runtime operands"):
+        _vscale.gemm(A, B, D_t, transform_a=_colvec_ktile_scale_a, **kw)
+    with pytest.raises(NotImplementedError, match="runtime-operand"):
+        _vscale(bundle, B.mT, transform_a=_colvec_ktile_scale_a, v=v)
+
+
 def test_a_transform_epi_mod_composition():
     """Value transforms compose with @gemm_epilogue fns through the eager
     mod(A, B, transform_a=...) surface (autotune bypassed; default config)."""
@@ -537,3 +571,151 @@ def test_a_transform_epi_mod_composition():
     ref = (A.float() * 0.5) @ Bkn.float() + bias
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out.float(), ref, atol=atol, rtol=1e-2)
+
+
+# ── Dropout on A ─────────────────────────────────────────────────────────────
+
+
+def _dropout_via_identity(A, seed, offset, p, tile_mnk=(128, 128, 64), pingpong=False, split_k=1):
+    """B = I recovers the masked A exactly: D[m, j] = mask(m, j) * A[m, j]
+    (under split-k too: only the split containing k = j contributes). Runs
+    through mod.gemm — the seed bundle exercises the full host path (fakes,
+    plan keys, warm cache)."""
+    from quack.gemm_epilogue import gemm_epilogue
+    from quack.operand_transform import dropout_a
+    from quack.operand_transform.host import transform_a_operand
+
+    global _ident_epi
+    if "_ident_epi" not in globals():
+
+        @gemm_epilogue()
+        def _ident_epi(acc):
+            return {"D": acc}
+
+    m, k = A.shape
+    B = torch.eye(k, dtype=A.dtype, device="cuda")
+    D = torch.empty(m, k, dtype=A.dtype, device="cuda")
+    seed_t = torch.tensor([seed, offset], dtype=torch.int64, device="cuda")
+    mod_t = dropout_a(p)
+    bundle = transform_a_operand(mod_t, A, {"seed": seed_t}, tile_mnk[0], tile_mnk[2])
+    _ident_epi.gemm(
+        bundle,
+        B,
+        D,
+        epi_args={},
+        transform_a=mod_t,
+        tile_M=tile_mnk[0],
+        tile_N=tile_mnk[1],
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=pingpong,
+        split_k=split_k,
+    )
+    torch.cuda.synchronize()
+    return D
+
+
+def test_dropout_semantics_and_determinism():
+    torch.manual_seed(7)
+    m, k, p = 384, 512, 0.25
+    # abs + 0.1 guarantees no exact zeros, so mask == (D != 0)
+    A = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16).abs() + 0.1) / 8
+    D1 = _dropout_via_identity(A, 1234, 0, p)
+    mask = D1 != 0
+    # kept elements pass through bitwise; dropped are exact zeros
+    assert torch.equal(D1[mask], A[mask]), "kept elements must be bitwise A"
+    rate = 1.0 - mask.float().mean().item()
+    assert abs(rate - 64 / 256) < 0.006, f"drop rate {rate} != {64 / 256}"
+    # determinism: same (seed, offset) -> identical mask (warm-cache replay)
+    D2 = _dropout_via_identity(A, 1234, 0, p)
+    assert torch.equal(D1, D2)
+    # different offset / seed -> different masks
+    D3 = _dropout_via_identity(A, 1234, 1, p)
+    D4 = _dropout_via_identity(A, 99, 0, p)
+    assert not torch.equal(D1, D3) and not torch.equal(D1, D4)
+    # the direct-compile layer (TransformAOperand straight into the kernel)
+    # produces the identical mask
+    from quack.operand_transform import dropout_a
+
+    seed_t = torch.tensor([1234, 0], dtype=torch.int64, device="cuda")
+    D_direct = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
+    _run_gemm(
+        A,
+        torch.eye(k, dtype=torch.bfloat16, device="cuda"),
+        D_direct,
+        (128, 128, 64),
+        (1, 1, 1),
+        False,
+        mma_is_rs=False,
+        transform_a=dropout_a(p),
+        aux=seed_t,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(D1, D_direct), "mod.gemm and direct-compile masks differ"
+
+
+def test_dropout_mask_is_canonical():
+    """The mask of (m, k) depends only on (m, k, seed, offset): identical
+    across tile shapes (different fragment ownership) and A majors."""
+    torch.manual_seed(8)
+    m, k, p = 512, 512, 0.4
+    A = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16).abs() + 0.1) / 8
+    D_ref = _dropout_via_identity(A, 42, 3, p)
+    D_tile = _dropout_via_identity(A, 42, 3, p, tile_mnk=(256, 128, 64))
+    assert torch.equal(D_ref, D_tile), "mask changed with tile_M (fragment ownership)"
+    D_pp = _dropout_via_identity(A, 42, 3, p, pingpong=True)
+    assert torch.equal(D_ref, D_pp), "mask changed with pingpong"
+    Am = A.t().contiguous().t()  # m-major storage, same values
+    D_maj = _dropout_via_identity(Am, 42, 3, p)
+    assert torch.equal(D_ref, D_maj), "mask changed with A major"
+
+
+def test_dropout_p_zero_and_scale_via_epi():
+    torch.manual_seed(9)
+    m, k = 256, 384
+    A = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16).abs() + 0.1) / 8
+    D0 = _dropout_via_identity(A, 5, 0, 0.0)
+    assert torch.equal(D0, A), "p=0 must be a bitwise passthrough"
+    # 1/(1-p) folded into the epilogue (the mainloop is mask-only); *2 is a
+    # pow2 so the fused fp32 scale == scaling the masked bf16 result exactly
+    from quack.gemm_epilogue import gemm_epilogue
+    from quack.operand_transform import dropout_a
+    from quack.operand_transform.host import transform_a_operand
+
+    @gemm_epilogue()
+    def _drop_scale_epi(acc):
+        return {"D": acc * 2.0}  # threshold(0.5) = 128 -> keep prob exactly 1/2
+
+    p = 0.5
+    B = torch.eye(k, dtype=torch.bfloat16, device="cuda")
+    seed_t = torch.tensor([77, 0], dtype=torch.int64, device="cuda")
+    Dt = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
+    mod_t = dropout_a(p)
+    bundle = transform_a_operand(mod_t, A, {"seed": seed_t}, 128, 64)
+    _drop_scale_epi.gemm(
+        bundle,
+        B,
+        Dt,
+        epi_args={},
+        transform_a=mod_t,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    D_mask = _dropout_via_identity(A, 77, 0, p)
+    torch.cuda.synchronize()
+    ref = (D_mask.float() * 2.0).to(torch.bfloat16)
+    assert torch.equal(Dt, ref), "epi-folded scale != masked * inv"
+
+
+def test_dropout_mask_split_k_invariant():
+    """Split-k must not change the mask: the philox counter uses the GLOBAL
+    k-tile (the seam's k_tile_start), so every split regenerates its slice
+    of the same canonical mask."""
+    torch.manual_seed(10)
+    m, k, p = 256, 2048, 0.3
+    A = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16).abs() + 0.1) / 8
+    D1 = _dropout_via_identity(A, 11, 5, p)
+    D4 = _dropout_via_identity(A, 11, 5, p, split_k=4)
+    assert torch.equal(D1, D4), "mask changed under split_k (k_tile_start broken?)"

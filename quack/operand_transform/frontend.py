@@ -47,9 +47,21 @@ Two families, one decorator:
     ``strip`` a contiguous (ceil(K / tile_K) * g, M) tensor in A's dtype
     (one row per k-group; ragged K padded to whole k-tiles).
 
-  Planned kinds (not ported from the transformA branch yet): ``colvec``
-  (per-row, k-invariant — needs the per-work-tile prologue hook), ``kvec``
-  (per-k-element, the LCE dw strip), scalars / RNG seeds.
+  There is deliberately NO k-invariant ``colvec`` kind: a per-row scale
+  commutes through the GEMM — ``(u ⊙ A) @ B = u ⊙ (A @ B)`` — so it belongs
+  in the EPILOGUE as an fp32 colvec (exact, measured free), and per-row
+  additive terms commute via the rank-1 ``z · colsum(B)`` correction; only a
+  fn NONLINEAR in x would need per-row mainloop values.
+
+* DROPOUT (``dropout_a(p)``): not a fn — a dedicated mask-only transform
+  (philox keep-mask ANDed onto the fragment at ~3 SASS per 2 elements; see
+  :class:`~quack.operand_transform.transform_a.TransformADropout`). The
+  (2,) int64 [seed, offset] tensor rides the same bundle
+  (``host.transform_a_operand(dropout_a(p), A, {"seed": t}, tile_m)``, or
+  ``TransformAOperand(A, t)`` at the direct-compile layer). The mask of
+  (m, k) is a pure function of (m, k, seed, offset) — any kernel
+  regenerates it — and is split-k invariant. Mask-only: fold 1/(1-p) into
+  the epilogue.
 
 * PACKED decodes (``packed=PackedInput(...)``): the fn IS the decode — the
   :meth:`~quack.blockscaled.decode_formats.DecodeFormat.decode_k16` body,
@@ -79,7 +91,7 @@ from quack.blockscaled.decode_formats import DecodeFormat, decode_format
 from quack.gemm_epilogue import _function_semantic_key, _semantic_value_key
 from quack.operand_transform.transform_a import TransformAValue, TransformAW4
 
-__all__ = ["a_transform", "ATransformMod", "PackedInput", "w4_transform"]
+__all__ = ["a_transform", "ATransformMod", "PackedInput", "dropout_a", "w4_transform"]
 
 
 @dataclass(frozen=True)
@@ -232,6 +244,45 @@ def w4_transform(fmt) -> PackedFormatMod:
     """A ``transform_a=`` handle for a packed dequant format (name from the
     W4_FORMATS registry, or a DecodeFormat instance)."""
     return PackedFormatMod(fmt)
+
+
+class DropoutAMod:
+    """``transform_a=`` handle for dropout on A (see TransformADropout): the
+    keep-mask of element (m, k) is a pure function of (m, k, seed, offset),
+    reproducible by any kernel and invariant under split-k. MASK-ONLY — fold
+    1/(1-p) into the epilogue. The (2,) int64 [seed, offset] CUDA tensor is
+    the runtime operand, riding the TransformAOperand bundle's sf slot
+    (``args`` declares it so the generic host plumbing — mod.gemm unpack,
+    trace fakes, plan keys — treats it like any strip operand)."""
+
+    packed = None
+    consts = None
+    regs = None
+    args = (("seed", "seed_i64x2"),)
+
+    def __init__(self, p: float, rounds: int = 7):
+        assert 0.0 <= p < 1.0, "drop probability must be in [0, 1)"
+        # keep iff byte >= threshold: P(drop) = threshold / 256, exactly
+        self.p = p
+        self.threshold = min(int(round(p * 256)), 255)
+        self.rounds = rounds
+        self.name = f"dropout_a_t{self.threshold}"
+        # trailing int: scheme version
+        self.semantic_digest = _digest(("dropout_a", self.threshold, rounds, 1))
+
+    def __call__(self, gemm):
+        from quack.operand_transform.transform_a import TransformADropout
+
+        return TransformADropout(gemm, self)
+
+    def __quack_semantic_key__(self):
+        return ("dropout_a_mod", self.semantic_digest)
+
+
+def dropout_a(p: float, rounds: int = 7) -> DropoutAMod:
+    """A ``transform_a=`` handle for dropout on A with drop probability
+    ``round(p * 256) / 256`` (mask-only; scale via the epilogue)."""
+    return DropoutAMod(p, rounds)
 
 
 def a_transform(

@@ -250,9 +250,11 @@ def partition_fragment_ABC(
 def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False):
     """The canonical A-operand produce for the RS mainloop: an ldmatrix tiled
     copy derived from the MMA (LDSM for k-major A, LDSM.T for m-major — one
-    code path, 16-bit only). Returns ``copy_block(stage_idx, b)``, which s2r
-    loads k16 block b (a static Python int) of pipeline stage stage_idx into
-    the fragment. This is the produce seam: transforms substitute their own
+    code path, 16-bit only). Returns ``copy_block(stage_idx, b, k_tile)``,
+    which s2r loads k16 block b (a static Python int) of pipeline stage
+    stage_idx into the fragment (``k_tile``, the global k-tile index the
+    mainloop threads through the seam for coordinate-dependent transforms,
+    is unused here). This is the produce seam: transforms substitute their own
     copy_block (e.g. LDS + dequant) while the mainloop keeps owning the WGMMA
     issue and commit-group discipline."""
     transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
@@ -268,7 +270,7 @@ def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False):
         tCsA_copy_view = thr_copy_A.partition_S(sA)
     tCrA_copy_view = thr_copy_A.retile(tCrA)
 
-    def copy_block(stage_idx, b):
+    def copy_block(stage_idx, b, k_tile=None):
         cute.copy(
             smem_tiled_copy_A,
             tCsA_copy_view[None, None, b, stage_idx],

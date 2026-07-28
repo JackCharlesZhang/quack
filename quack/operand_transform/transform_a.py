@@ -22,10 +22,12 @@ via the aux A-side TMA slot bundled into the mA argument
 (:class:`TransformAOperand`), not extra kernel parameters. Shipped: the
 strip family at 2-D (gran_m, gran_k) granularity — ``colvec_ktile`` /
 ``colvec_k64/k32/k16`` (per-(row, k-group), e.g. the linear-CE dx pow2
-rescale) and ``kvec_m64`` (per-(m64 block, k-element), the LCE dw strip).
-NOT ported yet: k-invariant colvec / dropout-seed operands (branch
-mTransformAArg + per-work-tile prologue hook) and the fp8 m-major layout
-transform.
+rescale) and ``kvec_m64`` (per-(m64 block, k-element), the LCE dw strip);
+plus dropout (:class:`TransformADropout` — seed rides the bundle RAW via
+``aux_raw``, per-tile coordinates via the ``on_work_tile`` hook and the
+seam's global ``k_tile``). There is deliberately no k-invariant colvec kind
+(per-row scales commute to the epilogue). NOT ported yet: the fp8 m-major
+layout transform.
 """
 
 from typing import NamedTuple, Optional
@@ -102,20 +104,34 @@ class TransformA:
       - ``__init__(gemm)`` validates the config and may adjust register
         budgets / occupancy (runs after the gemm's defaults, before
         _setup_attributes).
-      - ``make_copy_block(tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux)``:
-        called in-kernel by each MMA warpgroup; returns ``copy_block(stage_idx, b)``
-        which produces k16 block ``b`` (a static Python int: register
-        indexing) of pipeline stage ``stage_idx`` into the fragment ``tCrA``.
-        The mainloop calls it under the rs_warpspecialized schedule (produce
-        of block b+1 between WGMMA(b) and WGMMA(b+1), slot-0 preload of the
-        next tile during the last block) — per-block work only; the schedule
-        is never the transform's.
+      - ``make_copy_block(tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux,
+        mAux)``: called in-kernel by each MMA warpgroup; returns
+        ``copy_block(stage_idx, b, k_tile)`` which produces k16 block ``b``
+        (a static Python int: register indexing) of pipeline stage
+        ``stage_idx`` into the fragment ``tCrA``; ``k_tile`` is the GLOBAL
+        k-tile index the block belongs to (split-k correct — needed only by
+        coordinate-dependent transforms like dropout). The mainloop calls it
+        under the rs_warpspecialized schedule (produce of block b+1 between
+        WGMMA(b) and WGMMA(b+1), slot-0 preload of the next k-tile during
+        the last block) — per-block work only; the schedule is never the
+        transform's.
+      - ``aux_raw``: the bundle's ``sf`` tensor is NOT an AuxOperandA TMA
+        operand but a small raw gmem tensor (e.g. a dropout seed) handed to
+        ``make_copy_block`` as ``mAux`` untouched — no smem, no pipeline.
+      - ``uses_work_tile``: the mainloop calls ``on_work_tile(tile_coord_mnkl)``
+        at each work-tile start (MMA warps, before the k-tile loop) so the
+        transform can refresh per-tile register state (e.g. per-row RNG
+        coordinates). ``mma_rs_interleaved`` runs once per work tile, so all
+        ``copy_block`` calls between two hooks — including the next-k-tile
+        slot-0 preload — belong to the hooked tile.
     """
 
     a_major_mode = cute.nvgpu.OperandMajorMode.K
     tile_k = None  # None -> kernel default
     owns_a_layout = False
     aux = None
+    aux_raw = False
+    uses_work_tile = False
 
 
 class AuxKTileStrip(AuxOperandA):
@@ -267,7 +283,7 @@ class TransformAW4(TransformA):
             frag_i32[(0, 1, 1), m, b] = r3
 
     @cute.jit
-    def make_copy_block(self, tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=None):
+    def make_copy_block(self, tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=None, mAux=None):
         gemm = self.gemm
         tm64 = gemm.cta_tile_shape_mnk[0] // 64
         nw = self._nw
@@ -288,7 +304,7 @@ class TransformAW4(TransformA):
         xw = cute.make_rmem_tensor((nw, mma_m), Int32)
         sfw = cute.make_rmem_tensor((2, mma_m), Int32)
 
-        def copy_block(stage_idx, b):
+        def copy_block(stage_idx, b, k_tile=None):
             if const_expr(b == 0):
                 for m in cutlass.range_constexpr(mma_m):
                     m64 = m * atom_m + warp_group_idx
@@ -539,7 +555,7 @@ class TransformAValue(TransformA):
                     buf[coords[c * vec + i], m, b] = tmp[i]
 
     @cute.jit
-    def make_copy_block(self, tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=None):
+    def make_copy_block(self, tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=None, mAux=None):
         consts = None
         if const_expr(self.mod.consts is not None):
             consts = self.mod.consts()  # hoisted: once per kernel
@@ -548,10 +564,128 @@ class TransformAValue(TransformA):
         for impl in self._arg_impls:
             impl.setup(tiled_mma, tidx, mma_m, sAux)
 
-        def copy_block(stage_idx, b):
+        def copy_block(stage_idx, b, k_tile=None):
             for impl in self._arg_impls:
                 impl.on_block(stage_idx, b, mma_m)
             load_block(stage_idx, b)
             self._apply_block(tCrA, b, mma_m, consts)
+
+        return copy_block
+
+
+class TransformADropout(TransformA):
+    """Dropout: a philox-derived keep-mask ANDed onto the fragment. MASK-ONLY
+    — no 1/(1-p) multiply in the mainloop; fold the scale into the epilogue
+    (an alpha, or an epi-mod multiply).
+
+    Scheme (see quack/operand_transform/rng.py): the mask of element (m, k)
+    is a pure function of (m, k, seed, offset) — one philox4x32 call per
+    canonical group (row-pair x 32-k quad-strided set), which is exactly a
+    lane's fragment ownership, so generation is thread-local (no shuffles,
+    no redundancy) and any kernel (dgrad epilogue, wgrad) regenerates the
+    same mask. Block parity p, row v1 consume philox word v1 + 2p whole; the
+    per-register apply is PRMT (bytes -> constant-exponent b16 lanes) +
+    set.ge.u32.b16x2 (0xFFFF lane mask) + AND: 3 SASS per 2 elements, no
+    float math. The keep threshold int(round(p_drop * 256)) is a host
+    constant baked into the mod's semantic key.
+
+    Delivery: the (2,) int64 [seed, offset] tensor rides the
+    :class:`TransformAOperand` bundle's sf slot RAW (``aux_raw`` — no
+    TMA/smem); per-row coordinates refresh at each work tile via
+    ``on_work_tile``; the mask is split-k invariant because the seam's
+    ``k_tile`` is global (k_tile_start included)."""
+
+    aux_raw = True
+    uses_work_tile = True
+
+    def __init__(self, gemm, mod):
+        self.gemm = gemm
+        self.mod = mod
+        assert gemm.mma_a_dtype in (cutlass.BFloat16, cutlass.Float16), (
+            "dropout masks 16-bit A fragments"
+        )
+        # tile_K may be unresolved (0) at ctor time for (M, N) ctor tile
+        # shapes; geometry checks live in make_copy_block (lazy, like strips)
+
+    @cute.jit
+    def on_work_tile(self, tile_coord_mnkl):
+        m_base = tile_coord_mnkl[0] * self.gemm.cta_tile_shape_mnk[0]
+        for ma in cutlass.range_constexpr(self._mma_m):
+            r0 = m_base + self._row0[ma]
+            self._gm[ma] = (r0 // 16) * 8 + r0 % 8
+
+    @cute.jit
+    def _gen_pair(self, xw, span, mma_m):
+        """philox words for global 32-k span ``span``, all m-atoms."""
+        from cutlass import Uint64
+
+        from quack.operand_transform import rng
+
+        kg = (span << 2) | self._q
+        for ma in cutlass.range_constexpr(mma_m):
+            cnt = (Uint64(Int32(kg)) << Uint64(32)) | Uint64(self._gm[ma])
+            x0, x1, x2, x3 = rng.philox(cnt, self._key, n_rounds=self.mod.rounds)
+            xw[0, ma] = Int32(x0)
+            xw[1, ma] = Int32(x1)
+            xw[2, ma] = Int32(x2)
+            xw[3, ma] = Int32(x3)
+
+    @cute.jit
+    def _mask_block(self, frag_i32, xw, b, mma_m):
+        """AND the keep-mask onto k16 block b: block parity p, row v1 consume
+        philox word v1 + 2p; per register one PRMT + SET + AND."""
+        from quack.blockscaled.nvfp4_utils import prmt
+
+        from quack.operand_transform import rng
+
+        p = b % 2
+        for ma in cutlass.range_constexpr(mma_m):
+            for v1 in cutlass.range_constexpr(2):
+                word = xw[v1 + 2 * p, ma]
+                for h in cutlass.range_constexpr(2):
+                    sel = rng.PRMT_SEL_H0 if h == 0 else rng.PRMT_SEL_H1
+                    lanes = prmt(word, self._base_bytes, Int32(sel))
+                    mask = rng.set_ge_u32_b16x2(Int32(lanes), self._thr_pair, self.gemm.mma_a_dtype)
+                    frag_i32[(0, v1, h), ma, b] = frag_i32[(0, v1, h), ma, b] & mask
+
+    @cute.jit
+    def make_copy_block(self, tiled_mma, sA, tCrA, tidx, warp_group_idx, sAux=None, mAux=None):
+        from cutlass import Int64, Uint64
+
+        from quack.operand_transform import rng
+
+        gemm = self.gemm
+        tile_m, tile_k = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[2]
+        assert tile_k % 32 == 0, "dropout groups span 32 k"
+        assert mAux is not None, "dropout needs the (2,) int64 [seed, offset] via mA.sf"
+        load_block = canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=True)
+        base = rng.b16_base_pattern(gemm.mma_a_dtype)
+        t = self.mod.threshold
+        self._thr_pair = Int32((base | t) | ((base | t) << 16))
+        self._base_bytes = Int32((base >> 8) * 0x01010101)
+        # per-THREAD fragment coordinates: logical (m, k) of slot (e, v1, h)
+        cA = cute.make_identity_tensor((tile_m, tile_k))
+        tCcA = tiled_mma.get_slice(tidx).partition_A(cA)
+        mma_m = const_expr(cute.size(tCcA.shape[1]))
+        self._mma_m = mma_m
+        # tile-relative row of each m-atom's first slot (static per lane) and
+        # the quad class from the k coord of slot (e=0, v1=0, h=0): k = 2q
+        self._row0 = [tCcA[(0, 0, 0), ma, 0][0] for ma in range(mma_m)]
+        self._q = (tCcA[(0, 0, 0), 0, 0][1] % 8) // 2
+        self._gm = cute.make_rmem_tensor((mma_m,), Int32)
+        seed, offset = Int64(mAux[0]), Int64(mAux[1])
+        # offset stream folded into the key (counter words carry coordinates)
+        self._key = (seed + offset * Int64(rng.PHILOX_OFFSET_MIX)).to(Uint64)
+        xw = cute.make_rmem_tensor((4, mma_m), Int32)
+        frag_i32 = cute.recast_tensor(tCrA, Int32)
+        spans = const_expr(tile_k // 32)
+
+        def copy_block(stage_idx, b, k_tile):
+            load_block(stage_idx, b, k_tile)
+            # regenerate at each 32-k span boundary; span s+1 lands in the
+            # WGMMA shadow like every other produce
+            if const_expr(b % 2 == 0):
+                self._gen_pair(xw, k_tile * spans + b // 2, mma_m)
+            self._mask_block(frag_i32, xw, b, mma_m)
 
         return copy_block

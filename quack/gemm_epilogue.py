@@ -1312,6 +1312,21 @@ class EpiMod:
             A_bundle = w4_operand_views(owned_fmt, B, transform_sf, tile_M)
         elif transform_sf is not None:
             raise ValueError("transform_sf without a layout-owning transform_a")
+        arg_sf = None
+        if transform_a is not None and owned_fmt is None and getattr(transform_a, "args", ()):
+            # Value transform with runtime operands: A arrives as the
+            # transform_a_operand(mod, A, values, tile_M, tile_K) bundle —
+            # blob = plain (m, k) A for keys/validation, sf = the operand view
+            # (must have been built with THIS call's tile_M/tile_K; a mismatch
+            # fails at trace against the kind's fake).
+            from quack.operand_transform.transform_a import TransformAOperand
+
+            if not isinstance(A, TransformAOperand):
+                raise ValueError(
+                    "transform_a with runtime operands: pass A as "
+                    "transform_a_operand(mod, A, values, tile_M, tile_K)"
+                )
+            A_bundle, A, arg_sf = A, A.blob, A.sf
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
         if split_k > 1:
@@ -1376,7 +1391,9 @@ class EpiMod:
             int(split_k_mode),
             ag_args is not None,
             transform_key,
-            tensor_key(transform_sf),
+            # one slot for the transform's sf-side tensor: the W4 SF strip
+            # (owned) or the runtime-operand view (value mods with args)
+            tensor_key(transform_sf if arg_sf is None else arg_sf),
             # Per-op host arg keys: dtypes/ranks/static widths that the
             # compiled kernel specializes on (host_arg_key's documented
             # role). Without these, a same-shape call with e.g. a different
@@ -1399,7 +1416,7 @@ class EpiMod:
             if _launch:
                 run_gemm_epi_plan(
                     plan,
-                    A_bundle if owned_fmt is not None else (B if swap_ab else A),
+                    A_bundle if A_bundle is not None else (B if swap_ab else A),
                     A if (swap_ab or owned_fmt is not None) else B,
                     D,
                     C,
@@ -1685,6 +1702,8 @@ class EpiMod:
         GemmCls = self._mint(*mint_key)
         if owned_fmt is not None:
             A_s, B_s = A_bundle, A
+        elif A_bundle is not None:  # value transform with runtime operands
+            A_s, B_s = A_bundle, B
         else:
             A_s, B_s = (B, A) if swap_ab else (A, B)
         plan = build_gemm_epi_plan(
@@ -1730,7 +1749,7 @@ class EpiMod:
         if _launch:
             run_gemm_epi_plan(
                 plan,
-                A_bundle if owned_fmt is not None else (B if swap_ab else A),
+                A_bundle if A_bundle is not None else (B if swap_ab else A),
                 A if (swap_ab or owned_fmt is not None) else B,
                 D,
                 C,
@@ -1917,6 +1936,12 @@ class EpiMod:
 
             owned_fmt = transform_handle_fmt(transform_a)
             transform_key = transform_handle_key(transform_a)
+            if owned_fmt is None and getattr(transform_a, "args", ()):
+                raise NotImplementedError(
+                    "runtime-operand transforms: use mod.gemm(...) with A passed as the "
+                    "transform_a_operand(...) bundle (eager __call__ allocates from A's "
+                    "shape and cannot see through the bundle yet)"
+                )
 
         if torch.compiler.is_compiling():
             if dynamic_scheduler or epi_key_overrides is not None:
