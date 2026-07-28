@@ -45,7 +45,7 @@ guesses about vectorization.
   full-width D, no aux).
 * SINKS: ``outputs=(names,)`` declares aux tile stores (each TileStore owns
   its own dtype/rounding, so multiple mixed-dtype outputs compose); ``reduces={name:
-  ColVecReduce/RowVecReduce(name, combine="add"|"max")}`` declares reduce
+  ColVecReduce/RowVecReduce(name, combine="add"|"max"|"max_abs")}`` declares reduce
   outputs (fn returns the per-element value; buffers are per-CTA-tile
   partials). A reduce of a PRODUCT should use ``scaled=True`` and return the
   two factors — ``{"sqsum": (x, x)}`` — so the fold is one fused
@@ -86,10 +86,11 @@ Speed-of-light rules (bugs otherwise; all were hit once)
   with an unrolled scalar copy first; see the _dense helpers).
 * Sinks fold at fragment level: per-element accumulation into the zero-stride
   aliased accumulator slice double-counts on the SM100 packed path.
-* Ragged last N-tile: OOB accumulator lanes are ZERO — the identity for add,
-  not for max (reduce |x|-like quantities) and not for LSE (OnlineLSEReduce
-  predicates OOB per element by default; check_oob=False compiles the
-  predicate out and the host then requires divisible N).
+* Ragged last tile along the reduce dim: OOB accumulator lanes are ZERO —
+  the identity for add and max_abs, but not for max or LSE, so max/LSE mask
+  OOB lanes to -inf per element by default; check_oob=False compiles the
+  predicate out and the host then requires the reduce dim tile-divisible
+  (N for colvec/LSE, M for rowvec — varlen_m rejected).
 
 Caching and identity
 --------------------
@@ -593,14 +594,26 @@ class _EpiModMixinBase(ComposableEpiMixin):
     def epi_prepass_end(self, params, epi_tensors):
         # Flush register-accumulated statistics to smem (ops that batch the
         # prepass sweep in registers expose fn_prepass_end), then order every
-        # thread's prepass sink writes before the store pass reads the
-        # finalized statistics.
+        # thread's raw partial-plane stores before register resolution and any
+        # direct stats-output fold reads them.
         ops_by_name = {op.name: op for op in self._epi_ops}
         for name in self._epi_mod_prepass_outs:
             op = ops_by_name[name]
             if const_expr(hasattr(op, "fn_prepass_end")):
                 op.fn_prepass_end(self, epi_tensors[name])
         self.epilogue_barrier.arrive_and_wait()
+        # Resolve pass (grouped stats under a split-N warp layout): after the
+        # barrier publishes every raw partial plane, each consumer warp folds
+        # the planes into its own finalized register values. There are no
+        # shared writes, so no second barrier is needed.
+        resolve = [
+            name
+            for name in self._epi_mod_prepass_outs
+            if hasattr(ops_by_name[name], "fn_prepass_resolve")
+            and ops_by_name[name].prepass_resolve_needed(self)
+        ]
+        for name in resolve:
+            ops_by_name[name].fn_prepass_resolve(self, epi_tensors[name])
 
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
@@ -1099,8 +1112,17 @@ class EpiMod:
             semantic_digest=self.semantic_digest,
         )
 
-    def _mint(self, kind_sig, sm, paired_acc, packed_c, prepass_sig=(), rounding=RoundingMode.RN):
-        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding)
+    def _mint(
+        self,
+        kind_sig,
+        sm,
+        paired_acc,
+        packed_c,
+        prepass_sig=(),
+        rounding=RoundingMode.RN,
+        arg_forms=(),
+    ):
+        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms)
         cls = self._minted.get(key)
         if cls is not None:
             return cls
@@ -1131,13 +1153,9 @@ class EpiMod:
         # The DSL's TVM-FFI arg-spec converter reads per-field type hints off
         # the NamedTuple, so mint through typing.NamedTuple with the same
         # annotations the hand-written EpilogueArguments use.
+        forms_by_name = dict(arg_forms)
         arg_specs = [
-            (
-                op.name,
-                Optional[(op.dtype or Float32) | cute.Tensor]
-                if isinstance(op, Scalar)
-                else Optional[cute.Tensor],
-            )
+            (op.name, op.arg_spec_type(const=forms_by_name.get(op.name) == "Const"))
             for op in epi_ops
         ]
         # Split-K (SERIAL/PARALLEL) per-tile flag + partials workspace; None (and
@@ -1151,7 +1169,8 @@ class EpiMod:
         Args = mlir_namedtuple(Args)
         cls_name = (
             f"GemmMod_{self._ident}_{'g' if paired_acc else ''}{'p' if packed_c else ''}_"
-            f"{'_'.join(k for _, k in kind_sig) or 'none'}_sm{sm}"
+            f"{'_'.join(k for _, k in kind_sig) or 'none'}"
+            f"{''.join(f'_{n}{f}' for n, f in arg_forms)}_sm{sm}"
             # rounding is a call-time knob on an otherwise identical mint:
             # it must distinguish the class name or remints collide.
             f"{'' if rounding == RoundingMode.RN else f'_r{int(rounding)}'}"
@@ -1309,6 +1328,22 @@ class EpiMod:
             split_k,
             int(split_k_mode),
             ag_args is not None,
+            # Per-op host arg keys: dtypes/ranks/static widths that the
+            # compiled kernel specializes on (host_arg_key's documented
+            # role). Without these, a same-shape call with e.g. a different
+            # grouped-stats width would alias a stale plan — the tensor form
+            # was only ever saved by the launch-time shape check, and a
+            # constexpr-form width has no runtime footprint to check.
+            tuple(
+                sorted(
+                    (name, op.host_arg_key(epi_args.get(name)))
+                    for name, op in {
+                        **self.ops,
+                        **self.sinks,
+                        **{o.name: o for o in self.extra_ops},
+                    }.items()
+                )
+            ),
         )
         plan = self._plan_cache.get(key)
         if plan is not None:
@@ -1473,7 +1508,18 @@ class EpiMod:
             # Pinned ops own their host schema (host_arg_key validates the
             # value); the built-in shape rules only apply to inferred kinds.
             if kind == "pinned":
-                pass
+                validate = getattr(pins[name], "host_validate", None)
+                if validate is not None:
+                    validate(
+                        epi_args[name],
+                        m=m_i,
+                        n=n_i,
+                        tile_M=tile_M,
+                        tile_N=tile_N,
+                        batch=batch,
+                        varlen_m=varlen_m,
+                        epi_args=epi_args,
+                    )
             elif visit_kind == "row":
                 _require_shape(name, epi_args[name], (batch_l, n_i))
             elif visit_kind == "col":
@@ -1496,14 +1542,36 @@ class EpiMod:
                     inner = ((m + tile_M - 1) // tile_M, n_gemm)
                 expected = inner if varlen_m or batch is None else (batch, *inner)
                 _require_shape(sink_name, epi_args[sink_name], expected)
-            if getattr(op, "check_oob", True) is False and n_gemm % tile_N:
-                raise ValueError(
-                    f"sink '{sink_name}': check_oob=False requires N divisible by tile_N "
-                    f"(N={n_gemm}, tile_N={tile_N})"
-                )
+            if getattr(op, "check_oob", True) is False:
+                # The reduce dim must be tile-divisible: dim 0 (colvec) reduces
+                # along N, dim 1 (rowvec) along M (varlen_m boundaries are
+                # always potentially ragged).
+                if getattr(op, "dim", 0) == 0:
+                    if n_gemm % tile_N:
+                        raise ValueError(
+                            f"sink '{sink_name}': check_oob=False requires N divisible by "
+                            f"tile_N (N={n_gemm}, tile_N={tile_N})"
+                        )
+                elif varlen_m or m % tile_M:
+                    raise ValueError(
+                        f"sink '{sink_name}': check_oob=False requires M divisible by tile_M "
+                        f"and no varlen_m (M={m}, tile_M={tile_M})"
+                    )
             epi_values[sink_name] = epi_args[sink_name]
         for op in self.extra_ops:
             if op.name in epi_args:
+                validate = getattr(op, "host_validate", None)
+                if validate is not None:
+                    validate(
+                        epi_args[op.name],
+                        m=m,
+                        n=n_gemm,
+                        tile_M=tile_M,
+                        tile_N=tile_N,
+                        batch=batch,
+                        varlen_m=varlen_m,
+                        epi_args=epi_args,
+                    )
                 epi_values[op.name] = epi_args[op.name]
         kind_sig = tuple(kind_sig)
 
@@ -1543,6 +1611,14 @@ class EpiMod:
                 if out_name not in {n for n, _ in visit_sig} | set(self.sinks):
                     raise ValueError(f"prepass out '{out_name}' must be a declared op")
             prepass_sig = tuple((n, k) for n, k in visit_sig if n in self.prepass_operand_names)
+        # Arg FORMS that change the compiled signature (e.g. a constexpr
+        # width vs a tensor descriptor) distinguish the mint; kinds stay pure
+        # (they drive device-loop dispatch).
+        arg_forms = tuple(
+            (name, pins[name].host_arg_form(epi_args[name]))
+            for name, _ in kind_sig
+            if name in pins and pins[name].host_arg_form(epi_args[name])
+        )
         mint_key = (
             visit_sig,
             device_capacity[0],
@@ -1550,6 +1626,7 @@ class EpiMod:
             packed_c,
             prepass_sig,
             rounding_mode,
+            arg_forms,
         )
         GemmCls = self._mint(*mint_key)
         A_s, B_s = (B, A) if swap_ab else (A, B)
@@ -1776,7 +1853,8 @@ class EpiMod:
         # winner, output recipes, sink shapes, slot order) was recorded by a
         # previous identical-metadata call; only allocation + launch remain.
         # packed_cd rides it too (the f32 recast is trace-level, cd_packed);
-        # concat is excluded (its per-call B views live in mod.gemm).
+        # concat and transforms are excluded (their per-call views live in
+        # mod.gemm, whose own plan cache is the warm path).
         ck = None
         if concat_layout is None:
             ck = (

@@ -7,8 +7,8 @@ kernels are minted/cached per (fn source, op config, tensor metadata). Pass
 tensors via ``mod.gemm(A, B, D, C, epi_args={...}, tile_M=..., ...)``.
 
 Sections:
-  * packed-polymorphic math helpers (pexp, pabs) — raw cute.math fns are not
-    F2/Pair-aware; wrap transcendentals like these do.
+  * packed-polymorphic math helpers (pexp) — raw cute.math fns are not
+    F2/Pair-aware; wrap transcendentals like this does.
   * reusable domain resources live in ``quack.epilogue``: rotary table loads
     in ``rotary`` and per-head RMSNorm statistics in ``head_rmsnorm``.
   * elementwise mods: linear/bias, residual, activation factories, RMS-fused
@@ -49,7 +49,7 @@ from quack.epi_ops import (
     RowVecReduce,
     Scalar,
 )
-from quack.epilogue.head_rmsnorm import HeadRMSNormStats
+from quack.epilogue.head_rmsnorm import HeadRstd
 from quack.epilogue.rotary import rotary_cos_sin_load
 from quack.gemm_epilogue import F2, gemm_epilogue, pack, unpack
 
@@ -214,18 +214,12 @@ def rstd_lse_epi(acc, rstd):
     return {"D": v, "lse": v}
 
 
-def pabs(v):
-    if isinstance(v, tuple):
-        return F2(pabs(v[0]), pabs(v[1]))
-    return cute.arch.fmax(v, -v)
-
-
-@gemm_epilogue(reduces={"amax": ColVecReduce("amax", combine="max")})
+@gemm_epilogue(reduces={"amax": ColVecReduce("amax", combine="max_abs")})
 def amax_epi(acc):
     """Per-tile column amax — the quantized-output (SFD) building block.
-    |x| >= 0, so the zero OOB accumulator lanes of a ragged last tile can't
-    corrupt the max (see VecReduce.combine note)."""
-    return {"D": acc, "amax": pabs(acc)}
+    max_abs folds raw inputs with the fused PTX max.abs operation; OOB zeros
+    are its identity, so ragged last N tiles need no per-element mask."""
+    return {"D": acc, "amax": acc}
 
 
 def _sq_prepass(acc):
@@ -235,40 +229,75 @@ def _sq_prepass(acc):
     return {"qk": acc * acc}
 
 
+_head_rstd_op = HeadRstd("qk", eps=1e-6)
+
+
 @gemm_epilogue(
-    ops={"qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={"qk": _head_rstd_op},
     prepass=_sq_prepass,
     prepass_outs=("qk",),
+    extra_ops=(_head_rstd_op.out("rstd_out"),),
 )
-def qknorm_epi(acc, qk):
+def head_rmsnorm_epi(acc, qk):
+    """Per-head RMSNorm, no weight: qk is the per-(row, head) rstd from the
+    HeadRstd statistic (its (head_dim,) host arg only fixes the head width).
+    Optional rstd_out (l?, m, n/head_dim): the finalized rstd per (row,
+    head), written from the prepass stats — the backward needs it."""
     return {"D": acc * qk}
 
 
+_qknorm_rstd_op = HeadRstd("qk", eps=1e-6)
+
+
 @gemm_epilogue(
-    ops={"cs": rotary_cos_sin_load("cs"), "qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={"qk": _qknorm_rstd_op, "w": RowVecLoad("w")},
+    prepass=_sq_prepass,
+    prepass_outs=("qk",),
+    extra_ops=(_qknorm_rstd_op.out("rstd_out"),),
+)
+def qknorm_epi(acc, qk, w):
+    """Weighted per-head RMSNorm: the rstd statistic and the norm weight are
+    independent resources, multiplied in plain sight. w is an ordinary (N,)
+    rowvec — pass the head weight repeated per head; qk's host arg fixes
+    head_dim (an int, or any tensor whose length is head_dim).
+    Optional rstd_out (l?, m, n/head_dim): the finalized rstd per (row,
+    head) — the backward needs it."""
+    return {"D": acc * qk * w}
+
+
+@gemm_epilogue(
+    ops={
+        "cs": rotary_cos_sin_load("cs"),
+        "qk": HeadRstd("qk", eps=1e-6),
+        "w": RowVecLoad("w"),
+    },
     prepass=_sq_prepass,
     prepass_outs=("qk",),
     mode="acc_pair",
 )
-def qk_rope_epi(acc, cs, qk):
-    """The full epirope composition: per-head RMSNorm (prepass stats) then
-    rotary, in five lines of fn math. TMA table (see rotary_cos_sin_load):
-    at the winning clustered-pingpong configs the LDG table's register cost
-    is what tips this composition into spills."""
-    x1, x2 = unpack(acc * qk)
+def qk_rope_epi(acc, cs, qk, w):
+    """The full epirope composition: per-head RMSNorm (prepass stats x weight
+    rowvec) then rotary, in five lines of fn math. TMA table (see
+    rotary_cos_sin_load): at the winning clustered-pingpong configs the LDG
+    table's register cost is what tips this composition into spills."""
+    x1, x2 = unpack(acc * qk * w)
     c, s = unpack(cs)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
 @gemm_epilogue(
-    ops={"cs": rotary_cos_sin_load("cs", tma=False), "qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={
+        "cs": rotary_cos_sin_load("cs", tma=False),
+        "qk": HeadRstd("qk", eps=1e-6),
+        "w": RowVecLoad("w"),
+    },
     prepass=_sq_prepass,
     prepass_outs=("qk",),
     mode="acc_pair",
 )
-def qk_rope_ldg_epi(acc, cs, qk):
+def qk_rope_ldg_epi(acc, cs, qk, w):
     """qk_rope_epi on the gmem->rmem table op (see rope_table_ldg_epi)."""
-    x1, x2 = unpack(acc * qk)
+    x1, x2 = unpack(acc * qk * w)
     c, s = unpack(cs)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 

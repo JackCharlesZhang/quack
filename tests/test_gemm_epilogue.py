@@ -18,7 +18,8 @@ from quack.gemm_act import gemm_act
 from quack.gemm_dact import gemm_dact
 from quack.gemm_norm_act import gemm_norm_act_fn
 from quack.gemm_sq_reduce import gemm_sq_reduce
-from quack.epilogue.head_rmsnorm import HeadRMSNormStats  # noqa: F401
+from quack.epilogue.head_rmsnorm import HeadRstd  # noqa: F401
+from quack.epilogue.scaled_exp import LOG2E, scaled_exp_epi
 from quack.epilogue.rotary import (
     make_interleaved_inv_freq,
     make_mrope_inv_freq,
@@ -40,6 +41,7 @@ from quack.epilogues import (
     lse_partial_epi,
     norm_gelu,
     norm_swiglu_mod,
+    head_rmsnorm_epi,
     qk_rope_epi,
     qk_rope_ldg_epi,
     qknorm_epi,
@@ -80,7 +82,7 @@ def test_epi_mod_semantic_cache_key_and_resolver():
     from quack.rounding import RoundingMode
 
     assert _cache_add_mod.semantic_digest != _cache_max_mod.semantic_digest
-    mint_key = ((), 10, False, False, (), RoundingMode.RN)
+    mint_key = ((), 10, False, False, (), RoundingMode.RN, ())  # trailing (): arg_forms
     ref = pickle.loads(pickle.dumps(_cache_add_mod._class_ref(mint_key)))
     cls = resolve_gemm_class(ref)
     assert cls._epi_mod_class_semantic_key == (_cache_add_mod.semantic_digest, mint_key)
@@ -842,6 +844,81 @@ def test_epi_mod_amax_reduce(n, tile_N):
     _rel_check(amax, ref, "amax", tol=1e-3)
 
 
+_rawmax_row_mod = gemm_epilogue(reduces={"stat": RowVecReduce("stat", combine="max")})(
+    _cache_config_epi_fn
+)
+_rawmax_col_nooob_mod = gemm_epilogue(
+    reduces={"stat": ColVecReduce("stat", combine="max", check_oob=False)}
+)(_cache_config_epi_fn)
+_rawmax_row_nooob_mod = gemm_epilogue(
+    reduces={"stat": RowVecReduce("stat", combine="max", check_oob=False)}
+)(_cache_config_epi_fn)
+
+
+def test_epi_mod_max_reduce_ragged_oob():
+    """Raw (signed) max reduces on ragged tiles: the OOB accumulator zeros
+    (predicated loads) must be masked to the -inf fold identity — an
+    all-negative product would silently clamp at 0 otherwise. Colvec masks
+    ragged N, rowvec masks ragged M; check_oob=False compiles the mask out
+    and the host must then reject ragged shapes."""
+    device = "cuda"
+    torch.random.manual_seed(13)
+    l, k, tile_N = 2, 512, 128
+
+    def make(m, n):
+        # strictly negative product: positive A rows against negative B rows
+        A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16).abs() / math.sqrt(k)
+        B = -torch.randn((l, n, k), device=device, dtype=torch.bfloat16).abs() / math.sqrt(k)
+        D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+        return A, B, D, torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+
+    # --- colvec (reduce along N), ragged last N tile ---
+    m, n = 256, 1000
+    A, B, D, x = make(m, n)
+    n_tiles = (n + tile_N - 1) // tile_N
+    s = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+    _cache_max_mod.gemm(
+        A, B, D, epi_args=dict(stat=s), tile_M=128, tile_N=tile_N, cluster_M=1, cluster_N=1
+    )
+    xp = torch.nn.functional.pad(x, (0, n_tiles * tile_N - n), value=-math.inf)
+    ref = xp.unflatten(-1, (n_tiles, tile_N)).amax(dim=-1)
+    assert (ref < 0).all()  # the mask, not the data, keeps the ragged partial negative
+    _rel_check(D, x, "D")
+    _rel_check(s, ref, "colvec ragged max", tol=1e-3)
+    with pytest.raises(ValueError, match="check_oob"):
+        _rawmax_col_nooob_mod.gemm(
+            A, B, D, epi_args=dict(stat=s), tile_M=128, tile_N=tile_N, cluster_M=1, cluster_N=1
+        )
+
+    # --- rowvec (reduce along M), ragged last M tile ---
+    m, n, tile_M = 456, 512, 128
+    A, B, D, x = make(m, n)
+    m_tiles = (m + tile_M - 1) // tile_M
+    s = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+    _rawmax_row_mod.gemm(
+        A, B, D, epi_args=dict(stat=s), tile_M=tile_M, tile_N=tile_N, cluster_M=1, cluster_N=1
+    )
+    xp = torch.nn.functional.pad(x, (0, 0, 0, m_tiles * tile_M - m), value=-math.inf)
+    ref = xp.unflatten(1, (m_tiles, tile_M)).amax(dim=2)
+    assert (ref < 0).all()
+    _rel_check(D, x, "D")
+    _rel_check(s, ref, "rowvec ragged max", tol=1e-3)
+    with pytest.raises(ValueError, match="check_oob"):
+        _rawmax_row_nooob_mod.gemm(
+            A, B, D, epi_args=dict(stat=s), tile_M=tile_M, tile_N=tile_N, cluster_M=1, cluster_N=1
+        )
+
+    # check_oob=False on divisible shapes: mask compiled out, still exact
+    m, n = 256, 1024
+    A, B, D, x = make(m, n)
+    s = torch.empty((l, m, n // tile_N), device=device, dtype=torch.float32)
+    _rawmax_col_nooob_mod.gemm(
+        A, B, D, epi_args=dict(stat=s), tile_M=128, tile_N=tile_N, cluster_M=1, cluster_N=1
+    )
+    ref = x.unflatten(-1, (n // tile_N, tile_N)).amax(dim=-1)
+    _rel_check(s, ref, "colvec max no-oob", tol=1e-3)
+
+
 class RopeOp(TileLoad):
     """User-defined apply-port op (defined here, not in quack — that's the
     point): loads an interleaved cos/sin table through TileLoad's staged
@@ -1420,7 +1497,7 @@ def _skip_unless_acc_prepass():
 
 # (tile_N, head_dim): one head per tile, several heads per tile, and a
 # head_dim below the SM90 epi-tile N extent — each exercises a different
-# (row, head) smem indexing shape in HeadRMSNormStats. pingpong (SM90): the two
+# (row, head) smem indexing shape in HeadRstd. pingpong (SM90): the two
 # warpgroups' epilogues are strictly exclusive (TMA drain before the epi
 # barrier hand-off), so the temporally-shared stats smem must stay correct.
 @pytest.mark.parametrize(
@@ -1439,12 +1516,13 @@ def test_epi_mod_qknorm_prepass(tile_N, head_dim, pingpong):
     B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
     w = torch.randn(head_dim, device=device, dtype=torch.float32).abs() + 0.5
     D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    rstd_out = torch.empty((l, m, heads), device=device, dtype=torch.float32)
 
     qknorm_epi.gemm(
         A,
         B,
         D,
-        epi_args=dict(qk=w),
+        epi_args=dict(qk=w, w=w.repeat(heads), rstd_out=rstd_out),
         tile_M=128,
         tile_N=tile_N,
         cluster_M=1,
@@ -1454,6 +1532,84 @@ def test_epi_mod_qknorm_prepass(tile_N, head_dim, pingpong):
 
     x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
     _rel_check(D, _qknorm_ref(x, w, 1e-6), "D")
+    # the GroupedColStatsOut companion: finalized rstd per (row, head)
+    rstd_ref = torch.rsqrt(x.unflatten(-1, (heads, head_dim)).pow(2).mean(-1) + 1e-6)
+    _rel_check(rstd_out, rstd_ref, "rstd_out", tol=1e-3)
+
+    if tile_N == 128 and head_dim == 128 and not pingpong:
+        # The weightless primitive: acc * rstd alone. qk's host arg is only
+        # the group width — the plain-int form.
+        head_rmsnorm_epi.gemm(
+            A, B, D, epi_args=dict(qk=head_dim), tile_M=128, tile_N=tile_N, cluster_M=1, cluster_N=1
+        )
+        _rel_check(D, _qknorm_ref(x, torch.ones_like(w), 1e-6), "D (unweighted)")
+
+
+@pytest.mark.parametrize(
+    "n,tile_N,head_dim",
+    [
+        (192, 128, 128),  # GEMM N ends with a partial head
+        (128, 96, 64),  # a CTA tile would split a head across tiles
+    ],
+)
+def test_epi_mod_qknorm_rejects_partial_head_groups(n, tile_N, head_dim):
+    """Grouped stats require complete heads even when rstd_out is absent."""
+    _skip_unless_acc_prepass()
+    device = "cuda"
+    l, m, k = 1, 128, 64
+    A = torch.empty((l, m, k), device=device, dtype=torch.bfloat16)
+    B = torch.empty((l, n, k), device=device, dtype=torch.bfloat16)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    descriptor = torch.empty(head_dim, device=device, dtype=torch.float32)
+    weight = torch.empty(n, device=device, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="stats group width .* must divide"):
+        qknorm_epi.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(qk=descriptor, w=weight),
+            tile_M=128,
+            tile_N=tile_N,
+            cluster_M=1,
+            cluster_N=1,
+        )
+
+
+def test_epi_mod_scaled_exp_prepass_stats_out():
+    """The companion folds raw max planes and finalizes directly to gmem."""
+    _skip_unless_acc_prepass()
+    device = "cuda"
+    torch.random.manual_seed(41)
+    l, m, n, k, tile_N = 1, 128, 256, 64, 128
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    sum_exp = torch.empty((l, m, n // tile_N), device=device, dtype=torch.float32)
+    max_log2_out = torch.empty_like(sum_exp)
+    group_descriptor = torch.empty(tile_N, device=device, dtype=torch.float32)
+
+    scaled_exp_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(
+            max_log2=group_descriptor,
+            sum_exp=sum_exp,
+            max_log2_out=max_log2_out,
+        ),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()).unflatten(-1, (-1, tile_N))
+    max_log2_ref = torch.round(x.amax(-1) * LOG2E)
+    e_ref = torch.exp2(x * LOG2E - max_log2_ref[..., None])
+    assert torch.equal(max_log2_out, max_log2_ref)
+    _rel_check(sum_exp, e_ref.sum(-1), "sum_exp", tol=2e-3)
+    _rel_check(D.unflatten(-1, (-1, tile_N)), e_ref, "D")
 
 
 @pytest.mark.parametrize("tma", [True, False])  # TMA-staged (default) vs gmem->rmem table
@@ -1482,7 +1638,7 @@ def test_epi_mod_qknorm_rope_prepass(pingpong, tma):
         A,
         B,
         D,
-        epi_args=dict(cs=table, qk=w),
+        epi_args=dict(cs=table, qk=w, w=w.repeat(heads)),
         tile_M=128,
         tile_N=128,
         cluster_M=1,
@@ -1561,7 +1717,7 @@ def test_epi_mod_qknorm_prepass_split_k(split_k, split_k_mode):
             A,
             B,
             D,
-            epi_args=dict(qk=w),
+            epi_args=dict(qk=w, w=w.repeat(heads)),
             tile_M=128,
             tile_N=128,
             cluster_M=1,
@@ -1604,7 +1760,7 @@ def test_epi_mod_qknorm_rope_prepass_split_k():
         A,
         B,
         D,
-        epi_args=dict(cs=table, qk=w),
+        epi_args=dict(cs=table, qk=w, w=w.repeat(heads)),
         tile_M=128,
         tile_N=128,
         cluster_M=1,

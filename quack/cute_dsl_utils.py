@@ -184,6 +184,19 @@ def _namedtuple_dynamic_fields(self):
         yield field_val
 
 
+def _namedtuple_extract_mlir_values(self):
+    """Generic ``__extract_mlir_values__`` for ``@mlir_namedtuple`` classes.
+
+    Must agree with ``__get_mlir_types__`` field-for-field: without this, the
+    DSL's default tuple walk emits values for static fields (e.g. a plain int
+    width) that the declared types skipped — an off-by-N operand arity at the
+    generated call site (llvm.call verification failure)."""
+    values = []
+    for field_val in _namedtuple_dynamic_fields(self):
+        values.extend(cutlass.extract_mlir_values(field_val))
+    return values
+
+
 def _namedtuple_c_pointers(self):
     """Generic ``JitArgument.__c_pointers__`` for ``@mlir_namedtuple`` classes."""
     from cutlass.base_dsl.typing import get_c_pointers
@@ -221,6 +234,7 @@ def mlir_namedtuple(cls):
     """
     cls.__c_pointers__ = _namedtuple_c_pointers
     cls.__get_mlir_types__ = _namedtuple_get_mlir_types
+    cls.__extract_mlir_values__ = _namedtuple_extract_mlir_values
     cls.__new_from_mlir_values__ = _namedtuple_new_from_mlir_values
     return cls
 

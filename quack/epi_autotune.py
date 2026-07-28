@@ -163,8 +163,10 @@ def _prune_for_mod(mod, configs, named_args, **kwargs):
                 continue
         ok = True
         for name, op in mod.sinks.items():
-            if getattr(op, "check_oob", True) is False and n_gemm % c.tile_n:
-                ok = False
+            if getattr(op, "check_oob", True) is False:
+                ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % c.tile_m
+                if ragged:
+                    ok = False
             dim = getattr(op, "dim", None)
             buf = kwargs.get(name)
             if dim == 0 and buf is not None and buf.shape[-1] < _cdiv(n_gemm, c.tile_n):
