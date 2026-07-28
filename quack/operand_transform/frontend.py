@@ -29,11 +29,14 @@ Two families, one decorator:
   delivery and register staging; the fn just receives a same-length TensorSSA
   vector of values aligned with x. Kinds (transform_a.A_TRANSFORM_ARG_KINDS):
 
-  * the ``colvec_*`` strip family — one MMA-dtype value per (A row, k-group),
-    delivered via the aux A-side TMA slot (per-stage smem under the AB
-    mbarrier): ``"colvec_ktile"`` (per k-tile, g = 1), ``"colvec_k64"`` /
-    ``"colvec_k32"`` / ``"colvec_k16"`` (per 64 / 32 / 16 elements — dense
-    blockscaled-SF granularities). E.g. the linear-CE dx pow2 rescale::
+  * the strip family — one MMA-dtype value per (m-group, k-group) at 2-D
+    granularity, delivered via the aux A-side TMA slot (per-stage smem under
+    the AB mbarrier): ``"colvec_ktile"`` (per (row, k-tile)),
+    ``"colvec_k64"`` / ``"colvec_k32"`` / ``"colvec_k16"`` (per (row, 64 /
+    32 / 16 elements) — dense blockscaled-SF granularities), ``"kvec_m64"``
+    (per (m64 row block, k-element) — the LCE dw strip; resolve
+    coarser-than-64 M granularity host-side, e.g. a vocab-tile row per m64
+    block). E.g. the linear-CE dx pow2 rescale::
 
         @a_transform(vec_size=8, args={"u": "colvec_ktile"})
         def dx_scale(x, u):

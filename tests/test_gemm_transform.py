@@ -341,6 +341,67 @@ def test_a_transform_colvec_ktile_atom_layouts(tile_mnk):
     _check_colvec_strip(m=768, n=512, k=256, tile_mnk=tile_mnk)
 
 
+@a_transform(vec_size=8, args={"u": "kvec_m64"})
+def _kvec_m64_scale_a(x, u):
+    return x * u
+
+
+def _check_kvec_m64(
+    m=384, n=256, k=288, tile_mnk=(128, 128, 64), cluster_mnk=(1, 1, 1), a_major="k"
+):
+    """kvec_m64 gate (the LCE dw strip shape): one pow2 value per (m64 row
+    block, k-element), bitwise vs host-prescaled SS. The strip is (M/64,
+    rk*tile_K) k-contiguous, K padded to whole k-tiles."""
+    from quack.operand_transform.host import transform_a_operand
+
+    torch.manual_seed(5)
+    if a_major == "k":
+        A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
+    else:
+        A = (torch.randn(k, m, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)).t()
+    B = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
+    kg = -(-k // tile_mnk[2]) * tile_mnk[2]
+    strip = torch.ldexp(
+        torch.ones(m // 64, kg, device="cuda"), torch.randint(-3, 4, (m // 64, kg), device="cuda")
+    ).to(torch.bfloat16)
+    rows = torch.arange(m, device="cuda") // 64
+    A_pre = (A.float() * strip.float()[rows, :k]).to(torch.bfloat16)
+    aux = transform_a_operand(_kvec_m64_scale_a, A, {"u": strip}, tile_mnk[0], tile_mnk[2]).sf
+    D_ss = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    D_fn = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    _run_gemm(A_pre.contiguous(), B, D_ss, tile_mnk, cluster_mnk, False, mma_is_rs=False)
+    _run_gemm(
+        A,
+        B,
+        D_fn,
+        tile_mnk,
+        cluster_mnk,
+        False,
+        mma_is_rs=False,
+        transform_a=_kvec_m64_scale_a,
+        aux=aux,
+    )
+    torch.cuda.synchronize()
+    ref = (A_pre.float() @ B.float().mT).to(torch.bfloat16)
+    torch.testing.assert_close(D_fn, ref, atol=3e-2, rtol=1e-3)
+    assert torch.equal(D_fn, D_ss), "kvec_m64 fn is not bitwise vs host-prescaled SS"
+
+
+@pytest.mark.parametrize("a_major", ["k", "m"])
+def test_a_transform_kvec_m64(a_major):
+    # m-major A is the dw orientation (A = E^T); k tail = 4.5 k-tiles
+    _check_kvec_m64(a_major=a_major)
+
+
+@pytest.mark.parametrize("tile_mnk", [(256, 128, 64), (192, 256, 64)], ids=["atom21", "atom12"])
+def test_a_transform_kvec_m64_atom_layouts(tile_mnk):
+    _check_kvec_m64(m=768, n=512, k=256, tile_mnk=tile_mnk)
+
+
+def test_a_transform_kvec_m64_cluster():
+    _check_kvec_m64(m=512, n=512, k=256, cluster_mnk=(1, 2, 1))
+
+
 @a_transform(vec_size=8, args={"u": "colvec_k16"})
 def _colvec_k16_scale_a(x, u):
     return x * u
