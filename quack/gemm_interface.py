@@ -421,7 +421,9 @@ def gemm_tuned(
     if config is None:
         if blockscaled:
             m = A.shape[-2]
-            config = blockscaled_default_config(m, B.shape[-1])
+            config = blockscaled_default_config(
+                m, B.shape[-1], device_capacity=get_device_capacity(A.device)[0]
+            )
         else:
             # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
             is_pure_gemm = (

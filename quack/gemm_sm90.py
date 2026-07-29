@@ -297,6 +297,13 @@ class GemmSm90(GemmTmaBase):
             self.transform_a = transform_a(self)
             self.aux_a = self.transform_a.aux
 
+        # Blockscaled (real SFA/SFB operands) is only supported by the SM120
+        # subclass; the __call__/kernel seams below are gated on this flag.
+        self.blockscaled = False
+        self.sf_vec_size = None
+        self.sfa_smem_layout_staged = None
+        self.sfb_smem_layout_staged = None
+
         self.ab_stage = None
         self.epi_stage = None
         self.epi_m_major = True
@@ -312,6 +319,10 @@ class GemmSm90(GemmTmaBase):
     def epi_smem_warp_shape_mnk(self):
         atom_m, atom_n, atom_k = self.atom_layout_mnk
         return (atom_m * 4, atom_n, atom_k)
+
+    def _sf_smem_bytes_per_stage(self) -> int:
+        """SFA+SFB smem bytes per AB pipeline stage; nonzero only for blockscaled."""
+        return 0
 
     def _setup_tiled_mma(self):
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
@@ -417,9 +428,11 @@ class GemmSm90(GemmTmaBase):
                 if self.transform_a is not None and self.transform_a.owns_a_layout
                 else None
             ),
-            # aux A-side operand (e.g. a scale strip): rides the AB stages
+            # aux A-side operand (e.g. a scale strip) and blockscaled SFA/SFB
+            # both ride the AB stages
             ab_extra_bytes_per_stage=(
-                self.aux_a.bytes_per_stage() if self.aux_a is not None else 0
+                (self.aux_a.bytes_per_stage() if self.aux_a is not None else 0)
+                + self._sf_smem_bytes_per_stage()
             ),
         )
         self.sched_stage = 2 if self.pingpong else 1
@@ -465,6 +478,12 @@ class GemmSm90(GemmTmaBase):
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
+        # Unified SM90/SM100/SM120 signature: the trailing SF slots exist on
+        # every TMA arch (the compiled TVM-FFI arg spec bakes the full arity,
+        # defaults included, so hosts must always pass them — see
+        # launch_gemm). Real scale factors are SM120-blockscaled only.
+        mSFA: Optional[cute.Tensor] = None,
+        mSFB: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes
@@ -489,6 +508,18 @@ class GemmSm90(GemmTmaBase):
         # plain GEMMs. For layout-owning transforms blob is the repacked
         # storage; for value transforms it is the plain (M, K) operand and
         # continues down the standard path below.
+        if const_expr(self.blockscaled):
+            assert mSFA is not None and mSFB is not None
+            # Dense unbatched (rank-5) SFs: prepend the trivial batch mode so the
+            # rest of the kernel sees the usual (l, rm/rn, rk, 32, 4, 4) shape.
+            if const_expr(cute.rank(mSFA) == 5):
+                mSFA = layout_utils.expand(mSFA, 0, 1)
+            if const_expr(cute.rank(mSFB) == 5):
+                mSFB = layout_utils.expand(mSFB, 0, 1)
+        else:
+            # the slots are part of the unified signature; only blockscaled
+            # (SM120) kernels consume them
+            assert mSFA is None and mSFB is None, "mSFA/mSFB require a blockscaled GEMM"
         mAuxA = None
         if const_expr(isinstance(mA, TransformAOperand)):
             assert self.transform_a is not None, "TransformAOperand requires a transform_a"
@@ -525,6 +556,7 @@ class GemmSm90(GemmTmaBase):
         self.b_dtype = mB.element_type
         self.d_dtype = mD.element_type if mD is not None else None
         self.c_dtype = mC.element_type if mC is not None else None
+        self.sf_dtype = mSFA.element_type if const_expr(mSFA is not None) else None
         self.a_layout = LayoutEnum.from_tensor(mA)
         self.b_layout = LayoutEnum.from_tensor(mB)
         self.d_layout = LayoutEnum.from_tensor(mD) if mD is not None else None
@@ -591,6 +623,55 @@ class GemmSm90(GemmTmaBase):
             # the mAuxA slot untouched — no TMA atom, no smem, no pipeline
             tma_tensor_aux_a = mAuxA
 
+        tma_atom_sfa, tma_tensor_sfa, tma_atom_sfb, tma_tensor_sfb = None, None, None, None
+        if const_expr(self.blockscaled):
+            # Rebuild the SF logical (M/N, K, L) layouts from the blocked scale
+            # tensors' actual strides so non-packed buffers (slices of larger
+            # scale tensors) work; only the inner 512-B atom must be contiguous.
+            # For varlen the SF buffer is padded (tile-aligned per-batch padding
+            # along M for varlen_m / along K for varlen_k), so its extent comes
+            # from the SF tensor itself, not the packed operand.
+            if const_expr(cute.rank(mA) == 3):
+                sfa_shape = mA.shape
+            elif const_expr(varlen_m):
+                sfa_shape = (mSFA.shape[1] * 128, mA.shape[1])
+            else:  # varlen_k
+                sfa_shape = (mA.shape[0], mSFA.shape[2] * 128)
+            sfa_layout = layout_utils.tile_atom_to_shape_SF_strided(
+                sfa_shape, self.sf_vec_size, mSFA.stride
+            )
+            mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)
+            if const_expr(cute.rank(mB) == 3):
+                sfb_shape = mB.shape
+            else:  # varlen_k
+                sfb_shape = (mB.shape[0], mSFB.shape[2] * 128)
+            sfb_layout = layout_utils.tile_atom_to_shape_SF_strided(
+                sfb_shape, self.sf_vec_size, mSFB.stride
+            )
+            mSFB = cute.make_tensor(mSFB.iterator, sfb_layout)
+            sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, 0))
+            sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, 0))
+            # The SF layouts have stride-0 broadcast modes (sf_vec_size elements
+            # share one scale), which TMA can't express in E8M0/E4M3 element
+            # units; Int16 internal type views each 512-B atom as 256 x Int16
+            # boxes (same trick as the SM100 path and the CUTLASS SM120 example).
+            tma_atom_sfa, tma_tensor_sfa = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mSFA,
+                sfa_smem_layout,
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
+                internal_type=cutlass.Int16,
+            )
+            tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mSFB,
+                sfb_smem_layout,
+                (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
+                internal_type=cutlass.Int16,
+            )
+            self.num_tma_load_bytes += cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+            self.num_tma_load_bytes += cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+
         if const_expr(self.split_k > 1):
             assert mD is not None, "split_k requires an output tensor D"
         (
@@ -627,6 +708,9 @@ class GemmSm90(GemmTmaBase):
         aux_a_smem_size = 0
         if const_expr(self.aux_a is not None):
             aux_a_smem_size = cute.cosize(self.aux_a_smem_layout_staged)
+        sf_dtype_storage = self.sf_dtype if self.blockscaled else Int32
+        sfa_smem_size = cute.cosize(self.sfa_smem_layout_staged) if self.blockscaled else 0
+        sfb_smem_size = cute.cosize(self.sfb_smem_layout_staged) if self.blockscaled else 0
 
         @cute.struct
         class SharedStorage:
@@ -657,6 +741,14 @@ class GemmSm90(GemmTmaBase):
                 ],
                 128,
             ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[sf_dtype_storage, sfa_smem_size],
+                128,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[sf_dtype_storage, sfb_smem_size],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -667,6 +759,10 @@ class GemmSm90(GemmTmaBase):
             tma_tensor_a if const_expr(not self.gather_A) else mA,
             tma_atom_b,
             tma_tensor_b,
+            tma_atom_sfa,
+            tma_tensor_sfa,
+            tma_atom_sfb,
+            tma_tensor_sfb,
             tma_atom_d,
             tma_tensor_d,
             tma_atom_c,
@@ -676,6 +772,8 @@ class GemmSm90(GemmTmaBase):
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
+            self.sfa_smem_layout_staged,
+            self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
             tma_atom_aux_a,
@@ -704,6 +802,12 @@ class GemmSm90(GemmTmaBase):
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
+        # blockscaled SFA/SFB slots (real scale factors are SM120-only; always
+        # None here)
+        tma_atom_sfa: Optional[cute.CopyAtom],
+        mSFA_mkl: Optional[cute.Tensor],
+        tma_atom_sfb: Optional[cute.CopyAtom],
+        mSFB_nkl: Optional[cute.Tensor],
         tma_atom_d: Optional[cute.CopyAtom],
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
@@ -714,6 +818,8 @@ class GemmSm90(GemmTmaBase):
         # plain Layout for layout-owning transforms (unswizzled blob smem)
         a_smem_layout: Union[cute.ComposedLayout, cute.Layout],
         b_smem_layout: cute.ComposedLayout,
+        sfa_smem_layout: Optional[cute.Layout],
+        sfb_smem_layout: Optional[cute.Layout],
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
         tma_atom_aux_a: Optional[cute.CopyAtom],

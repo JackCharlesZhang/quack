@@ -258,7 +258,7 @@ class GemmEpiPlan(NamedTuple):
 
     compiled_fn: object
     gemm_cls: type
-    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA
     max_active_clusters: int
     max_swizzle_size: int
     scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore

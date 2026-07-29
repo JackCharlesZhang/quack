@@ -1509,7 +1509,9 @@ class EpiMod:
             if config is not None:
                 cfg = config
             elif SFA is not None:
-                cfg = blockscaled_default_config(A.shape[-2], n)
+                cfg = blockscaled_default_config(
+                    A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
+                )
             else:
                 cfg = self._default_config(A, B, transform_a)
             if needs_transform_operands:

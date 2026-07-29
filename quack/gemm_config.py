@@ -55,8 +55,18 @@ class GemmConfig:
 
 
 def blockscaled_config_ok(c: GemmConfig) -> bool:
-    """Can this config run a blockscaled (SM100 tcgen05 MMA) GEMM? THE single
-    statement of the constraint set — both autotune prune paths call this."""
+    """Can this config run a blockscaled GEMM (SM100 tcgen05 MMA, or SM120
+    warp MMA)? THE single statement of the constraint set — both autotune
+    prune paths call this."""
+    if c.device_capacity == 12:
+        # SM120 warp-MMA blockscaled (MXFP8): the SF smem layouts and fragment
+        # partition helpers are whole-128-tile granular.
+        return (
+            not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
+            and c.tile_k is None  # tile_k is derived from the SF atom column
+            and c.tile_m in (128, 256)
+            and c.tile_n in (128, 256)
+        )
     return (
         c.device_capacity in (10, 11)
         and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
@@ -261,14 +271,20 @@ def default_config(device) -> GemmConfig:
     return _default_config_for_cap(get_device_capacity(device)[0])
 
 
-def blockscaled_default_config(m: int, n: int) -> GemmConfig:
-    """Default SM100 config for blockscaled GEMM.
+def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> GemmConfig:
+    """Default config for blockscaled GEMM (SM100 unless ``device_capacity``
+    says otherwise).
 
-    Large shapes use a (256, 256) tile: it makes num_acc_stage == 1, which turns
-    on ``overlap_accum_sf`` (a second TMEM accumulator stage) so the per-tile
-    scale-apply + TMEM drain overlaps the next tile's MMA instead of
-    serializing after it.
+    On SM100, large shapes use a (256, 256) tile: it makes num_acc_stage == 1,
+    which turns on ``overlap_accum_sf`` (a second TMEM accumulator stage) so
+    the per-tile scale-apply + TMEM drain overlaps the next tile's MMA instead
+    of serializing after it.
+
+    SM120 (warp MMA, no clusters) sticks to a (128, 128) tile — the one shape
+    every blockscaled-legal SM120 tiling supports.
     """
+    if device_capacity == 12:
+        return _blockscaled_config(128, 128, (1, 1), device_capacity=12)
     if m >= 512 and n >= 256:
         tile_m, tile_n, cluster = 256, 256, (2, 1)
     elif m >= 512 and n >= 128:
@@ -279,7 +295,7 @@ def blockscaled_default_config(m: int, n: int) -> GemmConfig:
 
 
 @lru_cache(maxsize=None)
-def _blockscaled_config(tile_m, tile_n, cluster):
+def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10):
     return GemmConfig(
         tile_m=tile_m,
         tile_n=tile_n,
@@ -287,7 +303,7 @@ def _blockscaled_config(tile_m, tile_n, cluster):
         cluster_n=cluster[1],
         pingpong=False,
         is_dynamic_persistent=True,
-        device_capacity=10,
+        device_capacity=device_capacity,
     )
 
 

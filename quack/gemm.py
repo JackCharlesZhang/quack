@@ -223,7 +223,7 @@ class _GemmPlan(NamedTuple):
     """
 
     compiled_fn: object
-    is_sm100_family: bool  # SM100/110 use 2-CTA MMA and take trailing (SFA, SFB) args
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA
     use_d_as_c: bool  # SM8x lowers add_to_output to C = D
     alpha_mode: int
     beta_mode: int

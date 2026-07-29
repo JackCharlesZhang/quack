@@ -186,7 +186,7 @@ class _GemmSymmetricPlan(NamedTuple):
     """
 
     compiled_fn: object
-    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA
     alpha_mode: int
     beta_mode: int
     max_active_clusters: int

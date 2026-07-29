@@ -108,7 +108,15 @@ def validate_blockscaled_sf(
     varlen_m = num_batches is not None and not varlen_k
     assert not varlen_k or num_batches is not None, "varlen_k requires num_batches"
     assert SFB is not None, "SFA and SFB must be provided together"
-    assert device_capacity[0] in [10, 11], "Blockscaled GEMM requires SM100/SM110"
+    assert device_capacity[0] in [10, 11, 12], "Blockscaled GEMM requires SM100/SM110/SM120"
+    if device_capacity[0] == 12:
+        # SM120 warp-MMA blockscaled: MXFP8 only for now (K-major 8-bit
+        # operands; fp4/fp6 and varlen_k's m-major A are not implemented).
+        assert fmt_a.elem_bits == 8 and fmt_b.elem_bits == 8, (
+            f"SM120 blockscaled GEMM supports MXFP8 (8-bit) formats only, "
+            f"got {fmt_a.name} x {fmt_b.name}"
+        )
+        assert not varlen_k, "SM120 blockscaled GEMM does not support varlen_k (needs m-major A)"
     # Per-instruction the scale config is shared: every legal pair has matching
     # scale dtype and vec size (nvfp4 only pairs with itself; all other formats
     # are e8m0 / vec 32).
@@ -468,15 +476,14 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
 
 
 def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
-    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB).
-    A layout-owning transform's A is a TransformAOperand bundle — one slot,
-    the host never unpacks it."""
+    """Invoke the compiled kernel. Kernel signatures uniformly take trailing
+    (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
+    bakes the full declared arity, so they are always passed. A layout-owning
+    transform's A is a TransformAOperand bundle — one slot, the host never
+    unpacks it."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
-    if plan.is_sm100_family:
-        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
-    else:
-        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
+    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
 
 def make_fake_gemm_tensors(
@@ -684,6 +691,9 @@ def compile_gemm_kernel(
         sm8x_kwargs["arch"] = device_capacity[0] * 10 + device_capacity[1]
         GemmCls = partial(GemmCls, **sm8x_kwargs)
     elif device_capacity[0] in [9, 12]:
+        if device_capacity[0] == 12 and sf_vec_size is not None:
+            # SM120 blockscaled (real SFA/SFB); SM90 has no blockscaled path
+            split_k_kwargs["sf_vec_size"] = sf_vec_size
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
@@ -713,7 +723,11 @@ def compile_gemm_kernel(
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
+    # Unified signature across archs: every kernel class takes trailing
+    # (SFA, SFB) — None unless blockscaled (SM120), and SM100 consumes them
+    # natively. The compiled TVM-FFI arg spec bakes the full declared arity
+    # (defaults included), so they are always passed here and at launch.
+    sf_args = (mSFA, mSFB)
     return cute.compile(
         gemm_obj,
         mA,

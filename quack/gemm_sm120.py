@@ -49,6 +49,51 @@ from quack import sm80_utils
 import quack.sm90_utils as quack_sm90_utils
 
 
+def _make_sf_copy_block(tiled_mma, sf_dtype, sSFA, sSFB, tCrSFA, tCrSFB, tidx):
+    """s2r copies for REAL blockscaled SFA/SFB fragments (universal copy; the
+    SF TV layouts are fixed by the block-scaled MMA atom, see
+    mma_traits_sm120.hpp). Returns ``copy_sf_block(stage_idx, k_block)`` which
+    copies both operands' scale fragments for one k-block of one pipeline
+    stage — same produce seam shape as ``canonical_a_load_s2r``."""
+    atom_copy_SF = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), sf_dtype)
+    perm_mnk = tiled_mma.permutation_mnk
+    smem_tiled_copy_SFA = cute.make_tiled_copy(
+        atom_copy_SF,
+        blackwell_helpers.get_layoutSFA_TV(tiled_mma),
+        (cute.size(perm_mnk[0]), cute.size(perm_mnk[2])),
+    )
+    smem_tiled_copy_SFB = cute.make_tiled_copy(
+        atom_copy_SF,
+        blackwell_helpers.get_layoutSFB_TV(tiled_mma),
+        (cute.size(perm_mnk[1]), cute.size(perm_mnk[2])),
+    )
+    thr_copy_SFA = smem_tiled_copy_SFA.get_slice(tidx)
+    thr_copy_SFB = smem_tiled_copy_SFB.get_slice(tidx)
+    # (CPY, CPY_MN, CPY_K, STAGE)
+    tCsSFA_copy_view = thr_copy_SFA.partition_S(sSFA)
+    tCsSFB_copy_view = thr_copy_SFB.partition_S(sSFB)
+    tCrSFA_copy_view = thr_copy_SFA.retile(tCrSFA)
+    tCrSFB_copy_view = thr_copy_SFB.retile(tCrSFB)
+
+    def copy_sf_block(stage_idx, k_block):
+        # The SF views carry stride-0 broadcast modes (one scale per
+        # sf_vec_size elements); filter AFTER slicing the k-block/stage so
+        # mode coalescing cannot disturb the indexing — each scale is then
+        # copied once.
+        cute.copy(
+            smem_tiled_copy_SFA,
+            cute.filter_zeros(tCsSFA_copy_view[None, None, k_block, stage_idx]),
+            cute.filter_zeros(tCrSFA_copy_view[None, None, k_block]),
+        )
+        cute.copy(
+            smem_tiled_copy_SFB,
+            cute.filter_zeros(tCsSFB_copy_view[None, None, k_block, stage_idx]),
+            cute.filter_zeros(tCrSFB_copy_view[None, None, k_block]),
+        )
+
+    return copy_sf_block
+
+
 def _sf_group_vmk(t, k_atoms):
     """Group a raw SM120 SF fragment (V, rest-MN modes..., K modes...) to
     rank-3 (V, MN, K), walking the K modes off the right until their sizes
@@ -106,6 +151,7 @@ class GemmSm120(GemmSm90):
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
         transform_a: Optional[Callable] = None,
+        sf_vec_size: Optional[int] = None,
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
@@ -114,6 +160,16 @@ class GemmSm120(GemmSm90):
         self.use_clc_persistence = False
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
+        # Blockscaled (real SFA/SFB operands loaded from gmem): MXFP8 only for
+        # now — fp8 e4m3/e5m2 with e8m0 scales, sf_vec_size 32, K-major A and B.
+        self.sf_vec_size = sf_vec_size
+        self.blockscaled = sf_vec_size is not None
+        self.sfa_smem_layout_staged = None
+        self.sfb_smem_layout_staged = None
+        if self.blockscaled:
+            assert sf_vec_size == 32, "SM120 blockscaled (MXFP8) requires sf_vec_size == 32"
+            assert not gather_A, "Blockscaled SM120 GEMM does not support gather_A"
+            assert transform_a is None, "Blockscaled SM120 GEMM does not support transform_a"
         # The warp-MMA mainloop always consumes A from registers (ldmatrix
         # s2r), so there is no SS/RS mode split; mma_is_rs stays False for the
         # inherited __call__/_setup_attributes checks. A-operand transforms
@@ -137,6 +193,15 @@ class GemmSm120(GemmSm90):
             tuple(tile_shape_mnk) if len(tile_shape_mnk) == 3 else (*tile_shape_mnk, 0)
         )
         tile_M, tile_N = self.cta_tile_shape_mnk[:2]
+        if self.blockscaled:
+            # The SF smem layouts cover whole 128-row/col SF atoms, and the
+            # upstream partition_fragment_SFA/SFB helpers only handle whole
+            # 128-wide tiles (the CUTLASS SM120 example has the same
+            # restriction).
+            assert tile_M in (128, 256) and tile_N in (128, 256), (
+                f"Blockscaled SM120 GEMM requires tile_M/tile_N in (128, 256), "
+                f"got ({tile_M}, {tile_N})"
+            )
 
         # Pingpong: 2 warp groups each with (2,2,1) atom layout
         # Non-pingpong: 1 group of 8 warps with (4,2,1) atom layout.
@@ -221,6 +286,23 @@ class GemmSm120(GemmSm90):
     def epi_smem_warp_shape_mnk(self):
         return self.atom_layout_mnk
 
+    def _sf_smem_bytes_per_stage(self) -> int:
+        if not self.blockscaled:
+            return 0
+        tile_m, tile_n, tile_k = self.cta_tile_shape_mnk
+        # One 8-bit scale per sf_vec_size K elements, for both SFA and SFB.
+        return (tile_m + tile_n) * tile_k // self.sf_vec_size
+
+    def _setup_attributes(self, epilogue_args):
+        super()._setup_attributes(epilogue_args)
+        if self.blockscaled:
+            self.sfa_smem_layout_staged = blockscaled_layout.sm120_make_smem_layout_sfa(
+                self.tiled_mma, self.cta_tile_shape_mnk, self.sf_vec_size, self.ab_stage
+            )
+            self.sfb_smem_layout_staged = blockscaled_layout.sm120_make_smem_layout_sfb(
+                self.tiled_mma, self.cta_tile_shape_mnk, self.sf_vec_size, self.ab_stage
+            )
+
     def _setup_tiled_mma(self):
         """Set up warp-level MMA (MmaF16BF16Op / MmaMXF8Op / MmaFP8Op) and
         tile K.
@@ -250,17 +332,43 @@ class GemmSm120(GemmSm90):
             else self.mma_inst_mnk[2] * 4
         )
         mma_arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        self.use_mxf8_mma = (
-            self.mma_a_dtype.width == 8
-            and self.mma_a_dtype == self.b_dtype
-            and self.acc_dtype == Float32
-            and self.cta_tile_shape_mnk[0] % 128 == 0
-            # the SF layout is 4-SF (128-k at vec 32) granular
-            and tile_k_resolved % 128 == 0
-            # ptxas-target gate, not a dispatch gate (see docstring): mirror
-            # the op's own __post_init__ admissibility check
-            and mma_arch in warp.MmaMXF8Op.admissible_archs
-        )
+        if const_expr(self.blockscaled):
+            # Real block-scaled MXFP8: unlike the unit-scale fast path below,
+            # there is no MmaFP8Op fallback — the SF operands are real data, so
+            # every condition is a hard requirement.
+            assert self.mma_a_dtype.width == 8 and self.mma_a_dtype == self.b_dtype, (
+                f"SM120 blockscaled GEMM supports MXFP8 only (same-dtype e4m3/e5m2 A/B), "
+                f"got {self.mma_a_dtype} x {self.b_dtype}"
+            )
+            assert self.sf_dtype == cutlass.Float8E8M0FNU, (
+                f"MXFP8 requires e8m0 scales, got {self.sf_dtype}"
+            )
+            assert self.acc_dtype == Float32, "SM120 blockscaled GEMM requires f32 accumulation"
+            assert not self.a_layout.is_m_major_a() and not self.b_layout.is_n_major_b(), (
+                "SM120 blockscaled GEMM requires K-major A and B"
+            )
+            # one SF atom column covers 4 * sf_vec_size = 128 K elements
+            assert tile_k_resolved % (4 * self.sf_vec_size) == 0, (
+                f"Blockscaled CTA tile K ({tile_k_resolved}) must be divisible by one SF atom "
+                f"column (4 * sf_vec_size = {4 * self.sf_vec_size})"
+            )
+            assert mma_arch in warp.MmaMXF8Op.admissible_archs, (
+                "SM120 blockscaled GEMM needs an sm_120a/f or sm_121a/f compile target "
+                "(kind::mxf8f6f4 block_scale has no Hopper equivalent)"
+            )
+            self.use_mxf8_mma = True
+        else:
+            self.use_mxf8_mma = (
+                self.mma_a_dtype.width == 8
+                and self.mma_a_dtype == self.b_dtype
+                and self.acc_dtype == Float32
+                and self.cta_tile_shape_mnk[0] % 128 == 0
+                # the SF layout is 4-SF (128-k at vec 32) granular
+                and tile_k_resolved % 128 == 0
+                # ptxas-target gate, not a dispatch gate (see docstring): mirror
+                # the op's own __post_init__ admissibility check
+                and mma_arch in warp.MmaMXF8Op.admissible_archs
+            )
         if const_expr(self.mma_a_dtype.width == 16):
             op = warp.MmaF16BF16Op(self.mma_a_dtype, self.acc_dtype, self.mma_inst_mnk)
         elif const_expr(self.use_mxf8_mma):
@@ -328,6 +436,12 @@ class GemmSm120(GemmSm90):
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
+        # blockscaled SFA/SFB operands (real scale factors riding the AB
+        # pipeline; None unless self.blockscaled)
+        tma_atom_sfa: Optional[cute.CopyAtom],
+        mSFA_mkl: Optional[cute.Tensor],
+        tma_atom_sfb: Optional[cute.CopyAtom],
+        mSFB_nkl: Optional[cute.Tensor],
         tma_atom_d: Optional[cute.CopyAtom],
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
@@ -338,6 +452,8 @@ class GemmSm120(GemmSm90):
         # plain Layout for layout-owning transforms (unswizzled blob smem)
         a_smem_layout: Union[cute.ComposedLayout, cute.Layout],
         b_smem_layout: cute.ComposedLayout,
+        sfa_smem_layout: Optional[cute.Layout],
+        sfb_smem_layout: Optional[cute.Layout],
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
         # aux A-side operand slots (e.g. a transform's scale-factor strip
@@ -361,7 +477,15 @@ class GemmSm120(GemmSm90):
 
         # Prefetch TMA descriptors
         if warp_idx == self.ab_load_warp_id:
-            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c, tma_atom_aux_a):
+            for tma_atom in (
+                tma_atom_a,
+                tma_atom_b,
+                tma_atom_sfa,
+                tma_atom_sfb,
+                tma_atom_d,
+                tma_atom_c,
+                tma_atom_aux_a,
+            ):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
@@ -411,6 +535,10 @@ class GemmSm120(GemmSm90):
             # make_copy_block
             sA = storage.sA.get_tensor(a_smem_layout)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sSFA, sSFB = None, None
+        if const_expr(self.blockscaled):
+            sSFA = storage.sSFA.get_tensor(sfa_smem_layout)
+            sSFB = storage.sSFB.get_tensor(sfb_smem_layout)
         sAuxA = None
         if const_expr(self.aux_a is not None):
             sAuxA = storage.sAuxA.get_tensor(aux_a_smem_layout)
@@ -550,6 +678,34 @@ class GemmSm120(GemmSm90):
                         dst_tensor=sB,
                         tma_multicast=b_tma_multicast,
                     )
+                    copy_SFA, copy_SFB = None, None
+                    if const_expr(self.blockscaled):
+                        # (bM, bK, RestK). offset_batch_SFA lands on this batch's
+                        # tile-aligned region of the padded SF buffer for
+                        # varlen_m, and is a plain batch slice otherwise.
+                        gSFA_mk = cute.local_tile(
+                            varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
+                            cute.select(self.cta_tile_shape_mnk, [0, 2]),
+                            (tile_coord_mnkl[0], None),
+                        )
+                        copy_SFA = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_sfa,
+                            src_tensor=gSFA_mk,
+                            dst_tensor=sSFA,
+                            tma_multicast=a_tma_multicast,
+                        )
+                        # (bN, bK, RestK); varlen_k is excluded (K-major only)
+                        gSFB_nk = cute.local_tile(
+                            mSFB_nkl[None, None, batch_idx],
+                            cute.select(self.cta_tile_shape_mnk, [1, 2]),
+                            (tile_coord_mnkl[1], None),
+                        )
+                        copy_SFB = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_sfb,
+                            src_tensor=gSFB_nk,
+                            dst_tensor=sSFB,
+                            tma_multicast=b_tma_multicast,
+                        )
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     k_tile_start, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
@@ -559,7 +715,7 @@ class GemmSm120(GemmSm90):
                         ab_producer_state = self.load_tma(
                             ab_pipeline,
                             ab_producer_state,
-                            [copy_A, copy_B, copy_AuxA],
+                            [copy_A, copy_B, copy_AuxA, copy_SFA, copy_SFB],
                             k_tile_cnt,
                             k_tile_start=k_tile_start,
                         )
@@ -643,13 +799,34 @@ class GemmSm120(GemmSm90):
                 tCsB = thr_mma.partition_B(sB)
                 tCrB = thr_mma.make_fragment_B(tCsB[None, None, None, 0])
 
-            # Block-scaled fp8 (MmaMXF8Op): constant unit-scale fragments.
-            # The partition helpers only consume layout shapes, so a dummy
-            # tensor over any pointer serves; the fragments are filled with
-            # ue8m0 1.0 (0x7F) once and never reloaded — the block-scaled
-            # instruction is purely a 2x-rate fp8 mma here.
+            # Block-scaled fp8 (MmaMXF8Op). Two flavors:
+            # - self.blockscaled: REAL scale factors — SF fragments partitioned
+            #   from the staged smem SF tensors and copied s2r per k-block
+            #   alongside A/B (universal copy; the SF TV layouts are fixed by
+            #   the block-scaled MMA atom, see mma_traits_sm120.hpp).
+            # - plain fp8 fast path: constant unit-scale fragments (see below).
             tCrSFA, tCrSFB = None, None
-            if const_expr(self.use_mxf8_mma):
+            copy_sf_block = None
+            if const_expr(self.blockscaled):
+                tCrSFA = blackwell_helpers.partition_fragment_SFA(
+                    sSFA[None, None, 0], thr_mma, tidx
+                )
+                tCrSFB = blackwell_helpers.partition_fragment_SFB(
+                    sSFB[None, None, 0], thr_mma, tidx
+                )
+                # Normalize to (V, MN, K) — same rest-mode walk as the
+                # unit-scale path below.
+                tCrSFA = _sf_group_vmk(tCrSFA, self.cta_tile_shape_mnk[2] // 32)
+                tCrSFB = _sf_group_vmk(tCrSFB, self.cta_tile_shape_mnk[2] // 32)
+                copy_sf_block = _make_sf_copy_block(
+                    tiled_mma, self.sf_dtype, sSFA, sSFB, tCrSFA, tCrSFB, tidx
+                )
+            elif const_expr(self.use_mxf8_mma):
+                # Constant unit-scale fragments: the partition helpers only
+                # consume layout shapes, so a dummy tensor over any pointer
+                # serves; the fragments are filled with ue8m0 1.0 (0x7F) once
+                # and never reloaded — the block-scaled instruction is purely a
+                # 2x-rate fp8 mma here.
                 sfa_layout = blockscaled_layout.sm120_make_smem_layout_sfa(
                     tiled_mma, self.cta_tile_shape_mnk, 32, 1
                 )
@@ -797,6 +974,7 @@ class GemmSm120(GemmSm90):
                     k_tile_start=k_tile_start_mma,
                     tCrSFA=tCrSFA,
                     tCrSFB=tCrSFB,
+                    copy_sf_block=copy_sf_block,
                 )
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
@@ -977,6 +1155,7 @@ class GemmSm120(GemmSm90):
         k_tile_start: Int32 = 0,
         tCrSFA: Optional[cute.Tensor] = None,
         tCrSFB: Optional[cute.Tensor] = None,
+        copy_sf_block: Optional[Callable] = None,
     ) -> cutlass.pipeline.PipelineState:
         """Warp-level MMA mainloop: A produced per k16 block through the
         ``copy_block(stage_idx, b, k_tile)`` seam (canonical ldmatrix s2r, or
@@ -986,7 +1165,11 @@ class GemmSm120(GemmSm90):
         collective and GemmSm90.mma_rs_interleaved: produce block k+1 (slot 0
         of the next stage at the tile's last block), then MMA block k — the
         warp-synchronous mma.sync needs none of the WGMMA commit-group/wait
-        discipline, so the seam contract is the schedule alone."""
+        discipline, so the seam contract is the schedule alone.
+
+        For real blockscaled operands, ``copy_sf_block(stage_idx, k_block)``
+        copies the SFA/SFB scale fragments smem->rmem alongside each A/B
+        k-block (same stage/slot rhythm)."""
         tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
         load_sB = partial(cute.copy, smem_tiled_copy_B)
 
@@ -1002,6 +1185,8 @@ class GemmSm120(GemmSm90):
         tCsB_p = tCsB_copy_view[None, None, None, stage]
         copy_block(stage, 0, kt)
         load_sB(tCsB_p[None, None, 0], tCrB_copy_view[None, None, 0])
+        if const_expr(copy_sf_block is not None):
+            copy_sf_block(stage, 0)
 
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
             for k in cutlass.range_constexpr(num_k_blocks):
@@ -1022,6 +1207,8 @@ class GemmSm120(GemmSm90):
                 # the wrap load is the NEXT tile's slot-0 preload
                 copy_block(stage, k_next, kt + 1 if k == num_k_blocks - 1 else kt)
                 load_sB(tCsB_p[None, None, k_next], tCrB_copy_view[None, None, k_next])
+                if const_expr(copy_sf_block is not None):
+                    copy_sf_block(stage, k_next)
                 if const_expr(tCrSFA is not None):
                     # block-scaled mma: the constant unit-scale SF fragments
                     # ride as list operands (see kernel())
@@ -1052,6 +1239,8 @@ class GemmSm120(GemmSm90):
                 if const_expr(k_next > 0):
                     copy_block(stage, k_next, kt)
                     load_sB(tCsB_p[None, None, k_next], tCrB_copy_view[None, None, k_next])
+                    if const_expr(copy_sf_block is not None):
+                        copy_sf_block(stage, k_next)
                 if const_expr(tCrSFA is not None):
                     cute.gemm(
                         tiled_mma,
