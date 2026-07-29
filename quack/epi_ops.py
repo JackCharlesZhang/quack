@@ -23,8 +23,10 @@ from typing import NamedTuple, Optional
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as blackwell_helpers
-from cutlass import Boolean, Float32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import warp
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
 from quack.rounding import (
@@ -2346,3 +2348,316 @@ class OnlineLSEReduce(ColVecReduce):
             )
         else:
             self._fold(m_acc, s_acc, frag)
+
+
+@dsl_user_op
+def _dup_s16sat_from_s32(x: Int32, *, loc=None, ip=None) -> Uint32:
+    """sat16(x) packed into both halves of a b32 (one ALU instruction).
+
+    Feeds the f16x2 EQUALITY compares below as raw bit patterns: f16
+    equality is bit equality away from NaN/±0, and this scheme is exact for
+    ALL int32 inputs when the comparands are small POSITIVE ints — in-range
+    values map injectively, high saturation (0x7FFF) and the in-range slice
+    [31745, 32767] are f16 NaNs (match nothing), low saturation 0x8000 is
+    -0.0 (aliases only a ±0 comparand — callers bias by +1 so no comparand
+    is zero), and f16 compares never flush denormals. This replaces a
+    cvt.rn.f16.s32 (quarter-rate XU pipe) whose exactness needed a rounding
+    argument."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(x).ir_value(loc=loc, ip=ip)],
+            "cvt.pack.sat.s16.s32 $0, $1, $1;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _selp_pair_f16x2(
+    a2: Uint32, b2: Uint32, f0: Float32, f1: Float32, vin: Float32, *, loc=None, ip=None
+) -> Float32:
+    """One packed f16x2 equality (HSETP2: TWO predicates per instruction) plus
+    the two dependent f32 selects — 3 SASS for 2 elements vs 4 for the scalar
+    ISETP+FSEL pair. Inline PTX: the DSL has no two-predicate compare."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Uint32(a2).ir_value(loc=loc, ip=ip),
+                Uint32(b2).ir_value(loc=loc, ip=ip),
+                Float32(f0).ir_value(loc=loc, ip=ip),
+                Float32(f1).ir_value(loc=loc, ip=ip),
+                Float32(vin).ir_value(loc=loc, ip=ip),
+            ],
+            "{.reg .pred p, q; .reg .f32 t;\n"
+            "setp.eq.f16x2 p|q, $1, $2;\n"
+            "selp.f32 t, $3, $5, p;\n"
+            "selp.f32 $0, $4, t, q;}",
+            "=f,r,r,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+class ColVecSelect(EpiOp):
+    """Per-row column selection ("gather along N"): out[m] = the fn value at
+    column idx[m], written directly to an (l, m) / (m,) f32 colvec.
+
+    The fn returns the value under this op's name (a plain sink plane). The
+    per-row column index arrives through a companion integer ColVecLoad
+    (int32/int64) declared in ``extra_ops`` — the fn never sees it. This op
+    reads idx[row] straight from the companion's staged smem (one broadcast
+    LDS per aliased row-slot; smem is runtime-addressable where register
+    fragments are not) and compares in INTEGER against the static
+    per-element N offsets (rebased-compare idiom of OnlineLSEReduce._fold:
+    one ISETP against an immediate per element). At most one element in the
+    whole (M, N) grid satisfies ``col == idx[row]``, so unlike a reduce
+    there is no fold, no lane/warp exchange, and no barrier: whichever
+    thread holds the matching element predicated-stores it straight to
+    gmem. Rows whose index falls outside [0, N) (e.g. ignore_index -100)
+    are never written — pre-fill the output when that matters.
+
+    (Routing the index through the fn as a value-port operand instead costs
+    measurably more on an epilogue-exposed shape: the broadcast index frags
+    get materialized per element, converted to f32, and collected into a
+    second sink plane — all deleted by the companion-smem read.)
+
+    Extraction structure (see fn_sink_flush): per M-stripe, precompute WHICH
+    epi_n subtile each row-slot's target falls in and OR one-hot bits into a
+    Uint32 register mask; every subtile flush then tests one trace-time-
+    constant bit (`mask & (1 << epi_n)` = a LOP3 + branch — no smem load, no
+    compares on the hot path). The rarely-taken block extracts via packed
+    f16x2 equality (setp.eq.f16x2: TWO predicates per instruction, inline
+    PTX) — static footprint matters because the block is instantiated per
+    subtile and its I-cache pressure is the measurable residual on short-K
+    D-less shapes. Free vs the plain online-LSE epilogue at K >= 1024.
+
+    TOMBSTONES — measured dead ends, do not retry (H100, M=4096 V=128256,
+    pp 128x192, same-process interleaved medians):
+      * idx through the fn value port (scaled two-plane sink): broadcast
+        index frags materialized per element + f32 cvt + a second collection
+        plane — several times the select tax of the companion-smem read.
+      * per-element `if` around the store: ptxas rebuilds the entire gmem
+        address chain inside every element's BSSY/BRA block (+25% kernel).
+      * separate `hit` boolean guarding the store: ptxas emits the compare
+        chain TWICE (a predicate chain for the branch plus FSELs
+        re-materialized inside it) — guard on the selected value instead.
+      * FMNMX tree over independent selects (more ILP than a serial fold):
+        LOSES on the throughput-bound cooperative schedule — the epilogue
+        wall is the warpgroup-shared ALU pipe, not select latency.
+      * UNFENCED one-hot R2P extraction (flash-attn mask.py digit-inversion
+        of the j->offset map; R2P confirmed in SASS): loses to the fenced
+        window everywhere (K=512 D-less 1.18x vs 0.98x of plain) — R2P pays
+        when every element consumes a predicate every visit (attention
+        masking), not needle-in-haystack equality.
+      * one-hot R2P as the FENCED block body: correct, but static size is a
+        wash vs the scalar chain; select tax at K=512 D-less: scalar
+        ISETP+FSEL chain +0.166ms, one-hot R2P +0.137, packed f16x2 +0.124
+        (1 I2F.F16 + 4 HSETP2 + 8 FSEL per 8-element slot; ptxas folds the
+        offset pairs into HSETP2 half2 immediates and dual-issues the
+        broadcast via the .H0_H0 operand) — f16x2 shipped.
+    """
+
+    fn_port = "sink"
+
+    def __init__(self, name, idx_op):
+        super().__init__(name)
+        if not isinstance(idx_op, ColVecLoad):
+            raise ValueError(
+                f"ColVecSelect {name!r}: idx_op must be the companion ColVecLoad "
+                "staging the per-row column indices"
+            )
+        self.idx_op = idx_op
+
+    def config_key(self):
+        return (self.idx_op.cache_key(),)
+
+    def host_fake_arg(self, key, fctx):
+        from quack.compile_utils import make_fake_tensor
+
+        dtype, ndim = key
+        shape = (fctx.l, fctx.m) if ndim == 2 else (fctx.m,)
+        return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    def sink_alloc_shape(self, m, n):
+        # Full colvec, not per-tile partials: config-independent, and there is
+        # no host_finalize — the buffer IS the result.
+        return (m,)
+
+    def host_validate(self, value, *, m, n, tile_M, tile_N, batch, varlen_m, epi_args):
+        import torch
+
+        idx = epi_args.get(self.idx_op.name)
+        if idx is None:
+            raise ValueError(f"sink '{self.name}' requires the '{self.idx_op.name}' index operand")
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"'{self.idx_op.name}' must be int32 or int64, got {idx.dtype}")
+        expected = (m,) if varlen_m or batch is None else (batch, m)
+        if tuple(value.shape) != expected:
+            raise ValueError(
+                f"sink '{self.name}': expected shape {expected}, got {tuple(value.shape)}"
+            )
+        if value.dtype != torch.float32:
+            raise ValueError(f"sink '{self.name}' must be float32, got {value.dtype}")
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        # The COMPANION's staged index vector (the smem field is declared by
+        # the companion; this is the same view its get_smem_tensor returns).
+        return getattr(storage_epi, f"s_{self.idx_op.name}").get_tensor(
+            cute.make_layout(gemm.cta_tile_shape_mnk[0])
+        )
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        # Reference colvec-broadcast partition: its zero-N-stride layout
+        # groups aliased same-row elements in fn_sink_flush (layout only —
+        # the tensor itself is never read or written, so it costs nothing).
+        vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=(1, 0))
+        tDrRef = ctx.partition_for_epilogue_fn(cute.make_rmem_tensor(vec_mma_layout, Float32))
+        tDcD = ctx.partition_for_epilogue_fn(cute.make_identity_tensor((ctx.tile_M, ctx.tile_N)))
+        if const_expr(ctx.varlen_manager.varlen_m):
+            mVec = cute.domain_offset(
+                (ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx],), param
+            )
+        elif const_expr(cute.rank(param) == 2):
+            mVec = param[ctx.batch_idx, None]
+        else:
+            mVec = param  # dense rank-1 (m,)
+        gVec = cute.local_tile(mVec, (ctx.tile_M,), (ctx.tile_coord_mnkl[0],))
+        limit_m = min(
+            ctx.varlen_manager.len_m(ctx.batch_idx) - ctx.tile_coord_mnkl[0] * ctx.tile_M,
+            ctx.tile_M,
+        )
+        n_off = ctx.tile_coord_mnkl[1] * ctx.tile_N
+        epi_shape = cute.zipped_divide(
+            cute.make_layout((ctx.tile_M, ctx.tile_N)), ctx.epi_tile
+        ).shape[1]
+        n_epi = const_expr(cute.size(epi_shape[1]))
+        etN = const_expr(ctx.tile_N // n_epi)
+        # Per-stripe state for the subtile bitmask: the rebased target
+        # per row-slot and the Uint32 hit mask over epi_n subtiles.
+        assert n_epi <= 32, "ColVecSelect: > 32 N subtiles per tile needs mask chunking"
+        ref0 = tDrRef[None, None, None, 0, 0]
+        n_slots = const_expr(
+            cute.size(layout_utils.convert_layout_zero_stride(ref0, ref0.layout), mode=[0])
+        )
+        tMask = cute.make_rmem_tensor(1, Uint32)
+        tRel0 = cute.make_rmem_tensor(n_slots, Int32)
+        return (smem_tensor, tDrRef, tDcD, gVec, limit_m, n_off, tMask, tRel0, etN)
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        ref_cur = state[1][None, None, None, epi_coord[0], epi_coord[1]]
+        c_cur = state[2][None, None, None, epi_coord[0], epi_coord[1]]
+        return (state[0], ref_cur, c_cur, *state[3:], epi_coord)
+
+    @cute.jit
+    def fn_sink_flush(self, gemm, state, frag):
+        sIdx, ref_frag, coords, gVec, limit_m, n_off, tMask, tRel0, etN, epi_coord = state
+        ref = ref_frag.layout
+        frag_g = layout_utils.convert_layout_zero_stride(frag, ref)
+        coords_g = layout_utils.convert_layout_zero_stride(coords, ref)
+        # Static per-element N offset relative to the thread's base column
+        # (rebased compare, same idiom as OnlineLSEReduce._fold): the compare
+        # is one ISETP against an immediate, no per-element coordinate
+        # materialization.
+        lay_n = cute.composition(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2], stride=(0, 1)), coords_g.layout
+        )
+        n_aliased = const_expr(cute.size(frag_g, mode=[1]))
+        n_slots = const_expr(cute.size(frag_g, mode=[0]))
+        # Stripe-mask window (mask.py philosophy applied to the guard):
+        # the rows of a slot are fixed for a whole M stripe, so at the
+        # stripe's first subtile compute, per slot, WHICH epi_n subtile
+        # (if any) the target falls in, and OR one-hot bits into a
+        # Uint32 mask over subtiles. Every flush then tests one
+        # trace-time-constant bit — `mask & (1 << epi_n)` is a single
+        # LOP3 + branch, with no smem load and no compares on the hot
+        # path (vs an LDS -> IADD -> 2x ISETP -> branch chain per slot
+        # per subtile). The rare taken block re-derives idx_rel from the
+        # stashed rebased target with one immediate subtract per slot.
+        # range_constexpr so si is a Python int: crd2idx then folds to
+        # Python ints at trace time (static bounds / shift immediates).
+        n_epi = const_expr(gemm.cta_tile_shape_mnk[1] // etN)
+        epi_n = const_expr(epi_coord[1])
+        if const_expr(epi_n == 0 or gemm.epi_m_major):
+            # First subtile of this row-stripe (epi_m_major visits new
+            # rows every subtile, so it recomputes every time and the
+            # mask degenerates to a per-subtile test — still correct).
+            n_base0 = coords_g[0, 0][1] + n_off - epi_n * etN
+            mask = Uint32(0)
+            for si in cutlass.range_constexpr(n_slots):
+                offs = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
+                row = coords_g[si, 0][0]
+                # OOB rows hold garbage indices (predicated g2s copy):
+                # bake the row bound in as a value nothing can hit.
+                t_rel = Int32(cutlass.select_(row < limit_m, Int32(sIdx[row]) - n_base0, -1))
+                tRel0[si] = t_rel
+                e = t_rel // etN
+                w = t_rel - e * etN
+                # w/e >= 0 both checked: safe under floor OR trunc
+                # division semantics for negative t_rel.
+                ok = (w >= 0) & (w <= max(offs)) & (e >= 0) & (e < n_epi)
+                e_safe = Int32(cutlass.select_(ok, e, 0))  # shift stays in [0, 31]
+                mask = mask | Uint32(cutlass.select_(ok, Uint32(1) << e_safe, Uint32(0)))
+            tMask[0] = mask
+        if Boolean(tMask[0] & (Uint32(1) << epi_n)):
+            # Rare block body = packed f16x2 equality (below): what
+            # matters here is STATIC size — the block is instantiated
+            # per subtile and its I-cache footprint is the dominant
+            # residual on short-K D-less shapes (ladder in the class
+            # tombstones). Fresh *_cur names: a name born inside a
+            # dynamic-if body that is also assigned in a sibling
+            # (possibly compiled-out const_expr) arm trips
+            # TYPE_UNSTABLE_JOIN (None on the not-taken path).
+            for si in cutlass.range_constexpr(n_slots):
+                offs_cur = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
+                row_cur = coords_g[si, 0][0]
+                # +1 bias folded into the immediate (see _select_packed16).
+                ir1_cur = Int32(tRel0[si] - (epi_n * etN - 1))
+                self._select_packed16(frag_g, gVec, si, row_cur, ir1_cur, offs_cur, n_aliased)
+
+    @cute.jit
+    def _select_packed16(self, frag_g, gVec, si, row, idx1, offs, n_aliased):
+        # Packed-16 compare chain: pack sat16(idx1 = idx_rel + 1, the bias
+        # pre-folded into the caller's immediate subtract) into both halves
+        # of a b32 once, then one setp.eq.f16x2 per OFFSET PAIR yields two
+        # predicates per instruction feeding the two selects (inline PTX
+        # helpers above). The compares run on raw bit patterns with
+        # comparand halves = the +1-biased offsets — trace-time immediates
+        # (the stripe rebase already made the offsets thread-independent
+        # statics), exact for ALL idx_rel (see _dup_s16sat_from_s32); odd
+        # tails pad with an f16 NaN half. The -inf miss sentinel guards the
+        # store, so a genuinely -inf value at the target column is not
+        # written (as in the legacy kernel).
+        assert max(offs) + 1 < 31745, "packed16 select: biased offsets reach the f16 NaN range"
+        a2 = _dup_s16sat_from_s32(idx1)
+        val = Float32(-math.inf)
+        for j in cutlass.range_constexpr(0, n_aliased, 2):
+            lo = offs[j] + 1
+            hi = offs[j + 1] + 1 if j + 1 < n_aliased else 0x7FFF  # NaN pad
+            f1 = frag_g[si, j + 1] if j + 1 < n_aliased else Float32(0.0)
+            val = _selp_pair_f16x2(a2, Uint32(lo | (hi << 16)), frag_g[si, j], f1, val)
+        if val != Float32(-math.inf):
+            gVec[row] = val
+
+    # TOMBSTONE: the one-hot R2P extraction that used to live here (digit-
+    # inversion of the j->offset map by pow2 strides, one-hot mask, R2P into
+    # the predicate bank, valid-guarded store — flash-attn mask.py idiom) was
+    # measured and removed: unfenced it loses to the stripe-mask fence by
+    # ~15pp of plain-matmul time, and as the fenced block body it loses to
+    # the packed f16x2 chain above (+0.137 vs +0.124ms select tax, K=512
+    # D-less) while being no smaller statically. See the class docstring
+    # tombstones for the full ladder before resurrecting any of it.

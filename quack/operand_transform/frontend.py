@@ -77,10 +77,20 @@ A mod is a factory ``gemm -> TransformA`` — pass it straight to
 ``GemmSm90(transform_a=mod)``. ``__quack_semantic_key__`` fail-closed
 fingerprints the fn (source + every capture, via the gemm_epilogue keyer), so
 mods compose with the jit-cache machinery.
+
+Torch surfaces: ``EpiMod.__call__``/``plan`` take ``transform_a=mod`` plus
+``transform_operands={name: tensor}`` for runtime-operand mods (raw values —
+the TransformAOperand bundle is built there from the resolved config; only
+``mod.gemm`` takes pre-built bundles). Under torch.compile the same call
+records the single ``quack::gemm_epi`` custom op: mods cross by
+``semantic_digest`` (registered at construction; bind the mod to a module
+global for graphs that must survive a fresh process) and operand tensors
+ride the op's input list. See quack.epi_torch_op.
 """
 
 import hashlib
 import inspect
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -89,6 +99,7 @@ import cutlass.cute as cute
 
 from quack.blockscaled.decode_formats import DecodeFormat, decode_format
 from quack.gemm_epilogue import _function_semantic_key, _semantic_value_key
+from quack.gemm_host import TORCH_OP_TRANSFORM_MODS
 from quack.operand_transform.transform_a import TransformAValue, TransformAW4
 
 __all__ = ["a_transform", "ATransformMod", "PackedInput", "dropout_a", "w4_transform"]
@@ -133,11 +144,31 @@ class ATransformMod:
         self.args = _normalize_args(fn, args)
         self._fmt = None
         self.semantic_digest = _digest(self.__quack_semantic_key__())
+        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self  # quack::gemm_epi resolution
 
     def __call__(self, gemm):
         if self.packed is not None:
             return TransformAW4(gemm, self.as_decode_format())
         return TransformAValue(gemm, self)
+
+    def _module_locator(self):
+        """(module, global_name) if this mod is reachable by import in a fresh
+        process (the quack::gemm_epi custom op re-resolves it that way when a
+        compiled graph crosses processes), else None — same contract as
+        EpiMod._module_locator."""
+        module_name = self.fn.__module__
+        if module_name == "__main__":
+            return None
+        module = sys.modules.get(module_name)
+        if module is None:
+            return None
+        preferred = self.fn.__name__
+        if getattr(module, preferred, None) is self:
+            return module_name, preferred
+        names = sorted(name for name, value in vars(module).items() if value is self)
+        if not names:
+            return None
+        return module_name, names[0]
 
     def as_decode_format(self) -> DecodeFormat:
         """Mint the DecodeFormat backing a packed fn transform (cached)."""
@@ -232,6 +263,7 @@ class PackedFormatMod:
                 _function_semantic_key(type(self.fmt).make_consts),
             )
         )
+        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self
 
     def __call__(self, gemm):
         return TransformAW4(gemm, self.fmt)
@@ -269,6 +301,7 @@ class DropoutAMod:
         self.name = f"dropout_a_t{self.threshold}"
         # trailing int: scheme version
         self.semantic_digest = _digest(("dropout_a", self.threshold, rounds, 1))
+        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self
 
     def __call__(self, gemm):
         from quack.operand_transform.transform_a import TransformADropout

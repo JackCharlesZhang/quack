@@ -106,6 +106,14 @@ class GemmClassRef(NamedTuple):
 # entries so long-lived workers do not retain user closures.
 _LOCAL_EPI_MODS: dict[str, object] = {}
 
+# semantic_digest -> mod, for quack::gemm_epi resolution (quack.epi_torch_op).
+# Populated at CONSTRUCTION (EpiMod / transform-mod __init__), never inside
+# compile_call: Dynamo buffers global dict mutations as deferred side
+# effects, so a trace-time write would be invisible to the fake-tensor pass
+# that resolves the digest. Same-digest reconstruction overwrites in place.
+TORCH_OP_EPI_MODS: dict[str, object] = {}
+TORCH_OP_TRANSFORM_MODS: dict[str, object] = {}
+
 
 def register_local_epi_mod(digest: str, epi_mod) -> None:
     _LOCAL_EPI_MODS[digest] = epi_mod

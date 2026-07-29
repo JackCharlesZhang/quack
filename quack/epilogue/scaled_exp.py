@@ -25,7 +25,7 @@ nothing to re-derive and no rounding convention to match on the host side.
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-from quack.epi_ops import ColVecReduce, GroupedColStatsBase
+from quack.epi_ops import ColVecLoad, ColVecReduce, ColVecSelect, GroupedColStatsBase
 from quack.gemm_epilogue import F2, gemm_epilogue
 
 LOG2E = 1.4426950408889634
@@ -97,3 +97,26 @@ def scaled_exp_epi(acc, max_log2):
     # phase-1 prepass (PRE-exp, log2 units), written out via max_log2_out.
     e = pexp2(acc * LOG2E - max_log2)
     return {"D": e, "sum_exp": e}
+
+
+_max_log2_op_t = MaxLog2("max_log2")
+_target_idx_op = ColVecLoad("target")
+
+
+@gemm_epilogue(
+    ops={"max_log2": _max_log2_op_t},
+    prepass=_max_prepass,
+    prepass_outs=("max_log2",),
+    reduces={"sum_exp": ColVecReduce("sum_exp")},
+    outs={"target_logit": ColVecSelect("target_logit", idx_op=_target_idx_op)},
+    extra_ops=(_max_log2_op_t.out("max_log2_out"), _target_idx_op),
+)
+def scaled_exp_target_epi(acc, max_log2):
+    """scaled_exp_epi + the target column's RAW logit gathered to an (m,)
+    f32 colvec (``target`` int colvec in epi_args; see ColVecSelect). For
+    the linear-CE glue this deletes the exact-Zy recompute (a D-length
+    x/W-gather dot per row) — and the emitted Zy is the SAME accumulator
+    value E was computed from, so the target-fix term is self-consistent
+    rather than a reconstruction."""
+    e = pexp2(acc * LOG2E - max_log2)
+    return {"D": e, "sum_exp": e, "target_logit": acc}

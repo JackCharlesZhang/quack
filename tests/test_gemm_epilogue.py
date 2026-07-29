@@ -82,7 +82,8 @@ def test_epi_mod_semantic_cache_key_and_resolver():
     from quack.rounding import RoundingMode
 
     assert _cache_add_mod.semantic_digest != _cache_max_mod.semantic_digest
-    mint_key = ((), 10, False, False, (), RoundingMode.RN, ())  # trailing (): arg_forms
+    # trailing (): arg_forms; trailing False: add_to_output
+    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
     ref = pickle.loads(pickle.dumps(_cache_add_mod._class_ref(mint_key)))
     cls = resolve_gemm_class(ref)
     assert cls._epi_mod_class_semantic_key == (_cache_add_mod.semantic_digest, mint_key)
@@ -343,6 +344,43 @@ def test_epi_mod_factory_local():
         A, B, D2, epi_args=dict(alpha=2.0), tile_M=128, tile_N=256, cluster_M=1, cluster_N=1
     )
     _rel_check(D2, ref - 5.5, "D (different closure)")
+
+
+def test_epi_mod_add_to_output():
+    """add_to_output mints the D TMA atom as reduce-add (cp.reduce.async.bulk):
+    D += result with no C operand and no C load. For an f32 D the memory-side
+    add and a host f32 add of the same two values are the same single RN add,
+    so the check is bitwise. Also pins: warm-path replay keeps accumulating,
+    the plain-store mint is a DIFFERENT kernel (flag in the mint key), and the
+    C-operand contradiction is rejected."""
+    device = "cuda"
+    torch.random.manual_seed(7)
+    m, n, k = 384, 512, 512
+
+    @gemm_epilogue()
+    def _ident_ao(acc):
+        return {"D": acc}
+
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    kw = dict(epi_args={}, tile_M=128, tile_N=256, cluster_M=1, cluster_N=1)
+    delta = torch.empty((m, n), device=device, dtype=torch.float32)
+    _ident_ao.gemm(A, B, delta, **kw)  # plain-store mint
+    D0 = torch.randn((m, n), device=device, dtype=torch.float32)
+    D = D0.clone()
+    _ident_ao.gemm(A, B, D, add_to_output=True, **kw)
+    assert torch.equal(D, D0 + delta), "reduce-add store not bitwise vs host f32 add"
+    _ident_ao.gemm(A, B, D, add_to_output=True, **kw)  # warm-path replay
+    assert torch.equal(D, D0 + delta + delta), "warm add_to_output replay broke accumulation"
+    C = torch.zeros((m, n), device=device, dtype=torch.float32)
+    with pytest.raises(ValueError, match="no C operand"):
+        _ident_ao.gemm(A, B, D, C, add_to_output=True, **kw)
+    # eager __call__ surface: accumulator must be caller-provided
+    D2 = D0.clone()
+    out = _ident_ao(A, B.mT, out={"D": D2}, add_to_output=True, tuned=False)
+    assert torch.equal(out["D"], D0 + delta)
+    with pytest.raises(ValueError, match="out="):
+        _ident_ao(A, B.mT, add_to_output=True, tuned=False)
 
 
 @pytest.mark.parametrize("alpha", [0.5, 2.0])
@@ -1112,6 +1150,68 @@ def test_epi_mod_stochastic_rounding():
     assert err_rs < 3 * err_rn + 5e-3, f"RS err {err_rs} vs RN err {err_rn}"
 
 
+@pytest.mark.parametrize("target_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("n", [1024, 1160, 40960])
+def test_epi_mod_lse_target(n, target_dtype):
+    """CE-eval epilogue: online LSE partials + the target column's logit
+    gathered to an (l, m) f32 colvec (ColVecSelect — a predicated scattered
+    store from the one matching thread, no reduction). Targets pin the sharp
+    coordinates: column 0, n-1, both sides of a tile boundary, and lane-group
+    boundaries within a subtile; ignore rows (-100) must stay untouched.
+    n=40960 exercises |idx_rel| > 32767 in the packed16 compare: low-tile
+    targets seen from high-n_off CTAs (and vice versa) must saturate into
+    the never-matching f16 NaN / -0 bit ranges, not alias.
+    (An impl="onehot" R2P variant was tested here and removed — see the
+    ColVecSelect tombstones for the measured ladder.)"""
+    from quack.epilogues import lse_target_epi
+
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k = 2, 512, 512
+    tile_N = 256
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = (n + tile_N - 1) // tile_N
+    lse = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+    target = torch.randint(0, n, (l, m), device=device, dtype=target_dtype)
+    for i, col in enumerate([0, n - 1, tile_N - 1, tile_N, 7, 8, 15, 16]):
+        target[:, i] = col
+    ignore = torch.zeros((l, m), device=device, dtype=torch.bool)
+    ignore[:, 8:16] = True
+    ignore[:, -3:] = True
+    target[ignore] = -100
+    sentinel = -12345.0
+    target_logit = torch.full((l, m), sentinel, device=device, dtype=torch.float32)
+
+    lse_target_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(target=target, lse=lse, target_logit=target_logit),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    logits = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    _rel_check(D, logits, "D")
+    pad = n_tiles * tile_N - n
+    logits_p = torch.nn.functional.pad(logits, (0, pad), value=-math.inf) if pad else logits
+    ref_tiles = torch.logsumexp(logits_p.unflatten(-1, (n_tiles, tile_N)), dim=-1)
+    assert (lse - ref_tiles).abs().max().item() < 1e-2
+    ref_tl = logits.gather(-1, target.clamp(min=0).long().unsqueeze(-1)).squeeze(-1)
+    valid = ~ignore
+    err = (target_logit[valid] - ref_tl[valid]).abs().max().item()
+    assert err < 1e-2, f"target_logit err {err}"
+    assert (target_logit[ignore] == sentinel).all(), "ignore rows must stay untouched"
+    # CE loss end-to-end: logsumexp over partials minus the gathered logit.
+    loss = torch.logsumexp(lse, dim=-1) - target_logit
+    ref_loss = torch.logsumexp(logits, dim=-1) - ref_tl
+    assert (loss[valid] - ref_loss[valid]).abs().max().item() < 2e-2
+
+
 def test_epi_mod_online_lse_nocheck_rejects_ragged():
     """check_oob=False compiles the OOB predicate out, so the host must
     reject N not divisible by tile_N instead of silently corrupting the LSE."""
@@ -1610,6 +1710,60 @@ def test_epi_mod_scaled_exp_prepass_stats_out():
     assert torch.equal(max_log2_out, max_log2_ref)
     _rel_check(sum_exp, e_ref.sum(-1), "sum_exp", tol=2e-3)
     _rel_check(D.unflatten(-1, (-1, tile_N)), e_ref, "D")
+
+
+def test_epi_mod_scaled_exp_target():
+    """scaled_exp_target_epi: the two-phase stable-exp epilogue composed with
+    the target-logit ColVecSelect — the raw f32 accumulator at each row's
+    target column (the linear-CE glue's exact Zy, no per-row dot recompute)
+    alongside E / sum_exp / max_log2_out."""
+    from quack.epilogue.scaled_exp import scaled_exp_target_epi
+
+    _skip_unless_acc_prepass()
+    device = "cuda"
+    torch.random.manual_seed(42)
+    m, n, k, tile_N = 256, 512, 96, 128
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16)
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = n // tile_N
+    sum_exp = torch.empty((m, n_tiles), device=device, dtype=torch.float32)
+    max_log2_out = torch.empty_like(sum_exp)
+    target = torch.randint(0, n, (m,), device=device, dtype=torch.int64)
+    target[:4] = torch.tensor([0, n - 1, tile_N - 1, tile_N], device=device)
+    target[4] = -100  # ignore row: buffer must stay untouched
+    sentinel = -54321.0
+    target_logit = torch.full((m,), sentinel, device=device, dtype=torch.float32)
+
+    scaled_exp_target_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(
+            max_log2=tile_N,
+            sum_exp=sum_exp,
+            max_log2_out=max_log2_out,
+            target=target,
+            target_logit=target_logit,
+        ),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("mk,nk->mn", A.float(), B.float())
+    xt = x.unflatten(-1, (-1, tile_N))
+    max_log2_ref = torch.round(xt.amax(-1) * LOG2E)
+    e_ref = torch.exp2(xt * LOG2E - max_log2_ref[..., None])
+    assert torch.equal(max_log2_out, max_log2_ref)
+    _rel_check(sum_exp, e_ref.sum(-1), "sum_exp", tol=2e-3)
+    _rel_check(D.unflatten(-1, (-1, tile_N)), e_ref, "D")
+    zy_ref = x.gather(-1, target.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    valid = target >= 0
+    err = (target_logit[valid] - zy_ref[valid]).abs().max().item()
+    assert err < 1e-2, f"target_logit err {err}"
+    assert target_logit[4] == sentinel, "ignore row must stay untouched"
 
 
 @pytest.mark.parametrize("tma", [True, False])  # TMA-staged (default) vs gmem->rmem table

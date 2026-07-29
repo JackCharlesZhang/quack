@@ -168,7 +168,10 @@ class GemmSm90(GemmTmaBase):
         self._transform_a_factory = transform_a
         if transform_a is not None:
             mma_is_rs = True
-        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
+        # Transforms own their accumulation policy: an 8-bit-MMA transform
+        # (w4a8) does its own scaled per-k-tile promotion (transform.promote),
+        # not the plain fp8 slow-accum path.
+        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8 and transform_a is None
         # RS mainloop: A comes from registers (canonical ldmatrix s2r load from smem) instead
         # of the SS descriptor, CUTLASS rs_warpspecialized style — one tile-wide fragment, s2r
         # load of k16 block b+1 interleaved between WGMMA(b) and WGMMA(b+1), one commit group per
@@ -1015,9 +1018,13 @@ class GemmSm90(GemmTmaBase):
             acc, tCrA, tCrB = quack_sm90_utils.partition_fragment_ABC(
                 thr_mma, self.cta_tile_shape_mnk, sA, sB
             )
+            transform_promote = const_expr(
+                self.transform_a is not None and self.transform_a.promote
+            )
             acc_slow = None
-            if const_expr(self.fp8_slow_accum):
+            if const_expr(self.fp8_slow_accum or transform_promote):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+            promote_fn = None
             if const_expr(not self.mma_is_rs):
                 mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
             else:
@@ -1034,6 +1041,11 @@ class GemmSm90(GemmTmaBase):
                         sAux=sAuxA,
                         mAux=mAuxA_mkl if const_expr(self.transform_a.aux_raw) else None,
                     )
+                    if const_expr(transform_promote):
+                        # slow-accum transform: WGMMAs write acc as the
+                        # per-k-tile wave; the transform folds it into
+                        # acc_slow at each tile's drain
+                        promote_fn = partial(self.transform_a.promote_acc, acc_slow, acc)
                 else:
                     copy_block = quack_sm90_utils.canonical_a_load_s2r(
                         tiled_mma, sA, tidx, tCrA, position_independent=True
@@ -1132,7 +1144,12 @@ class GemmSm90(GemmTmaBase):
                         tCrA,
                         tCrB,
                         k_tile_start=k_tile_start_mma,
+                        promote_fn=promote_fn,
                     )
+                    if const_expr(transform_promote):
+                        # the epilogue reads acc (mirrors fp8_slow_accum)
+                        if k_tile_cnt > 0:
+                            acc.store(acc_slow.load())
                 if const_expr(varlen_k or self.split_k > 1):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
@@ -1501,6 +1518,7 @@ class GemmSm90(GemmTmaBase):
         tCrA: cute.Tensor,
         tCrB: cute.Tensor,
         k_tile_start: Int32 = 0,
+        promote_fn: Optional[Callable] = None,
     ) -> cutlass.pipeline.PipelineState:
         """RS mainloop, CUTLASS sm90 rs_warpspecialized scheme: one tile-wide
         fragment, produce of block k+1 (``copy_block(stage, k, k_tile)`` — the
@@ -1517,8 +1535,19 @@ class GemmSm90(GemmTmaBase):
         released at block mma_k - 3 of the following tile, the first point
         where the wait guarantees all of its WGMMAs retired (mma_k >= 4
         asserted at setup; for the canonical 4-block tile this is CUTLASS's
-        wait<2> / release-at-block-1)."""
+        wait<2> / release-at-block-1).
+
+        ``promote_fn`` (slow-accum transforms, e.g. w4a8): acc becomes the
+        per-k-tile WAVE accumulator — zero-init at every tile's block 0,
+        wait_group(0) after its last block, then ``promote_fn(zero_init=
+        first_tile)`` folds it into the transform's persistent accumulator.
+        The drain is issued AFTER the next tile's slot-0 preload, so the
+        preload's LDS + decode run under the draining WGMMAs; the caller
+        copies the persistent accumulator back into acc afterwards. Per-tile
+        drains only strengthen the wait/release bounds above, so the block
+        schedule is unchanged."""
         mma_k = const_expr(cute.size(tCrA.shape[2]))
+        promote = const_expr(promote_fn is not None)
         wgmma_block = partial(self._rs_wgmma_block, tiled_mma, acc, tCrA, tCrB)
         ab_release_state = ab_read_state.clone()
         peek = Boolean(True)
@@ -1543,7 +1572,12 @@ class GemmSm90(GemmTmaBase):
             ab_pipeline.consumer_wait(ab_read_state, peek)
             warpgroup.wait_group(mma_k - 1)
             copy_block(ab_read_state.index, 0, kt + 1)
-            warpgroup.wait_group(mma_k - 2)
+            if const_expr(not promote):
+                warpgroup.wait_group(mma_k - 2)
+        if const_expr(promote):
+            if 0 < k_tile_cnt:
+                warpgroup.wait_group(0)
+                promote_fn(zero_init=True)
         # ---- steady tiles (all but the first and last) ----
         for _ in cutlass.range(max(k_tile_cnt - 2, 0), unroll=1):
             kt += 1
@@ -1559,15 +1593,25 @@ class GemmSm90(GemmTmaBase):
                     copy_block(ab_read_state.index, 0, kt + 1)
                 else:
                     copy_block(stage, k + 1, kt)
-                wgmma_block(stage, k, zero_init=False)
-                warpgroup.wait_group(mma_k - 2)
+                wgmma_block(stage, k, zero_init=const_expr(promote) and k == 0)
+                # In promote mode the previous tile is fully drained, so
+                # produces of slots 1.. have no pending reader; the only
+                # required intra-tile wait is the one before the slot-0
+                # preload (retire this tile's block-0 group) — the rest are
+                # pure DEPBAR overhead.
+                if const_expr(not promote or k == mma_k - 2):
+                    warpgroup.wait_group(mma_k - 2)
                 if const_expr(k == mma_k - 3):
                     # earliest block whose wait leaves only THIS tile's groups pending. Eg for
                     # mma_k = 4, at k == 1, we have called wait_group(2), so the only
                     # outstanding MMAs are the current k_tile with k=0, 1, which means that the
                     # previous k_tile has retired and its stage can be released.
+                    # (Promote mode: the previous tile retired at its drain.)
                     ab_pipeline.consumer_release(ab_release_state)
                     ab_release_state.advance()
+            if const_expr(promote):
+                warpgroup.wait_group(0)
+                promote_fn()
         # ---- last tile (slot 0 already loaded; nothing to prefetch) ----
         if 1 < k_tile_cnt:
             kt += 1
@@ -1575,8 +1619,9 @@ class GemmSm90(GemmTmaBase):
             ab_read_state.advance()
             for k in cutlass.range_constexpr(mma_k - 1):
                 copy_block(stage, k + 1, kt)
-                wgmma_block(stage, k, zero_init=False)
-                warpgroup.wait_group(mma_k - 2)
+                wgmma_block(stage, k, zero_init=const_expr(promote) and k == 0)
+                if const_expr(not promote):
+                    warpgroup.wait_group(mma_k - 2)
                 if const_expr(k == mma_k - 3):
                     ab_pipeline.consumer_release(ab_release_state)
                     ab_release_state.advance()
@@ -1586,6 +1631,9 @@ class GemmSm90(GemmTmaBase):
             self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
         # Drain all WGMMAs and release the final stage
         warpgroup.wait_group(0)
+        if const_expr(promote):
+            if 1 < k_tile_cnt:
+                promote_fn()
         if 0 < k_tile_cnt:
             ab_pipeline.consumer_release(ab_release_state)
             ab_release_state.advance()

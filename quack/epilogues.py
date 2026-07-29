@@ -13,8 +13,9 @@ Sections:
     in ``rotary`` and per-head RMSNorm statistics in ``head_rmsnorm``.
   * elementwise mods: linear/bias, residual, activation factories, RMS-fused
     (sq-sum reduce), amax (quantization stats), per-tile LSE partials, online
-    LSE (stable), transformer-block forward (rms_partial -> rstd_swiglu) and
-    the rmsnorm-backward link.
+    LSE (stable, plus the CE-eval variant with target-logit gather),
+    transformer-block forward (rms_partial -> rstd_swiglu) and the
+    rmsnorm-backward link.
   * paired mods (gated / RoPE) and packed-C/D mods (dgated), via unpack/pack.
 
 Numerics of every mod here are pinned by tests/test_gemm_epilogue.py against
@@ -44,6 +45,7 @@ from quack.activation import (
 from quack.epi_ops import (
     ColVecLoad,
     ColVecReduce,
+    ColVecSelect,
     OnlineLSEReduce,
     RowVecLoad,
     RowVecReduce,
@@ -202,6 +204,35 @@ def lse_partial_epi(acc, scale):
     the host finalizes log(sum(partials)). NOTE: no online max — needs a
     max-combine reduce for large-logit stability (Coda's LSEReduce is online)."""
     return {"D": acc, "sexp": pexp(acc * scale)}
+
+
+@gemm_epilogue(outs={"lse": OnlineLSEReduce("lse")})
+def lse_epi(acc):
+    """Logits + stable online (max, sum) LSE partials (l, m, n_tiles). Host:
+    lse = logsumexp(partials, -1)."""
+    return {"D": acc, "lse": acc}
+
+
+_lse_target_idx = ColVecLoad("target")
+
+
+@gemm_epilogue(
+    outs={
+        "lse": OnlineLSEReduce("lse"),
+        "target_logit": ColVecSelect("target_logit", idx_op=_lse_target_idx),
+    },
+    extra_ops=(_lse_target_idx,),
+)
+def lse_target_epi(acc):
+    """Cross-entropy-eval LM-head epilogue: write the logits, accumulate stable online
+    (max, sum) LSE partials (l, m, n_tiles), and gather each row's target-column logit into an
+    (l, m) f32 colvec — exact, never rounded through the D dtype (the anchor for the
+    fused linear-cross-entropy backward). ``target`` (an (l, m) int32/int64
+    colvec in epi_args) feeds the select through its companion load, not the
+    fn; rows with out-of-range targets (e.g. ignore_index -100) leave
+    target_logit untouched. Host CE forward:
+    loss = logsumexp(lse, -1) - target_logit."""
+    return {"D": acc, "lse": acc, "target_logit": acc}
 
 
 @gemm_epilogue(ops={"rstd": ColVecLoad("rstd")}, outs={"lse": OnlineLSEReduce("lse")})

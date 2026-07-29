@@ -20,6 +20,15 @@ Reduce sinks under torch.compile: the wrapper pins the config (the partial
 buffers must be graph-allocated at exact shapes BEFORE the op runs, so
 runtime autotuning inside the op cannot pick a different tiling) and
 finalizes the partials with traced torch ops.
+
+A-operand transforms ride the same op: ``meta['transform']`` carries the
+handle's semantic digest (+ import locator when the mod is bound to a
+module global — @a_transform fns get this automatically), runtime operand
+tensors ride ``ins`` as ``ta__<name>``, a layout-owning transform's SF strip
+as ``transform_sf`` (its blob is already B, with D's N coming from the blob
+rows via n_override). The op body resolves the handle through _TA_REGISTRY
+and re-enters ``EpiMod.__call__`` eagerly, which rebuilds the
+TransformAOperand bundle from the resolved config.
 """
 
 from __future__ import annotations
@@ -47,13 +56,18 @@ def _sf_decode(SF, bs_format):
     return SF
 
 
-# digest -> EpiMod, populated by the compile-path wrapper (same process) or
-# lazily by import through the meta locator.
-_EPI_REGISTRY: dict = {}
+# digest -> EpiMod / transform mod. Populated at mod CONSTRUCTION (see
+# gemm_host — a compile_call-time write would be buffered by Dynamo's
+# side-effect tracking and invisible to the fake-tensor pass), or lazily by
+# import through the meta locator in a fresh process.
+from quack.gemm_host import (  # noqa: E402
+    TORCH_OP_EPI_MODS as _EPI_REGISTRY,
+    TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
+)
 
 
-def _resolve(digest: str, locator):
-    mod = _EPI_REGISTRY.get(digest)
+def _resolve(digest: str, locator, registry=_EPI_REGISTRY, what="epilogue"):
+    mod = registry.get(digest)
     if mod is None and locator:
         import importlib
 
@@ -61,13 +75,13 @@ def _resolve(digest: str, locator):
         mod = getattr(module, locator[1])
         if mod.semantic_digest != digest:
             raise RuntimeError(
-                f"epilogue {locator[0]}.{locator[1]} changed since this graph was compiled"
+                f"{what} {locator[0]}.{locator[1]} changed since this graph was compiled"
             )
-        _EPI_REGISTRY[digest] = mod
+        registry[digest] = mod
     if mod is None:
         raise RuntimeError(
-            "epilogue digest not resolvable in this process; bind the @gemm_epilogue "
-            "object to a module-global name in an importable module"
+            f"{what} digest not resolvable in this process; bind the object "
+            "to a module-global name in an importable module"
         )
     return mod
 
@@ -91,6 +105,12 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
         operands[name] = outs[i]
         i += 1
     cfg = GemmConfig(**m["config"]) if m["config"] is not None else None
+    t = m.get("transform")
+    transform_a = None
+    transform_operands = None
+    if t is not None:
+        transform_a = _resolve(t["digest"], t["locator"], _TA_REGISTRY, "transform")
+        transform_operands = {k[4:]: v for k, v in named.items() if k.startswith("ta__")} or None
     mod(
         named["A"],
         named["B"],
@@ -106,6 +126,10 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
         bs_format_a=m.get("bs_format_a"),
         bs_format_b=m.get("bs_format_b"),
         rounding_mode=m["rounding_mode"],
+        transform_a=transform_a,
+        transform_sf=named.get("transform_sf"),
+        transform_operands=transform_operands,
+        add_to_output=m.get("add_to_output", False),
         **operands,
     )
 
@@ -128,10 +152,13 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     A, B, C = named["A"], named["B"], named.get("C")
     cu, A_idx = named.get("cu_seqlens_m"), named.get("A_idx")
     dt = getattr(torch, m["out_dtype"]) if m.get("out_dtype") else None
-    out = mod._alloc_outputs(None, A, B, C, m["store_d"], dt, cu, A_idx)
+    # layout-owning transform: B is the repacked blob, N comes from its rows
+    n_ov = B.shape[0] * 64 if (m.get("transform") or {}).get("owned") else None
+    out = mod._alloc_outputs(None, A, B, C, m["store_d"], dt, cu, A_idx, n_override=n_ov)
     outs = ([out["D"]] if m["store_d"] else []) + [out[name] for name in m["out_names"]]
     if m["sink_names"]:
-        cfg, lead, n = m["config"], mod._lead_shape(A, cu, A_idx), B.shape[-1]
+        cfg, lead = m["config"], mod._lead_shape(A, cu, A_idx)
+        n = B.shape[-1] if n_ov is None else n_ov
         for name in m["sink_names"]:
             op = mod.sinks[name]
             if op.dim == 0:
@@ -176,12 +203,22 @@ def compile_call(
     bs_format_b,
     rounding_mode,
     operands,
+    transform_a=None,
+    transform_sf=None,
+    transform_operands=None,
+    add_to_output=False,
 ):
     """torch.compile-path body of ``EpiMod.__call__``: record one functional
     ``quack::gemm_epi_f`` call (allocation inside the op, so the graph gets a
     single node) and finalize reduces with traced ops. Caller-provided out=/
     partial buffers cannot be graph-owned, so that case keeps the mutating
-    ``quack::gemm_epi`` form. Returns the same dict as eager."""
+    ``quack::gemm_epi`` form. Returns the same dict as eager.
+
+    transform_a crosses by semantic digest (registry + optional import
+    locator, exactly like the epilogue itself); runtime operand tensors ride
+    ``ins`` under ``ta__<name>`` and the op body hands them back to
+    ``__call__`` as ``transform_operands`` (the bundle is rebuilt there from
+    the config the op resolves — same deterministic path as this trace)."""
     cfg: Optional[GemmConfig] = config
     if mod.sinks and cfg is None:
         # Partials are graph-allocated before the op runs, so the tiling must
@@ -190,6 +227,22 @@ def compile_call(
         tuned = False
     caller_owned = bool(out) or any(operands.get(name) is not None for name in mod.sinks)
     sink_names = tuple(name for name in mod.sinks if operands.get(name) is None)
+
+    transform_meta = None
+    n_override = None
+    if transform_a is not None:
+        from quack.operand_transform.host import transform_handle_fmt
+
+        owned = transform_handle_fmt(transform_a) is not None
+        if owned:
+            n_override = B.shape[0] * 64  # B is the repacked blob
+        for k, v in (transform_operands or {}).items():
+            assert isinstance(v, torch.Tensor), f"transform operand {k!r} must be a tensor"
+        transform_meta = dict(
+            digest=transform_a.semantic_digest,  # registered at construction
+            locator=getattr(transform_a, "_module_locator", lambda: None)(),
+            owned=owned,
+        )
 
     ins_names, ins = [], []
     for name, t in (
@@ -200,6 +253,8 @@ def compile_call(
         ("A_idx", A_idx),
         ("SFA", _sf_encode(SFA) if SFA is not None else None),
         ("SFB", _sf_encode(SFB) if SFB is not None else None),
+        ("transform_sf", transform_sf),
+        *((f"ta__{k}", v) for k, v in (transform_operands or {}).items()),
         *((f"op__{k}", v) for k, v in operands.items() if isinstance(v, torch.Tensor)),
     ):
         if t is not None:
@@ -220,13 +275,16 @@ def compile_call(
             scalar_ops=scalar_ops,
             out_dtype=None if out_dtype is None else str(out_dtype).split(".")[-1],
             locator=mod._module_locator(),
+            transform=transform_meta,
+            add_to_output=bool(add_to_output),
         )
     )
-    _EPI_REGISTRY[mod.semantic_digest] = mod
     if caller_owned:
-        out = mod._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
+        out = mod._alloc_outputs(
+            out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx, n_override=n_override
+        )
         lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
-        n = B.shape[-1]
+        n = B.shape[-1] if n_override is None else n_override
         partials = {}
         for name in sink_names:
             op = mod.sinks[name]

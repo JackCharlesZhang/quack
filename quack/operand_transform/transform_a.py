@@ -124,6 +124,15 @@ class TransformA:
         coordinates). ``mma_rs_interleaved`` runs once per work tile, so all
         ``copy_block`` calls between two hooks — including the next-k-tile
         slot-0 preload — belong to the hooked tile.
+      - ``promote``: slow-accum transform (W4A8): the mainloop zero-inits the
+        WGMMA accumulator at each k-tile's block 0, drains (wait_group(0))
+        after its last block, and calls ``promote_acc(acc_slow, acc_wave,
+        zero_init)`` — the transform's fp32 fold of the k-tile's wave into
+        the persistent accumulator (e.g. ``acc += scale_row * wave``). The
+        drain kills cross-tile WGMMA overlap by design: with 2 cooperative
+        warpgroups the other WG's WGMMAs fill the tensor pipe during a WG's
+        drain+promote, and single-fresh-buffer drain-promote measured ahead
+        of every double-buffered variant on SM90 (see memory: kscale).
     """
 
     a_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -132,6 +141,7 @@ class TransformA:
     aux = None
     aux_raw = False
     uses_work_tile = False
+    promote = False
 
 
 class AuxKTileStrip(AuxOperandA):
@@ -197,7 +207,11 @@ class TransformAW4(TransformA):
 
     def __init__(self, gemm, w4_format):
         self.fmt = decode_format(w4_format)
-        assert gemm.mma_a_dtype == cutlass.BFloat16, "w4 decodes to bf16 (W4A16)"
+        assert gemm.mma_a_dtype == self.fmt.mma_dtype, (
+            f"w4 format {self.fmt.name!r} decodes to {self.fmt.mma_dtype}, "
+            f"but the GEMM was built for {gemm.mma_a_dtype}"
+        )
+        self.promote = self.fmt.promote
         self.gemm = gemm
         self.w4_format = self.fmt.name
         self.tile_k = self.fmt.tile_k
@@ -233,6 +247,15 @@ class TransformAW4(TransformA):
                 # keeps decode LUT constants resident instead of UR->R
                 # rematerializing them in the mainloop.
                 gemm.num_regs_load, gemm.num_regs_mma = 40, 152
+        elif self.promote:
+            # Slow accum doubles the accumulator (persistent + per-tile
+            # wave); redo the ctor's heavy-pressure rule with the doubled
+            # acc + the (8-bit) A fragment.
+            tile_m, tile_n = gemm.cta_tile_shape_mnk[:2]
+            acc_regs = tile_m * tile_n // (gemm.atom_layout_mnk[0] * 128)
+            frag_regs = (tile_m // gemm.atom_layout_mnk[0]) * self.tile_k // (128 * 4)
+            if 2 * acc_regs + frag_regs >= 208:
+                gemm.num_regs_load, gemm.num_regs_mma = 24, 240
 
     # ---- A layout ownership -------------------------------------------------
 
@@ -301,8 +324,23 @@ class TransformAW4(TransformA):
         mma_m = const_expr(cute.size(tCrA.shape[1]))
         atom_m = gemm.atom_layout_mnk[0]
         sf_words = self.fmt.sf_words
+        ts_words = const_expr(self.fmt.tile_state_words)
         xw = cute.make_rmem_tensor((nw, mma_m), Int32)
         sfw = cute.make_rmem_tensor((2, mma_m), Int32)
+        tstate = None
+        if const_expr(ts_words > 0):
+            # per-tile register state derived from the strip words at each
+            # tile's block-0 produce (e.g. folded-W4A8 scaled LUTs); decode
+            # reads it in place of the raw strip words
+            tstate = cute.make_rmem_tensor((ts_words, mma_m), Int32)
+        if const_expr(self.promote):
+            # promote reads the k-tile's scale words AFTER the next tile's
+            # slot-0 preload has overwritten sfw (the preload is issued
+            # before this tile's drain); move them to a second buffer at
+            # b == 1 — by then this tile's words are in sfw (loaded at its
+            # own b == 0, i.e. during the previous tile), and b == 1 always
+            # precedes the preload.
+            self._sfc = cute.make_rmem_tensor((sf_words, mma_m), Int32)
 
         def copy_block(stage_idx, b, k_tile=None):
             if const_expr(b == 0):
@@ -311,9 +349,34 @@ class TransformAW4(TransformA):
                     cute.autovec_copy(sA_i32[None, t128, m64, stage_idx], xw[None, m])
                     for w in cutlass.range_constexpr(sf_words):
                         sfw[w, m] = sAux_i32[sf_words * pair_slot + w, m64, stage_idx]
-            self._decode_block(xw, sfw, frag_i32, b, mma_m, consts)
+                    if const_expr(ts_words > 0):
+                        self.fmt.build_tile_state(sfw[None, m], consts, tstate[None, m])
+            if const_expr(self.promote and b == 1):
+                for m in cutlass.range_constexpr(mma_m):
+                    for w in cutlass.range_constexpr(sf_words):
+                        self._sfc[w, m] = sfw[w, m]
+            self._decode_block(
+                xw, tstate if const_expr(ts_words > 0) else sfw, frag_i32, b, mma_m, consts
+            )
 
         return copy_block
+
+    @cute.jit
+    def promote_acc(self, acc_slow, acc, zero_init: cutlass.Constexpr[bool] = False):
+        """The k-tile's fp32 promotion: acc_slow (+)= scale_row * acc, the
+        scale pair (row r, row r+8) from the strip word staged by
+        copy_block. Called by the mainloop after the tile's WGMMA drain."""
+        mma_m = const_expr(cute.size(acc.shape[1]))
+        for m in cutlass.range_constexpr(mma_m):
+            sf0, sf1 = self.fmt.promote_scale_pair(self._sfc[0, m])
+            for r in cutlass.range_constexpr(2):
+                acc_sl = acc_slow[(None, r, None), m, None]
+                wave_sl = acc[(None, r, None), m, None]
+                sf = sf0 if r == 0 else sf1
+                if const_expr(zero_init):
+                    acc_sl.store(wave_sl.load() * sf)
+                else:
+                    acc_sl.store(acc_sl.load() + wave_sl.load() * sf)
 
 
 # ---- fn-operand kinds --------------------------------------------------------

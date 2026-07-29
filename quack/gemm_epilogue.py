@@ -179,6 +179,7 @@ from quack.gemm_host import (
     GemmEpiPlan,
     build_gemm_epi_plan,
     register_local_epi_mod,
+    TORCH_OP_EPI_MODS,
     run_gemm_epi_plan,
 )
 from quack.gemm_config import GemmConfig, SplitKMode, blockscaled_default_config, default_config
@@ -1061,6 +1062,7 @@ class EpiMod:
         self._minted = {}
         self._plan_cache = {}
         self._call_cache = {}  # eager __call__ fast path: metadata -> launch recipe
+        TORCH_OP_EPI_MODS[self.semantic_digest] = self  # quack::gemm_epi resolution
 
     def __getstate__(self):
         # Shipped by value (cloudpickle) to async-compile workers when there
@@ -1121,8 +1123,9 @@ class EpiMod:
         prepass_sig=(),
         rounding=RoundingMode.RN,
         arg_forms=(),
+        add_to_output=False,  # trailing with default: old shorter mint_keys still resolve
     ):
-        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms)
+        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output)
         cls = self._minted.get(key)
         if cls is not None:
             return cls
@@ -1167,13 +1170,20 @@ class EpiMod:
         Args = NamedTuple("EpilogueArguments", arg_specs)
         Args.__new__.__defaults__ = (None,) * len(arg_specs)
         Args = mlir_namedtuple(Args)
+        # Class attribute, not a field: GemmBase reads epilogue_args.add_to_output
+        # (duck-typed) to pick the D TMA atom — "add" (cp.reduce.async.bulk,
+        # D += delta with no C load) vs "store". A plain bool on the class is
+        # trace-time constexpr and invisible to the FFI field walk.
+        Args.add_to_output = add_to_output
         cls_name = (
             f"GemmMod_{self._ident}_{'g' if paired_acc else ''}{'p' if packed_c else ''}_"
             f"{'_'.join(k for _, k in kind_sig) or 'none'}"
             f"{''.join(f'_{n}{f}' for n, f in arg_forms)}_sm{sm}"
-            # rounding is a call-time knob on an otherwise identical mint:
-            # it must distinguish the class name or remints collide.
+            # rounding / add_to_output are call-time knobs on an otherwise
+            # identical mint: they must distinguish the class name or remints
+            # collide.
             f"{'' if rounding == RoundingMode.RN else f'_r{int(rounding)}'}"
+            f"{'_ao' if add_to_output else ''}"
         )
         class_semantic_key = (self.semantic_digest, key)
         existing = getattr(sys.modules[__name__], cls_name, None)
@@ -1258,6 +1268,10 @@ class EpiMod:
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
         split_k: int = 1,  # K-dim split factor (SERIAL/PARALLEL only; see quack.gemm)
         split_k_mode: int = SplitKMode.SERIAL,
+        add_to_output: bool = False,  # D += result via the TMA reduce-add store atom
+        #                               (cp.reduce.async.bulk — no C load, half the
+        #                               accumulate traffic of C=D). The fn still
+        #                               returns the DELTA; requires C=None.
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
         # A-operand transform (SM90 RS mainloop). Value transforms leave the
         # call contract unchanged. Layout-owning (packed-weight) transforms
@@ -1329,6 +1343,20 @@ class EpiMod:
             A_bundle, A, arg_sf = A, A.blob, A.sf
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
+        if add_to_output:
+            import torch
+
+            if C is not None:
+                raise ValueError("add_to_output accumulates onto D (no C operand); pass C=None")
+            if D is None:
+                raise ValueError("add_to_output requires the D output tensor")
+            if varlen_m:
+                raise ValueError("add_to_output under varlen_m: not supported")
+            if D.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "add_to_output needs an f32/f16/bf16 D (cp.reduce.async.bulk add), "
+                    f"got {D.dtype}"
+                )
         if split_k > 1:
             split_k_mode = SplitKMode(split_k_mode)
             if split_k_mode == SplitKMode.SEPARATE:
@@ -1389,6 +1417,7 @@ class EpiMod:
             swap_ab,
             split_k,
             int(split_k_mode),
+            add_to_output,
             ag_args is not None,
             transform_key,
             # one slot for the transform's sf-side tensor: the W4 SF strip
@@ -1606,6 +1635,18 @@ class EpiMod:
             if sink_name not in epi_args:
                 raise ValueError(f"missing sink output buffer '{sink_name}'")
             op = self.sinks[sink_name]
+            validate = getattr(op, "host_validate", None)
+            if validate is not None:
+                validate(
+                    epi_args[sink_name],
+                    m=m,
+                    n=n_gemm,
+                    tile_M=tile_M,
+                    tile_N=tile_N,
+                    batch=batch,
+                    varlen_m=varlen_m,
+                    epi_args=epi_args,
+                )
             if hasattr(op, "dim"):
                 if op.dim == 0:
                     inner = (m, (n_gemm + tile_N - 1) // tile_N)
@@ -1698,6 +1739,7 @@ class EpiMod:
             prepass_sig,
             rounding_mode,
             arg_forms,
+            add_to_output,
         )
         GemmCls = self._mint(*mint_key)
         if owned_fmt is not None:
@@ -1785,9 +1827,14 @@ class EpiMod:
 
             fmt = transform_handle_fmt(transform_a)
             if fmt is not None:
-                from quack.gemm_w4 import _pick_w4_cfg
+                from quack.gemm_w4 import _pick_w4_cfg, _pick_w4a8_cfg
 
-                tm, tn, _sk = _pick_w4_cfg(A.shape[-2], B.shape[0] * 64, A.shape[-1] // fmt.tile_k)
+                if fmt.promote:
+                    tm, tn, _sk = _pick_w4a8_cfg(A.shape[-2], B.shape[0] * 64)
+                else:
+                    tm, tn, _sk = _pick_w4_cfg(
+                        A.shape[-2], B.shape[0] * 64, A.shape[-1] // fmt.tile_k
+                    )
                 return GemmConfig(
                     tile_m=tm,
                     tile_n=tn,
@@ -1831,7 +1878,13 @@ class EpiMod:
         for name, op in self.sinks.items():
             if epi_args.get(name) is not None:
                 continue
-            if op.dim == 0:
+            alloc = getattr(op, "sink_alloc_shape", None)
+            if alloc is not None:
+                # Config-independent full-vector sink (ColVecSelect). NOTE:
+                # rows the kernel never writes (out-of-range select indices)
+                # stay uninitialized — callers who care pass the buffer.
+                shape = (*lead[:-1], *alloc(lead[-1], n))
+            elif op.dim == 0:
                 shape = (*lead, -(-n // config.tile_n))
             else:
                 shape = (*lead[:-1], -(-lead[-1] // config.tile_m), n)
@@ -1853,8 +1906,9 @@ class EpiMod:
             else None
         )
         blockscaled = ctx.get("SFA") is not None
+        A_bundle = ctx.get("A_bundle")  # runtime-operand transform: A crosses bundled
         plan = self.gemm(
-            A,
+            A if A_bundle is None else A_bundle,
             ctx["B_d"],
             D,
             C,
@@ -1883,6 +1937,7 @@ class EpiMod:
             concat_layout=ctx.get("concat_layout"),
             transform_a=ctx.get("transform_a"),
             transform_sf=ctx.get("transform_sf"),
+            add_to_output=ctx.get("add_to_output", False),
             _launch=_launch,
         )
         return config, dyn, plan, sink_bufs
@@ -1910,6 +1965,11 @@ class EpiMod:
         concat_layout=None,  # tensors whose non-contiguous dim is concat [gate; up]
         transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
         transform_sf=None,  # layout-owning transform, B is the repacked blob
+        transform_operands=None,  # {name: tensor} for a runtime-operand transform_a
+        #                           (raw values; the bundle is built here from
+        #                           the resolved config's tile_M/tile_K)
+        add_to_output=False,  # D += result via the TMA reduce-add store atom (see
+        #                       EpiMod.gemm); requires out={"D": buf} and C=None
         **operands,  # epilogue operand tensors/scalars by fn-parameter name
     ):
         """Eager torch-facing call: resolve config (autotune via
@@ -1926,7 +1986,11 @@ class EpiMod:
 
         Under torch.compile the call records the single ``quack::gemm_epi``
         custom op (see quack.epi_torch_op); with reduce sinks the config is
-        pinned there (partials must be graph-allocated at exact shapes)."""
+        pinned there (partials must be graph-allocated at exact shapes).
+        transform_a rides the same op: the handle crosses by semantic digest
+        (bind it to a module global for cross-process graphs), runtime
+        operand tensors ride the op's input list, and the bundle is rebuilt
+        inside the op body."""
         import torch
 
         owned_fmt = None
@@ -1936,20 +2000,47 @@ class EpiMod:
 
             owned_fmt = transform_handle_fmt(transform_a)
             transform_key = transform_handle_key(transform_a)
-            if owned_fmt is None and getattr(transform_a, "args", ()):
-                raise NotImplementedError(
-                    "runtime-operand transforms: use mod.gemm(...) with A passed as the "
-                    "transform_a_operand(...) bundle (eager __call__ allocates from A's "
-                    "shape and cannot see through the bundle yet)"
+        # Runtime-operand transforms: the torch-facing surface takes the RAW
+        # operand tensors and builds the TransformAOperand bundle itself from
+        # the resolved config's tiles (bundles — whose views bake tile_M/
+        # tile_K — stay a mod.gemm/direct-layer contract).
+        needs_transform_operands = (
+            transform_a is not None and owned_fmt is None and bool(getattr(transform_a, "args", ()))
+        )
+        if needs_transform_operands:
+            from quack.operand_transform.transform_a import TransformAOperand
+
+            if isinstance(A, TransformAOperand):
+                raise ValueError(
+                    "__call__ builds the operand bundle itself from the resolved config: "
+                    "pass the plain (M, K) A plus transform_operands={name: tensor} "
+                    "(pre-built bundles go to mod.gemm)"
                 )
+            if not transform_operands:
+                raise ValueError(
+                    f"transform_a {getattr(transform_a, 'name', transform_a)!r} declares "
+                    "runtime operands: pass transform_operands={name: tensor}"
+                )
+        elif transform_operands:
+            raise ValueError("transform_operands requires a transform_a with declared args")
+        if add_to_output:
+            # The accumulator must be caller-provided: an auto-allocated D
+            # would reduce-add onto garbage.
+            if C is not None:
+                raise ValueError("add_to_output accumulates onto D (no C operand); pass C=None")
+            if not store_d or out is None or out.get("D") is None:
+                raise ValueError('add_to_output requires the accumulator as out={"D": buf}')
 
         if torch.compiler.is_compiling():
             if dynamic_scheduler or epi_key_overrides is not None:
                 raise NotImplementedError(
                     "dynamic_scheduler/epi_key_overrides under torch.compile: not supported yet"
                 )
-            if transform_a is not None:
-                raise NotImplementedError("transform_a under torch.compile: not supported yet")
+            if transform_a is not None and not hasattr(transform_a, "semantic_digest"):
+                raise NotImplementedError(
+                    "transform_a under torch.compile needs a digest-carrying handle "
+                    "(@a_transform / dropout_a / w4_transform)"
+                )
             from quack.epi_torch_op import compile_call
 
             return compile_call(
@@ -1970,6 +2061,10 @@ class EpiMod:
                 bs_format_b=bs_format_b,
                 rounding_mode=rounding_mode,
                 operands=operands,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+                transform_operands=transform_operands,
+                add_to_output=add_to_output,
             )
 
         # ── Eager warm fast path: one metadata key -> captured launch recipe.
@@ -2012,6 +2107,7 @@ class EpiMod:
                 None if epi_key_overrides is None else tuple(sorted(epi_key_overrides.items())),
                 transform_key,
                 tensor_key(transform_sf),
+                add_to_output,
             )
             entry = self._call_cache.get(ck)
             if entry is not None:
@@ -2070,6 +2166,7 @@ class EpiMod:
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
             and transform_a is None  # transform-aware autotune: not wired yet
+            and not add_to_output  # ditto for the reduce-add D mint
         )
         if use_tuner:
             from quack.epi_autotune import sink_arg_shapes, tuned_mod_gemm
@@ -2133,6 +2230,7 @@ class EpiMod:
                 concat_layout=concat_layout,
                 transform_a=transform_a,
                 transform_sf=transform_sf,
+                add_to_output=add_to_output,
             )
             if config is not None:
                 cfg = config
@@ -2140,6 +2238,14 @@ class EpiMod:
                 cfg = blockscaled_default_config(A.shape[-2], n)
             else:
                 cfg = self._default_config(A, B, transform_a)
+            if needs_transform_operands:
+                from quack.operand_transform.host import transform_a_operand
+
+                # tile_K None resolves to the 16-bit kernel default (64) —
+                # mirrors build_gemm_epi_plan's transform-fake fallback.
+                ctx["A_bundle"] = transform_a_operand(
+                    transform_a, A, transform_operands, cfg.tile_m, cfg.tile_k or 64
+                )
             _, _, plan_used, sink_bufs = self._iface_execute(cfg, dynamic_scheduler, ctx)
             cfg_used = cfg
         if ck is not None:
@@ -2190,6 +2296,8 @@ class EpiMod:
         epi_key_overrides=None,
         transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
         transform_sf=None,  # layout-owning transform, B is the repacked blob
+        transform_operands=None,  # {name: tensor}, as in __call__ (bundle built here)
+        add_to_output=False,  # D += result via the TMA reduce-add store atom (see EpiMod.gemm)
         **operands,
     ):
         """Resolve (and compile on a cold cache) WITHOUT launching; returns an
@@ -2207,14 +2315,25 @@ class EpiMod:
             if out.get(name) is None:
                 raise ValueError(f"plan() requires a buffer for output {name!r}")
         n = B.shape[-1]
+        A_bundle = None
         if transform_a is not None:
-            from quack.operand_transform.host import transform_handle_fmt
+            from quack.operand_transform.host import transform_a_operand, transform_handle_fmt
 
             if transform_handle_fmt(transform_a) is not None:
                 B_d = B  # the blob crosses kernel-native
                 n = B.shape[0] * 64
+            elif getattr(transform_a, "args", ()):
+                if not transform_operands:
+                    raise ValueError(
+                        f"transform_a {getattr(transform_a, 'name', transform_a)!r} declares "
+                        "runtime operands: pass transform_operands={name: tensor}"
+                    )
+                A_bundle = transform_a_operand(
+                    transform_a, A, transform_operands, cfg.tile_m, cfg.tile_k or 64
+                )
         ctx = dict(
             A=A,
+            A_bundle=A_bundle,
             B_d=B_d,
             C=C,
             D=D,
@@ -2233,6 +2352,7 @@ class EpiMod:
             epi_key_overrides=epi_key_overrides,
             transform_a=transform_a,
             transform_sf=transform_sf,
+            add_to_output=add_to_output,
         )
         _, _, gemm_plan, sink_bufs = self._iface_execute(cfg, dyn, ctx, _launch=False)
         return EpiPlan(

@@ -524,7 +524,10 @@ def test_a_transform_args_epi_mod_gemm():
     mod.gemm: A crosses as the transform_a_operand bundle and the epilogue
     runs on the strip-rescaled accumulator — the LCE dx pattern (colvec_ktile
     strip + fused per-row fp32 v multiply). Bitwise vs the same epi mod on
-    host-prescaled A. The eager __call__ surface rejects the bundle."""
+    host-prescaled A. The eager __call__ surface takes the RAW operand
+    tensors (transform_operands=) and builds the bundle itself from the
+    resolved config; pre-built bundles there are rejected."""
+    from quack.gemm_config import GemmConfig
     from quack.gemm_epilogue import gemm_epilogue
     from quack.operand_transform.host import transform_a_operand
 
@@ -549,8 +552,118 @@ def test_a_transform_args_epi_mod_gemm():
     assert torch.equal(D_t, D_ref), "strip transform + colvec epi not bitwise vs prescaled A"
     with pytest.raises(ValueError, match="runtime operands"):
         _vscale.gemm(A, B, D_t, transform_a=_colvec_ktile_scale_a, **kw)
-    with pytest.raises(NotImplementedError, match="runtime-operand"):
-        _vscale(bundle, B.mT, transform_a=_colvec_ktile_scale_a, v=v)
+    # eager __call__: raw operands in, bundle built from the (pinned) config
+    cfg = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        tile_k=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+    )
+    out = _vscale(
+        A,
+        B.mT,
+        transform_a=_colvec_ktile_scale_a,
+        transform_operands={"u": strip},
+        config=cfg,
+        v=v,
+    )
+    assert torch.equal(out["D"], D_ref), "__call__ transform_operands not bitwise vs mod.gemm"
+    with pytest.raises(ValueError, match="bundle"):
+        _vscale(bundle, B.mT, transform_a=_colvec_ktile_scale_a, config=cfg, v=v)
+    with pytest.raises(ValueError, match="runtime operands"):
+        _vscale(A, B.mT, transform_a=_colvec_ktile_scale_a, config=cfg, v=v)
+    with pytest.raises(ValueError, match="transform_operands requires"):
+        _vscale(A, B.mT, transform_operands={"u": strip}, config=cfg, v=v)
+
+
+def test_a_transform_torch_compile():
+    """transform_a under torch.compile rides the single quack::gemm_epi op:
+    the handle crosses by semantic digest, runtime operand tensors ride the
+    op's input list (ta__<name>), and the op body rebuilds the bundle —
+    numerics match eager exactly (same kernels either way)."""
+    from quack.gemm_config import GemmConfig
+    from quack.gemm_epilogue import gemm_epilogue
+
+    @gemm_epilogue()
+    def _vscale_c(acc, v):
+        return {"D": acc * v}
+
+    m, n, k = 384, 256, 512
+    A, B, strip, _A_pre = _make_colvec_strip_case(m, n, k, tile_k=64, seed=17)
+    Bkn = B.mT.contiguous()  # (k, n) torch convention for __call__
+    v = torch.rand(1, m, device="cuda", dtype=torch.float32) + 0.5
+    cfg = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        tile_k=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+    )
+
+    # value transform (no runtime operands) + runtime-operand strip transform
+    def f(A, Bkn, strip, v):
+        d_halve = _vscale_c(A, Bkn, transform_a=_halve_a, config=cfg, v=v)["D"]
+        d_strip = _vscale_c(
+            A,
+            Bkn,
+            transform_a=_colvec_ktile_scale_a,
+            transform_operands={"u": strip},
+            config=cfg,
+            v=v,
+        )["D"]
+        return d_halve, d_strip
+
+    eager_h, eager_s = f(A, Bkn, strip, v)
+    cf = torch.compile(f, fullgraph=True, dynamic=False)
+    comp_h, comp_s = cf(A, Bkn, strip, v)
+    assert torch.equal(comp_h, eager_h), "value transform under compile != eager"
+    assert torch.equal(comp_s, eager_s), "strip transform under compile != eager"
+    # graph replay on fresh data
+    A2, _, strip2, _ = _make_colvec_strip_case(m, n, k, tile_k=64, seed=18)
+    comp_h2, comp_s2 = cf(A2, Bkn, strip2, v)
+    eager_h2, eager_s2 = f(A2, Bkn, strip2, v)
+    assert torch.equal(comp_h2, eager_h2) and torch.equal(comp_s2, eager_s2)
+
+
+def test_a_transform_dropout_torch_compile():
+    """Dropout on A under torch.compile: the seed tensor rides the op input
+    list like any runtime operand; the mask is a pure function of (m, k,
+    seed, offset) so compiled == eager bitwise."""
+    from quack.gemm_config import GemmConfig
+    from quack.epilogues import identity_epi
+    from quack.operand_transform import dropout_a
+
+    torch.manual_seed(11)
+    m, k = 256, 512
+    A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k)
+    Ikn = torch.eye(k, device="cuda", dtype=torch.bfloat16)  # (k, n=k): D = mask ⊙ A
+    seed = torch.tensor([1234, 0], device="cuda", dtype=torch.int64)
+    drop = dropout_a(0.5)
+    cfg = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        tile_k=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+    )
+
+    def f(A, Ikn, seed):
+        return identity_epi(
+            A, Ikn, transform_a=drop, transform_operands={"seed": seed}, config=cfg
+        )["D"]
+
+    eager = f(A, Ikn, seed)
+    comp = torch.compile(f, fullgraph=True, dynamic=False)(A, Ikn, seed)
+    assert torch.equal(comp, eager), "dropout transform under compile != eager"
+    kept = (eager != 0).float().mean().item()
+    assert 0.4 < kept < 0.6, f"keep rate {kept} inconsistent with p=0.5"
 
 
 def test_a_transform_epi_mod_composition():

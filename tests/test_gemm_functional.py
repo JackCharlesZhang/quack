@@ -37,7 +37,6 @@ def test_gemm_add_functional_parity():
 
 @requires_sm90
 def test_gemm_add_functional_fp32_residual():
-    """The trainstation seam: bf16 gemm operands, fp32 residual C, fp32 out."""
     A, B, C = _abc(c_dtype=torch.float32)
     out = torch.ops.quack.gemm_add(A, B, C, out_dtype=torch.float32, tuned=False)
     assert out.dtype == torch.float32

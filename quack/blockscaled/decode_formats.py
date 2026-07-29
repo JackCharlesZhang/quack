@@ -70,6 +70,15 @@ class DecodeFormat:
     index then runs 0..7).
     ``sf_words``: i32 scale words per thread slot per k-tile (0 = no strip);
     the strip is 128 * sf_words bytes per m64 block.
+    ``promote``: slow-accum format (W4A8): the group scale is NOT folded in
+    the decode — the mainloop WGMMAs each k-tile into a zero-init wave
+    accumulator and the transform promotes ``acc += scale_row * wave`` in
+    fp32 at tile end, reading the strip word via ``promote_scale_pair``.
+    ``tile_state_words``: per-(m-atom, k-tile) register state derived from
+    the strip words once per tile — ``build_tile_state(sfw, consts, ts)``
+    fills the (tile_state_words,) i32 slice at each tile's block-0 produce,
+    and ``decode_k16`` receives ``ts`` in place of ``sfw`` (e.g. the folded
+    W4A8's per-row scaled magnitude tables).
 
     Host contract: ``quantize_reference(w) -> (q, sf)``,
     ``dequant_reference(q, sf) -> w'`` (fp32), and ``prepare(q, sf) ->
@@ -82,8 +91,10 @@ class DecodeFormat:
     w8 = False
     tile_k = 64
     sf_words = 0
+    promote = False
+    tile_state_words = 0
     # the MMA compute dtype decode_k16 produces (the gemm ctor a_dtype);
-    # bf16 for the whole W4A16 family, e4m3 for a future w4a8
+    # bf16 for the whole W4A16 family, e4m3 for w4a8 (int4sm)
     mma_dtype = cutlass.BFloat16
 
     @property
@@ -213,6 +224,97 @@ class Int4Awq(DecodeFormat):
             scales = torch.cat([scales, scales.new_ones(pad, scales.shape[1])])
             zeros = torch.cat([zeros, zeros.new_full((pad, zeros.shape[1]), 8)])
         return U.repack_int4_weight(q), U.repack_int4_awq_sf(scales, zeros, q.shape[1] * 2)
+
+
+class Int4Sm(DecodeFormat):
+    """W4A8: sign-magnitude int4 g128 weights x e4m3 per-token activations.
+    Decodes raw integers -8..7 to e4m3 (prmt LUT + sign planes, EXACT — no
+    scale fold: the 8-bit product grid can't hold it), fp8 QGMMA per k32
+    block, and the group scale promotes in fp32 at k-tile end (tile_k 128 ==
+    group, so it's constant per tile). ``b`` indexes k32 blocks: two raw
+    words each, four e4m3x4 fragment registers out — the same slot order as
+    the bf16 formats' k16 blocks. The per-token activation scale is an
+    output-column factor applied in the epilogue (see gemm_w4.gemm_w4a8)."""
+
+    name = "int4sm"
+    tile_k = 128
+    sf_words = 1
+    mma_dtype = cutlass.Float8E4M3FN
+    promote = True
+
+    def make_consts(self):
+        return U.make_e4m3_luts()
+
+    @cute.jit
+    def decode_k16(self, xw, sfw, b, consts):
+        r0, r1 = U.decode_i4smx8_to_e4m3x8(xw[2 * b], consts)
+        r2, r3 = U.decode_i4smx8_to_e4m3x8(xw[2 * b + 1], consts)
+        return r0, r1, r2, r3
+
+    @cute.jit
+    def promote_scale_pair(self, sfp):
+        """Strip word = the (sf_r, sf_r8) bf16 pair -> two exact f32."""
+        sf0 = U.i32_as_f32(sfp << 16)
+        sf1 = U.i32_as_f32(sfp & cutlass.Int32(U._s32(0xFFFF0000)))
+        return sf0, sf1
+
+    def quantize_reference(self, w):
+        return U.quantize_int4sm_reference(w)
+
+    def dequant_reference(self, q, sf):
+        return U.dequant_int4sm_reference(q, sf)
+
+    def prepare(self, q, sf):
+        q, sf = _pad_n128(q, sf)
+        return U.repack_w4a8_weight(q), U.repack_w4a8_sf(sf, q.shape[1] * 2)
+
+
+class Int4SmFold(DecodeFormat):
+    """Folded (no-drain) W4A8: same blob as int4sm, but the group scale is
+    folded INTO the e4m3 decode via per-(row, k-tile) scaled magnitude
+    tables rebuilt from the exact bf16 strip scale at each tile's block 0
+    (build_tile_state: 6 FMUL + 2 packed cvts per row, amortized over 64
+    values) — the per-word decode cost is identical to int4sm. No promote:
+    the kernel runs the plain fast-accum fp8 mainloop at full pipelining.
+    Accuracy: ONE e4m3 rounding of m * sf per weight (~2^-4 rel worst case)
+    + the fast-accum fp8 chain; the exact alternative is int4sm. The
+    channel scale from fold_int4sm_scales (|7 sf| <= 448 normalization) and
+    the per-token act scale are epilogue vec factors (gemm_w4.gemm_w4a8)."""
+
+    name = "int4smf"
+    tile_k = 128
+    sf_words = 1
+    tile_state_words = 4
+    mma_dtype = cutlass.Float8E4M3FN
+
+    def make_consts(self):
+        return None
+
+    @cute.jit
+    def build_tile_state(self, sfw, consts, ts):
+        sf0 = U.i32_as_f32(sfw[0] << 16)
+        sf1 = U.i32_as_f32(sfw[0] & cutlass.Int32(U._s32(0xFFFF0000)))
+        ts[0], ts[1] = U.build_i4sm_scaled_luts(sf0)
+        ts[2], ts[3] = U.build_i4sm_scaled_luts(sf1)
+
+    @cute.jit
+    def decode_k16(self, xw, ts, b, consts):
+        r0, r1 = U.decode_i4smx8_scaled_e4m3x8(xw[2 * b], ts[0], ts[1], ts[2], ts[3])
+        r2, r3 = U.decode_i4smx8_scaled_e4m3x8(xw[2 * b + 1], ts[0], ts[1], ts[2], ts[3])
+        return r0, r1, r2, r3
+
+    def quantize_reference(self, w):
+        q, sf = U.quantize_int4sm_reference(w)
+        return q, U.fold_int4sm_scales(sf)
+
+    def dequant_reference(self, q, sf):
+        sf_folded, chan = sf
+        return U.dequant_int4smf_reference(q, sf_folded, chan)
+
+    def prepare(self, q, sf):
+        sf_folded, chan = sf
+        q, sf_folded = _pad_n128(q, sf_folded)
+        return U.repack_w4a8_weight(q), U.repack_w4a8_sf(sf_folded, q.shape[1] * 2)
 
 
 class Mxfp4(DecodeFormat):
@@ -400,6 +502,8 @@ W4_FORMATS = {
         Int4(group=64),
         Int4(group=32),
         Int4Awq(),
+        Int4Sm(),
+        Int4SmFold(),
         Mxfp4(),
         Int8(),
         Fp8(),

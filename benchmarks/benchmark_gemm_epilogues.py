@@ -222,6 +222,8 @@ def _parse_epi_args(specs: list[str], dims: dict) -> dict:
         fill = parts[2] if len(parts) > 2 else "randn"
         if fill == "randn" and dtype.is_floating_point:
             out[name] = torch.randn(shape, device="cuda", dtype=dtype)
+        elif fill == "randint":  # uniform over [0, N) — column-index args (targets)
+            out[name] = torch.randint(0, dims["n"], shape, device="cuda", dtype=dtype)
         elif fill in ("zeros", "randn"):  # randn on int dtypes degrades to zeros
             out[name] = torch.zeros(shape, device="cuda", dtype=dtype)
         elif fill == "ones":
@@ -229,7 +231,7 @@ def _parse_epi_args(specs: list[str], dims: dict) -> dict:
         elif fill == "empty":
             out[name] = torch.empty(shape, device="cuda", dtype=dtype)
         else:
-            raise ValueError(f"--epi-arg fill must be randn|zeros|ones|empty, got {fill!r}")
+            raise ValueError(f"--epi-arg fill must be randn|randint|zeros|ones|empty, got {fill!r}")
     return out
 
 

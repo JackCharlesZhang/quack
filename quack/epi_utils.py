@@ -17,9 +17,11 @@ def assume_stride_divisibility(tensor):
     """
     if tensor is None:
         return None
+    divby = 32 // tensor.element_type.width
+    if divby <= 1:  # >= 32-bit elements: nothing to assume
+        return tensor
     new_stride = tuple(
-        cute.assume(s, divby=32 // tensor.element_type.width) if not cute.is_static(s) else s
-        for s in tensor.stride
+        cute.assume(s, divby=divby) if not cute.is_static(s) else s for s in tensor.stride
     )
     return cute.make_tensor(tensor.iterator, cute.make_layout(tensor.shape, stride=new_stride))
 

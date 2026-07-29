@@ -72,6 +72,11 @@ LUT_LO_A, LUT_LO_B = _pack_table(_BF16_MAG_LO)
 LUT_HI_A, LUT_HI_B = _pack_table(_BF16_MAG_HI)
 _SIGN_MASK = _s32(0x80808080)
 
+# e4m3 byte patterns of integer magnitudes 0..7 for the sign-magnitude int4
+# (W4A8) decode: [0, 1, 2, 3, 4, 5, 6, 7]
+_E4M3_MAG = [0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C, 0x4E]
+E4M3_LUT_A, E4M3_LUT_B = _pack_table(_E4M3_MAG)
+
 
 # ---------------------------------------------------------------------------
 # Host-side repack
@@ -226,6 +231,94 @@ def dequant_int4_reference(packed: torch.Tensor, scales: torch.Tensor, group: in
     hi = (packed >> 4).float() - 8.0
     vals = torch.stack([lo, hi], dim=-1).view(n, kb * 2)
     return vals * scales.float().repeat_interleave(group, dim=1)
+
+
+def quantize_int4sm_reference(w: torch.Tensor, group: int = 128):
+    """(N, K) float -> sign-magnitude int4 packed (N, K/2) + bf16 scales
+    (N, K/group). Nibble = sign<<3 | mag, range [-7, 7] (symmetric)."""
+    n, k = w.shape
+    assert k % group == 0
+    wb = w.float().view(n, k // group, group)
+    scale = (wb.abs().amax(dim=-1) / 7.0).clamp(min=1e-8).to(torch.bfloat16)
+    q = torch.clamp(torch.round(wb / scale.float()[..., None]), -7, 7).view(n, k)
+    code = (q.abs().to(torch.uint8) | ((q < 0).to(torch.uint8) << 3)).view(n, k)
+    packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
+    return packed, scale
+
+
+def dequant_int4sm_reference(packed: torch.Tensor, scales: torch.Tensor, group: int = 128):
+    n, kb = packed.shape
+    lut = torch.tensor(
+        [float(v) for v in range(8)] + [-float(v) for v in range(8)], device=packed.device
+    )
+    vals = torch.stack([lut[(packed & 0xF).long()], lut[(packed >> 4).long()]], dim=-1).view(
+        n, kb * 2
+    )
+    return vals * scales.float().repeat_interleave(group, dim=1)
+
+
+def repack_w4a8_weight(w_packed: torch.Tensor) -> torch.Tensor:
+    """(M, K/2) packed sign-mag int4 -> (M/64, K/128, 128, 32) blob for the
+    fp8 RS fragment: thread t = 32w+l, R_p of k32-block b holds 4 consecutive
+    k at row 16w+l//4+8*(p%2), k = 32b + 4*(l%4) + 16*(p//2)."""
+    assert w_packed.dtype == torch.uint8 and w_packed.dim() == 2
+    m, kb = w_packed.shape
+    assert m % 64 == 0 and kb % 64 == 0  # K % 128 == 0
+    g, kt = m // 64, kb // 64
+    dev = w_packed.device
+    t = torch.arange(128, device=dev)
+    j = torch.arange(32, device=dev)  # byte within thread
+    b, p, e = j >> 3, (j >> 1) & 3, j & 1  # k32 block, register, byte-of-pair
+    r16 = 16 * (t >> 5) + (t & 31) // 4
+    c = t & 3
+    row = r16[:, None] + 8 * (p % 2)[None, :]
+    col = 16 * b[None, :] + 2 * c[:, None] + 8 * (p >> 1)[None, :] + e[None, :]
+    rows = 64 * torch.arange(g, device=dev)[:, None, None, None] + row[None, None]
+    cols = 64 * torch.arange(kt, device=dev)[None, :, None, None] + col[None, None]
+    return w_packed[rows, cols].contiguous()
+
+
+def repack_w4a8_sf(scales: torch.Tensor, k: int) -> torch.Tensor:
+    """(N, K/128) bf16 group scales -> (N/64, K/128, 32, 2) strip (one scale
+    per row per 128-wide k-tile; slots as in repack_int4_sf)."""
+    assert scales.dtype == torch.bfloat16
+    m, ng = scales.shape
+    assert m % 64 == 0 and ng == k // 128
+    g, kt = m // 64, k // 128
+    dev = scales.device
+    ss = torch.arange(32, device=dev)
+    r = 16 * (ss >> 3) + (ss & 7)
+    rows = (
+        64 * torch.arange(g, device=dev)[:, None, None, None]
+        + r[None, None, :, None]
+        + 8 * torch.arange(2, device=dev)[None, None, None, :]
+    )
+    cols = torch.arange(kt, device=dev)[None, :, None, None]
+    return scales[rows, cols].contiguous()
+
+
+def fold_int4sm_scales(scales: torch.Tensor):
+    """(N, K/g) bf16 group scales -> (folded bf16 scales, (N,) fp32 channel
+    scales) with 7 * folded <= 448 so every scaled magnitude m * sf fits
+    e4m3 (the satfinite cvt in the table build never clips)."""
+    s = scales.float()
+    chan = (s.amax(dim=1) * (7.0 / 448.0)).clamp(min=1e-30)
+    return (s / chan[:, None]).to(torch.bfloat16), chan
+
+
+def dequant_int4smf_reference(packed: torch.Tensor, sf_folded: torch.Tensor, chan: torch.Tensor):
+    """Folded-W4A8 dequant: the kernel's e4m3 rounding of m * sf (single
+    rounding — the fold's only loss) times the fp32 channel scale."""
+    n, kb = packed.shape
+    lut = torch.tensor(
+        [float(v) for v in range(8)] + [-float(v) for v in range(8)], device=packed.device
+    )
+    vals = torch.stack([lut[(packed & 0xF).long()], lut[(packed >> 4).long()]], dim=-1).view(
+        n, kb * 2
+    )
+    group = kb * 2 // sf_folded.shape[1]
+    scaled = (vals * sf_folded.float().repeat_interleave(group, dim=1)).to(torch.float8_e4m3fn)
+    return scaled.float() * chan.float()[:, None]
 
 
 def quantize_mxfp4_reference(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -677,6 +770,93 @@ def decode_u4b8x8_to_bf16x8(x: Int32, consts) -> Tuple[Int32, Int32, Int32, Int3
         add_bf16x2(t2, bias),
         add_bf16x2(t3, bias),
     )
+
+
+def make_e4m3_luts():
+    return (mov_b32_vreg(E4M3_LUT_A), mov_b32_vreg(E4M3_LUT_B))
+
+
+@cute.jit
+def decode_i4smx8_to_e4m3x8(x: Int32, luts) -> Tuple[Int32, Int32]:
+    """8 sign-magnitude int4 nibbles -> 8 e4m3 bytes (2 i32): magnitude via
+    prmt LUT, sign planes exactly as in the e2m1 decode."""
+    lut_a, lut_b = luts
+    xm = x & Int32(_s32(0x77777777))
+    lo = prmt(lut_a, lut_b, xm)
+    hi = prmt(lut_a, lut_b, xm >> 16)
+    se = x << 4
+    s_lo = prmt(se, x, Int32(0x5140))
+    s_hi = prmt(se, x, Int32(0x7362))
+    return (
+        lop3_or_and(lo, s_lo, Int32(_SIGN_MASK)),
+        lop3_or_and(hi, s_hi, Int32(_SIGN_MASK)),
+    )
+
+
+@dsl_user_op
+def e4m3x4_pack_f32(v0, v1, v2, v3, *, loc=None, ip=None) -> Int32:
+    """Four f32 -> one i32 of e4m3 bytes [v0, v1, v2, v3] (v0 lowest), RN
+    satfinite (cvt.rn.satfinite.e4m3x2.f32 d, a, b packs d = [b, a])."""
+    from cutlass import Float32
+
+    args = [Float32(v).ir_value(loc=loc, ip=ip) for v in (v0, v1, v2, v3)]
+    res = llvm.inline_asm(
+        T.i32(),
+        args,
+        "{.reg .b16 lo, hi; cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;"
+        " cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3; mov.b32 $0, {lo, hi};}",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(res)
+
+
+@cute.jit
+def build_i4sm_scaled_luts(sf: "Float32"):
+    """The row's scaled magnitude tables for the folded W4A8 decode:
+    (bytes [e4m3(0), e4m3(sf), e4m3(2 sf), e4m3(3 sf)],
+     bytes [e4m3(4 sf) .. e4m3(7 sf)]). m * sf is exact in f32 (3-bit int x
+    bf16), so each table byte is the correctly-RN-rounded product — the
+    fold's single rounding."""
+    from cutlass import Float32
+
+    tbl_a = e4m3x4_pack_f32(Float32(0.0), sf, sf * 2.0, sf * 3.0)
+    tbl_b = e4m3x4_pack_f32(sf * 4.0, sf * 5.0, sf * 6.0, sf * 7.0)
+    return tbl_a, tbl_b
+
+
+@cute.jit
+def decode_i4smx8_scaled_e4m3x8(x: Int32, ta_r, tb_r, ta_r8, tb_r8) -> Tuple[Int32, Int32]:
+    """decode_i4smx8_to_e4m3x8 with per-row SCALED tables (folded W4A8): the
+    raw word's low nibbles are all row r and the high nibbles all row r+8
+    (repack byte order), so per-row tables cost zero extra ops."""
+    xm = x & Int32(_s32(0x77777777))
+    lo = prmt(ta_r, tb_r, xm)
+    hi = prmt(ta_r8, tb_r8, xm >> 16)
+    se = x << 4
+    s_lo = prmt(se, x, Int32(0x5140))
+    s_hi = prmt(se, x, Int32(0x7362))
+    return (
+        lop3_or_and(lo, s_lo, Int32(_SIGN_MASK)),
+        lop3_or_and(hi, s_hi, Int32(_SIGN_MASK)),
+    )
+
+
+@dsl_user_op
+def i32_as_f32(v: Int32, *, loc=None, ip=None):
+    """Bitcast an Int32 register to Float32 (a plain mov)."""
+    res = llvm.inline_asm(
+        T.f32(),
+        [Int32(v).ir_value(loc=loc, ip=ip)],
+        "mov.b32 $0, $1;",
+        "=f,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(res)
 
 
 @dsl_user_op

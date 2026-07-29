@@ -97,9 +97,17 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     min_tile_m = min(c.tile_m for c in cfgs)
     shapes = {}
     for name, op in mod.sinks.items():
-        if not hasattr(op, "dim"):
+        alloc = getattr(op, "sink_alloc_shape", None)
+        if alloc is not None:
+            # Config-independent full-vector sink (ColVecSelect): no per-config
+            # slicing (_slice_sinks skips ops without ``dim``).
+            inner = alloc(m, n_gemm)
+        elif not hasattr(op, "dim"):
             continue
-        inner = (m, _cdiv(n_gemm, min_tile_n)) if op.dim == 0 else (_cdiv(m, min_tile_m), n_gemm)
+        elif op.dim == 0:
+            inner = (m, _cdiv(n_gemm, min_tile_n))
+        else:
+            inner = (_cdiv(m, min_tile_m), n_gemm)
         shapes[name] = inner if l is None else (l, *inner)
     return shapes
 

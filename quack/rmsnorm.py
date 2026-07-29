@@ -1363,7 +1363,7 @@ def rmsnorm_bwd(
     # plain-dense fast path -> the functional ops: identical eager behavior,
     # but under torch.compile the graph gets one insertable node per site
     # instead of empties + an auto_functionalized cluster (which downstream
-    # graph passes must never mutate — see trainstation's hard rule)
+    # graph passes must never mutate)
     if not per_head and weight is not None and not has_bias and x.numel() > 0:
         sm_count = get_sm_count(N, device)
         if dresidual_out is not None and dresidual_out.dtype != x.dtype:
