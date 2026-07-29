@@ -10,6 +10,7 @@ from cutlass import Int32, Float32, Float4E2M1FN
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
@@ -212,24 +213,6 @@ def validate_blockscaled_sf(
             f"got {SF.stride()[-3:]}"
         )
     return sf_dtype, sf_vec_size
-
-
-def div_for_dtype(dtype):
-    """16-byte alignment: divisibility in elements = 128 // dtype_width_bits."""
-    return 128 // dtype.width
-
-
-def fake_batched(dtype, x, y, l, leading_dim, divisibility):
-    """Batch-first (l, x, y) fake tensor; ``leading_dim`` indexes into (x, y).
-
-    Batched tensors cross the FFI boundary in the caller's natural torch order
-    (l, x, y) and the kernel rotates them to (x, y, l) at trace time
-    (GemmBase.rotate_batch_last), so the batch dim always prepends — hence the
-    ``+ 1``. Pass ``l=None`` for a varlen-flattened 2D (x, y) tensor.
-    """
-    if l is None:
-        return fake_tensor(dtype, (x, y), leading_dim=leading_dim, divisibility=divisibility)
-    return fake_tensor(dtype, (l, x, y), leading_dim=leading_dim + 1, divisibility=divisibility)
 
 
 def get_major(t, dim0, dim1):

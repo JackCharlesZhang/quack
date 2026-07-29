@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Han Guo, Tri Dao.
 """Ready-to-use fused-GEMM epilogues, written with the @gemm_epilogue fn
-contract (quack.gemm_epilogue) on top of the EpiOp library (quack.epi_ops).
+contract (quack.epilogue.frontend) on top of the EpiOp library (quack.epilogue.ops).
 
 Each entry is a plain function over the accumulator plus declared resources;
 kernels are minted/cached per (fn source, op config, tensor metadata). Pass
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import functools
 
-import cutlass.cute as cute
 
 from cutlass import Int32
 
@@ -42,7 +41,7 @@ from quack.activation import (
     relu_sq,
     swiglu,
 )
-from quack.epi_ops import (
+from quack.epilogue.ops import (
     ColVecLoad,
     ColVecReduce,
     ColVecSelect,
@@ -53,7 +52,8 @@ from quack.epi_ops import (
 )
 from quack.epilogue.head_rmsnorm import HeadRstd
 from quack.epilogue.rotary import rotary_cos_sin_load
-from quack.gemm_epilogue import F2, gemm_epilogue, pack, unpack
+from quack.epilogue.math import pack, pexp, unpack
+from quack.epilogue.frontend import gemm_epilogue
 
 
 @gemm_epilogue(outputs=("postact",))
@@ -187,15 +187,6 @@ def rope_epi(acc, table):
     x1, x2 = unpack(acc)
     cos, sin = unpack(table)
     return {"D": pack(x1 * cos - x2 * sin, x1 * sin + x2 * cos)}
-
-
-def pexp(v):
-    """Tuple-polymorphic exp, activation.py-style: raw cute.math fns are not
-    F2-aware, so mods needing transcendentals wrap them like this (candidate
-    for a shared quack epi-math module)."""
-    if isinstance(v, tuple):
-        return F2(*cute.arch.exp_packed_f32x2(v))
-    return cute.math.exp(v, fastmath=True)
 
 
 @gemm_epilogue(reduces={"sexp": ColVecReduce("sexp")})
@@ -454,7 +445,7 @@ def _gen_epi_fn(fname, tag, params, body, ns):
     lines += [f"    {ln}" for ln in body]
     src = "\n".join(lines)
     code = compile(src, f"<quack-epilogue:{tag}>", "exec")
-    ns = {**ns, "unpack": unpack, "pack": pack, "__name__": "quack.epilogues_generated"}
+    ns = {**ns, "unpack": unpack, "pack": pack, "__name__": "quack.epilogue.library_generated"}
     exec(code, ns)
     return ns[fname]
 

@@ -14,7 +14,7 @@ from quack.cute_dsl_utils import (
     torch2cute_dtype_map,
 )
 from quack.rounding import RoundingMode
-from quack.epi_ops import TileStore
+from quack.epilogue.ops import TileStore
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90

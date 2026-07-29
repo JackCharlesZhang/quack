@@ -1,4 +1,4 @@
-"""Tests for the generic @gemm_epilogue mod autotuner (quack.epi_autotune).
+"""Tests for the generic @gemm_epilogue mod autotuner (quack.gemm_runtime.autotune).
 
 Small shapes, injected 2-3 config sweeps (monkeypatched _config_space) so the
 suite stays fast; the full-space sweep is exercised by the llama block harness.
@@ -9,10 +9,10 @@ import math
 import pytest
 import torch
 
-import quack.epi_autotune as epi_autotune
+import quack.gemm_runtime.autotune as epi_autotune
 from quack.cute_dsl_utils import get_device_capacity
-from quack.epi_autotune import sink_arg_shapes, tuned_mod_gemm
-from quack.epilogues import rms_fused, rstd_swiglu_epi
+from quack.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
+from quack.epilogue.library import rms_fused, rstd_swiglu_epi
 from quack.gemm_config import GemmConfig
 
 
@@ -132,7 +132,7 @@ def test_prune_rules(small_space):
 def test_mod_digest_in_disk_key(small_space):
     """The disk-cache directory hash includes the mod digest via key=; two
     mods with different fn bodies must not share tuning files."""
-    from quack.epilogues import rms_fused as m1, rstd_swiglu_epi as m2
+    from quack.epilogue.library import rms_fused as m1, rstd_swiglu_epi as m2
 
     t1 = epi_autotune._get_tuner(m1, ("weight",), False, torch.device("cuda"))
     t2 = epi_autotune._get_tuner(m2, ("rstd",), False, torch.device("cuda"))

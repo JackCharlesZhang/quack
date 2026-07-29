@@ -23,7 +23,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 from quack import layout_utils
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
-from quack.operand_transform.transform_a import TransformAOperand
+from quack.operand_transform.transform import TransformAOperand
 from quack.tile_scheduler import TileSchedulerOptions, ag_wait_m_tile
 from quack.varlen_utils import VarlenArguments, VarlenManager
 

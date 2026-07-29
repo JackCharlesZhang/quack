@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Tri Dao.
 """GEMM + column sq-sum reduce + optional rowvec scaling: thin wrapper over
-the epilogue-mod path (quack.epilogues.sq_reduce_mod)."""
+the epilogue-mod path (quack.epilogue.library.sq_reduce_mod)."""
 
 from __future__ import annotations
 from typing import Optional
@@ -32,7 +32,7 @@ def gemm_sq_reduce(
 
     D_raw = A @ B (+ C), colvec_reduce[m] = sum_n(D_raw[m,n]^2), D = D_raw * rowvec.
     """
-    from quack.epilogues import sq_reduce_mod
+    from quack.epilogue.library import sq_reduce_mod
 
     mod = sq_reduce_mod(
         has_c=C is not None, has_rowvec=rowvec is not None, has_aux=aux_out is not None
@@ -75,7 +75,7 @@ def run_gemm_sq_reduce_plan(
     aux_out: Optional[Tensor] = None,
 ) -> None:
     """Launch a resolved mod plan: only per-call pointers here."""
-    from quack.gemm_host import run_gemm_epi_plan
+    from quack.gemm_runtime.host import run_gemm_epi_plan
 
     run_gemm_epi_plan(
         plan,

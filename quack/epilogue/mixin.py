@@ -40,7 +40,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiContext, EpiSmemBytes, Scalar
+from quack.epilogue.ops import EpiContext, EpiSmemBytes, Scalar
 
 
 def _make_epi_params(epi_ops, extra_fields, bases):

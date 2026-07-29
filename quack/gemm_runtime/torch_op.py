@@ -40,6 +40,10 @@ import torch
 
 from quack.blockscaled.operand import BlockScaledFormat
 from quack.gemm_config import GemmConfig, default_config
+from quack.gemm_runtime.identity import (
+    TORCH_OP_EPI_MODS as _EPI_REGISTRY,
+    TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
+)
 from quack.rounding import RoundingMode
 
 
@@ -54,16 +58,6 @@ def _sf_decode(SF, bs_format):
     if SF is not None and SF.dtype == torch.uint8:
         SF = SF.view(BlockScaledFormat.from_name(bs_format).scale_dtype)
     return SF
-
-
-# digest -> EpiMod / transform mod. Populated at mod CONSTRUCTION (see
-# gemm_host — a compile_call-time write would be buffered by Dynamo's
-# side-effect tracking and invisible to the fake-tensor pass), or lazily by
-# import through the meta locator in a fresh process.
-from quack.gemm_host import (  # noqa: E402
-    TORCH_OP_EPI_MODS as _EPI_REGISTRY,
-    TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
-)
 
 
 def _resolve(digest: str, locator, registry=_EPI_REGISTRY, what="epilogue"):
@@ -153,18 +147,18 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     cu, A_idx = named.get("cu_seqlens_m"), named.get("A_idx")
     dt = getattr(torch, m["out_dtype"]) if m.get("out_dtype") else None
     # layout-owning transform: B is the repacked blob, N comes from its rows
-    n_ov = B.shape[0] * 64 if (m.get("transform") or {}).get("owned") else None
+    # (the padded-N rule lives on the transform handle)
+    t = m.get("transform")
+    n_ov = None
+    if t is not None and t["owned"]:
+        n_ov = _resolve(t["digest"], t["locator"], _TA_REGISTRY, "transform").padded_n(B)
     out = mod._alloc_outputs(None, A, B, C, m["store_d"], dt, cu, A_idx, n_override=n_ov)
     outs = ([out["D"]] if m["store_d"] else []) + [out[name] for name in m["out_names"]]
     if m["sink_names"]:
         cfg, lead = m["config"], mod._lead_shape(A, cu, A_idx)
         n = B.shape[-1] if n_ov is None else n_ov
         for name in m["sink_names"]:
-            op = mod.sinks[name]
-            if op.dim == 0:
-                shape = (*lead, -(-n // cfg["tile_n"]))
-            else:
-                shape = (*lead[:-1], -(-lead[-1] // cfg["tile_m"]), n)
+            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg["tile_m"], cfg["tile_n"])
             outs.append(torch.empty(shape, dtype=torch.float32, device=A.device))
     return outs
 
@@ -231,17 +225,13 @@ def compile_call(
     transform_meta = None
     n_override = None
     if transform_a is not None:
-        from quack.operand_transform.host import transform_handle_fmt
-
-        owned = transform_handle_fmt(transform_a) is not None
-        if owned:
-            n_override = B.shape[0] * 64  # B is the repacked blob
+        n_override = transform_a.padded_n(B)  # None unless B is a repacked blob
         for k, v in (transform_operands or {}).items():
             assert isinstance(v, torch.Tensor), f"transform operand {k!r} must be a tensor"
         transform_meta = dict(
             digest=transform_a.semantic_digest,  # registered at construction
-            locator=getattr(transform_a, "_module_locator", lambda: None)(),
-            owned=owned,
+            locator=transform_a._module_locator(),
+            owned=transform_a.owned_fmt is not None,
         )
 
     ins_names, ins = [], []
@@ -287,11 +277,7 @@ def compile_call(
         n = B.shape[-1] if n_override is None else n_override
         partials = {}
         for name in sink_names:
-            op = mod.sinks[name]
-            if op.dim == 0:
-                shape = (*lead, -(-n // cfg.tile_n))
-            else:
-                shape = (*lead[:-1], -(-lead[-1] // cfg.tile_m), n)
+            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg.tile_m, cfg.tile_n)
             partials[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
         outs = []
         if store_d:

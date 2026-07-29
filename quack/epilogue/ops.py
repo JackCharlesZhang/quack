@@ -28,7 +28,11 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
+import torch
+
+from quack.compile_utils import div_for_dtype, fake_batched, make_fake_tensor
+from quack.cute_dsl_utils import torch2cute_dtype_map
+import quack.sm90_utils as sm90_utils
 from quack.rounding import (
     RoundingMode,
     convert_f32_to_bf16_sr,
@@ -39,6 +43,60 @@ from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
+
+
+def assume_stride_divisibility(tensor):
+    """Assume all strides are divisible by 32 bits (except static strides).
+
+    Used for broadcast vectors and similar tensors where stride alignment is guaranteed.
+    Returns a new tensor with the assumed strides.
+    """
+    if tensor is None:
+        return None
+    divby = 32 // tensor.element_type.width
+    if divby <= 1:  # >= 32-bit elements: nothing to assume
+        return tensor
+    new_stride = tuple(
+        cute.assume(s, divby=divby) if not cute.is_static(s) else s for s in tensor.stride
+    )
+    return cute.make_tensor(tensor.iterator, cute.make_layout(tensor.shape, stride=new_stride))
+
+
+def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
+    """Create copy metadata + smem layout for a supplemental epilogue tensor.
+
+    Args:
+        gemm: The GEMM object (provides arch, epi_stage, and epilogue layout helpers).
+        tensor: The global memory tensor to set up for the epilogue.
+        epi_tile: Epilogue tile shape. Defaults to gemm.epi_tile.
+        op_type: "store" or "load".
+
+    Returns:
+        (copy_atom, tensor, smem_layout_staged, epi_tile). copy_atom is None for pre-TMA archs.
+    """
+    if epi_tile is None:
+        epi_tile = gemm.epi_tile
+    if stage is None:
+        stage = gemm.epi_stage
+    dtype = tensor.element_type
+    layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
+    utils_cls = blackwell_helpers if gemm.arch >= 100 else sm90_utils
+    smem_layout_staged = utils_cls.make_smem_layout_epi(dtype, layout, epi_tile, stage)
+    # Ragging-for-TMA is for varlen_m stores that need a per-batch row offset baked
+    # into the TMA descriptor. Loads don't currently support varlen_m, so skip the
+    # ragging conversion.
+    tma_input = (
+        copy_utils.create_ragged_tensor_for_tma(tensor, ragged_dim=0, ptr_shift=True)
+        if op_type != "load" and cute.rank(tensor) == 2
+        else tensor
+    )
+    tma_atom, tma_tensor = gemm._make_tma_epi_atoms_and_tensors(
+        tma_input,
+        smem_layout_staged,
+        epi_tile,
+        op_type=op_type,
+    )
+    return tma_atom, tma_tensor, smem_layout_staged, epi_tile
 
 
 def _callable_config_key(fn):
@@ -210,10 +268,16 @@ class EpiSmemBytes(NamedTuple):
 class EpiOp:
     """Base class for composable epilogue operations."""
 
-    # --- Value-port protocol (quack.gemm_epilogue fn frontend). Ports are how
-    # an op joins the fn's per-element dataflow; the resource lifecycle below
+    # --- Value-port protocol (quack.epilogue.frontend fn frontend). fn_port is
+    # THE declaration of how an op joins the fn's per-element dataflow (the
+    # frontend never isinstance-dispatches); the resource lifecycle below
     # (begin/begin_loop/end_loop/end) stays the smem/TMA/flush protocol.
-    #   "value": the fn receives op.name as a per-element value (loads, scalars).
+    #   "row" / "col" / "tile" / "scalar": built-in fragment kinds — the fn
+    #            receives op.name as a per-element value (or the scalar), with
+    #            the frontend's standard shape checks and swap-relabeling.
+    #   "value": custom value-source op: the fn receives op.name per element;
+    #            begin_loop's fragment must be elementwise congruent with the
+    #            accumulator tile and DENSE (fn_prepare may densify).
     #   "apply": the fn receives op.name as a CALLABLE — `y = rope(acc)` — so the
     #            op's math slots into the fn's dataflow at a user-chosen point.
     #            fn_apply runs inside the (possibly vectorized) loop: index only
@@ -223,6 +287,7 @@ class EpiOp:
     #            dense fragment and hands it to fn_sink_flush once per subtile
     #            (fragment-level, so sinks can do numerically smart things like
     #            one rescale per subtile instead of per element).
+    #   None: not usable from the fn frontend (hand-written mixins only).
     fn_port = None
 
     def fn_prepare(self, gemm, state, paired):
@@ -265,12 +330,12 @@ class EpiOp:
         )
 
     def __quack_semantic_key__(self):
-        # Fail-closed semantic-key protocol (quack.gemm_epilogue): op instances
+        # Fail-closed semantic-key protocol (quack.epilogue.frontend): op instances
         # captured by epilogue fns fingerprint as their cache identity.
         return self.cache_key()
 
     # --- Host-side: torch-arg schema (drives the generic plan/compile layer in
-    # quack.gemm_host). Each op describes its own argument in three steps:
+    # quack.gemm_runtime.host). Each op describes its own argument in three steps:
     # host_arg_key extracts a small picklable descriptor from the caller's torch
     # value (part of the jit_cache disk key), host_fake_arg rebuilds the fake
     # trace-time argument from that descriptor alone, and host_call_arg converts
@@ -280,13 +345,12 @@ class EpiOp:
         (the op is filtered out of the compiled epilogue)."""
         if value is None:
             return None
-        from quack.cute_dsl_utils import torch2cute_dtype_map
 
         return (torch2cute_dtype_map[value.dtype], value.ndim)
 
     def host_fake_arg(self, key, fctx):
         """Fake trace-time argument reconstructed from ``host_arg_key``'s
-        descriptor. ``fctx`` is a quack.gemm_host.FakeArgCtx with the shared
+        descriptor. ``fctx`` is a quack.gemm_runtime.host.FakeArgCtx with the shared
         (m, n, k, l) sym ints and the batched/varlen_m flags."""
         return None
 
@@ -414,6 +478,8 @@ class EpiOp:
 class Scalar(EpiOp):
     """Loads a scalar value or device pointer once per tile. No smem."""
 
+    fn_port = "scalar"
+
     def __init__(self, name, dtype=None):
         super().__init__(name)
         self.dtype = dtype
@@ -428,9 +494,6 @@ class Scalar(EpiOp):
         return Optional[(self.dtype or Float32) | cute.Tensor]
 
     def _validate_pointer_value(self, value):
-        import torch
-        from quack.cute_dsl_utils import torch2cute_dtype_map
-
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"scalar '{self.name}' pointer value must be a torch.Tensor")
         if value.numel() != 1:
@@ -508,8 +571,6 @@ class VecLoad(EpiOp):
     dim = None  # 0 for col (M), 1 for row (N)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         vec_dim = fctx.n if self.dim == 1 else fctx.m
         shape = (fctx.l, vec_dim) if ndim == 2 else (vec_dim,)
@@ -620,6 +681,7 @@ class RowVecLoad(VecLoad):
     """Loads a row vector (N,) via cp_async, broadcasts along M with stride (0,1)."""
 
     dim = 1
+    fn_port = "row"
 
 
 class ColVecLoad(VecLoad):
@@ -631,6 +693,7 @@ class ColVecLoad(VecLoad):
     """
 
     dim = 0
+    fn_port = "col"
 
     @cute.jit
     def _get_gmem_vec(self, param, ctx):
@@ -759,14 +822,11 @@ class TileStore(EpiOp):
     def host_arg_key(self, value):
         if value is None:
             return None
-        from quack.cute_dsl_utils import torch2cute_dtype_map
 
         major = "n" if value.stride(-1) == 1 else "m"
         return (torch2cute_dtype_map[value.dtype], major)
 
     def host_fake_arg(self, key, fctx):
-        from quack.gemm_tvm_ffi_utils import div_for_dtype, fake_batched
-
         dtype, major = key
         # A halved/reshaped tile (epi_tile_fn, e.g. gated postact) has an N
         # extent unrelated to the GEMM's n: use a fresh sym. Such tiles are
@@ -987,6 +1047,8 @@ class TileLoad(EpiOp):
     descriptor and smem buffer, and the pipeline transaction count includes C plus
     all enabled TileLoad buffers. Supported on SM90, SM100, and SM120.
     """
+
+    fn_port = "tile"
 
     def __init__(self, name, epi_tile_fn=None):
         super().__init__(name)
@@ -1282,6 +1344,16 @@ class VecReduce(EpiOp):
     def config_key(self):
         return (self.combine, self.scaled, self.check_oob)
 
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n):
+        """Buffer shape for a (lead=(batch?, m) or (total_m,), n) problem at
+        (tile_m, tile_n): per-CTA-tile partials along the reduce dim. THE
+        single statement of the sink tiling rule — validation (EpiMod.gemm),
+        eager allocation (_alloc_sinks), the torch-op fakes, and the autotune
+        worst-case/slicing all call this."""
+        if self.dim == 0:
+            return (*lead, -(-n // tile_n))
+        return (*lead[:-1], -(-lead[-1] // tile_m), n)
+
     def host_finalize(self, partials):
         """Fold the per-tile partial buffer into the user-visible reduce value
         (host side, after the kernel): colvec partials are (..., m, n_tiles),
@@ -1322,8 +1394,6 @@ class VecReduce(EpiOp):
             rowvec_reduce_accumulate(gemm, state, frag, rScale=scale, combine=self.combine)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         # Reduce outputs are partial per CTA tile along the reduced dim:
         # ColVecReduce (l, m, n_tiles), RowVecReduce (l, m_tiles, n); rank 2
@@ -1744,8 +1814,6 @@ class GroupedColStatsBase(EpiOp):
         return {"add": 0.0, "max": -math.inf}[self.combine]
 
     def host_arg_key(self, value):
-        from quack.cute_dsl_utils import torch2cute_dtype_map
-
         if isinstance(value, int):
             # Plain group width: a true constexpr — baked at trace, no kernel
             # argument at all (distinct key from the tensor form, which
@@ -1754,8 +1822,6 @@ class GroupedColStatsBase(EpiOp):
         return (torch2cute_dtype_map[value.dtype], value.shape[0])
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         if key[0] == "width":
             # Baked at trace through the Constexpr[int]-annotated Args field.
             return key[1]
@@ -2088,8 +2154,6 @@ class GroupedColStatsOut(EpiOp):
         return (self.stats_op.cache_key(),)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         groups = cute.sym_int()
         shape = (fctx.l, fctx.m, groups) if ndim == 3 else (fctx.m, groups)
@@ -2198,8 +2262,6 @@ class OnlineLSEReduce(ColVecReduce):
         self.check_oob = check_oob
 
     def host_finalize(self, partials):
-        import torch
-
         return torch.logsumexp(partials, dim=-1)
 
     def config_key(self):
@@ -2479,8 +2541,6 @@ class ColVecSelect(EpiOp):
         return (self.idx_op.cache_key(),)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         shape = (fctx.l, fctx.m) if ndim == 2 else (fctx.m,)
         return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
@@ -2491,14 +2551,12 @@ class ColVecSelect(EpiOp):
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
-    def sink_alloc_shape(self, m, n):
-        # Full colvec, not per-tile partials: config-independent, and there is
-        # no host_finalize — the buffer IS the result.
-        return (m,)
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n):
+        # Full colvec, not per-tile partials: config-independent (tiles
+        # ignored), and there is no host_finalize — the buffer IS the result.
+        return tuple(lead)
 
     def host_validate(self, value, *, m, n, tile_M, tile_N, batch, varlen_m, epi_args):
-        import torch
-
         idx = epi_args.get(self.idx_op.name)
         if idx is None:
             raise ValueError(f"sink '{self.name}' requires the '{self.idx_op.name}' index operand")

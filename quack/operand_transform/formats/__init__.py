@@ -10,8 +10,8 @@
 
 Adding a format = one class here + registration; no kernel edits. The
 kernel-facing plumbing (TMA, smem, Machete interleave, fragment buffering)
-lives in :class:`quack.operand_transform.transform_a.TransformAW4` and never branches on the
-format. tests/test_gemm_nvfp4.py's roundtrip fixture exercises every
+lives in :class:`quack.operand_transform.transform.TransformAW4` and never
+branches on the format. tests/test_gemm_w4.py's roundtrip fixture exercises every
 registered format against its own dequant reference, so fn/repack
 consistency is pinned for free.
 """
@@ -23,7 +23,7 @@ import cutlass.cute as cute
 from cutlass import const_expr
 
 from quack.blockscaled import nvfp4_utils as U
-from quack.blockscaled import qtip as Q
+from quack.operand_transform.formats import qtip as Q
 
 
 @cute.jit
@@ -90,6 +90,11 @@ class DecodeFormat:
     name: str
     w8 = False
     tile_k = 64
+    # False: the format's dequant needs operands the W4A16 roundtrip harness
+    # doesn't supply (e.g. an epilogue-side per-channel scale). Opt OUT
+    # explicitly — a new format is covered by tests/test_gemm_w4.py's
+    # roundtrip fixture by default, never silently skipped.
+    roundtrip = True
     sf_words = 0
     promote = False
     tile_state_words = 0
@@ -349,6 +354,7 @@ class Int8(DecodeFormat):
 
     name = "int8"
     w8 = True
+    roundtrip = False  # per-channel scale lives in the epilogue, not the bundle
 
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
@@ -368,6 +374,7 @@ class Fp8(DecodeFormat):
 
     name = "fp8"
     w8 = True
+    roundtrip = False  # per-channel scale lives in the epilogue (see Int8)
 
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
@@ -409,7 +416,7 @@ class Mxfp8(DecodeFormat):
 class Qtip(DecodeFormat):
     """QTIP trellis-coded 4-bit (arXiv 2406.11235), lookup-free bf16 "3INST"
     decode; one thread's 16 raw bytes = one tail-biting bitshift-trellis
-    stream for its 32 fragment values (see blockscaled/qtip.py). No SF strip:
+    stream for its 32 fragment values (see formats/qtip.py). No SF strip:
     values decode at codebook scale, the per-tensor weight scale rides the
     epilogue alpha."""
 
@@ -442,7 +449,7 @@ class Qtip2(DecodeFormat):
     the hash is a pure 64-bit multiply with the addend folded into the mask
     lop3s — 6 SASS per pair vs qtip's 11, and slightly LOWER quantization
     MSE (the V=2 step pins 8 tail-biting boundary bits instead of 12, and
-    T=64 halves the short-sequence tax). See blockscaled/qtip.py."""
+    T=64 halves the short-sequence tax). See formats/qtip.py."""
 
     name = "qtip2"
     tile_k = 128

@@ -6,7 +6,7 @@ from __future__ import annotations
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-from quack.epi_ops import GroupedColStatsBase
+from quack.epilogue.ops import GroupedColStatsBase
 
 
 class HeadRstd(GroupedColStatsBase):

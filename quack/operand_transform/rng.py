@@ -2,7 +2,7 @@
 """Packed-mask helpers for RNG operand transforms (dropout). The generator is
 quack.rounding.philox (4x32, 7 rounds — same engine as the SR epilogue).
 
-The dropout scheme (see AI/transform_a_plan.md "Dropout design"): one philox
+The dropout scheme: one philox
 call per canonical GROUP — group(m, k) = (row-pair (m//16, m%8), k//32,
 quad-class (k%8)//2), 16 elements at 8 bits/decision — chosen so a lane's
 WGMMA fragment ownership is exactly whole groups (thread-local generation, no
@@ -27,7 +27,7 @@ import cutlass
 from cutlass import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
-from quack.blockscaled.nvfp4_utils import _asm_i32
+from quack.blockscaled.nvfp4_utils import asm_i32
 from quack.rounding import philox  # noqa: F401  (re-exported for transforms)
 
 # Odd 64-bit mix folding the offset stream into the philox key.
@@ -53,7 +53,7 @@ def set_ge_u32_b16x2(a: Int32, b: Int32, dtype, *, loc=None, ip=None) -> Int32:
     positive normals)."""
     suffix = "bf16x2" if dtype is cutlass.BFloat16 else "f16x2"
     return Int32(
-        _asm_i32(
+        asm_i32(
             [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
             f"set.ge.u32.{suffix} $0, $1, $2;",
             "=r,r,r",

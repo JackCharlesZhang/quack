@@ -17,8 +17,8 @@ Ported from the transformA branch, restructured for the interleaved mainloop
 (the branch's whole-tile ``make_mma_fn`` / double-buffered fragment scheme is
 gone — main has a single tile-wide fragment and per-block produce). Runtime
 operands of value fns are a KIND taxonomy over the transform's (M, K) index
-space (see the fn-operand kinds section / A_TRANSFORM_ARG_KINDS), delivered
-via the aux A-side TMA slot bundled into the mA argument
+space (see quack.operand_transform.kinds.ARG_KINDS), delivered via the aux
+A-side TMA slot bundled into the mA argument
 (:class:`TransformAOperand`), not extra kernel parameters. Shipped: the
 strip family at 2-D (gran_m, gran_k) granularity — ``colvec_ktile`` /
 ``colvec_k64/k32/k16`` (per-(row, k-group), e.g. the linear-CE dx pow2
@@ -36,8 +36,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from quack.blockscaled.decode_formats import decode_format
 from quack.cute_dsl_utils import mlir_namedtuple
+from quack.operand_transform.kinds import ARG_KINDS
 from quack.sm90_utils import canonical_a_load_s2r
 
 
@@ -206,6 +206,10 @@ class TransformAW4(TransformA):
     owns_a_layout = True
 
     def __init__(self, gemm, w4_format):
+        # Lazy: this module is imported by GemmSm90 — resolving the format
+        # here keeps the W4 registry (and qtip) out of the kernel import path.
+        from quack.operand_transform.formats import decode_format
+
         self.fmt = decode_format(w4_format)
         assert gemm.mma_a_dtype == self.fmt.mma_dtype, (
             f"w4 format {self.fmt.name!r} decodes to {self.fmt.mma_dtype}, "
@@ -379,170 +383,10 @@ class TransformAW4(TransformA):
                     acc_sl.store(acc_sl.load() + wave_sl.load() * sf)
 
 
-# ---- fn-operand kinds --------------------------------------------------------
-#
-# Runtime operands of value-fn transforms, a taxonomy over the transform's
-# (M, K) index space — the mainloop mirror of EpiOps' operand kinds over
-# (M, N) (scalar / colvec / rowvec / tile). Each kind owns its indexing
-# (which fragment coordinate the value depends on), its delivery (aux TMA
-# box geometry vs a future per-work-tile prologue load), and its register
-# staging; the fn only ever sees a vec of values aligned with x. Shipped:
-# the strip family — one value per (m-group, k-group) at 2-D granularity
-# (gran_m, gran_k): the ``colvec_*`` corners (gran_m = 1: per-row, k at
-# tile_K / 64 / 32 / 16) and ``kvec_m64`` (gran_m = 64, gran_k = 1: per
-# (m64 block, k-element) — the LCE dw strip). Planned: ``colvec`` (per-row,
-# k-invariant — needs the prologue hook), scalars/seeds.
-
-
-def _strip_geometry(gemm, gran_m, gran_k):
-    """(gran_m, g_m, gran_k, g_k, k_inner): resolved LAZILY — tile_K is 0 at
-    transform-ctor time when the ctor tile shape is (M, N) (resolved in
-    _setup_tiled_mma); every consumer below runs after that. ``k_inner``:
-    the box's stride-1 axis is the FINER one — TMA needs 16 B alignment on
-    every non-inner stride, and only the finer axis's group count is large
-    enough to guarantee it (e.g. the dw strip's per-m-tile stride is
-    tile_M/64 elements = 4-16 B)."""
-    tile_m, tile_k = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[2]
-    gran_m = tile_m if gran_m is None else gran_m
-    gran_k = tile_k if gran_k is None else gran_k
-    assert tile_m % gran_m == 0, f"gran_m {gran_m} must divide tile_M ({tile_m})"
-    assert tile_k % gran_k == 0, f"gran_k {gran_k} must divide tile_K ({tile_k})"
-    return gran_m, tile_m // gran_m, gran_k, tile_k // gran_k, gran_k < gran_m
-
-
-class _StripAux(AuxOperandA):
-    """Dense per-(m-group, k-group) values riding the aux-operand slot: a
-    (g_m x g_k)-element MMA-dtype box per k-tile TMA'd into per-stage smem
-    under the AB mbarrier — the values arrive WITH A, no gather latency in
-    the produce path. Element-typed, so no byte/m64 factorization is needed
-    (TMA box dims count ELEMENTS, <= 256 each: g_m <= tile_M <= 256 and
-    g_k <= tile_K always hold). Box modes are (inner, outer) with the finer
-    axis inner (see _strip_geometry); gmem view: (inner, outer, G_m, RestK,
-    L) over a contiguous (outer-groups, inner-groups) tensor (see
-    :func:`quack.operand_transform.host.transform_a_operand`)."""
-
-    multicast = False  # small boxes: dup loads beat mcast box-splitting
-
-    def __init__(self, gemm, gran_m, gran_k):
-        self.gemm = gemm
-        self.gran_m, self.gran_k = gran_m, gran_k
-        self.dtype = gemm.mma_a_dtype
-
-    def _box(self):
-        _, g_m, _, g_k, k_inner = _strip_geometry(self.gemm, self.gran_m, self.gran_k)
-        return (g_k, g_m) if k_inner else (g_m, g_k)
-
-    def bytes_per_stage(self):
-        box = self._box()
-        return box[0] * box[1] * self.dtype.width // 8
-
-    def make_smem_layout_staged(self, ab_stage):
-        return cute.make_ordered_layout((*self._box(), ab_stage), order=(0, 1, 2))
-
-    def make_tma(self, mAux):
-        gemm = self.gemm
-        box = self._box()
-        smem_layout = cute.make_ordered_layout(box, order=(0, 1))
-        return gemm._make_tma_atoms_and_tensors(mAux, smem_layout, box, gemm.cluster_shape_mnk[1])
-
-    def gmem_slice(self, mAux, tile_coord_mnkl, batch_idx):
-        # (inner, outer, Gm, RestK, L) -> (inner, outer, RestK)
-        return mAux[None, None, tile_coord_mnkl[0], None, batch_idx]
-
-
-class _StripArg:
-    """The strip family: one MMA-dtype value per (m-group of ``gran_m`` A
-    rows, k-group of ``gran_k`` elements), refreshed per k-tile. Corners:
-    (1, tile_K) = ``colvec_ktile`` (the LCE dx pow2 rescale), (1, 16/32/64)
-    = dense blockscaled-SF granularities, (64, 1) = ``kvec_m64`` (the LCE
-    dw strip: per (vocab m64 block, token)). ``None`` means the whole tile
-    extent on that axis.
-
-    Staging (the epi_ops VecLoad idiom, all partition algebra — no index
-    math): broadcast the smem box to (tile_M, tile_K) with NESTED modes —
-    m-mode (gran_m, g_m) and k-mode (gran_k, g_k), stride 0 on the inner
-    (within-group) levels — partition it with the fragment's own tiled_mma,
-    and cache a fragment-congruent rmem tensor whose zero-stride modes share
-    registers, refreshed once per k-tile with one LDS per distinct value
-    (filter_zeros). Per-element reads are identity indexing, so the staging
-    is selects only and the fn math stays packed (HMUL2). Which fragment
-    slots share a value falls out of the layout composition — any
-    granularities dividing the tile work, including quad-varying ones."""
-
-    def __init__(self, gemm, gran_m, gran_k):
-        self.gemm = gemm
-        self.gran_m, self.gran_k = gran_m, gran_k  # geometry resolves lazily
-        self.aux = _StripAux(gemm, gran_m, gran_k)
-        self._tCsS = None
-        self._rvals = None
-
-    @cute.jit
-    def setup(self, tiled_mma, tidx, mma_m, sAux):
-        """Once per kernel (inside make_copy_block)."""
-        assert sAux is not None, "strip operands ride the aux slot (pass A as TransformAOperand)"
-        gemm = self.gemm
-        gran_m, g_m, gran_k, g_k, k_inner = _strip_geometry(gemm, self.gran_m, self.gran_k)
-        # Broadcast the (inner, outer, stage) box to (tile_M, tile_K, stage):
-        # each axis is a nested (gran, g) mode — expand within a group
-        # (stride 0), advance one box column across groups (the g factor is
-        # the mode's second level, not a separate axis).
-        sm, sk = (g_k, 1) if k_inner else (1, g_m)  # box strides of (m-group, k-group)
-        sMK = cute.make_tensor(
-            sAux.iterator,
-            cute.make_layout(
-                ((gran_m, g_m), (gran_k, g_k), gemm.ab_stage),
-                stride=((0, sm), (0, sk), g_m * g_k),
-            ),
-        )
-        # Partition with the fragment's own tiled_mma (epi_ops VecLoad
-        # idiom): every value lands aligned with its fragment element — no
-        # coordinate math. True lane: the fragment tensors are partitioned
-        # from the per-warpgroup slice, but addressing needs the real thread.
-        self._tCsS = tiled_mma.get_slice(tidx).partition_A(sMK)
-        # fragment-congruent cache: make_rmem_tensor keeps the zero strides
-        # (duplicates share a register) and compacts the rest, so the cache
-        # holds exactly the per-lane distinct values
-        self._rvals = cute.make_rmem_tensor(
-            self._tCsS[None, None, None, 0].layout, gemm.mma_a_dtype
-        )
-
-    @cute.jit
-    def on_block(self, stage_idx, b, mma_m):
-        """Refresh the register cache — one LDS per DISTINCT value
-        (filter_zeros pairs the deduped elements). k-coarse strips (a value
-        spans >= one k16 block) load the whole tile's values once at b == 0;
-        k-fine strips load block b's disjoint slice each block — the same
-        produce rhythm as A itself, so the LDS spread across the WGMMA
-        shadow and live ranges stay one block long (ptxas schedules within
-        the unrolled body but won't restructure a whole-tile live range)."""
-        gran_k = _strip_geometry(self.gemm, self.gran_m, self.gran_k)[2]
-        if const_expr(gran_k >= 16):
-            if const_expr(b == 0):
-                cute.autovec_copy(
-                    cute.filter_zeros(self._tCsS[None, None, None, stage_idx]),
-                    cute.filter_zeros(self._rvals),
-                )
-        else:
-            cute.autovec_copy(
-                cute.filter_zeros(self._tCsS[None, None, b, stage_idx]),
-                cute.filter_zeros(self._rvals[None, None, b]),
-            )
-
-    def element(self, coord, m, b):
-        """The operand value of fragment element (coord, m, b): the cache is
-        fragment-congruent, so this is identity indexing — the zero-stride
-        modes resolve duplicates to the same register."""
-        return self._rvals[coord, m, b]
-
-
-# kind name -> kernel-side impl factory (host geometry: operand_transform.host)
-A_TRANSFORM_ARG_KINDS = {
-    "colvec_ktile": lambda gemm: _StripArg(gemm, gran_m=1, gran_k=None),
-    "colvec_k64": lambda gemm: _StripArg(gemm, gran_m=1, gran_k=64),
-    "colvec_k32": lambda gemm: _StripArg(gemm, gran_m=1, gran_k=32),
-    "colvec_k16": lambda gemm: _StripArg(gemm, gran_m=1, gran_k=16),
-    "kvec_m64": lambda gemm: _StripArg(gemm, gran_m=64, gran_k=1),
-}
+# Runtime operands of value-fn transforms are a KIND taxonomy over the
+# transform's (M, K) index space — see quack.operand_transform.kinds
+# (ARG_KINDS): each kind owns its geometry, device staging, and host
+# view/fake in one object.
 
 
 class TransformAValue(TransformA):
@@ -557,7 +401,7 @@ class TransformAValue(TransformA):
 
     ``mod.args`` ((param_name, kind) pairs): runtime operands — the fn's
     parameters between x and consts, each staged per element by its kind
-    (see the fn-operand kinds section above / A_TRANSFORM_ARG_KINDS). At
+    (see quack.operand_transform.kinds.ARG_KINDS). At
     most one aux-delivered operand for now (the bundle has a single aux
     slot); the host passes A as a ``TransformAOperand(A, view)`` bundle
     built by :func:`quack.operand_transform.host.transform_a_operand`."""
@@ -571,7 +415,7 @@ class TransformAValue(TransformA):
         if getattr(mod, "regs", None) is not None:
             gemm.num_regs_load, gemm.num_regs_mma = mod.regs
         self._arg_impls = [
-            A_TRANSFORM_ARG_KINDS[kind](gemm) for _name, kind in getattr(mod, "args", ()) or ()
+            ARG_KINDS[kind].device_arg(gemm) for _name, kind in getattr(mod, "args", ()) or ()
         ]
         aux_impls = [impl for impl in self._arg_impls if getattr(impl, "aux", None) is not None]
         assert len(aux_impls) <= 1, "one aux-delivered operand per transform (single aux slot)"

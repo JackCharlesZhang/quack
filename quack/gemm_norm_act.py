@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Tri Dao.
 """GEMM + normalize (colvec/rowvec multiply) + activation: thin wrappers over
-the epilogue-mod path (quack.epilogues.norm_act_mod)."""
+the epilogue-mod path (quack.epilogue.library.norm_act_mod)."""
 
 from __future__ import annotations
 from typing import Optional
@@ -36,8 +36,8 @@ def gemm_norm_act_fn(
     sr_seed: int | Tensor = 0,
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
 ):
-    """GEMM + normalize + activation, on the epilogue-mod path (quack.epilogues)."""
-    from quack.epilogues import norm_act_mod
+    """GEMM + normalize + activation, on the epilogue-mod path (quack.epilogue.library)."""
+    from quack.epilogue.library import norm_act_mod
 
     gated = activation in gate_fn_map
     if not gated:
@@ -101,7 +101,7 @@ def run_gemm_norm_act_plan(
     A_idx: Optional[Tensor] = None,
 ) -> None:
     """Launch a resolved mod plan: only per-call pointers and scalar values."""
-    from quack.gemm_host import run_gemm_epi_plan
+    from quack.gemm_runtime.host import run_gemm_epi_plan
 
     run_gemm_epi_plan(
         plan,

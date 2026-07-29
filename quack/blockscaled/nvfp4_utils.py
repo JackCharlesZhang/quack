@@ -490,7 +490,7 @@ def dequant_nvfp4_reference(
 # ---------------------------------------------------------------------------
 
 
-def _asm_i32(operands, asm, constraints, *, loc=None, ip=None):
+def asm_i32(operands, asm, constraints, *, loc=None, ip=None):
     return llvm.inline_asm(
         T.i32(), operands, asm, constraints, has_side_effects=False, loc=loc, ip=ip
     )
@@ -500,7 +500,7 @@ def _asm_i32(operands, asm, constraints, *, loc=None, ip=None):
 def prmt(a: Int32, b: Int32, sel: Int32, *, loc=None, ip=None) -> Int32:
     # Not cute.arch.prmt: that wrapper emits its (identical) asm with
     # has_side_effects=True, which blocks LLVM from CSE/hoisting a pure op.
-    res = _asm_i32(
+    res = asm_i32(
         [
             Int32(a).ir_value(loc=loc, ip=ip),
             Int32(b).ir_value(loc=loc, ip=ip),
@@ -525,7 +525,7 @@ def lop3_or_and(a: Int32, b: Int32, mask: Int32) -> Int32:
 def imad_lo(a: Int32, b: int, c: int, *, loc=None, ip=None) -> Int32:
     """a * b + c (b, c compile-time immediates) via mad.lo.s32: a single
     FMA-pipe IMAD, keeping shift+bias work off the (busier) ALU pipe."""
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip)],
         f"mad.lo.s32 $0, $1, {b}, {_s32(c)};",
         "=r,r",
@@ -545,7 +545,7 @@ def lop3_and_imm_or(a: Int32, mask: int, orval: Int32) -> Int32:
 
 @dsl_user_op
 def add_bf16x2(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
         "add.rn.bf16x2 $0, $1, $2;",
         "=r,r,r",
@@ -557,7 +557,7 @@ def add_bf16x2(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def mul_bf16x2(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
         "mul.rn.bf16x2 $0, $1, $2;",
         "=r,r,r",
@@ -579,7 +579,7 @@ def mul_bf16x2_bcast(
         "{.reg .b16 l, h; .reg .b32 bb; mov.b32 {l, h}, $2; "
         f"mov.b32 bb, {{{lane}, {lane}}}; mul.rn.bf16x2 $0, $1, bb;}}"
     )
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(pair).ir_value(loc=loc, ip=ip)],
         asm,
         "=r,r,r",
@@ -600,7 +600,7 @@ def add_bf16x2_bcast(
         "{.reg .b16 l, h; .reg .b32 bb; mov.b32 {l, h}, $2; "
         f"mov.b32 bb, {{{lane}, {lane}}}; add.rn.bf16x2 $0, $1, bb;}}"
     )
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(pair).ir_value(loc=loc, ip=ip)],
         asm,
         "=r,r,r",
@@ -623,7 +623,7 @@ def fma_bf16x2_bcast(
         f"mov.b32 bb, {{{'h2' if hi else 'l2'}, {'h2' if hi else 'l2'}}}; "
         "fma.rn.bf16x2 $0, $1, ss, bb;}"
     )
-    res = _asm_i32(
+    res = asm_i32(
         [
             Int32(a).ir_value(loc=loc, ip=ip),
             Int32(s_pair).ir_value(loc=loc, ip=ip),
@@ -878,7 +878,7 @@ def _dp4a_extract_f32(x: Int32, byte: int, *, loc=None, ip=None):
 def _pack_bf16x2_f32(lo, hi, *, loc=None, ip=None) -> Int32:
     # Not cute.arch.cvt_f32x2_bf16x2: that wrapper emits cvt.rn.SATFINITE
     # (and takes a vector value); this is the plain .rn packed convert.
-    res = _asm_i32(
+    res = asm_i32(
         [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
         "cvt.rn.bf16x2.f32 $0, $2, $1;",
         "=r,f,f",
@@ -909,7 +909,7 @@ def _e4m3x2_to_bf16x2(
     F2FP.BF16.F32). The half select folds into the cvt's operand unpack
     (F2FP ...UNPACK_B) — no SHF, so hi=True beats converting `x >> 16`."""
     sel = "{_, p}" if hi else "{p, _}"
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(pair).ir_value(loc=loc, ip=ip)],
         "{.reg .b16 lo, hi, p; .reg .b32 h2; .reg .f32 f0, f1; "
         f"mov.b32 {sel}, $1; cvt.rn.f16x2.e4m3x2 h2, p; "

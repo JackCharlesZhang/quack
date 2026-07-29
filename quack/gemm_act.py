@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Wentao Guo, Tri Dao.
 """GEMM + activation (optionally gated): thin wrappers over the epilogue-mod
-path (quack.epilogues.linear_act_mod)."""
+path (quack.epilogue.library.linear_act_mod)."""
 
 from __future__ import annotations
 from typing import Optional
@@ -8,7 +8,7 @@ from typing import Optional
 from torch import Tensor
 
 from quack.activation import act_fn_map, gate_fn_map
-from quack.gemm_host import GemmEpiPlan, run_gemm_epi_plan
+from quack.gemm_runtime.host import GemmEpiPlan, run_gemm_epi_plan
 from quack.gemm_tvm_ffi_utils import scalar_mode
 from quack.rounding import RoundingMode
 
@@ -49,11 +49,11 @@ def gemm_act(
     ag_args: Optional[tuple] = None,  # AllGather+GEMM flags contract (see quack/distributed/)
 ) -> GemmEpiPlan:
     """GEMM + activation (optionally gated), on the epilogue-mod path
-    (quack.epilogues.linear_act_mod). ``alpha`` scales the accumulator BEFORE
+    (quack.epilogue.library.linear_act_mod). ``alpha`` scales the accumulator BEFORE
     the activation (``aux = act(alpha * A @ B + ...)``) -- an output alpha
     cannot produce that through the nonlinearity. Neutral values (None or
     1.0) keep the alpha-free epilogue."""
-    from quack.epilogues import linear_act_mod
+    from quack.epilogue.library import linear_act_mod
 
     gated = activation in gate_fn_map
     if not gated:

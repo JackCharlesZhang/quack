@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026, Tri Dao.
 """GEMM + activation backward (dact / dgated): thin wrappers over the
-epilogue-mod path (quack.epilogues.dact_mod / dgated_mod)."""
+epilogue-mod path (quack.epilogue.library.dact_mod / dgated_mod)."""
 
 from __future__ import annotations
 from typing import Optional
@@ -36,8 +36,8 @@ def gemm_dact(
     use_tma_gather: bool = False,
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
 ):
-    """GEMM + activation backward, on the epilogue-mod path (quack.epilogues)."""
-    from quack.epilogues import dact_mod, dgated_mod
+    """GEMM + activation backward, on the epilogue-mod path (quack.epilogue.library)."""
+    from quack.epilogue.library import dact_mod, dgated_mod
 
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
@@ -96,7 +96,7 @@ def run_gemm_dact_plan(
 ) -> None:
     """Launch a resolved mod plan: only per-call pointers here (packed dgated
     C/D cross raw — the f32 recast is compiled into the trace, cd_packed)."""
-    from quack.gemm_host import run_gemm_epi_plan
+    from quack.gemm_runtime.host import run_gemm_epi_plan
 
     run_gemm_epi_plan(
         plan,

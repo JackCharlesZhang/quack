@@ -4,7 +4,7 @@
 The packed weights are the WGMMA A operand (RS, decoded to bf16 in registers
 by a :class:`~quack.operand_transform.TransformAW4`), the bf16 activations
 are B, and the output is written transposed (D is (N, M) m-major = out
-row-major). See quack/blockscaled/decode_formats.py for the formats and
+row-major). See quack/operand_transform/formats/ for the formats and
 quack/blockscaled/nvfp4_utils.py for the repack layout.
 
 Scale-factor-strip formats (nvfp4, int4*, int4awq, mxfp4, mxfp8) pass their
@@ -13,12 +13,13 @@ formats (qtip*, int8/fp8 with the per-channel scale left to the caller,
 fn-authored formats) take ``sf=None``. Per-tensor weight scales ride the
 epilogue alpha.
 
-This wrapper is thin sugar over the generic host layer (quack.gemm_host):
-transforms are a first-class axis there — ``build_gemm_epi_plan(...,
-transform_a=...)`` — so W4 kernels share the jit/disk cache, async compile,
-and the EpiOp argument machinery with every epilogue variant. What remains
-here is W4's own host surface: the offline ``prepare`` step, validation, the
-measured config rule (:func:`_pick_w4_cfg`), and the split-k buffer reuse.
+This wrapper is thin sugar over the fn epilogue frontend: both entry points
+are ``EpiMod.gemm(..., transform_a=...)`` calls, so W4 kernels share the plan
+cache, jit/disk cache, async compile, and EpiOp argument machinery with every
+epilogue variant. What remains here is W4's own host surface: the offline
+``prepare`` step, validation, explicit-tile handling over the measured config
+rules (which live with the transform handles:
+quack.operand_transform.host.pick_w4_cfg), and the split-k buffer reuse.
 """
 
 from typing import Optional
@@ -26,20 +27,18 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from quack.blockscaled.decode_formats import decode_format
-from quack.cute_dsl_utils import get_device_capacity
-from quack.epi_ops import ColVecLoad, RowVecLoad
+from quack.operand_transform.formats import decode_format
+from quack.epilogue.ops import ColVecLoad, RowVecLoad
 from quack.gemm import _split_k_buffers
 from quack.gemm_config import SplitKMode
-from quack.gemm_default_epi import GemmDefaultSm90
-from quack.gemm_epilogue import gemm_epilogue
-from quack.gemm_host import build_gemm_epi_plan, run_gemm_epi_plan
-from quack.gemm_tvm_ffi_utils import tensor_key
-from quack.operand_transform.host import w4_operand_views
+from quack.epilogue.frontend import gemm_epilogue
+from quack.operand_transform.host import (
+    pick_w4_cfg as _pick_w4_cfg,
+    pick_w4a8_cfg as _pick_w4a8_cfg,
+)
 
 __all__ = ["gemm_w4a16", "gemm_w4a8", "prepare_w4_weight", "quantize_act_per_token_fp8"]
 
-_plan_cache = {}
 _splitk_buf_cache = {}
 
 
@@ -51,45 +50,11 @@ def prepare_w4_weight(q, sf=None, wformat="qtip2s"):
     return decode_format(wformat).prepare(q, sf)
 
 
-def _pick_tile_n(m_act: int) -> int:
-    for cand in (16, 32, 64, 128):
-        if m_act <= cand:
-            return cand
-    return 192
-
-
-def _pick_w4_cfg(m_act: int, n_full: int, k_tiles: int) -> tuple:
-    """(tile_m, tile_n, split_k). Measured invariant (H100, int4/qtip, incl.
-    the machete faceoff): every winning config puts the grid at ~112-128 CTAs
-    with the LARGEST tile that gets there — tile_m=128 beats 64 by 10-25% at
-    equal CTA counts (2x TMA boxes, half the per-k-tile pipeline overhead per
-    byte), tile_n is the largest with under half a tile of padding on m, and
-    serial split-k makes up remaining grid coverage when each split keeps
-    >= ~24 k-tiles (and tile_n <= 128: the f32 finalize round-trip scales
-    with tile area). Prefill (m > 256): (128, 256, 1)."""
-    if n_full % 128 != 0:
-        tn = _pick_tile_n(m_act) if m_act <= 128 else 192
-        mt = -(-m_act // tn)
-        sk = 2 if (m_act <= 32 and (n_full // 64) * mt < 128 and k_tiles >= 32) else 1
-        return 64, tn, sk
-    if m_act > 256:
-        return 128, 256, 1
-    n128 = n_full // 128
-    for tn in (256, 128, 64, 32, 16):
-        if tn >= 2 * m_act and tn > 16:
-            continue  # half the tile or more would be padding
-        mt = -(-m_act // tn)
-        for sk in (1, 2, 4):
-            if sk > 1 and (tn > 128 or k_tiles // sk < 24):
-                break
-            if n128 * mt * sk >= 112:
-                return 128, tn, sk
-    # coverage unreachable under the tile_m=128 constraints (small N, short K):
-    # fall back to 64-row tiles with the plain starvation rule
-    tn = _pick_tile_n(m_act)
-    mt = -(-m_act // tn)
-    sk = 2 if ((n_full // 64) * mt < 128 and k_tiles >= 32) else 1
-    return 64, tn, sk
+# Per-tensor weight scale as an exact fp32 epilogue multiply (scalar infers
+# to a Scalar op; alpha == 1.0 is bitwise-identity).
+@gemm_epilogue()
+def _w4a16_alpha(acc, alpha):
+    return {"D": acc * alpha}
 
 
 def gemm_w4a16(
@@ -135,46 +100,6 @@ def gemm_w4a16(
         n_ctas = (n_full // tile_m) * ((m_act + tile_n - 1) // tile_n)
         split_k = 2 if (n_ctas < 128 and k // tk >= 32) else 1
 
-    mA = w4_operand_views(fmt, blob, sf, tile_m)  # (blob, strip) bundle
-    # out crosses caller-oriented (M_act, N_full) row-major; the trace
-    # relabels it to the kernel's (N_full, M_act) m-major D (cd_transposed)
-    epi_values = {"alpha": tensor_scale}
-
-    key = (
-        tensor_key(act),
-        tensor_key(blob),
-        tensor_key(sf),
-        fmt.name if isinstance(wformat, str) else id(fmt),
-        tile_m,
-        tile_n,
-        cluster_n,
-        max_swizzle_size,
-        use_pdl,
-        split_k,
-        tensor_scale != 1.0,
-        act.device.index,
-    )
-    plan = _plan_cache.get(key)
-    if plan is None:
-        plan = build_gemm_epi_plan(
-            GemmDefaultSm90,
-            get_device_capacity(act.device),
-            mA,
-            act,
-            out,
-            None,
-            epi_values=epi_values,
-            tile_M=tile_m,
-            tile_N=tile_n,
-            tile_K=tk,
-            cluster_M=1,
-            cluster_N=cluster_n,
-            max_swizzle_size=max_swizzle_size,
-            transform_a=wformat if isinstance(wformat, str) else fmt,
-            post_init_attrs=(() if use_pdl else (("use_pdl", False),)),
-            split_k=split_k,
-        )
-        _plan_cache[key] = plan
     bufs = None
     if split_k > 1:
         # serial split-k turnstile + partials workspace; the kernel leaves the
@@ -186,7 +111,25 @@ def gemm_w4a16(
                 out.t()[None], SplitKMode.SERIAL, tile_m, tile_n, 1, cluster_n, False
             )
             _splitk_buf_cache[buf_key] = bufs
-    run_gemm_epi_plan(plan, mA, act, out, None, epi_values, split_k_buffers=bufs)
+    # out crosses caller-oriented (M_act, N_full) row-major; the trace
+    # relabels it to the kernel's (N_full, M_act) m-major D (cd_transposed)
+    _w4a16_alpha.gemm(
+        act,
+        blob,
+        out,
+        epi_args={"alpha": tensor_scale},
+        transform_a=wformat if isinstance(wformat, str) else fmt,
+        transform_sf=sf,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        tile_K=tk,
+        cluster_M=1,
+        cluster_N=cluster_n,
+        max_swizzle_size=max_swizzle_size,
+        split_k=split_k,
+        post_init_attrs=() if use_pdl else (("use_pdl", False),),
+        split_k_buffers=bufs,
+    )
     if n_out != n_full:
         out = out[:, :n_out]
     return out
@@ -205,27 +148,6 @@ def _w4a8_token_scale(acc, v):
 @gemm_epilogue(ops={"v": ColVecLoad("v"), "cs": RowVecLoad("cs")})
 def _w4a8_folded_scale(acc, v, cs):
     return {"D": acc * v * cs}
-
-
-def _pick_w4a8_cfg(m_act: int, n_full: int) -> tuple:
-    """(tile_m, tile_n, split_k). Measured (H100, N=K=8192, AI/bench_w4a8.py):
-    slow accum flips the W4A16 preferences. 64-row tiles win every decode
-    shape through m=128 (the doubled accumulator makes 128-row consumers
-    register-heavy; occupancy-2 64-row tiles hide the decode+promote latency
-    better: m=1 21.0 vs 23.6us, m=64 22.1 vs 29.3), with tile_n covering m in
-    one tile column. 128-row wins from m=256 (128x128 37.8 vs 64x128 44.5);
-    prefill caps tile_n at 192 (2*96+16 regs — 256-wide tiles spill).
-    split-k always loses here (the fp32 finalize round-trip stacks on the
-    promote: m=1 sk2 24.9 vs sk1 21.0)."""
-    if m_act <= 128:
-        tm, tn = 64, _pick_tile_n(m_act)
-    elif m_act <= 256:
-        tm, tn = 128, 128
-    else:
-        tm, tn = 128, 192
-    if n_full % tm != 0:
-        tm = 64
-    return tm, tn, 1
 
 
 def quantize_act_per_token_fp8(act: Tensor):

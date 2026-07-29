@@ -13,8 +13,8 @@ import triton.language as tl
 
 from quack.cross_entropy import cross_entropy, cross_entropy_fwd_out
 from quack.epilogue.scaled_exp import scaled_exp_target_epi
-from quack.epilogues import identity_epi, lse_target_epi
-from quack.gemm_epilogue import gemm_epilogue
+from quack.epilogue.library import identity_epi, lse_target_epi
+from quack.epilogue.frontend import gemm_epilogue
 from quack.gemm_interface import gemm, gemm_add, gemm_add_inplace
 from quack.linear import linear_fwd_convert_type
 from quack.operand_transform import a_transform

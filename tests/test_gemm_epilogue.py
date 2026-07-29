@@ -6,9 +6,9 @@ fn frontend must produce the same math the mixin produces.
 """
 
 import pytest
-from quack.epi_ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
-from quack.gemm_epilogue import gemm_epilogue, pack, unpack
-from quack.gemm_host import resolve_gemm_class
+from quack.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
+from quack.epilogue.frontend import gemm_epilogue, pack, unpack
+from quack.gemm_runtime.host import resolve_gemm_class
 import math
 import pickle
 import torch
@@ -32,7 +32,7 @@ from quack.epilogue.rotary import (
     rope_table_ldg_epi,
     xpos_posfreq_epi,
 )
-from quack.epilogues import (
+from quack.epilogue.library import (
     amax_epi,
     dgelu_mod,
     dswiglu_mod,
@@ -92,7 +92,8 @@ def test_epi_mod_semantic_cache_key_and_resolver():
 def test_epi_mod_local_payload_identity_and_consumption():
     cloudpickle = pytest.importorskip("cloudpickle")  # noqa: F841
     from quack.cache.async_compile import PoolPayload
-    from quack.gemm_host import _LOCAL_EPI_MODS, install_epi_mod_payload
+    from quack.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
+    from quack.rounding import RoundingMode
 
     def build():
         @gemm_epilogue()
@@ -102,22 +103,21 @@ def test_epi_mod_local_payload_identity_and_consumption():
         return local_epi
 
     mod = build()
-    mint_key = ((), 10, False, False, ())
+    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
     ref = mod._class_ref(mint_key)
     payload = ref.__quack_pool_payload__()
     assert isinstance(payload, PoolPayload)
     assert payload.identity == mod.semantic_digest
 
     # Model the separate worker: it starts without the submitter's registry.
-    _LOCAL_EPI_MODS.pop(mod.semantic_digest)
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is mod  # consumes (pops)
     with pytest.raises(ValueError, match="digest mismatch"):
         install_epi_mod_payload("wrong-digest", payload.data)
-    assert mod.semantic_digest not in _LOCAL_EPI_MODS
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
 
     install_epi_mod_payload(payload.identity, payload.data)
-    assert mod.semantic_digest in _LOCAL_EPI_MODS
-    resolve_gemm_class(ref)
-    assert mod.semantic_digest not in _LOCAL_EPI_MODS
+    resolve_gemm_class(ref)  # consumes the installed payload
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
 
 
 def test_epi_scalar_fixed_abi():
@@ -1163,7 +1163,7 @@ def test_epi_mod_lse_target(n, target_dtype):
     the never-matching f16 NaN / -0 bit ranges, not alias.
     (An impl="onehot" R2P variant was tested here and removed — see the
     ColVecSelect tombstones for the measured ladder.)"""
-    from quack.epilogues import lse_target_epi
+    from quack.epilogue.library import lse_target_epi
 
     device = "cuda"
     torch.random.manual_seed(16)
@@ -2243,7 +2243,7 @@ def test_semantic_digest_ignores_extern_library_state():
     on the first traced op, so a digest that recursed into cutlass function
     globals differed between "before any compile" and "after a compile" in the
     same process: async-compile workers (which typically compile other keys
-    before their lazy first import of quack.epilogues) then rejected every
+    before their lazy first import of quack.epilogue.library) then rejected every
     module-global epilogue ref as "changed while resolving" and every one of
     those keys fell back to an in-process compile."""
     import cutlass._mlir_helpers.op as _op
@@ -2501,7 +2501,7 @@ def test_epi_mod_rstd_swiglu_preact():
     = swiglu(rstd * pairs)."""
     device = "cuda"
     torch.random.manual_seed(25)
-    from quack.epilogues import rstd_swiglu_preact_epi
+    from quack.epilogue.library import rstd_swiglu_preact_epi
 
     l, m, k, pairs = 2, 384, 512, 512
     n = 2 * pairs
@@ -2537,7 +2537,7 @@ def test_epi_mod_dswiglu_rstd_preact(tile_N):
     checked against torch autograd."""
     device = "cuda"
     torch.random.manual_seed(26)
-    from quack.epilogues import dswiglu_rstd_preact_mod
+    from quack.epilogue.library import dswiglu_rstd_preact_mod
 
     l, m, n, k = 2, 384, 1536, 512
     ds_in = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
@@ -2580,7 +2580,7 @@ def test_epi_mod_rstd_lse(regime):
     sharp OOB-predication regression (see test_epi_mod_online_lse)."""
     device = "cuda"
     torch.random.manual_seed(27)
-    from quack.epilogues import rstd_lse_epi
+    from quack.epilogue.library import rstd_lse_epi
 
     l, m, n, k = 2, 384, 1160, 512  # ragged last N tile (1160 = 4*256 + 136)
     tile_N = 256
@@ -2630,7 +2630,7 @@ def test_epi_mod_ln_affine(gelu):
     t*wg + wb (+ tanh-GELU postact for fc1)."""
     device = "cuda"
     torch.random.manual_seed(28)
-    from quack.epilogues import ln_affine_epi, ln_affine_gelu_epi
+    from quack.epilogue.library import ln_affine_epi, ln_affine_gelu_epi
 
     m, n, k = 384, 1024, 512
     A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
@@ -2659,7 +2659,7 @@ def test_epi_mod_ln_partial():
     apply + DUAL colvec stats (sum and sqsum partials -> mu/sig)."""
     device = "cuda"
     torch.random.manual_seed(29)
-    from quack.epilogues import ln_partial_epi
+    from quack.epilogue.library import ln_partial_epi
 
     m, n, k = 384, 1024, 512
     tile_N = 256
@@ -2696,7 +2696,7 @@ def test_epi_mod_dgelu_ln_stats():
     boundary-bwd stats (1 colvec + 2 rowvec reduces)."""
     device = "cuda"
     torch.random.manual_seed(30)
-    from quack.epilogues import dgelu_ln_stats_epi
+    from quack.epilogue.library import dgelu_ln_stats_epi
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256
@@ -2735,7 +2735,7 @@ def test_epi_mod_ln_bwd_apply():
     sinks incl. a computed-value sink (dbias = column-sums of the OUTPUT)."""
     device = "cuda"
     torch.random.manual_seed(31)
-    from quack.epilogues import ln_bwd_apply_epi
+    from quack.epilogue.library import ln_bwd_apply_epi
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256

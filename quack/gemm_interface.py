@@ -680,7 +680,7 @@ def _gemm_execute(
 
 ## ── gemm_act / gemm_gated ───────────────────────────────────────────────────
 # Ported to the epilogue-object surface (see the gemm_rms note below):
-# quack.epilogues.linear_act_mod owns canonicalization, plan caching, and
+# quack.epilogue.library.linear_act_mod owns canonicalization, plan caching, and
 # tuning (incl. varlen/gather, blockscaled, concat_layout, and swap-at-trace
 # for the element-mode forms; the gated config space never had swap_ab).
 # SR (rounding_mode/sr_seed) stays on the raw dispatch (quack.gemm_act).
@@ -707,7 +707,7 @@ def _gemm_act_call(
     tuned: bool,
     config: Optional[GemmConfig] = None,
 ) -> None:
-    from quack.epilogues import linear_act_mod
+    from quack.epilogue.library import linear_act_mod
 
     if concat_layout:
         # A 16-bit concat bias is materialized interleaved; a wide bias keeps
@@ -775,7 +775,7 @@ def _act_concat_bias(bias, concat_layout, swap_ab):
 
 ## ── gemm_dact / gemm_dgated ─────────────────────────────────────────────────
 # Ported to the epilogue-object surface (see the gemm_rms note below):
-# quack.epilogues.dact_mod / dgated_mod own canonicalization, plan caching,
+# quack.epilogue.library.dact_mod / dgated_mod own canonicalization, plan caching,
 # and tuning (incl. varlen/gather and dynamic_scheduler=True, dact's default).
 # The dgated colvec reduce comes back finalized via the generic
 # VecReduce.host_finalize — the same partials.sum(dim=-1) the old wrapper ran.
@@ -799,7 +799,7 @@ def _gemm_dact_call(
 ) -> Optional[Tensor]:
     """Launch dact/dgated on the epilogue object. Returns the finalized colvec
     reduce (dgated with colvec_reduce=True) or None."""
-    from quack.epilogues import dact_mod, dgated_mod
+    from quack.epilogue.library import dact_mod, dgated_mod
 
     operands = {}
     if activation in gated_to_pytorch_fn_map:
@@ -2607,7 +2607,7 @@ def gemm_symmetric_out_fake(
 
 
 ## ── gemm_rms ────────────────────────────────────────────────────────────────
-# Ported to the epilogue-object surface: quack.epilogues.sq_reduce_mod owns
+# Ported to the epilogue-object surface: quack.epilogue.library.sq_reduce_mod owns
 # canonicalization, plan caching, and tuning; the wrapper binds the operand
 # presence pattern to the right mod and fuses the final rstd reduction
 # (rms_final_reduce over the raw per-tile sq-sum partials — the same second
@@ -2628,7 +2628,7 @@ def _gemm_rms_call(
 ) -> Tensor:
     """Launch the sq_reduce GEMM on the epilogue object; returns the raw
     (..., n_tiles) per-tile squared-sum partials."""
-    from quack.epilogues import sq_reduce_mod
+    from quack.epilogue.library import sq_reduce_mod
 
     mod = sq_reduce_mod(
         has_c=C is not None,
@@ -2809,7 +2809,7 @@ def gemm_rms(
 
 ## ── gemm_norm_act ─────────────────────────────────────────────────────────────
 # Ported to the epilogue-object surface (see the gemm_rms note above):
-# quack.epilogues.norm_act_mod owns canonicalization, plan caching, and tuning
+# quack.epilogue.library.norm_act_mod owns canonicalization, plan caching, and tuning
 # (element-mode norm_act keeps swap_ab configs via swap-at-trace; the gated
 # config space never had swap_ab).
 
@@ -2827,7 +2827,7 @@ def _gemm_norm_act_call(
     tuned: bool,
     config: Optional[GemmConfig] = None,
 ) -> None:
-    from quack.epilogues import norm_act_mod
+    from quack.epilogue.library import norm_act_mod
 
     mod = norm_act_mod(
         activation,

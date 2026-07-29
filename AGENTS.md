@@ -56,7 +56,16 @@ Key rules:
 - `gemm.py` — public API, validates inputs, selects SM version, caches compiled kernels
 - `gemm_interface.py` — unified interface across SM versions
 - `gemm_sm90.py` / `gemm_sm100.py` — SM-specific implementations
-- `gemm_default_epi.py` + `gemm_*_epi.py` — epilogue variants (bias, activation, etc.)
+- `quack/epilogue/` — fused epilogues: `ops.py` (EpiOp vocabulary) → `mixin.py`
+  (ComposableEpiMixin) → `frontend.py`/`visit.py` (`@gemm_epilogue` fn authoring +
+  minted kernel classes) → `library.py` + domain modules (rotary, scaled_exp, ...).
+  Hand-written mixins (`gemm_default_epi.py`, `gemm_drmsnorm_bwd.py`) are the escape hatch.
+- `quack/gemm_runtime/` — generic host plumbing shared by every epilogue/transform:
+  `identity.py` (digests, refs, registries — a leaf) → `host.py` (plan/compile/launch) →
+  `torch_op.py` (the single `quack::gemm_epi` custom op) + `autotune.py`
+- `quack/operand_transform/` — A-operand transforms (dequant, dropout, value fns):
+  `transform.py`/`kinds.py` (kernel-side) → `frontend.py` (`@a_transform`, handles) →
+  `host.py` (bundles, W4 config rules) + `formats/` (packed-weight decode formats)
 - `gemm_config.py` — `GemmConfig` dataclass with tile sizes, cluster dims, swizzle settings
 
 ### Core utilities

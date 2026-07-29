@@ -88,6 +88,19 @@ def _gemm_mn(A, B, b_kn):
     return m, n
 
 
+def _lead(A, A_idx, m_gemm):
+    """(batch?, m) lead shape matching EpiMod._lead_shape (m_gemm already
+    accounts for gather)."""
+    return (A.shape[0], m_gemm) if A.ndim == 3 else (m_gemm,)
+
+
+def _sink_slice(buf, shape):
+    """The leading `shape` view of a worst-case sink buffer."""
+    if tuple(buf.shape) == tuple(shape):
+        return buf
+    return buf[tuple(slice(0, s) for s in shape)]
+
+
 def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     """Worst-case (over the tuning sweep) buffer shapes for the mod's reduce
     sinks, keyed by sink name. Allocate these f32 and pass them in epi_args;
@@ -95,34 +108,25 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     cfgs = _config_space(mod, torch.device(device))
     min_tile_n = min(c.tile_n for c in cfgs)
     min_tile_m = min(c.tile_m for c in cfgs)
+    lead = (m,) if l is None else (l, m)
     shapes = {}
     for name, op in mod.sinks.items():
         alloc = getattr(op, "sink_alloc_shape", None)
-        if alloc is not None:
-            # Config-independent full-vector sink (ColVecSelect): no per-config
-            # slicing (_slice_sinks skips ops without ``dim``).
-            inner = alloc(m, n_gemm)
-        elif not hasattr(op, "dim"):
+        if alloc is None:
             continue
-        elif op.dim == 0:
-            inner = (m, _cdiv(n_gemm, min_tile_n))
-        else:
-            inner = (_cdiv(m, min_tile_m), n_gemm)
-        shapes[name] = inner if l is None else (l, *inner)
+        # cdiv is monotone in the tile size, so the min tiles give the sweep's
+        # worst case (config-independent sinks ignore the tiles).
+        shapes[name] = alloc(lead, n_gemm, min_tile_m, min_tile_n)
     return shapes
 
 
-def _slice_sinks(mod, epi_args, config, m_gemm, n_gemm):
+def _slice_sinks(mod, epi_args, config, lead, n_gemm):
     views = {}
     for name, op in mod.sinks.items():
-        dim = getattr(op, "dim", None)
-        if dim is None or name not in epi_args:
+        alloc = getattr(op, "sink_alloc_shape", None)
+        if alloc is None or name not in epi_args:
             continue
-        buf = epi_args[name]
-        if dim == 0:
-            views[name] = buf[..., : _cdiv(n_gemm, config.tile_n)]
-        else:
-            views[name] = buf[..., : _cdiv(m_gemm, config.tile_m), :]
+        views[name] = _sink_slice(epi_args[name], alloc(lead, n_gemm, config.tile_m, config.tile_n))
     return views
 
 
@@ -175,19 +179,21 @@ def _prune_for_mod(mod, configs, named_args, **kwargs):
                 ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % c.tile_m
                 if ragged:
                     ok = False
-            dim = getattr(op, "dim", None)
             buf = kwargs.get(name)
-            if dim == 0 and buf is not None and buf.shape[-1] < _cdiv(n_gemm, c.tile_n):
-                ok = False  # caller's partial buffer too small for this tile_N
-            if dim == 1 and buf is not None and buf.shape[-2] < _cdiv(m_gemm, c.tile_m):
-                ok = False
+            alloc = getattr(op, "sink_alloc_shape", None)
+            if buf is not None and alloc is not None:
+                need = alloc(_lead(A, A_idx, m_gemm), n_gemm, c.tile_m, c.tile_n)
+                if any(b < s for b, s in zip(buf.shape, need)):
+                    ok = False  # caller's partial buffer too small for this tiling
         if ok:
             survivors.append(conf)
     return survivors
 
 
 def _make_tuned_fn(mod, epi_names):
-    sink_dims = {n: op.dim for n, op in mod.sinks.items() if hasattr(op, "dim")}
+    sink_allocs = {
+        n: op.sink_alloc_shape for n, op in mod.sinks.items() if hasattr(op, "sink_alloc_shape")
+    }
 
     def fn(
         A=None,
@@ -211,14 +217,13 @@ def _make_tuned_fn(mod, epi_names):
         m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
         if A_idx is not None:
             m_gemm = A_idx.shape[0]
+        lead = _lead(A, A_idx, m_gemm)
         epi_args = {}
         for name in epi_names:
             v = epi_flat[name]
-            dim = sink_dims.get(name)
-            if dim == 0 and isinstance(v, torch.Tensor):
-                v = v[..., : _cdiv(n_gemm, c.tile_n)]
-            elif dim == 1 and isinstance(v, torch.Tensor):
-                v = v[..., : _cdiv(m_gemm, c.tile_m), :]
+            alloc = sink_allocs.get(name)
+            if alloc is not None and isinstance(v, torch.Tensor):
+                v = _sink_slice(v, alloc(lead, n_gemm, c.tile_m, c.tile_n))
             epi_args[name] = v
         dyn = c.is_dynamic_persistent or dynamic_scheduler
         # SM90 dynamic-persistent scheduling consumes a semaphore; a fresh
@@ -359,4 +364,6 @@ def tuned_mod_gemm(
     m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
     if A_idx is not None:
         m_gemm = A_idx.shape[0]
-    return TunedModGemm(plan, best, _slice_sinks(mod, epi_args, best, m_gemm, n_gemm))
+    return TunedModGemm(
+        plan, best, _slice_sinks(mod, epi_args, best, _lead(A, A_idx, m_gemm), n_gemm)
+    )

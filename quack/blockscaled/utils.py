@@ -745,7 +745,7 @@ def compile_blockscaled_gemm_tvm_ffi(
 
     # Lazy: this SM100 compile helper must not force the kernel-class import
     # chain (gemm_default_epi -> gemm_sm90) onto every consumer of the
-    # blockscaled package (e.g. decode_formats, imported by kernel-side code).
+    # blockscaled package (e.g. nvfp4_utils, imported by kernel-side code).
     from quack.gemm_default_epi import GemmDefaultSm100
 
     gemm = partial(

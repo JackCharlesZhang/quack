@@ -26,7 +26,7 @@ the grouping choice does not affect quantization quality — only which
 sequence a weight lands in.
 
 Per-tensor scale: values decode at codebook scale (std ~1.24); fold the
-weight scale into the epilogue alpha (gemm_nvfp4's tensor_scale).
+weight scale into the epilogue alpha (gemm_w4a16's tensor_scale).
 """
 
 import math
@@ -40,7 +40,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import T
 
-from quack.blockscaled.nvfp4_utils import _asm_i32, _s32, add_bf16x2, imad_lo, mov_b32_vreg, prmt
+from quack.blockscaled.nvfp4_utils import asm_i32, _s32, add_bf16x2, imad_lo, mov_b32_vreg, prmt
 
 __all__ = [
     "QTIP_MUL",
@@ -75,7 +75,7 @@ QTIP_FPMASK = 0x3E003E00  # exponent base 124 -> exp in {124..127}, |v| in [0.12
 def _window16(lo: Int32, hi: Int32, sh: int, *, loc=None, ip=None) -> Int32:
     """bits [sh, sh+16) of the 64-bit pair (hi:lo), zero-extended: one funnel
     shift + one AND."""
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(lo).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
         f"{{.reg .b32 t; shf.r.clamp.b32 t, $1, $2, {sh}; and.b32 $0, t, 0xFFFF;}}",
         "=r,r,r",
@@ -88,7 +88,7 @@ def _window16(lo: Int32, hi: Int32, sh: int, *, loc=None, ip=None) -> Int32:
 @dsl_user_op
 def _mad_lo(a: Int32, *, loc=None, ip=None) -> Int32:
     """a * QTIP_MUL + QTIP_ADD, mod 2^32 (one IMAD)."""
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip)],
         f"mad.lo.s32 $0, $1, {_s32(QTIP_MUL)}, {_s32(QTIP_ADD)};",
         "=r,r",
@@ -103,7 +103,7 @@ def _and_imm_xor(a: Int32, xor_reg: Int32, *, loc=None, ip=None) -> Int32:
     """(a & QTIP_RMASK) ^ xor_reg in one LOP3 (mask immediate, base pinned in
     a vector register so ptxas cannot UR-rematerialize it in the mainloop)."""
     # immLut: a=0xF0, b=0xCC, c=0xAA -> (a & b) ^ c = 0x6A
-    res = _asm_i32(
+    res = asm_i32(
         [Int32(a).ir_value(loc=loc, ip=ip), Int32(xor_reg).ir_value(loc=loc, ip=ip)],
         f"lop3.b32 $0, $1, {_s32(QTIP_RMASK)}, $2, 0x6A;",
         "=r,r,r",

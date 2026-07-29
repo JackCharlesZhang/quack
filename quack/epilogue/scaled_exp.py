@@ -25,16 +25,11 @@ nothing to re-derive and no rounding convention to match on the host side.
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-from quack.epi_ops import ColVecLoad, ColVecReduce, ColVecSelect, GroupedColStatsBase
-from quack.gemm_epilogue import F2, gemm_epilogue
+from quack.epilogue.ops import ColVecLoad, ColVecReduce, ColVecSelect, GroupedColStatsBase
+from quack.epilogue.math import pexp2
+from quack.epilogue.frontend import gemm_epilogue
 
 LOG2E = 1.4426950408889634
-
-
-def pexp2(v):
-    if isinstance(v, tuple):
-        return F2(pexp2(v[0]), pexp2(v[1]))
-    return cute.math.exp2(v, fastmath=True)
 
 
 class MaxLog2(GroupedColStatsBase):

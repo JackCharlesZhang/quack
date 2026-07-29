@@ -16,7 +16,7 @@ import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
+from quack.epilogue.ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed

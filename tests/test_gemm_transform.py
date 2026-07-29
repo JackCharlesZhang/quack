@@ -427,7 +427,7 @@ def test_a_transform_colvec_ktile_via_host_plan():
     crosses as the transform_a_operand bundle, the operand fake is derived
     from the mod + tile_M, and the launch is bitwise == the plain plan on
     prescaled A."""
-    from quack.gemm_host import build_gemm_epi_plan, run_gemm_epi_plan
+    from quack.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
     from quack.operand_transform.host import transform_a_operand
 
     m, n, k = 384, 256, 512
@@ -487,7 +487,7 @@ def test_a_transform_via_host_plan():
     build_gemm_epi_plan(transform_a=<mod>) compiles/launches through the same
     machinery as every epilogue variant, bitwise == the plain plan on
     host-prescaled A (exact for the power-of-2 fn)."""
-    from quack.gemm_host import build_gemm_epi_plan, run_gemm_epi_plan
+    from quack.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
 
     torch.manual_seed(7)
     m, n, k = 256, 256, 512
@@ -528,7 +528,7 @@ def test_a_transform_args_epi_mod_gemm():
     tensors (transform_operands=) and builds the bundle itself from the
     resolved config; pre-built bundles there are rejected."""
     from quack.gemm_config import GemmConfig
-    from quack.gemm_epilogue import gemm_epilogue
+    from quack.epilogue.frontend import gemm_epilogue
     from quack.operand_transform.host import transform_a_operand
 
     @gemm_epilogue()
@@ -585,7 +585,7 @@ def test_a_transform_torch_compile():
     op's input list (ta__<name>), and the op body rebuilds the bundle —
     numerics match eager exactly (same kernels either way)."""
     from quack.gemm_config import GemmConfig
-    from quack.gemm_epilogue import gemm_epilogue
+    from quack.epilogue.frontend import gemm_epilogue
 
     @gemm_epilogue()
     def _vscale_c(acc, v):
@@ -635,7 +635,7 @@ def test_a_transform_dropout_torch_compile():
     list like any runtime operand; the mask is a pure function of (m, k,
     seed, offset) so compiled == eager bitwise."""
     from quack.gemm_config import GemmConfig
-    from quack.epilogues import identity_epi
+    from quack.epilogue.library import identity_epi
     from quack.operand_transform import dropout_a
 
     torch.manual_seed(11)
@@ -669,7 +669,7 @@ def test_a_transform_dropout_torch_compile():
 def test_a_transform_epi_mod_composition():
     """Value transforms compose with @gemm_epilogue fns through the eager
     mod(A, B, transform_a=...) surface (autotune bypassed; default config)."""
-    from quack.gemm_epilogue import gemm_epilogue
+    from quack.epilogue.frontend import gemm_epilogue
 
     @gemm_epilogue()
     def _plus_bias(acc, bias):
@@ -694,7 +694,7 @@ def _dropout_via_identity(A, seed, offset, p, tile_mnk=(128, 128, 64), pingpong=
     (under split-k too: only the split containing k = j contributes). Runs
     through mod.gemm — the seed bundle exercises the full host path (fakes,
     plan keys, warm cache)."""
-    from quack.gemm_epilogue import gemm_epilogue
+    from quack.epilogue.frontend import gemm_epilogue
     from quack.operand_transform import dropout_a
     from quack.operand_transform.host import transform_a_operand
 
@@ -791,7 +791,7 @@ def test_dropout_p_zero_and_scale_via_epi():
     assert torch.equal(D0, A), "p=0 must be a bitwise passthrough"
     # 1/(1-p) folded into the epilogue (the mainloop is mask-only); *2 is a
     # pow2 so the fused fp32 scale == scaling the masked bf16 result exactly
-    from quack.gemm_epilogue import gemm_epilogue
+    from quack.epilogue.frontend import gemm_epilogue
     from quack.operand_transform import dropout_a
     from quack.operand_transform.host import transform_a_operand
 
