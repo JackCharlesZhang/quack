@@ -3,7 +3,7 @@
 import enum
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -44,6 +44,30 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+
+
+def reinterpret_packed_fp6(mT, dtype):
+    """View a (mn, 3k/4[, l]) Uint8 tensor as a (mn, k[, l]) packed-fp6 tensor.
+
+    The byte tensor holds a little-endian 6-bit stream along K (element i at
+    bits [6i, 6i+6) of its row), so the K mode (mode 1, stride 1 - sub-byte
+    operands are K-major) scales by 8/6 in extent and keeps stride 1. The K
+    EXTENT conversion is exact: K % 128 makes every row whole 96-byte groups.
+
+    The non-K STRIDE conversion (x4//3, floor) is NOT exact for byte pitches
+    that aren't multiples of 3 (e.g. a padded 416 B row pitch -> 554.67 fp6
+    elements, floored to 554 = 415.5 B). This is safe because the FFI arg
+    spec admits only 32 B-aligned pitches and the tensormap encode rounds the
+    element stride back to the nearest TMA granule, recovering the true pitch
+    exactly: the residue is < 0.75 B either way (verified bit-exact with
+    poisoned padding at pitches 416/448/544/4128, both floor and ceil -
+    AI/probe_fp6_pitch.py). The 32 B stride validation is load-bearing for
+    correctness here, not just for the tensormap's alignment rule.
+    """
+    shape = tuple(s * 4 // 3 if i == 1 else s for i, s in enumerate(mT.shape))
+    stride = tuple(st if i == 1 else st * 4 // 3 for i, st in enumerate(mT.stride))
+    ptr = cute.recast_ptr(mT.iterator, dtype=dtype)
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
 
 
 class GemmBase:
@@ -1014,6 +1038,8 @@ class GemmTmaBase(GemmBase):
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         varlen_k: bool,
+        a_internal_type: Optional[Type[cutlass.Numeric]] = None,
+        b_internal_type: Optional[Type[cutlass.Numeric]] = None,
     ):
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
@@ -1024,12 +1050,14 @@ class GemmTmaBase(GemmBase):
                 a_smem_layout,
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
+                internal_type=a_internal_type,
             )
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
             b_smem_layout,
             (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
             self.cluster_shape_mnk[0],
+            internal_type=b_internal_type,
         )
         return tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b
 
@@ -1178,10 +1206,18 @@ class GemmTmaBase(GemmBase):
         smem_layout: cute.ComposedLayout,
         smem_tile: Tuple[int, int],
         mcast_dim: int,
+        internal_type: Optional[Type[cutlass.Numeric]] = None,
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for input tensors."""
+        """Create TMA atoms and tensors for input tensors.
+
+        ``internal_type=Int8`` with a packed-fp4 gmem tensor selects the
+        16U4_ALIGN8B tensormap (SM120 mixed fp4 x fp8): each 16-element group
+        lands as 8 packed-nibble bytes + 8 pad bytes of smem footprint, ready
+        for the ldsm.b4x16_p64 unpacking ldmatrix."""
         # block_copy takes compiler-driven multicast metadata at the copy site,
         # so the TMA atom itself must stay the non-multicast variant here.
         op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(op, tensor, smem_layout, smem_tile)
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            op, tensor, smem_layout, smem_tile, internal_type=internal_type
+        )
         return tma_atom, tma_tensor

@@ -1,12 +1,16 @@
 # Copyright (c) 2026, Tri Dao.
-"""SM120 MXFP8 block-scaled GEMM (warp-level MmaMXF8Op with REAL e8m0 scale
+"""SM120 block-scaled GEMM (warp-level kind::mxf8f6f4 with REAL e8m0 scale
 factors): numerics vs the dequantized reference, and bit-exact vs cuBLAS.
 
-Scope (first cut): K-major A and B, fp8 e4m3/e5m2 with e8m0 scales
-(sf_vec_size 32). fp4/fp6 formats and varlen_k (m-major A) are rejected at
-validation. Unlike the plain-fp8 unit-scale fast path (which falls back to
-MmaFP8Op on the H100 CI proxy), real scale factors REQUIRE the sm_120a
-kind::mxf8f6f4 block_scale instruction, so these tests run on SM120 only.
+Scope: K-major A and B, sf_vec_size 32, independent A/B dtypes across
+fp8 (e4m3/e5m2) / fp6 (e2m3/e3m2, packed) / fp4 (e2m1, packed) — same-dtype
+fp8 rides MmaMXF8Op, everything else MmaMXF8F6F4OpFull. Sub-byte operands
+are TMA-loaded via padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) and
+unpacked at s2r by ldsm.b4x16_p64 / b6x16_p32 (fp4 additionally shifted <<2
+into MMA position). Same-dtype fp4 (kind::mxf4 / mxf4nvf4) and varlen_k
+(m-major A) are rejected at validation. Unlike the plain-fp8 unit-scale fast
+path (which falls back to MmaFP8Op on the H100 CI proxy), these instructions
+REQUIRE an sm_120a target, so the tests run on SM120 only.
 """
 
 import pytest
@@ -233,12 +237,123 @@ def test_sm120_mxfp8_gemm_act(activation):
     assert rel < 5e-3, f"gemm_act {activation}: rel_err={rel}"
 
 
+def _mixed_operand(fmt, rows, k, seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    return BlockScaledOperand.quantize(x, fmt)
+
+
+_MIXED_PAIRS = [
+    # fp4 x fp8 (16U4_ALIGN8B TMA + b4x16_p64 ldmatrix + <<2 shift)
+    ("mxfp4", "mxfp8_e4m3"),
+    ("mxfp8_e4m3", "mxfp4"),
+    ("mxfp4", "mxfp8_e5m2"),
+    ("mxfp8_e5m2", "mxfp4"),
+    # same-width mixed fp8 (independent .e4m3/.e5m2 qualifiers)
+    ("mxfp8_e4m3", "mxfp8_e5m2"),
+    ("mxfp8_e5m2", "mxfp8_e4m3"),
+    # fp6 (16U6_ALIGN16B TMA + b6x16_p32 ldmatrix, no shift): x fp8, x fp6
+    # (mixed and same-dtype), x fp4
+    ("mxfp6_e2m3_packed", "mxfp8_e4m3"),
+    ("mxfp8_e4m3", "mxfp6_e2m3_packed"),
+    ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"),
+    ("mxfp6_e2m3_packed", "mxfp6_e2m3_packed"),
+    ("mxfp6_e2m3_packed", "mxfp4"),
+    ("mxfp4", "mxfp6_e3m2_packed"),
+]
+
+
+@requires_sm120
+@pytest.mark.parametrize("fmt_pair", _MIXED_PAIRS)
+@pytest.mark.parametrize(
+    "shape_mnk",
+    [
+        (256, 512, 512),
+        (448, 320, 512),  # M, N not multiples of 128 (padded SF rows)
+        (256, 256, 8192),  # long K: ALIGN8B + SF pipeline over many k-tiles
+    ],
+)
+def test_sm120_mixed_fp4_fp8_gemm(fmt_pair, shape_mnk):
+    """Mixed-dtype blockscaled pairs (kind::mxf8f6f4, independent a/b dtype
+    qualifiers — the CUTLASS C++ SM120_16x8x32_TN matrix): sub-byte operands
+    ride padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) into byte-domain
+    smem, ldsm.b4x16_p64 / b6x16_p32 unpacks into byte lanes, and fp4
+    fragments are shifted <<2 into MMA position. Checked against both the
+    blockscaled reference and the dequantized product."""
+    fmt_a, fmt_b = fmt_pair
+    m, n, k = shape_mnk
+    A = _mixed_operand(fmt_a, m, k, seed=0)
+    W = _mixed_operand(fmt_b, n, k, seed=1)
+    out = gemm(A, W.mT, tuned=False)
+    ref = gemm_blockscaled_ref(A, W.mT)
+    rel = _rel_err(out, ref)
+    assert rel < 5e-3, f"{fmt_a} x {fmt_b} {shape_mnk}: rel_err={rel}"
+    ref_dq = A.dequantize(torch.float32) @ W.dequantize(torch.float32).T
+    rel_dq = (out.float() - ref_dq).abs().max().item() / ref_dq.abs().max().item()
+    assert rel_dq < 5e-3, f"{fmt_a} x {fmt_b} {shape_mnk}: rel_err vs dequant={rel_dq}"
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "tile_mn,pingpong",
+    [((128, 128), True), ((256, 128), False), ((128, 256), False)],
+)
+def test_sm120_mixed_fp4_fp8_tiles(tile_mn, pingpong):
+    m, n, k = 512, 512, 512
+    A = _mixed_operand("mxfp4", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    B = W.mT
+    out = _gemm_with_config(A, B, config=_sm120_config(*tile_mn, pingpong=pingpong))
+    ref = gemm_blockscaled_ref(A, B)
+    rel = _rel_err(out, ref)
+    assert rel < 5e-3, f"mixed tile={tile_mn} pingpong={pingpong}: rel_err={rel}"
+
+
+@requires_sm120
+def test_sm120_mixed_fp4_fp8_gemm_add():
+    """Mixed operands through the epilogue frontend."""
+    m, n, k = 256, 256, 512
+    A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp4", n, k, seed=1)
+    B = W.mT
+    C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, alpha=0.5, beta=2.0, tuned=False)
+    ref = 0.5 * gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + 2.0 * C.float()
+    rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 5e-3, f"mixed gemm_add: rel_err={rel}"
+
+
+@requires_sm120
+@pytest.mark.parametrize("tile_m", [128, 64])
+def test_sm120_plain_mixed_fp8_gemm(tile_m):
+    """PLAIN (non-blockscaled) mixed e4m3 x e5m2. tile_m=128 rides
+    kind::mxf8f6f4 with constant unit scales (full Blackwell rate); tile_m=64
+    forces the Ada-instruction fallback (MmaFP8MixedOp — the sm_89 opcode
+    takes independent .e4m3/.e5m2 qualifiers), the same path H100 CI proxy
+    legs take."""
+    import math
+
+    torch.manual_seed(0)
+    m, n, k = 256, 256, 512
+    A = (torch.randn(m, k, device="cuda") / math.sqrt(k)).to(torch.float8_e4m3fn)
+    B = (torch.randn(n, k, device="cuda") / math.sqrt(k)).to(torch.float8_e5m2)
+    D = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    from quack.gemm import gemm as gemm_ffi
+
+    gemm_ffi(A, B, D, None, None, tile_m, 128, 1, 1)
+    torch.cuda.synchronize()
+    ref = A.float() @ B.float().mT
+    atol = ref.abs().max().item() * 2**-7 + 1e-6
+    torch.testing.assert_close(D.float(), ref, atol=atol, rtol=1e-2)
+
+
 @requires_sm120
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
-def test_sm120_fp4_rejected(fmt):
-    """SM120 blockscaled is MXFP8-only for now; fp4 formats must be rejected
-    at validation with a legible error, not at kernel compile."""
+def test_sm120_same_dtype_fp4_rejected(fmt):
+    """Same-dtype fp4 (kind::mxf4 / mxf4nvf4) is not implemented on SM120;
+    it must be rejected at validation with a legible error, not at kernel
+    compile."""
     m, n, k = 256, 256, 256
     A, B = _quantized_operands(fmt, m, n, k)
-    with pytest.raises(AssertionError, match="8-bit"):
+    with pytest.raises(AssertionError, match="same-dtype fp4"):
         gemm(A, B, tuned=False)

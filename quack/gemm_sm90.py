@@ -21,7 +21,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 
 
 from quack import layout_utils
-from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
+from quack.gemm_base import GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
 from quack.gemm_config import SplitKMode
 from quack.operand_transform.transform import TransformAOperand
 from quack.tile_scheduler import TileSchedulerOptions, ag_wait_m_tile
@@ -303,6 +303,9 @@ class GemmSm90(GemmTmaBase):
         self.sf_vec_size = None
         self.sfa_smem_layout_staged = None
         self.sfb_smem_layout_staged = None
+        # B's MMA element type when it differs from the storage dtype (packed
+        # fp6 crosses the FFI boundary as raw bytes); SM120-blockscaled only.
+        self.b_mma_dtype_cfg = None
 
         self.ab_stage = None
         self.epi_stage = None
@@ -409,12 +412,15 @@ class GemmSm90(GemmTmaBase):
         )
         self.epi_tile_shape = cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile)
 
-        # Compute stage before compute smem layout
+        # Compute stage before compute smem layout. Smem accounting and layout
+        # atoms use the smem STORAGE dtypes: identical to the element dtypes
+        # except SM120 mixed-blockscaled fp4 operands, whose 16U4_ALIGN8B smem
+        # footprint is one byte per element (Int8, set by _setup_tiled_mma).
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
             self.epi_tile,
-            self.a_dtype,
-            self.b_dtype,
+            self.a_smem_dtype,
+            self.b_smem_dtype,
             self.d_dtype,
             self.c_dtype,
             epilogue_args,
@@ -445,9 +451,9 @@ class GemmSm90(GemmTmaBase):
         ) = self._make_smem_layouts(
             self.cta_tile_shape_mnk,
             self.epi_tile,
-            self.a_dtype,
+            self.a_smem_dtype,
             self.a_layout,
-            self.b_dtype,
+            self.b_smem_dtype,
             self.b_layout,
             self.ab_stage,
             self.d_dtype,
@@ -551,12 +557,29 @@ class GemmSm90(GemmTmaBase):
                 None, mB, mD, mC, epilogue_args, append_batch_if_2d=const_expr(varlen_args is None)
             )
 
+        if const_expr(self.blockscaled):
+            # Packed 6-bit operands cross the FFI boundary as raw bytes (torch
+            # has no fp6 dtype): reinterpret (mn, 3k/4[, l]) Uint8 as
+            # (mn, k[, l]) fp6, same as the SM100 path.
+            if const_expr(self.mma_a_dtype.width == 6):
+                mA = reinterpret_packed_fp6(mA, self.mma_a_dtype)
+            if const_expr(self.b_mma_dtype_cfg is not None and self.b_mma_dtype_cfg.width == 6):
+                mB = reinterpret_packed_fp6(mB, self.b_mma_dtype_cfg)
+
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
         self.d_dtype = mD.element_type if mD is not None else None
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype = mSFA.element_type if const_expr(mSFA is not None) else None
+        # smem storage / TMA-internal dtypes default to the element dtypes; the
+        # SM120 mixed-blockscaled path overrides sub-byte (fp4/fp6) sides to
+        # Int8 in _setup_tiled_mma (16U4_ALIGN8B / 16U6_ALIGN16B footprint,
+        # see gemm_sm120.py).
+        self.a_smem_dtype = self.a_dtype
+        self.b_smem_dtype = self.b_dtype
+        self.a_tma_internal_dtype = None
+        self.b_tma_internal_dtype = None
         self.a_layout = LayoutEnum.from_tensor(mA)
         self.b_layout = LayoutEnum.from_tensor(mB)
         self.d_layout = LayoutEnum.from_tensor(mD) if mD is not None else None
@@ -572,12 +595,15 @@ class GemmSm90(GemmTmaBase):
                 )
             if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
                 raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-            if const_expr(self.a_dtype.width != self.b_dtype.width):
-                raise TypeError(
-                    f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
-                )
-            if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
-                raise TypeError("a_dtype should be float16 or float8")
+            # Blockscaled (SM120) admits mixed-width fp4 x fp8 pairs; its dtype
+            # legality is enforced in GemmSm120._setup_tiled_mma.
+            if const_expr(not self.blockscaled):
+                if const_expr(self.a_dtype.width != self.b_dtype.width):
+                    raise TypeError(
+                        f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
+                    )
+                if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
+                    raise TypeError("a_dtype should be float16 or float8")
             if const_expr(self.mma_is_rs and self.a_dtype.width != 16):
                 # The canonical RS s2r load is ldmatrix (trans for m-major A),
                 # which is 16-bit only; other-width RS variants bring their own
@@ -596,7 +622,15 @@ class GemmSm90(GemmTmaBase):
         if const_expr(not a_owned):
             a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
             tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = (
-                self.make_tma_load_atoms_and_tensors(mA, mB, a_smem_layout, b_smem_layout, varlen_k)
+                self.make_tma_load_atoms_and_tensors(
+                    mA,
+                    mB,
+                    a_smem_layout,
+                    b_smem_layout,
+                    varlen_k,
+                    a_internal_type=self.a_tma_internal_dtype,
+                    b_internal_type=self.b_tma_internal_dtype,
+                )
             )
         else:
             # packed-weight A: the transform owns A's TMA (blob boxes); its
@@ -728,11 +762,11 @@ class GemmSm90(GemmTmaBase):
             ]
             epi: self.epi_get_smem_struct(epilogue_params)
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
+                cute.struct.MemRange[self.a_smem_dtype, cute.cosize(self.a_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
+                cute.struct.MemRange[self.b_smem_dtype, cute.cosize(self.b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sAuxA: cute.struct.Align[

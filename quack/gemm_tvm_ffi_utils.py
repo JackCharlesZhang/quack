@@ -110,10 +110,16 @@ def validate_blockscaled_sf(
     assert SFB is not None, "SFA and SFB must be provided together"
     assert device_capacity[0] in [10, 11, 12], "Blockscaled GEMM requires SM100/SM110/SM120"
     if device_capacity[0] == 12:
-        # SM120 warp-MMA blockscaled: MXFP8 only for now (K-major 8-bit
-        # operands; fp4/fp6 and varlen_k's m-major A are not implemented).
-        assert fmt_a.elem_bits == 8 and fmt_b.elem_bits == 8, (
-            f"SM120 blockscaled GEMM supports MXFP8 (8-bit) formats only, "
+        # SM120 warp-MMA blockscaled: same-dtype MXFP8 (MmaMXF8Op), or any
+        # kind::mxf8f6f4 pair with independent a/b dtypes — fp8/fp6/fp4 mixes
+        # incl. e4m3 x e5m2 (sub-byte sides ride padded 16U4_ALIGN8B /
+        # 16U6_ALIGN16B tensormaps + ldsm.b4x16_p64/b6x16_p32 unpack).
+        # Same-dtype fp4 (kind::mxf4 / mxf4nvf4) and varlen_k's m-major A are
+        # not implemented.
+        pair_bits = (fmt_a.elem_bits, fmt_b.elem_bits)
+        assert pair_bits != (4, 4), (
+            f"SM120 blockscaled GEMM does not implement same-dtype fp4 "
+            f"(kind::mxf4 / mxf4nvf4); pair fp4 with an fp8/fp6 format, "
             f"got {fmt_a.name} x {fmt_b.name}"
         )
         assert not varlen_k, "SM120 blockscaled GEMM does not support varlen_k (needs m-major A)"
@@ -692,8 +698,12 @@ def compile_gemm_kernel(
         GemmCls = partial(GemmCls, **sm8x_kwargs)
     elif device_capacity[0] in [9, 12]:
         if device_capacity[0] == 12 and sf_vec_size is not None:
-            # SM120 blockscaled (real SFA/SFB); SM90 has no blockscaled path
+            # SM120 blockscaled (real SFA/SFB); SM90 has no blockscaled path.
+            # MMA element types ride along when they differ from storage
+            # dtypes (packed fp6 crosses the FFI boundary as raw bytes).
             split_k_kwargs["sf_vec_size"] = sf_vec_size
+            split_k_kwargs["a_mma_dtype"] = a_mma_dtype
+            split_k_kwargs["b_mma_dtype"] = b_mma_dtype
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
