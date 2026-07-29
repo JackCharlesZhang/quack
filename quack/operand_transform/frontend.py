@@ -218,10 +218,13 @@ class TransformModBase:
         if fmt.promote:
             tm, tn, _sk = pick_w4a8_cfg(A.shape[-2], self.padded_n(B))
         else:
-            # SM120's warp-MMA tiled MMA always spans 32 N: floor tile_n there
-            tile_n_min = 32 if get_device_capacity(A.device)[0] == 12 else 16
+            # W4 runs atom_n == 1 on every arch (SM120's (4,1,1)/(8,1,1)
+            # decode layouts included): tile_n floor is the 16-wide warp span
             tm, tn, _sk = pick_w4_cfg(
-                A.shape[-2], self.padded_n(B), A.shape[-1] // fmt.tile_k, tile_n_min
+                A.shape[-2],
+                self.padded_n(B),
+                A.shape[-1] // fmt.tile_k,
+                sm120=get_device_capacity(A.device)[0] == 12,
             )
         return GemmConfig(
             tile_m=tm,

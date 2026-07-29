@@ -29,8 +29,9 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 
 __all__ = [
@@ -680,13 +681,35 @@ def pin_b32_vreg(v: int, *, loc=None, ip=None) -> Int32:
     return Int32(res)
 
 
+def _arch_has_bf16_narrow_cvt():
+    """True on Blackwell-family targets (sm_100/103/110/120/121, a/f): the
+    PTX 9.2 direct fp4/fp8 -> bf16x2 converts (SASS F2FP.BF16.E2M1/E4M3,
+    optional fused ue8m0 scale) are available. Measured on RTX 5090: the hw
+    convert decodes e2m1 at 2.0x the prmt-LUT sequence's rate (2.45x with
+    the fused scale) and e4m3 at 1.6x the f16-route — both are shorter AND
+    faster, so the arch check is the only gate."""
+    from cutlass.base_dsl.arch import Arch
+
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    # Arch orders by (major, minor, suffix): everything from sm_100 up has
+    # the hw cvt, and unlike the block-scaled mma there is no per-op
+    # admissible list to mirror — the cvt is plain PTX.
+    return arch >= Arch.sm_100
+
+
 def make_decode_luts():
     """Loop-invariant vector-register LUTs for decode_e2m1x8_to_bf16x8.
     The A-halves are tid-pinned: each prmt has ONE immediate slot and ptxas
     reliably gives it to the B-half, so an unpinned A-half gets demoted to a
     uniform reg and remat-copied into the decode under tight budgets. The
     B-halves stay plain movs so ptxas CAN immediate-ize them (pinning them
-    would force two extra live registers)."""
+    would force two extra live registers).
+
+    Blackwell (hw-cvt decode): no LUTs — None keeps the four constants (two
+    of them tid-pinned, i.e. undead-code-eliminable) out of the register
+    budget."""
+    if _arch_has_bf16_narrow_cvt():
+        return None
     return (
         pin_b32_vreg(LUT_LO_A),
         mov_b32_vreg(LUT_LO_B),
@@ -695,16 +718,90 @@ def make_decode_luts():
     )
 
 
+@dsl_user_op
+def decode_e2m1x8_to_bf16x8_cvt(x: Int32, *, loc=None, ip=None):
+    """8 packed e2m1 nibbles -> 4 bf16x2 via the Blackwell hw converter:
+    byte j -> R_j = (bf16(v_2j), bf16(v_{2j+1})) — cvt.rn.bf16x2.e2m1x2 maps
+    the low nibble to the low lane, so the nibble order matches the LUT
+    sequence exactly. 4 SASS (F2FP.BF16.E2M1.UNPACK_B; the byte unpack folds
+    into the converter's operand select) vs the LUT sequence's 15."""
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>")
+    res = llvm.inline_asm(
+        struct_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip)],
+        "{.reg .b8 b0, b1, b2, b3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, $4;\n\t"
+        "cvt.rn.bf16x2.e2m1x2 $0, b0;\n\t"
+        "cvt.rn.bf16x2.e2m1x2 $1, b1;\n\t"
+        "cvt.rn.bf16x2.e2m1x2 $2, b2;\n\t"
+        "cvt.rn.bf16x2.e2m1x2 $3, b3;}",
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    i32 = T.i32()
+    return (
+        Int32(llvm.extractvalue(i32, res, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [1], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [2], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def decode_e2m1x8_mul_e8m0pair_cvt(
+    x: Int32, sf_bytes: Int32, byte_idx: cutlass.Constexpr[int], *, loc=None, ip=None
+):
+    """8 packed e2m1 nibbles times the (row r, row r+8) ue8m0 scale bytes at
+    (byte_idx, byte_idx+1) of sf_bytes -> 4 bf16x2 in fragment slot order
+    (R0, R2 = row r; R1, R3 = row r+8), via the fused-scale hw converter
+    (cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2). 5 SASS per 8 values (1 PRMT
+    building both duplicated-byte scale operands + 4 F2FP) — replaces the
+    15-op LUT decode AND the 4 HMUL2 scale multiplies AND the e8m0->bf16
+    strip unpack."""
+    i, j = byte_idx, byte_idx + 1
+    sel = i * 0x11 + j * 0x1100  # prmt bytes [i, i, j, j]
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>")
+    res = llvm.inline_asm(
+        struct_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip), Int32(sf_bytes).ir_value(loc=loc, ip=ip)],
+        "{.reg .b8 b0, b1, b2, b3; .reg .b32 t; .reg .b16 sr, sr8;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, $4;\n\t"
+        f"prmt.b32 t, $5, 0, {sel:#x};\n\t"
+        "mov.b32 {sr, sr8}, t;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 $0, b0, sr;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 $1, b1, sr8;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 $2, b2, sr;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 $3, b3, sr8;}",
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    i32 = T.i32()
+    return (
+        Int32(llvm.extractvalue(i32, res, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [1], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [2], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [3], loc=loc, ip=ip)),
+    )
+
+
 @cute.jit
 def decode_e2m1x8_to_bf16x8(x: Int32, luts) -> Tuple[Int32, Int32, Int32, Int32]:
     """Decode 8 packed e2m1 nibbles (v0 lowest) into 4 bf16x2 registers
     R_j = (bf16(v_{2j}), bf16(v_{2j+1})). luts from make_decode_luts().
 
+    Blackwell targets take the hw converter (4 F2FP.BF16.E2M1, no LUTs —
+    2.0x measured on RTX 5090); pre-Blackwell:
     15 SASS ops per 8 values (10 PRMT + 3 LOP3 + SHF + IMAD.SHL), surveyed
     tight (2026-07-27): Marlin's exponent-alignment scheme costs the same construct
     + 4 unfoldable 2^126 fixup HMUL2s (bf16's 7-bit mantissa blocks the fp16-only in-place
     high-nibble trick, and any OR-able exponent offset breaks e2m1
     subnormals); IMAD/LEA pipe moves are no-ops (fma-heavy shares dispatch with IMAD)."""
+    if const_expr(_arch_has_bf16_narrow_cvt()):
+        return decode_e2m1x8_to_bf16x8_cvt(x)
     lo_a, lo_b, hi_a, hi_b = luts
     # prmt reads only selector bits [15:0], so one full-width mask serves both
     # halves: the lo selector ignores the extra high bits, the hi selector is
@@ -904,11 +1001,22 @@ def _e4m3x2_to_bf16x2(
     pair: Int32, hi: cutlass.Constexpr[bool] = False, *, loc=None, ip=None
 ) -> Int32:
     """(e4m3 b0, e4m3 b1) in the low (hi=False) or high (hi=True) 16 bits ->
-    (bf16 b0, bf16 b1). Uses the sm_89+ hw cvt via f16/f32 (exact for all
-    e4m3 incl. zero/denormals; 4 SASS: F2FP.F16.E4M3 + 2 HADD2.F32 +
-    F2FP.BF16.F32). The half select folds into the cvt's operand unpack
-    (F2FP ...UNPACK_B) — no SHF, so hi=True beats converting `x >> 16`."""
+    (bf16 b0, bf16 b1). Blackwell targets take the direct hw convert
+    (cvt.rn.bf16x2.e4m3x2, 1 SASS — 1.6x measured); pre-Blackwell uses the
+    sm_89+ hw cvt via f16/f32 (exact for all e4m3 incl. zero/denormals;
+    4 SASS: F2FP.F16.E4M3 + 2 HADD2.F32 + F2FP.BF16.F32). Either way the
+    half select folds into the cvt's operand unpack (F2FP ...UNPACK_B) —
+    no SHF, so hi=True beats converting `x >> 16`."""
     sel = "{_, p}" if hi else "{p, _}"
+    if _arch_has_bf16_narrow_cvt():
+        res = asm_i32(
+            [Int32(pair).ir_value(loc=loc, ip=ip)],
+            f"{{.reg .b16 p; mov.b32 {sel}, $1; cvt.rn.bf16x2.e4m3x2 $0, p;}}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+        return Int32(res)
     res = asm_i32(
         [Int32(pair).ir_value(loc=loc, ip=ip)],
         "{.reg .b16 lo, hi, p; .reg .b32 h2; .reg .f32 f0, f1; "

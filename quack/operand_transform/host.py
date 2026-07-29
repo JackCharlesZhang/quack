@@ -84,7 +84,9 @@ def _pick_tile_n(m_act: int, tile_n_min: int = 16) -> int:
     return 192
 
 
-def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int, tile_n_min: int = 16) -> tuple:
+def pick_w4_cfg(
+    m_act: int, n_full: int, k_tiles: int, tile_n_min: int = 16, sm120: bool = False
+) -> tuple:
     """(tile_m, tile_n, split_k). Measured invariant (H100, int4/qtip, incl.
     the machete faceoff): every winning config puts the grid at ~112-128 CTAs
     with the LARGEST tile that gets there — tile_m=128 beats 64 by 10-25% at
@@ -93,15 +95,41 @@ def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int, tile_n_min: int = 16) -> 
     serial split-k makes up remaining grid coverage when each split keeps
     >= ~24 k-tiles (and tile_n <= 128: the f32 finalize round-trip scales
     with tile area). Prefill (m > 256): (128, 256, 1). ``tile_n_min``: the
-    arch's tile_N floor (32 on SM120 — its tiled MMA always spans 32 N)."""
+    arch's tile_N floor. ``sm120``: RTX 5090-measured decode rule (see below)."""
     if n_full % 128 != 0:
         tn = _pick_tile_n(m_act, tile_n_min) if m_act <= 128 else 192
         mt = -(-m_act // tn)
         sk = 2 if (m_act <= 32 and (n_full // 64) * mt < 128 and k_tiles >= 32) else 1
         return 64, tn, sk
     if m_act > 256:
+        # SM120 (RTX 5090 measured): short-K prefill wants 128-wide tiles —
+        # qkv m=2048 (128,128,1) 207 TF vs (128,256,1) 177 (matches Marlin);
+        # long-K keeps 256 (down m=2048: (128,256) 183 > (128,128) 175).
+        if sm120 and k_tiles <= 96:
+            return 128, 128, 1
         return 128, 256, 1
     n128 = n_full // 128
+    if sm120 and m_act <= 64:
+        # RTX 5090 measured (qtip2s/int4, all four Llama-8B layers,
+        # 2026-07-29): m <= 64 wants 128-row tiles unconditionally — (128,
+        # tn, sk) beats every 64-row config (qkv m=1: 12.3us vs 17.3; down:
+        # 20.9 vs 25.7 — 1.0-1.4 TB/s of weight BW vs the 64-row ~0.7-1.1;
+        # gateup m=64: (128,64,2) 84.5us vs the H100 rule's 114) — with the
+        # LARGEST serial split-k keeping >= 32 k-tiles per split, relaxed to
+        # >= 16 only when the grid would stay under ~96 CTAs (o-proj: 128
+        # CTAs at 16 k-tiles beats 64 CTAs at 32). The 170-SM part rewards
+        # more CTAs well past the H100 112 target (gateup m=1: 448 > 224).
+        tn = _pick_tile_n(m_act, tile_n_min)
+        sk = 1
+        for cand in (2, 4, 8):
+            if k_tiles // cand >= 32 and n128 * cand <= 512:
+                sk = cand
+        if n128 * sk < 96:
+            for cand in (2, 4, 8):
+                if cand > sk and k_tiles // cand >= 16 and n128 * cand >= 96:
+                    sk = cand
+                    break
+        return 128, tn, sk
     for tn in (256, 128, 64, 32, 16):
         if tn < tile_n_min:
             break

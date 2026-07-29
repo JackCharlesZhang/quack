@@ -82,9 +82,11 @@ def gemm_w4a16(
     assert kt * tk == k, f"K mismatch: act K={k}, blob K={kt * tk}"
     if n_out is None:
         n_out = n_full
-    # SM120's warp-MMA tiled MMA always spans 32 N: floor tile_n there
-    tile_n_min = 32 if get_device_capacity(act.device)[0] == 12 else 16
-    auto_tm, auto_tn, auto_sk = _pick_w4_cfg(m_act, n_full, k // tk, tile_n_min)
+    # W4 runs atom_n == 1 on every arch (SM120 included since the (4,1,1)/
+    # (8,1,1) decode layouts): tile_n floor is the 16-wide warp N span.
+    auto_tm, auto_tn, auto_sk = _pick_w4_cfg(
+        m_act, n_full, k // tk, sm120=get_device_capacity(act.device)[0] == 12
+    )
     if tile_m is None and tile_n is None and split_k is None:
         tile_m, tile_n, split_k = auto_tm, auto_tn, auto_sk
     if tile_m is None:

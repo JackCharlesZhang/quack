@@ -333,6 +333,10 @@ class Mxfp4(DecodeFormat):
 
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
+        if const_expr(U._arch_has_bf16_narrow_cvt()):
+            # pow2 scale rides the converter's fused ue8m0 operand: decode +
+            # scale + strip unpack in 5 SASS per 8 values
+            return U.decode_e2m1x8_mul_e8m0pair_cvt(xw[b], sfw[0], (b // 2) * 2)
         r0, r1, r2, r3 = U.decode_e2m1x8_to_bf16x8(xw[b], consts)
         h = U.sf_e8m0_pair_to_bf16x2(sfw[0], (b // 2) * 2)
         return _mul4(r0, r1, r2, r3, h)

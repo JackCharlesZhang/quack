@@ -247,7 +247,9 @@ def partition_fragment_ABC(
     return acc, tCrA, tCrB
 
 
-def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False, transpose=None):
+def canonical_a_load_s2r(
+    tiled_mma, sA, tidx, tCrA, position_independent=False, transpose=None, atom=None
+):
     """The canonical A-operand produce for the RS mainloop: an ldmatrix tiled
     copy derived from the MMA (LDSM for k-major A, LDSM.T for m-major — one
     code path, 16-bit only). Returns ``copy_block(stage_idx, b, k_tile)``,
@@ -262,7 +264,8 @@ def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False, 
     so ``transpose`` must be passed explicitly there."""
     if transpose is None:
         transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
-    atom = copy_utils.get_smem_load_atom(sA.element_type, transpose)
+    if const_expr(atom is None):
+        atom = copy_utils.get_smem_load_atom(sA.element_type, transpose)
     smem_tiled_copy_A = cute.make_tiled_copy_A(atom, tiled_mma)
     thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
     # (CPY, CPY_M, CPY_K, STAGE); position-independent partition absorbs the

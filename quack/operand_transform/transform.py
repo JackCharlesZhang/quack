@@ -235,16 +235,16 @@ class TransformAW4(TransformA):
             "w4 supports (1, cluster_N, 1) clusters"
         )
         if gemm.arch == 120:
-            # Warp-MMA mainloop: an MMA_M step covers atom_m * 16 rows, and the
-            # decode's m64-block/thread-slot mapping below needs that to be
-            # exactly one m64 block (atom_m == 4; the (4, 2, 1) cooperative
-            # atom layout always satisfies this). A fragments are duplicated
-            # across the n-warps, so atom_n > 1 just repeats the decode —
-            # correct, same as the duplicated ldmatrix it replaces.
-            assert gemm.atom_layout_mnk[0] == 4, "w4 on SM120 needs 64-row MMA_M steps"
-            assert self.fmt.mma_dtype.width == 16 and not self.promote, (
-                "fp8-MMA formats (int4sm/int4smf/W4A8 promote) need fp8 tensor cores; "
-                "the SM120 warp-MMA path is 16-bit only"
+            # Warp-MMA mainloop, atom_n == 1 (the gemm ctor picks (4,1,1) or
+            # (8,1,1) for layout-owning transforms): an MMA_M step covers
+            # atom_m * 16 rows = atom_m/4 m64 blocks, one per 4-warp group —
+            # the same m64-block/warp-group split as a WGMMA warpgroup stack,
+            # so the mapping below mirrors SM90's (m64 = m * groups + wg).
+            assert gemm.atom_layout_mnk[0] in (4, 8), "w4 on SM120 needs 4- or 8-warp MMA_M steps"
+            assert gemm.atom_layout_mnk[1] == 1, "w4 requires atom_layout_n == 1"
+            assert not self.promote, (
+                "W4A8 promote (int4sm) needs the per-k-tile promote seam; SM120's mma() "
+                "does not implement it yet — use int4smf (folded, fast-accum) instead"
             )
         else:
             assert gemm.atom_layout_mnk[1] == 1, "w4 requires atom_layout_n == 1"
@@ -253,9 +253,19 @@ class TransformAW4(TransformA):
             # of the k-tile strip geometry, consumed inside decode_k16
             self.aux = AuxKTileStrip(gemm, self.fmt.sf_bytes)
         if gemm.arch == 120:
-            # register budgets: keep the SM120 defaults (the SM90 rules below
-            # encode H100-measured warpgroup/occupancy trade-offs)
-            pass
+            # Small-N decode shapes stall at occupancy 1 (RTX 5090 measured:
+            # ~500 GB/s of weight BW at (64, 32) vs ~1.5 TB/s machine peak;
+            # split-k sweeps 1-8 move it < 1.3x, so it's consumer-side stall
+            # latency, not grid coverage). Same fix as the SM90 rule below:
+            # 2 CTAs/SM, with the budget arithmetic keyed on the CTA's warp
+            # group count (2 mma WGs -> 384 threads, launch cap 80; 1 mma WG
+            # ((4,1,1) decode layout) -> 256 threads, launch cap 128).
+            if gemm.cta_tile_shape_mnk[1] <= 32:
+                gemm.occupancy = 2
+                if gemm.mma_warp_groups == 2:
+                    gemm.num_regs_load, gemm.num_regs_mma = 32, 104
+                else:
+                    gemm.num_regs_load, gemm.num_regs_mma = 40, 152
         elif const_expr(gemm.cta_tile_shape_mnk[1] <= 32):
             # Small-N (decode) shapes are latency-bound: consumers need few
             # regs (small acc + A frag), so shrink budgets to fit 2 CTAs/SM
@@ -342,13 +352,15 @@ class TransformAW4(TransformA):
         )
         sAux_i32 = cute.recast_tensor(sAux, Int32) if const_expr(sAux is not None) else None
         if const_expr(gemm.arch == 120):
-            # Warp-MMA fragment ownership: MMA_M step m IS m64 block m (64-row
-            # steps asserted in __init__), warp w = (tidx // 32) % 4 covers rows
-            # 16w..16w+15 within it — the same (warp, lane) -> fragment-row map
-            # as a WGMMA warpgroup, so the repacked blob's thread slots carry
-            # over with t128 = m-warp * 32 + lane (n-warps duplicate the LDS).
+            # Warp-MMA fragment ownership (atom_n == 1): an MMA_M step covers
+            # atom_m/4 m64 blocks, one per 4-warp group — warp w covers rows
+            # 16*(w%4)..+15 of its group's block, the same (warp, lane) ->
+            # fragment-row map as a WGMMA warpgroup, so the repacked blob's
+            # thread slots carry over with t128 = (w%4) * 32 + lane and
+            # m64 = m * groups + warp_group_idx (groups = atom_m/4; the
+            # (4,1,1) decode layout has one group, so wg is always 0 there).
             t128 = ((tidx // 32) % 4) * 32 + tidx % 32
-            atom_m, wg = 1, 0
+            atom_m, wg = gemm.atom_layout_mnk[0] // 4, warp_group_idx
         else:
             t128 = tidx % 128
             atom_m, wg = gemm.atom_layout_mnk[0], warp_group_idx
