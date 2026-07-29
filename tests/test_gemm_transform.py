@@ -1,14 +1,16 @@
 # Copyright (c) 2026, Tri Dao.
 """Gates for the RS mainloop (mma_is_rs=True) and the A-operand transform
-frontend riding it.
+frontend riding it, on both register-sourced mainloops: SM90 RS (WGMMA) and
+SM120 (warp MMA — always register-sourced; run on an SM90 part via
+QUACK_ARCH=120, the kernel uses no SM120-exclusive instructions).
 
-RS gate: bitwise-identical to the SS mainloop — same WGMMA instruction, same
-k-tile order, same accumulation order; only the A operand source differs
-(ldmatrix s2r load of the fragment vs the SS descriptor read).
+RS gate (SM90 only): bitwise-identical to the SS mainloop — same WGMMA
+instruction, same k-tile order, same accumulation order; only the A operand
+source differs (ldmatrix s2r load of the fragment vs the SS descriptor read).
 
 Value-fn gate: an ``@a_transform`` fn applied on the fragment must be bitwise
 == pre-applying it to A on the host (exact for powers of 2) and running the
-plain SS mainloop."""
+plain mainloop."""
 
 import math
 
@@ -23,13 +25,16 @@ from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_default_epi import GemmDefaultSm90
+from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm120
 from quack.tile_scheduler import TileSchedulerOptions
 
+_ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] != 9,
-    reason="RS mainloop (mma_is_rs) is SM90 only",
+    _ARCH not in (9, 12),
+    reason="A-operand transforms are SM90 (RS mainloop) / SM120 (warp-MMA mainloop) only",
 )
+_GEMM_CLS = {9: GemmDefaultSm90, 12: GemmDefaultSm120}.get(_ARCH, GemmDefaultSm90)
+sm90_only = pytest.mark.skipif(_ARCH != 9, reason="SS/RS mode split is SM90 only")
 
 _TORCH2CUTE = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}
 
@@ -43,16 +48,18 @@ def _run_gemm(A, B, D, tile_mnk, cluster_mnk, pingpong, mma_is_rs, transform_a=N
         mA = TransformAOperand(mA, from_dlpack(aux, assumed_align=16))
     mB = from_dlpack(B, assumed_align=16)
     mD = from_dlpack(D, assumed_align=16)
-    epi_args = GemmDefaultSm90.EpilogueArguments()
+    epi_args = _GEMM_CLS.EpilogueArguments()
     scheduler_args = TileSchedulerOptions(Int32(get_max_active_clusters(math.prod(cluster_mnk))))
-    gemm_obj = GemmDefaultSm90(
+    # SM120 has no SS/RS mode split (A is always register-sourced)
+    rs_kwargs = {"mma_is_rs": mma_is_rs} if _ARCH == 9 else {}
+    gemm_obj = _GEMM_CLS(
         Float32,
         _TORCH2CUTE[A.dtype],
         tile_mnk,
         cluster_mnk,
         pingpong=pingpong,
-        mma_is_rs=mma_is_rs,
         transform_a=transform_a,
+        **rs_kwargs,
     )
     compiled = cute.compile(gemm_obj, mA, mB, mD, None, epi_args, scheduler_args, None, stream)
     compiled(mA, mB, mD, None, epi_args, scheduler_args, None, stream)
@@ -80,6 +87,7 @@ def _check_rs_vs_ss(m, n, k, tile_mnk, cluster_mnk, pingpong, a_major, dtype):
 
 @pytest.mark.parametrize("pingpong", [False, True])
 @pytest.mark.parametrize("a_major", ["k", "m"])
+@sm90_only
 def test_rs_identity_bitwise(a_major, pingpong):
     # k = 4.5 k-tiles exercises the TMA zero-fill K tail through the fill.
     _check_rs_vs_ss(
@@ -94,6 +102,7 @@ def test_rs_identity_bitwise(a_major, pingpong):
     )
 
 
+@sm90_only
 def test_rs_identity_fp16():
     _check_rs_vs_ss(
         m=256,
@@ -115,6 +124,7 @@ def test_rs_identity_fp16():
         (192, 256, 64),  # atom (1, 2): N-split warpgroups + N-permuted tiled_mma
     ],
 )
+@sm90_only
 def test_rs_identity_atom_layouts(tile_mnk):
     _check_rs_vs_ss(
         m=384,
@@ -128,6 +138,7 @@ def test_rs_identity_atom_layouts(tile_mnk):
     )
 
 
+@sm90_only
 def test_rs_identity_cluster():
     # A-multicast (cluster_N = 2) writes sA; the RS s2r load reads it — orthogonal.
     _check_rs_vs_ss(
@@ -142,6 +153,7 @@ def test_rs_identity_cluster():
     )
 
 
+@sm90_only
 def test_rs_identity_short_k():
     # 1- and 2-k-tile problems exercise the mainloop's prologue/tail special
     # cases (no steady iterations; preload straight into the tail).
@@ -437,7 +449,7 @@ def test_a_transform_colvec_ktile_via_host_plan():
 
     def make_plan(a_arg, transform):
         return build_gemm_epi_plan(
-            GemmDefaultSm90,
+            _GEMM_CLS,
             cap,
             a_arg,
             B,
@@ -497,7 +509,7 @@ def test_a_transform_via_host_plan():
 
     def make_plan(transform):
         return build_gemm_epi_plan(
-            GemmDefaultSm90,
+            _GEMM_CLS,
             cap,
             A,
             B,

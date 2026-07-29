@@ -27,6 +27,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from quack.cute_dsl_utils import get_device_capacity
 from quack.operand_transform.formats import decode_format
 from quack.epilogue.ops import ColVecLoad, RowVecLoad
 from quack.gemm import _split_k_buffers
@@ -81,14 +82,15 @@ def gemm_w4a16(
     assert kt * tk == k, f"K mismatch: act K={k}, blob K={kt * tk}"
     if n_out is None:
         n_out = n_full
-    auto_tm, auto_tn, auto_sk = _pick_w4_cfg(m_act, n_full, k // tk)
+    # SM120's warp-MMA tiled MMA always spans 32 N: floor tile_n there
+    tile_n_min = 32 if get_device_capacity(act.device)[0] == 12 else 16
+    auto_tm, auto_tn, auto_sk = _pick_w4_cfg(m_act, n_full, k // tk, tile_n_min)
     if tile_m is None and tile_n is None and split_k is None:
         tile_m, tile_n, split_k = auto_tm, auto_tn, auto_sk
     if tile_m is None:
         tile_m = auto_tm
     if tile_n is None:
         tile_n = auto_tn
-    assert n_full % tile_m == 0, f"padded N ({n_full}) must be divisible by tile_m ({tile_m})"
     if out is None:
         out = torch.empty(m_act, n_full, dtype=torch.bfloat16, device=act.device)
     else:
@@ -210,7 +212,6 @@ def gemm_w4a8(
         tile_n = auto_tn
     if split_k is None:
         split_k = auto_sk if (tile_m, tile_n) == (auto_tm, auto_tn) else 1
-    assert n_full % tile_m == 0, f"padded N ({n_full}) must be divisible by tile_m ({tile_m})"
     if out is None:
         out = torch.empty(m_act, n_full, dtype=torch.bfloat16, device=act.device)
     else:

@@ -157,6 +157,40 @@ def _detect_arch_env() -> tuple[Optional[str], Optional[str]]:
     return None, os.environ.get("CUTE_DSL_ARCH")
 
 
+def _install_gpu_blind_device_attrs() -> None:
+    """Serve the DSL's one TRACE-time driver query from its own static table.
+
+    ``cute.compile`` is driver-free except for one path:
+    ``cutlass_dsl.cutlass._generate_kernel_attrs`` calls
+    ``cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)`` when the
+    launch sets ``min_blocks_per_mp > 1`` without an explicit
+    ``preferred_smem_carveout`` (occupancy-bound kernels, e.g. the W4
+    small-N decode configs) — in a GPU-blind worker that raises
+    ``CUDA_ERROR_NOT_INITIALIZED`` and the key falls back to an in-process
+    compile. Answer it from the DSL's static per-arch capacity table
+    instead: SM total = per-CTA capacity + the 1 KiB reserved slice
+    (233472 on sm_90, verified against the driver), keyed by the pinned
+    ``CUTE_DSL_ARCH`` — so worker ``.o`` files stay bit-identical to
+    in-process compiles for the target arch. Unknown arch or any other
+    attribute keeps the original driver path (fails in the worker, consumer
+    falls back, as designed)."""
+    from cutlass.base_dsl.runtime import cuda as cuda_helpers
+    from cutlass.utils.smem_allocator import SMEM_CAPACITY_MAP
+
+    smem_attr = cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+    orig = cuda_helpers.get_device_attribute
+
+    def get_device_attribute(attribute, device_id: int = 0):
+        if attribute == smem_attr:
+            sm = os.environ.get("CUTE_DSL_ARCH", "").removesuffix("a")
+            capacity = SMEM_CAPACITY_MAP.get(sm)
+            if capacity is not None:
+                return capacity + 1024  # per-CTA capacity + reserved = SM total
+        return orig(attribute, device_id)
+
+    cuda_helpers.get_device_attribute = get_device_attribute
+
+
 def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     # GPU-blind compilation: hide devices and pin the target arch via the
     # same overrides the CPU-only compile workflow uses. Forked workers must
@@ -170,6 +204,11 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     # Pay the heavy torch/cutlass import at worker start (no-op under
     # forkserver: the preload already imported it before the fork).
     import quack.cache  # noqa: F401
+
+    if quack_arch is not None:
+        # GPU-blind: the driver can never answer, so the one trace-time
+        # device query must come from the static arch table.
+        _install_gpu_blind_device_attrs()
 
 
 def _pool_worker(

@@ -54,6 +54,23 @@ class GemmConfig:
     use_tma_gather: bool = False
 
 
+def blockscaled_config_ok(c: GemmConfig) -> bool:
+    """Can this config run a blockscaled (SM100 tcgen05 MMA) GEMM? THE single
+    statement of the constraint set — both autotune prune paths call this."""
+    return (
+        c.device_capacity in (10, 11)
+        and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
+        and c.tile_k is None  # tile_k is derived from the MMA instruction
+        and c.tile_m in (128, 256)
+        # SF tmem datapath is 64-N granular; tcgen05 MMA N is capped at 256
+        and c.tile_n % 64 == 0
+        and 64 <= c.tile_n <= 256
+        # SF multicast is limited to 4 CTAs per cluster dim
+        and c.cluster_m <= 4
+        and c.cluster_n <= 4
+    )
+
+
 def config_supports(config: GemmConfig, *, gather_A: bool = False, varlen_m: bool = False) -> bool:
     """Structural validity of a config for gather_A / varlen_m.
 

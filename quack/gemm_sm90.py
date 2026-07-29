@@ -1047,9 +1047,7 @@ class GemmSm90(GemmTmaBase):
                         # acc_slow at each tile's drain
                         promote_fn = partial(self.transform_a.promote_acc, acc_slow, acc)
                 else:
-                    copy_block = quack_sm90_utils.canonical_a_load_s2r(
-                        tiled_mma, sA, tidx, tCrA, position_independent=True
-                    )
+                    copy_block = self.canonical_a_load(tiled_mma, sA, tidx, tCrA)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -1315,6 +1313,15 @@ class GemmSm90(GemmTmaBase):
             if const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
+
+    def canonical_a_load(self, tiled_mma, sA, tidx, tCrA):
+        """The arch's canonical A-fragment produce (the seam transforms wrap
+        or replace): ldmatrix s2r, major mode from the WGMMA op. SM120
+        overrides to pass the smem major explicitly (its warp-MMA op carries
+        none)."""
+        return quack_sm90_utils.canonical_a_load_s2r(
+            tiled_mma, sA, tidx, tCrA, position_independent=True
+        )
 
     @cute.jit
     def load_AB_gather_A(

@@ -1,13 +1,19 @@
 # Copyright (c) 2026, Tri Dao.
-"""A-operand transforms for the SM90 RS GEMM mainloop.
+"""A-operand transforms for the register-sourced GEMM mainloops: SM90 RS
+(WGMMA) and SM120 (warp MMA).
 
-The RS mainloop (``GemmSm90.mma_rs_interleaved``, CUTLASS rs_warpspecialized
-scheme) produces the WGMMA A fragment one k16 block at a time through an
-abstract seam: ``copy_block(stage_idx, b)``. The default produce is the
-canonical ldmatrix s2r load (``sm90_utils.canonical_a_load_s2r``); a
-transform substitutes its own — a dequant of packed weights, or a value fn
-applied on the way — while the mainloop keeps owning the WGMMA issue, the
-commit-group discipline and the pipeline waits.
+Both mainloops (``GemmSm90.mma_rs_interleaved``, CUTLASS rs_warpspecialized
+scheme; ``GemmSm120.mma``, whose warp-level MMA always consumes A from
+registers) produce the A fragment one k16 block at a time through an
+abstract seam: ``copy_block(stage_idx, b, k_tile)``. The default produce is
+the canonical ldmatrix s2r load (``gemm.canonical_a_load``); a transform
+substitutes its own — a dequant of packed weights, or a value fn applied on
+the way — while the mainloop keeps owning the MMA issue, the commit-group
+discipline (SM90) and the pipeline waits. The A fragment atom is
+``((2, 2, 2), MMA_M, MMA_K)`` with identical slot semantics on both archs (a
+WGMMA m64 block is four warps' m16n8k16 fragments stacked in M), so the
+per-block transform bodies are arch-independent; only the m64-block/thread
+slot mapping of layout-owning decodes branches on ``gemm.arch``.
 
 The kernel is agnostic to what the transform computes. It only consumes the
 declarative contract below: A's storage layout (possibly transform-owned),
@@ -38,7 +44,6 @@ from cutlass import Int32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.operand_transform.kinds import ARG_KINDS
-from quack.sm90_utils import canonical_a_load_s2r
 
 
 @mlir_namedtuple
@@ -225,16 +230,33 @@ class TransformAW4(TransformA):
         # (N/tile_m CTAs < machine): serial split-k 1.2-1.5x there.
         assert not gemm.gather_A
         assert not gemm.pingpong, "w4 only supports cooperative for now"
-        assert gemm.atom_layout_mnk[1] == 1, "w4 requires atom_layout_n == 1"
         assert gemm.cta_tile_shape_mnk[0] % 64 == 0, "w4 requires tile_M % 64 == 0"
         assert gemm.cluster_shape_mnk[0] == 1 and gemm.cluster_shape_mnk[2] == 1, (
             "w4 supports (1, cluster_N, 1) clusters"
         )
+        if gemm.arch == 120:
+            # Warp-MMA mainloop: an MMA_M step covers atom_m * 16 rows, and the
+            # decode's m64-block/thread-slot mapping below needs that to be
+            # exactly one m64 block (atom_m == 4; the (4, 2, 1) cooperative
+            # atom layout always satisfies this). A fragments are duplicated
+            # across the n-warps, so atom_n > 1 just repeats the decode —
+            # correct, same as the duplicated ldmatrix it replaces.
+            assert gemm.atom_layout_mnk[0] == 4, "w4 on SM120 needs 64-row MMA_M steps"
+            assert self.fmt.mma_dtype.width == 16 and not self.promote, (
+                "fp8-MMA formats (int4sm/int4smf/W4A8 promote) need fp8 tensor cores; "
+                "the SM120 warp-MMA path is 16-bit only"
+            )
+        else:
+            assert gemm.atom_layout_mnk[1] == 1, "w4 requires atom_layout_n == 1"
         if self.fmt.sf_words > 0:
             # the format's SF words: a compressed colvec-per-k-group instance
             # of the k-tile strip geometry, consumed inside decode_k16
             self.aux = AuxKTileStrip(gemm, self.fmt.sf_bytes)
-        if const_expr(gemm.cta_tile_shape_mnk[1] <= 32):
+        if gemm.arch == 120:
+            # register budgets: keep the SM120 defaults (the SM90 rules below
+            # encode H100-measured warpgroup/occupancy trade-offs)
+            pass
+        elif const_expr(gemm.cta_tile_shape_mnk[1] <= 32):
             # Small-N (decode) shapes are latency-bound: consumers need few
             # regs (small acc + A frag), so shrink budgets to fit 2 CTAs/SM
             # and double the warps available to hide LDS/decode latency.
@@ -319,14 +341,23 @@ class TransformAW4(TransformA):
             cute.make_ordered_layout((nw, 128, tm64, gemm.ab_stage), order=(0, 1, 2, 3)),
         )
         sAux_i32 = cute.recast_tensor(sAux, Int32) if const_expr(sAux is not None) else None
-        t128 = tidx % 128
+        if const_expr(gemm.arch == 120):
+            # Warp-MMA fragment ownership: MMA_M step m IS m64 block m (64-row
+            # steps asserted in __init__), warp w = (tidx // 32) % 4 covers rows
+            # 16w..16w+15 within it — the same (warp, lane) -> fragment-row map
+            # as a WGMMA warpgroup, so the repacked blob's thread slots carry
+            # over with t128 = m-warp * 32 + lane (n-warps duplicate the LDS).
+            t128 = ((tidx // 32) % 4) * 32 + tidx % 32
+            atom_m, wg = 1, 0
+        else:
+            t128 = tidx % 128
+            atom_m, wg = gemm.atom_layout_mnk[0], warp_group_idx
         # this thread's SF word slot within the m64 block's 32 fragment rows:
         # (warp, quad) -> row pair (matches repack_*_sf's word order)
         pair_slot = (t128 // 32) * 8 + (t128 % 32) // 4
         consts = self.fmt.make_consts()
         frag_i32 = cute.recast_tensor(tCrA, Int32)
         mma_m = const_expr(cute.size(tCrA.shape[1]))
-        atom_m = gemm.atom_layout_mnk[0]
         sf_words = self.fmt.sf_words
         ts_words = const_expr(self.fmt.tile_state_words)
         xw = cute.make_rmem_tensor((nw, mma_m), Int32)
@@ -349,7 +380,7 @@ class TransformAW4(TransformA):
         def copy_block(stage_idx, b, k_tile=None):
             if const_expr(b == 0):
                 for m in cutlass.range_constexpr(mma_m):
-                    m64 = m * atom_m + warp_group_idx
+                    m64 = m * atom_m + wg
                     cute.autovec_copy(sA_i32[None, t128, m64, stage_idx], xw[None, m])
                     for w in cutlass.range_constexpr(sf_words):
                         sfw[w, m] = sAux_i32[sf_words * pair_slot + w, m64, stage_idx]
@@ -466,7 +497,9 @@ class TransformAValue(TransformA):
         consts = None
         if const_expr(self.mod.consts is not None):
             consts = self.mod.consts()  # hoisted: once per kernel
-        load_block = canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=True)
+        # the gemm owns the canonical produce (WGMMA RS ldmatrix on SM90,
+        # warp-MMA ldmatrix on SM120 — same fragment atoms either way)
+        load_block = self.gemm.canonical_a_load(tiled_mma, sA, tidx, tCrA)
         mma_m = const_expr(cute.size(tCrA.shape[1]))
         for impl in self._arg_impls:
             impl.setup(tiled_mma, tidx, mma_m, sAux)
@@ -565,7 +598,7 @@ class TransformADropout(TransformA):
         tile_m, tile_k = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[2]
         assert tile_k % 32 == 0, "dropout groups span 32 k"
         assert mAux is not None, "dropout needs the (2,) int64 [seed, offset] via mA.sf"
-        load_block = canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=True)
+        load_block = gemm.canonical_a_load(tiled_mma, sA, tidx, tCrA)
         base = rng.b16_base_pattern(gemm.mma_a_dtype)
         t = self.mod.threshold
         self._thr_pair = Int32((base | t) | ((base | t) << 16))

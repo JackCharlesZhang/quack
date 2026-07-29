@@ -8,7 +8,7 @@
 # This is a work in progress and not very optimized.
 
 import math
-from typing import Tuple, Type, Callable, Optional
+from typing import Tuple, Type, Callable, Optional, Union
 from functools import partial
 
 import cutlass
@@ -16,7 +16,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import SmemPartition
 
 from quack.varlen_utils import VarlenManager
@@ -26,6 +26,7 @@ from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
 from quack.tile_scheduler import ag_wait_m_tile
 from quack import sm80_utils
+import quack.sm90_utils as quack_sm90_utils
 
 
 class GemmSm120(GemmSm90):
@@ -37,6 +38,13 @@ class GemmSm120(GemmSm90):
     - Thread config: num_mma_warps regular warps + 1 DMA warp
     - Pingpong: 2 warp groups of (2,2,1), each processing alternating tiles
     - No fp8 support (warp-level MMA only supports fp16/bf16)
+
+    A-operand transforms (quack/operand_transform/) are supported through the
+    same ``copy_block(stage_idx, b, k_tile)`` produce seam as GemmSm90's RS
+    mainloop — A is always register-sourced here, so value fns / dropout wrap
+    the canonical ldmatrix load, and layout-owning W4 decodes replace it
+    (16-bit MMA formats only: no fp8 tensor cores on this path, so W4A8 /
+    promote is SM90-only).
     """
 
     arch = 120
@@ -54,6 +62,7 @@ class GemmSm120(GemmSm90):
         use_pdl: bool = True,
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
+        transform_a: Optional[Callable] = None,
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
@@ -62,11 +71,13 @@ class GemmSm120(GemmSm90):
         self.use_clc_persistence = False
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
-        # no RS-transform / aux-operand support on the warp-MMA path; the
-        # inherited __call__/_setup_attributes still read these
+        # The warp-MMA mainloop always consumes A from registers (ldmatrix
+        # s2r), so there is no SS/RS mode split; mma_is_rs stays False for the
+        # inherited __call__/_setup_attributes checks. A-operand transforms
+        # (quack/operand_transform/) plug into the same copy_block seam as
+        # SM90's RS mainloop — instantiated below after the register budgets.
         self.mma_is_rs = False
-        self.transform_a = None
-        self.aux_a = None
+        self._transform_a_factory = transform_a
         self.mma_a_dtype = a_dtype
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
@@ -83,6 +94,10 @@ class GemmSm120(GemmSm90):
             tuple(tile_shape_mnk) if len(tile_shape_mnk) == 3 else (*tile_shape_mnk, 0)
         )
         tile_M, tile_N = self.cta_tile_shape_mnk[:2]
+        if tile_N % 32 != 0:
+            # both atom layouts have atom_n = 2, and the N permutation gives
+            # each warp 16 consecutive columns: the tiled MMA always spans 32 N
+            raise ValueError("SM120 CTA tile N must be divisible by 32")
 
         # Pingpong: 2 warp groups each with (2,2,1) atom layout
         # Non-pingpong: 1 group of 8 warps with (4,2,1) atom layout
@@ -126,6 +141,16 @@ class GemmSm120(GemmSm90):
             self.num_regs_load = 56
             self.num_regs_mma = 224
 
+        # TransformA: created after the default register budgets above so it
+        # can override them (and occupancy) per its config. The transform may
+        # install an aux A-side operand (per-stage strip riding the AB
+        # pipeline) — same contract as GemmSm90.
+        self.transform_a = None
+        self.aux_a = None
+        if transform_a is not None:
+            self.transform_a = transform_a(self)
+            self.aux_a = self.transform_a.aux
+
         self.ab_stage = None
         self.epi_stage = None
         self.epi_m_major = True
@@ -141,7 +166,9 @@ class GemmSm120(GemmSm90):
 
     def _setup_tiled_mma(self):
         """Set up warp-level MMA (MmaF16BF16Op) and tile K dimension."""
-        op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
+        # mma_a_dtype, not a_dtype: a layout-owning transform's mA is a
+        # storage blob (e.g. uint8) decoded to the MMA compute dtype
+        op = warp.MmaF16BF16Op(self.mma_a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
         atom_m, atom_n, atom_k = self.atom_layout_mnk
         # We want each warp to have 16 consecutive elements in the N direction, for STSM
@@ -162,7 +189,25 @@ class GemmSm120(GemmSm90):
         assert tile_k % self.mma_inst_mnk[2] == 0, (
             f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({self.mma_inst_mnk[2]})"
         )
+        if self.transform_a is not None and self.transform_a.tile_k is not None:
+            assert tile_k == self.transform_a.tile_k, (
+                f"transform_a requires tile_K == {self.transform_a.tile_k}, got {tile_k}"
+            )
         self.cta_tile_shape_mnk = (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], tile_k)
+
+    def canonical_a_load(self, tiled_mma, sA, tidx, tCrA):
+        """The canonical A produce for the warp-MMA mainloop: the same
+        ldmatrix seam as SM90 RS (identical fragment atoms), with the smem
+        major passed explicitly — MmaF16BF16Op carries no major mode (operand
+        layout is fixed K-major; the smem major only picks LDSM vs LDSM.T)."""
+        return quack_sm90_utils.canonical_a_load_s2r(
+            tiled_mma,
+            sA,
+            tidx,
+            tCrA,
+            position_independent=True,
+            transpose=self.a_layout.is_m_major_a(),
+        )
 
     # __call__, _setup_attributes, make_ab_pipeline, make_epi_store_pipeline,
     # make_sched_pipeline, epilogue are all inherited from GemmSm90.
@@ -182,12 +227,13 @@ class GemmSm120(GemmSm90):
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_mnk: cute.Layout,
-        a_smem_layout: cute.ComposedLayout,
+        # plain Layout for layout-owning transforms (unswizzled blob smem)
+        a_smem_layout: Union[cute.ComposedLayout, cute.Layout],
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
-        # aux A-side operand slots (GemmSm90.__call__ passes them; SM120 has
-        # no transform/aux support, so they are always None here)
+        # aux A-side operand slots (e.g. a transform's scale-factor strip
+        # riding the AB pipeline, or a raw dropout seed tensor)
         tma_atom_aux_a: Optional[cute.CopyAtom],
         mAuxA_mkl: Optional[cute.Tensor],
         aux_a_smem_layout: Optional[cute.Layout],
@@ -207,7 +253,7 @@ class GemmSm120(GemmSm90):
 
         # Prefetch TMA descriptors
         if warp_idx == self.ab_load_warp_id:
-            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c):
+            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c, tma_atom_aux_a):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
@@ -248,8 +294,18 @@ class GemmSm120(GemmSm90):
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
 
         # SMEM tensors
-        sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        a_owned = const_expr(self.transform_a is not None and self.transform_a.owns_a_layout)
+        if const_expr(not a_owned):
+            sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        else:
+            # TMA-facing staged blob view (plain layout, no swizzle); the
+            # transform's per-thread math view recasts the same bytes inside
+            # make_copy_block
+            sA = storage.sA.get_tensor(a_smem_layout)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sAuxA = None
+        if const_expr(self.aux_a is not None):
+            sAuxA = storage.sAuxA.get_tensor(aux_a_smem_layout)
         sD = None
         if const_expr(has_D):
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -260,12 +316,18 @@ class GemmSm120(GemmSm90):
 
         varlen_manager = VarlenManager.create(
             varlen_params,
+            # Only used if not varlen_m; a layout-owning transform's mA is a
+            # storage blob, so kernel-M comes from D instead.
             len_m_static=Int32(
-                cute.size(mA_mkl, mode=[0])
+                (
+                    cute.size(mA_mkl, mode=[0])
+                    if const_expr(not a_owned)
+                    else cute.size(mD_mnl, mode=[0])
+                )
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
+            len_k_static=Int32(cute.size(mB_nkl, mode=[1])),
             len_n_static=Int32(cute.size(mB_nkl, mode=[0])),
         )
 
@@ -324,7 +386,16 @@ class GemmSm120(GemmSm90):
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
-                    if const_expr(not self.gather_A):
+                    if const_expr(a_owned):
+                        # the transform owns A's gmem interpretation
+                        gA_owned = self.transform_a.a_gmem_slice(mA_mkl, tile_coord_mnkl, batch_idx)
+                        copy_A = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_a,
+                            src_tensor=gA_owned,
+                            dst_tensor=sA,
+                            tma_multicast=a_tma_multicast,
+                        )
+                    elif const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
                         # (bM, bK, RestK)
                         gA_mk = cute.local_tile(
@@ -342,6 +413,21 @@ class GemmSm120(GemmSm90):
                     else:
                         copy_A, prefetch_A = self._make_gather_A_copy(
                             mA_mkl, sA, varlen_manager, tile_coord_mnkl, batch_idx
+                        )
+                    copy_AuxA = None
+                    if const_expr(self.aux_a is not None):
+                        # aux A-side operand: one box per k-tile alongside A/B
+                        gAux = self.aux_a.gmem_slice(mAuxA_mkl, tile_coord_mnkl, batch_idx)
+                        copy_AuxA = copy_utils.tma_get_block_copy_fn(
+                            tma_atom_aux_a,
+                            src_tensor=gAux,
+                            dst_tensor=sAuxA,
+                            # small-box aux operands (e.g. 128 B scale strips)
+                            # may opt out of the A-side multicast: each CTA
+                            # loads its own copy instead of splitting the box
+                            tma_multicast=a_tma_multicast
+                            if const_expr(getattr(self.aux_a, "multicast", True))
+                            else None,
                         )
                     # (bN, bK, RestK)
                     gB_nk = cute.local_tile(
@@ -365,7 +451,7 @@ class GemmSm120(GemmSm90):
                         ab_producer_state = self.load_tma(
                             ab_pipeline,
                             ab_producer_state,
-                            [copy_A, copy_B],
+                            [copy_A, copy_B, copy_AuxA],
                             k_tile_cnt,
                             k_tile_start=k_tile_start,
                         )
@@ -407,27 +493,51 @@ class GemmSm120(GemmSm90):
             if const_expr(self.pingpong):
                 tidx = tidx % self.num_threads_per_warp_group
 
-            # ldmatrix copy atoms for SMEM → RMEM
-            atom_copy_ldmatrix_A = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
-                self.a_dtype,
-            )
+            # ldmatrix copy atom for SMEM → RMEM (B side; A goes through the
+            # copy_block seam below)
             atom_copy_ldmatrix_B = cute.make_copy_atom(
                 warp.LdMatrix8x8x16bOp(self.b_layout.is_n_major_b(), 4),
                 self.b_dtype,
             )
-            smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
-            thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
             thr_copy_ldmatrix_B = smem_tiled_copy_B.get_slice(tidx)
-            tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
             tCsB_copy_view = thr_copy_ldmatrix_B.partition_S(sB)
 
             # Make fragments
             thr_mma = tiled_mma.get_slice(tidx)
-            acc, tCsA, tCsB, tCrA, tCrB = sm80_utils.partition_fragment_ABC(
-                thr_mma, self.cta_tile_shape_mnk, sA, sB
-            )
+            if const_expr(not a_owned):
+                acc, tCsA, tCsB, tCrA, tCrB = sm80_utils.partition_fragment_ABC(
+                    thr_mma, self.cta_tile_shape_mnk, sA, sB
+                )
+            else:
+                # mA is a storage blob: the A fragment can't be partitioned
+                # from sA — build it from the tile shape (the transform's
+                # copy_block fills it in fragment order)
+                acc = cute.make_rmem_tensor(
+                    thr_mma.partition_shape_C(self.cta_tile_shape_mnk[:2]), Float32
+                )
+                tCrA = thr_mma.make_fragment_A(
+                    thr_mma.partition_shape_A(cute.select(self.cta_tile_shape_mnk, [0, 2]))
+                )
+                tCsB = thr_mma.partition_B(sB)
+                tCrB = thr_mma.make_fragment_B(tCsB[None, None, None, 0])
+
+            # A produce seam: the canonical ldmatrix s2r load, or a
+            # transform's own produce (e.g. blob LDS + dequant) — same
+            # copy_block(stage_idx, b, k_tile) contract as GemmSm90's RS
+            # mainloop.
+            if const_expr(self.transform_a is not None):
+                copy_block = self.transform_a.make_copy_block(
+                    tiled_mma,
+                    sA,
+                    tCrA,
+                    tidx,
+                    warp_group_idx,
+                    sAux=sAuxA,
+                    mAux=mAuxA_mkl if const_expr(self.transform_a.aux_raw) else None,
+                )
+            else:
+                copy_block = self.canonical_a_load(tiled_mma, sA, tidx, tCrA)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -488,7 +598,15 @@ class GemmSm120(GemmSm90):
                 batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(k_tile_total, split_idx)
+                k_tile_start_mma, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                    k_tile_total, split_idx
+                )
+                if const_expr(self.transform_a is not None):
+                    if const_expr(self.transform_a.uses_work_tile):
+                        # per-work-tile register state (e.g. dropout's per-row
+                        # RNG coordinates); every copy_block until the next
+                        # hook — incl. the slot-0 preloads — is this tile's
+                        self.transform_a.on_work_tile(tile_coord_mnkl)
                 acc.fill(0.0)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
@@ -499,12 +617,12 @@ class GemmSm120(GemmSm90):
                     tiled_mma,
                     acc,
                     k_tile_cnt,
-                    smem_tiled_copy_A,
+                    copy_block,
                     smem_tiled_copy_B,
-                    tCsA_copy_view,
                     tCsB_copy_view,
                     tCrA,
                     tCrB,
+                    k_tile_start=k_tile_start_mma,
                 )
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
@@ -677,29 +795,36 @@ class GemmSm120(GemmSm90):
         tiled_mma: cute.TiledMma,
         acc: cute.Tensor,
         k_tile_cnt: Int32,
-        smem_tiled_copy_A: cute.TiledCopy,
+        copy_block: Callable,
         smem_tiled_copy_B: cute.TiledCopy,
-        tCsA_copy_view: cute.Tensor,
         tCsB_copy_view: cute.Tensor,
         tCrA: cute.Tensor,
         tCrB: cute.Tensor,
+        k_tile_start: Int32 = 0,
     ) -> cutlass.pipeline.PipelineState:
-        """Warp-level MMA mainloop: ldmatrix SMEM→RMEM + warp MMA."""
-        tCrA_copy_view = smem_tiled_copy_A.retile(tCrA)
+        """Warp-level MMA mainloop: A produced per k16 block through the
+        ``copy_block(stage_idx, b, k_tile)`` seam (canonical ldmatrix s2r, or
+        a transform's decode; ``k_tile`` is the GLOBAL k-tile index of the
+        produced block, split-k correct via ``k_tile_start``), B via
+        ldmatrix, then warp MMA. Same produce rhythm as CUTLASS's SM120
+        collective and GemmSm90.mma_rs_interleaved: produce block k+1 (slot 0
+        of the next stage at the tile's last block), then MMA block k — the
+        warp-synchronous mma.sync needs none of the WGMMA commit-group/wait
+        discipline, so the seam contract is the schedule alone."""
         tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
-        load_sA = partial(cute.copy, smem_tiled_copy_A)
         load_sB = partial(cute.copy, smem_tiled_copy_B)
 
         num_k_blocks = cute.size(tCrA, mode=[2])
+        kt = Int32(k_tile_start)  # global k-tile index of the tile being consumed
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
         ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
 
         # Load first k-block
-        tCsA_p = tCsA_copy_view[None, None, None, ab_read_state.index]
-        tCsB_p = tCsB_copy_view[None, None, None, ab_read_state.index]
-        load_sA(tCsA_p[None, None, 0], tCrA_copy_view[None, None, 0])
+        stage = ab_read_state.index
+        tCsB_p = tCsB_copy_view[None, None, None, stage]
+        copy_block(stage, 0, kt)
         load_sB(tCsB_p[None, None, 0], tCrB_copy_view[None, None, 0])
 
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
@@ -715,12 +840,14 @@ class GemmSm120(GemmSm90):
                     ab_pipeline.consumer_release(ab_read_state)
                     ab_read_state.advance()
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
-                    tCsA_p = tCsA_copy_view[None, None, None, ab_read_state.index]
-                    tCsB_p = tCsB_copy_view[None, None, None, ab_read_state.index]
+                    stage = ab_read_state.index
+                    tCsB_p = tCsB_copy_view[None, None, None, stage]
                     ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
-                load_sA(tCsA_p[None, None, k_next], tCrA_copy_view[None, None, k_next])
+                # the wrap load is the NEXT tile's slot-0 preload
+                copy_block(stage, k_next, kt + 1 if k == num_k_blocks - 1 else kt)
                 load_sB(tCsB_p[None, None, k_next], tCrB_copy_view[None, None, k_next])
                 cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+            kt += 1
 
         # Last k-tile (hoisted)
         if 0 < k_tile_cnt:
@@ -736,7 +863,7 @@ class GemmSm120(GemmSm90):
                     ab_pipeline.consumer_release(ab_read_state)
                     ab_read_state.advance()
                 if const_expr(k_next > 0):
-                    load_sA(tCsA_p[None, None, k_next], tCrA_copy_view[None, None, k_next])
+                    copy_block(stage, k_next, kt)
                     load_sB(tCsB_p[None, None, k_next], tCrB_copy_view[None, None, k_next])
                 cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 

@@ -589,7 +589,8 @@ class EpiMod:
         #                               accumulate traffic of C=D). The fn still
         #                               returns the DELTA; requires C=None.
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
-        # A-operand transform (SM90 RS mainloop). Value transforms leave the
+        # A-operand transform (SM90 RS / SM120 warp-MMA mainloop). Value
+        # transforms leave the
         # call contract unchanged. Layout-owning (packed-weight) transforms
         # flip the slots: caller A = ACTIVATIONS (m, k), caller B = the
         # repacked BLOB from fmt.prepare (+ its SF strip via transform_sf);
@@ -1250,9 +1251,9 @@ class EpiMod:
         passed the partial buffer as an operand.
 
         The tuned path covers the non-SR surface (see quack.gemm_runtime.autotune,
-        incl. varlen/gather/blockscaled/concat and dynamic_scheduler=True);
-        other calls resolve with the explicit ``config=`` or the per-arch
-        default.
+        incl. varlen/gather/blockscaled/concat, A-operand transforms and
+        dynamic_scheduler=True); other calls resolve with the explicit
+        ``config=`` or the per-arch default.
 
         Under torch.compile the call records the single ``quack::gemm_epi``
         custom op (see quack.gemm_runtime.torch_op); with reduce sinks the config is
@@ -1435,8 +1436,7 @@ class EpiMod:
             and config is None
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
-            and transform_a is None  # transform-aware autotune: not wired yet
-            and not add_to_output  # ditto for the reduce-add D mint
+            and not add_to_output  # the reduce-add D mint is not swept
         )
         if use_tuner:
             from quack.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
@@ -1475,6 +1475,10 @@ class EpiMod:
                 bs_format_a=bs_format_a,
                 bs_format_b=bs_format_b,
                 concat_layout=concat_layout,
+                # raw operand tensors: the sweep builds per-config bundles
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+                transform_operands=transform_operands,
             )
             sink_bufs = {name: res.sinks[name] for name in owned_sinks}
             cfg_used, plan_used = res.config, res.plan

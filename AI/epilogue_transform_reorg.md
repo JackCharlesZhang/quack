@@ -287,7 +287,23 @@ compatibility stops being a design constraint on key schemas.
   `_plan_cache`/`build_gemm_epi_plan` path and its `w4_operand_views` call
   are gone (bundle building now rides `resolve_operands` like w4a8).
   Scalar floats are launch-time immediates (host_call_arg), so tensor_scale
-  values share one plan safely. Transform-aware autotune remains unwired.
+  values share one plan safely.
+* ~~Transform-aware autotune~~ DONE (round 3): `TransformModBase.config_ok`
+  is the cheap prune hook (swap_ab always out; W4: no pingpong, cluster_m=1,
+  tile_m%64, tile_k in {None, fmt.tile_k}; padded-N divisibility checked in
+  `_prune_for_mod` and hardened into `resolve_operands` — the w4 wrappers
+  stopped restating it). `tuned_mod_gemm` takes
+  transform_a/transform_sf/transform_operands: the handle digest keys the
+  tuner (and `_MOD_TUNERS`), strips ride as top-level `ta__<name>` kwargs
+  (keyed + L2-cloned by the Autotuner), and runtime-operand bundles are
+  rebuilt per config inside the ValueError->RuntimeError rewrap so
+  geometry-mismatched configs bench as inf pre-compile. `EpiMod.__call__`'s
+  tuner gate no longer excludes transforms. Tests:
+  test_epi_autotune.py::test_tuned_{value,w4}_transform.
+* ~~Prune-predicate merge~~ DONE (round 3): the blockscaled constraint set is
+  `gemm_config.blockscaled_config_ok`, called by both
+  `gemm_interface.prune_invalid_gemm_configs` and
+  `gemm_runtime.autotune._prune_for_mod`.
 * Merge `epi_autotune._prune_for_mod` with
   `gemm_interface.prune_invalid_gemm_configs` into one predicate library in
   `gemm_config`.

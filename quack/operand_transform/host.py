@@ -77,14 +77,14 @@ def w4_padded_n(blob) -> int:
 # ---- quack.gemm_w4's explicit-tile surface) --------------------------------
 
 
-def _pick_tile_n(m_act: int) -> int:
+def _pick_tile_n(m_act: int, tile_n_min: int = 16) -> int:
     for cand in (16, 32, 64, 128):
-        if m_act <= cand:
+        if cand >= tile_n_min and m_act <= cand:
             return cand
     return 192
 
 
-def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int) -> tuple:
+def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int, tile_n_min: int = 16) -> tuple:
     """(tile_m, tile_n, split_k). Measured invariant (H100, int4/qtip, incl.
     the machete faceoff): every winning config puts the grid at ~112-128 CTAs
     with the LARGEST tile that gets there — tile_m=128 beats 64 by 10-25% at
@@ -92,9 +92,10 @@ def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int) -> tuple:
     byte), tile_n is the largest with under half a tile of padding on m, and
     serial split-k makes up remaining grid coverage when each split keeps
     >= ~24 k-tiles (and tile_n <= 128: the f32 finalize round-trip scales
-    with tile area). Prefill (m > 256): (128, 256, 1)."""
+    with tile area). Prefill (m > 256): (128, 256, 1). ``tile_n_min``: the
+    arch's tile_N floor (32 on SM120 — its tiled MMA always spans 32 N)."""
     if n_full % 128 != 0:
-        tn = _pick_tile_n(m_act) if m_act <= 128 else 192
+        tn = _pick_tile_n(m_act, tile_n_min) if m_act <= 128 else 192
         mt = -(-m_act // tn)
         sk = 2 if (m_act <= 32 and (n_full // 64) * mt < 128 and k_tiles >= 32) else 1
         return 64, tn, sk
@@ -102,6 +103,8 @@ def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int) -> tuple:
         return 128, 256, 1
     n128 = n_full // 128
     for tn in (256, 128, 64, 32, 16):
+        if tn < tile_n_min:
+            break
         if tn >= 2 * m_act and tn > 16:
             continue  # half the tile or more would be padding
         mt = -(-m_act // tn)
@@ -112,7 +115,7 @@ def pick_w4_cfg(m_act: int, n_full: int, k_tiles: int) -> tuple:
                 return 128, tn, sk
     # coverage unreachable under the tile_m=128 constraints (small N, short K):
     # fall back to 64-row tiles with the plain starvation rule
-    tn = _pick_tile_n(m_act)
+    tn = _pick_tile_n(m_act, tile_n_min)
     mt = -(-m_act // tn)
     sk = 2 if ((n_full // 64) * mt < 128 and k_tiles >= 32) else 1
     return 64, tn, sk

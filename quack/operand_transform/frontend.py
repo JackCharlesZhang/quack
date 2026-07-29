@@ -174,6 +174,23 @@ class TransformModBase:
         """Cheap plan-cache identity (the digest is precomputed)."""
         return ("mod", self.semantic_digest)
 
+    def config_ok(self, cfg):
+        """Cheap autotune prune: can this GemmConfig possibly run this
+        transform? Geometry/kernel asserts still guard correctness (a
+        mispruned config fails host validation and benches as inf) — this
+        only avoids wasted compile attempts."""
+        if cfg.swap_ab:
+            return False  # transform_a + swap_ab is rejected at the call
+        fmt = self.owned_fmt
+        if fmt is None:
+            return True
+        return (
+            not cfg.pingpong
+            and cfg.cluster_m == 1
+            and cfg.tile_m % 64 == 0
+            and cfg.tile_k in (None, fmt.tile_k)
+        )
+
     def compile_ref(self):
         """Picklable ref for the jit-cache / async-compile boundary
         (registers this mod for in-process resolution; workers get it as a
@@ -194,13 +211,18 @@ class TransformModBase:
         fmt = self.owned_fmt
         if fmt is None:
             return None
+        from quack.cute_dsl_utils import get_device_capacity
         from quack.gemm_config import GemmConfig
         from quack.operand_transform.host import pick_w4_cfg, pick_w4a8_cfg
 
         if fmt.promote:
             tm, tn, _sk = pick_w4a8_cfg(A.shape[-2], self.padded_n(B))
         else:
-            tm, tn, _sk = pick_w4_cfg(A.shape[-2], self.padded_n(B), A.shape[-1] // fmt.tile_k)
+            # SM120's warp-MMA tiled MMA always spans 32 N: floor tile_n there
+            tile_n_min = 32 if get_device_capacity(A.device)[0] == 12 else 16
+            tm, tn, _sk = pick_w4_cfg(
+                A.shape[-2], self.padded_n(B), A.shape[-1] // fmt.tile_k, tile_n_min
+            )
         return GemmConfig(
             tile_m=tm,
             tile_n=tn,
@@ -248,8 +270,14 @@ class TransformModBase:
             raise ValueError(
                 f"K mismatch: activations K={A.shape[-1]}, blob K={B.shape[1] * fmt.tile_k}"
             )
+        n_full = self.padded_n(B)
+        if n_full % tile_m:
+            raise ValueError(
+                f"padded N ({n_full}) must be divisible by tile_M ({tile_m}): the blob's"
+                " gmem view tiles kernel-M in whole CTA tiles"
+            )
         bundle = w4_operand_views(fmt, B, transform_sf, tile_m)
-        return ResolvedOperands(bundle, A, A, tile_k=fmt.tile_k, n_gemm=self.padded_n(B))
+        return ResolvedOperands(bundle, A, A, tile_k=fmt.tile_k, n_gemm=n_full)
 
     def bundle(self, A, operand_values, tile_m, tile_k):
         """TransformAOperand from RAW operand tensors (the __call__/plan

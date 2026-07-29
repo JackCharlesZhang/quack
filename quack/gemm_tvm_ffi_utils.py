@@ -677,7 +677,7 @@ def compile_gemm_kernel(
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
         split_k_kwargs = {"split_k": split_k, "split_k_mode": split_k_mode}
     if transform_a is not None:
-        assert device_capacity[0] == 9, "A-operand transforms are SM90 only"
+        assert device_capacity[0] in (9, 12), "A-operand transforms are SM90/SM120 only"
         split_k_kwargs["transform_a"] = transform_a
     if device_capacity[0] == 8:
         sm8x_kwargs = {"is_persistent": persistent, "num_warps": num_warps}

@@ -19,6 +19,7 @@ from quack.blockscaled.operand import (
 from quack.gemm_config import (
     GemmConfig,
     SplitKMode,
+    blockscaled_config_ok,
     blockscaled_default_config,
     config_supports,
     default_config,
@@ -369,22 +370,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     if not gather_A or device_capacity not in [10, 11]:
         configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
     if kwargs.get("SFA", None) is not None:  # blockscaled (SM100 tcgen05 MMA constraints)
-
-        def _blockscaled_ok(c: GemmConfig) -> bool:
-            return (
-                c.device_capacity in (10, 11)
-                and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
-                and c.tile_k is None  # tile_k is derived from the MMA instruction
-                and c.tile_m in (128, 256)
-                # SF tmem datapath is 64-N granular; tcgen05 MMA N is capped at 256
-                and c.tile_n % 64 == 0
-                and 64 <= c.tile_n <= 256
-                # SF multicast is limited to 4 CTAs per cluster dim
-                and c.cluster_m <= 4
-                and c.cluster_n <= 4
-            )
-
-        configs = [conf for conf in configs if _blockscaled_ok(conf.kwargs["config"])]
+        configs = [conf for conf in configs if blockscaled_config_ok(conf.kwargs["config"])]
     # Autotuned split-K: only the plain-gemm family exposes the knob; split_k=None means
     # "tune the factor" (an explicit int is forced in gemm_tuned and needs no variants).
     if (

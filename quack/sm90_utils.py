@@ -247,7 +247,7 @@ def partition_fragment_ABC(
     return acc, tCrA, tCrB
 
 
-def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False):
+def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False, transpose=None):
     """The canonical A-operand produce for the RS mainloop: an ldmatrix tiled
     copy derived from the MMA (LDSM for k-major A, LDSM.T for m-major — one
     code path, 16-bit only). Returns ``copy_block(stage_idx, b, k_tile)``,
@@ -256,8 +256,12 @@ def canonical_a_load_s2r(tiled_mma, sA, tidx, tCrA, position_independent=False):
     mainloop threads through the seam for coordinate-dependent transforms,
     is unused here). This is the produce seam: transforms substitute their own
     copy_block (e.g. LDS + dequant) while the mainloop keeps owning the WGMMA
-    issue and commit-group discipline."""
-    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
+    issue and commit-group discipline. Also serves the SM120 warp-MMA mainloop
+    (fragment atoms are LDSM-identical); its MmaF16BF16Op carries no major mode
+    (operand layout fixed K-major, the smem major only picks LDSM vs LDSM.T),
+    so ``transpose`` must be passed explicitly there."""
+    if transpose is None:
+        transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
     atom = copy_utils.get_smem_load_atom(sA.element_type, transpose)
     smem_tiled_copy_A = cute.make_tiled_copy_A(atom, tiled_mma)
     thr_copy_A = smem_tiled_copy_A.get_slice(tidx)

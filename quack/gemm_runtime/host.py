@@ -106,7 +106,8 @@ def _compile_gemm_epi(
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
-    # A-operand transform (SM90 RS mainloop, quack.operand_transform): a
+    # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
+    # quack.operand_transform): a
     # picklable TransformARef. Layout-owning (packed W4) transforms replace
     # the standard fake operands: A is the repacked blob (static geometry
     # from transform_dims = (n_full, k)), the SF strip rides a trailing AuxA

@@ -19,10 +19,14 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_w4 import gemm_w4a16
 from quack.operand_transform import PackedInput, a_transform
 
+_ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] != 9,
-    reason="W4A16 (RS transform mainloop) is SM90 only",
+    _ARCH not in (9, 12),
+    reason="W4A16 (register-sourced transform mainloop) is SM90/SM120 only",
 )
+# fp8-MMA formats (W4A8 / int4sm folded) need fp8 tensor cores; the SM120
+# warp-MMA path is 16-bit only
+sm90_only = pytest.mark.skipif(_ARCH != 9, reason="fp8-MMA W4 formats are SM90 only")
 
 # Every registered 16-bit-MMA format, opt-out via DecodeFormat.roundtrip
 # (int8/fp8: per-channel scale is an epilogue concern). fp8-MMA formats are
@@ -100,6 +104,8 @@ def test_gemm_w4a16_configs(tile_m, tile_n):
     m, n, k = 512, 1536, 1152  # N divisible by 64 but ragged vs tiles; odd k-tiles
     if n % tile_m:
         pytest.skip("padded N not divisible by tile_m")
+    if _ARCH == 12 and tile_n % 32:
+        pytest.skip("SM120 tiled MMA always spans 32 N")
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     fmt = W4_FORMATS["qtip2s"]
     w = torch.randn(n, k, device="cuda", dtype=torch.float32)
@@ -190,6 +196,8 @@ def test_gemm_sf_configs(tile_m, tile_n):
     """SF strip across tile configs: tile_m=128/256 exercise the multi-m64
     strip slices (and MMA_M = 2 per warpgroup at 256); (64, 16) the
     occupancy-2 decode config."""
+    if _ARCH == 12 and tile_n % 32:
+        pytest.skip("SM120 tiled MMA always spans 32 N")
     torch.manual_seed(6)
     m, n, k = 256, 1536, 1024
     if n % tile_m:
@@ -242,6 +250,7 @@ def _w4a8_setup(m, n, k, seed=13):
 
 
 @pytest.mark.parametrize("k", [128, 256, 384, 1024])
+@sm90_only
 def test_gemm_w4a8_decode_exactness(k):
     """One-hot e4m3 activations with unit token scales make the kernel output
     the dequantized weights EXACTLY (q and the promote are fp32-exact; one
@@ -272,6 +281,7 @@ def test_gemm_w4a8_decode_exactness(k):
         (2048, 4096, 2048),  # prefill (tile_n capped at 192: slow accum)
     ],
 )
+@sm90_only
 def test_gemm_w4a8_shapes(m, n, k):
     from quack.gemm_w4 import gemm_w4a8
 
@@ -282,6 +292,7 @@ def test_gemm_w4a8_shapes(m, n, k):
 
 
 @pytest.mark.parametrize("tile_m,tile_n", [(64, 128), (128, 128), (128, 192)])
+@sm90_only
 def test_gemm_w4a8_configs(tile_m, tile_n):
     from quack.gemm_w4 import gemm_w4a8
 
@@ -292,6 +303,7 @@ def test_gemm_w4a8_configs(tile_m, tile_n):
 
 
 @pytest.mark.parametrize("split_k", [2, 4])
+@sm90_only
 def test_gemm_w4a8_split_k(split_k):
     from quack.gemm_w4 import gemm_w4a8
 
@@ -302,6 +314,7 @@ def test_gemm_w4a8_split_k(split_k):
 
 
 @pytest.mark.parametrize("k", [128, 384, 1024])
+@sm90_only
 def test_gemm_w4a8_folded_decode_exactness(k):
     """Folded W4A8 (int4smf): the scaled-LUT decode's e4m3 rounding must
     match the reference exactly — one-hot acts pin the per-(row, tile) table
@@ -339,6 +352,7 @@ def test_gemm_w4a8_folded_decode_exactness(k):
         (2048, 4096, 2048),  # prefill (no-drain fast-accum path, tile_n 256)
     ],
 )
+@sm90_only
 def test_gemm_w4a8_folded_shapes(m, n, k):
     from quack.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
 
@@ -357,6 +371,7 @@ def test_gemm_w4a8_folded_shapes(m, n, k):
     torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=2e-2)
 
 
+@sm90_only
 def test_gemm_w4a8_bf16_act_convenience():
     """bf16 acts quantize per-token internally; bitwise == the manual path."""
     from quack.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
