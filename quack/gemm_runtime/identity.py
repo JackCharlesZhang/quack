@@ -198,7 +198,15 @@ def module_locator(obj, fn) -> Optional[tuple]:
     objects that way. ``fn`` anchors the search (the authored function whose
     ``__module__``/``__name__`` name the natural home); returns None for
     ``__main__`` / notebook objects and objects never bound to a module
-    global."""
+    global.
+
+    A binding found here may not exist in a fresh process: a module global
+    bound at CALL time (e.g. a test helper's ``global`` trick) satisfies this
+    scan but is never replayed by a fresh import. That can't be detected on
+    the fn object (a ``global``-declared def even strips the ``<locals>``
+    qualname marker), so consumers must tolerate it at resolve time — the
+    async pool ships the mod by value as a fallback payload (see
+    ``GemmClassRef.__quack_pool_payload__``)."""
     module_name = getattr(fn, "__module__", None)
     if module_name is None or module_name == "__main__":
         return None
@@ -317,10 +325,38 @@ class GemmClassRef(NamedTuple):
     semantic_digest: str = ""
 
     def __quack_pool_payload__(self):
-        """Worker setup for a local EpiMod, or None for importable refs."""
-        if self.kind != "epi_mod_local":
+        """Worker setup payload for the EpiMod.
+
+        ``epi_mod_local``: mandatory (no importable anchor; a serialization
+        failure makes the pool refuse the key -> in-process compile).
+
+        ``epi_mod``: best-effort belt-and-braces. Resolvable-by-import at
+        submit time does not guarantee resolvable in a worker: a module
+        global bound at CALL time (a test helper's ``global`` trick)
+        satisfies the locator here but doesn't exist after the worker's
+        fresh import — or resolves to a different mod the module binds at
+        import time. Ship the mod by value too and let
+        :func:`resolve_gemm_class` fall back to the installed payload in
+        both cases; if it can't be serialized, keep the by-ref-only behavior
+        (those mods resolve fine when the binding is real, exactly as
+        before)."""
+        if self.kind == "epi_mod_local":
+            return LOCAL_EPI_MODS.payload(self.semantic_digest)
+        if self.kind != "epi_mod":
             return None
-        return LOCAL_EPI_MODS.payload(self.semantic_digest)
+        mod = TORCH_OP_EPI_MODS.get(self.semantic_digest)
+        if mod is None:
+            return None
+        try:
+            import cloudpickle
+
+            from quack.cache.async_compile import PoolPayload
+
+            return PoolPayload(
+                __name__, "install_epi_mod_payload", self.semantic_digest, cloudpickle.dumps(mod)
+            )
+        except Exception:
+            return None
 
 
 def _resolve_qualname(obj, qualname):
@@ -344,16 +380,30 @@ def resolve_gemm_class(ref: GemmClassRef):
                 "to make it resolvable by import"
             )
         return obj._mint(*ref.mint_key)
-    module = importlib.import_module(ref.module)
-    obj = _resolve_qualname(module, ref.qualname)
     if ref.kind == "static":
-        return obj
+        return _resolve_qualname(importlib.import_module(ref.module), ref.qualname)
     if ref.kind != "epi_mod":
         raise ValueError(f"unknown GEMM class reference kind {ref.kind!r}")
-    if obj.semantic_digest != ref.semantic_digest:
-        raise RuntimeError(
-            f"epilogue {ref.module}.{ref.qualname} changed while resolving a compile request"
-        )
+    obj = err = None
+    try:
+        obj = _resolve_qualname(importlib.import_module(ref.module), ref.qualname)
+    except AttributeError as e:
+        err = e
+    if obj is None or obj.semantic_digest != ref.semantic_digest:
+        # The submitter saw a module-global binding that a fresh import does
+        # not replay (bound at call time, e.g. via a `global` declaration
+        # inside a function): the attribute is missing here, or holds a
+        # different mod the module binds at import time. Async workers get
+        # the mod by value as a side-channel payload for exactly this case
+        # (digest-checked at install) — resolve through it.
+        installed = LOCAL_EPI_MODS.resolve(ref.semantic_digest)
+        if installed is None:
+            if err is not None:
+                raise err
+            raise RuntimeError(
+                f"epilogue {ref.module}.{ref.qualname} changed while resolving a compile request"
+            )
+        obj = installed
     return obj._mint(*ref.mint_key)
 
 

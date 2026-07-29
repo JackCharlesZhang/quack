@@ -128,33 +128,44 @@ class CompilePending(BaseException):
 def _detect_arch_env() -> tuple[Optional[str], Optional[str]]:
     """Return (QUACK_ARCH, CUTE_DSL_ARCH) for GPU-blind pool workers.
 
-    An explicit ``QUACK_ARCH`` env override wins — CI cross-compiles for a
-    different arch than the runner's GPU (e.g. ``QUACK_ARCH=120`` on an
-    H100), and workers must compile for the *target* arch, not the physical
-    one. Otherwise detect from the parent's GPU. Either way the workers
-    themselves never touch the CUDA driver (no context per worker,
-    fork-safe).
+    The two overrides answer different questions. ``QUACK_ARCH`` is the
+    Python-side *dispatch* arch (which kernel class / configs get traced) and
+    is forwarded verbatim so worker-side dispatch matches the submitter.
+    ``CUTE_DSL_ARCH`` is the ptxas *target*, and it must be whatever the main
+    process compiles and loads: the explicit env override if set, else the
+    physical GPU. It must NOT be derived from ``QUACK_ARCH`` — on the CI
+    proxy legs (``QUACK_ARCH=120`` on an H100) the main process still
+    compiles the SM120-dispatched code for sm_90a, the only arch the runner
+    can load; a worker .o targeting sm_120a would fail cuModuleLoad and
+    demote every pool compile to an in-process recompile. Only on a GPU-less
+    box (the CPU-only cross-compile workflow) does ``QUACK_ARCH`` double as
+    the target. The workers themselves never touch the CUDA driver (no
+    context per worker, fork-safe) — this detection runs in the parent.
     """
     quack_arch = os.environ.get("QUACK_ARCH")
-    if quack_arch is not None:
-        cute_arch = os.environ.get("CUTE_DSL_ARCH")
-        if cute_arch is None:
-            from quack.cute_dsl_utils import _parse_arch_str
+    cute_arch = os.environ.get("CUTE_DSL_ARCH")
+    if cute_arch is None:
+        try:
+            import torch
 
-            major, minor = _parse_arch_str(quack_arch)
-            cc = f"{major}{minor}"
-            cute_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
-        return quack_arch, cute_arch
-    try:
-        import torch
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                cc = f"{major}{minor}"
+                cute_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
+        except Exception:
+            pass
+    if cute_arch is None and quack_arch is not None:
+        # CPU-only box: the dispatch arch is the only target we have.
+        from quack.cute_dsl_utils import _parse_arch_str
 
-        if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
-            cc = f"{major}{minor}"
-            return cc, f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
-    except Exception:
-        pass
-    return None, os.environ.get("CUTE_DSL_ARCH")
+        major, minor = _parse_arch_str(quack_arch)
+        cc = f"{major}{minor}"
+        cute_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
+    if quack_arch is None and cute_arch is not None:
+        # No dispatch override: pin workers to the physical arch so their
+        # GPU-blind get_device_capacity agrees with the parent's detection.
+        quack_arch = cute_arch.removeprefix("sm_").removesuffix("a")
+    return quack_arch, cute_arch
 
 
 def _install_gpu_blind_device_attrs() -> None:
@@ -242,7 +253,15 @@ def _pool_worker(
             return "compile succeeded but .o was not exported"
         return None
     except Exception as e:
-        return f"{type(e).__name__}: {e}"
+        # The consumer will recompile in-process for a first-class traceback,
+        # but a worker-only failure (env/serialization skew) never reproduces
+        # there — keep the last frames so those are diagnosable from the
+        # stats line alone.
+        import traceback
+
+        frames = traceback.format_exception(type(e), e, e.__traceback__)
+        tail = "".join(frames[-4:]).strip().replace("\n", " | ")
+        return f"{type(e).__name__}: {e} [worker: {tail[-600:]}]"
 
 
 def _make_executor(jobs: int) -> ProcessPoolExecutor:
