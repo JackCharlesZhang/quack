@@ -8,11 +8,13 @@ fp4 the packed kind::mxf4 (e8m0/vec32) / kind::mxf4nvf4 (e4m3/vec16) atoms,
 everything else MmaMXF8F6F4OpFull. Sub-byte sides of MIXED pairs are
 TMA-loaded via padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) and unpacked
 at s2r by ldsm.b4x16_p64 / b6x16_p32 (fp4 additionally shifted <<2 into MMA
-position); same-dtype fp4 stays packed throughout. B is K-major; A is
-K-major, or M-major for fp8 (transposing m16n16.trans.b8 ldmatrix).
-varlen_k (needs n-major B) is rejected at validation. Unlike the plain-fp8
-unit-scale fast path (which falls back to MmaFP8Op on the H100 CI proxy),
-these instructions REQUIRE an sm_120a target, so the tests run on SM120 only.
+position); same-dtype fp4 stays packed throughout. MN-major operands are
+fp8-only: both sides ride the transposing m16n16.trans.b8 ldmatrix — A via
+make_tiled_copy_A, B via a hand-built TV layout (_nmajor_b_tiled_copy) — which
+also unlocks varlen_k (m-major A / n-major B, K-padded SF buffers, ragged-tail
+MMA skip). Unlike the plain-fp8 unit-scale fast path (which falls back to
+MmaFP8Op on the H100 CI proxy), these instructions REQUIRE an sm_120a target,
+so the tests run on SM120 only.
 """
 
 import pytest
@@ -384,3 +386,85 @@ def test_sm120_mxfp8_a_m_major(fmt_b):
     out = gemm(A_mm, W.mT, tuned=False)
     rel = _rel_err(out, ref)
     assert rel < 5e-3, f"m-major A x {fmt_b}: rel_err={rel}"
+
+
+def _n_major_b(W):
+    """(k, n) row-major view of an (n, k) quantized operand — the interface's
+    .mT relabel makes it n-major B. The scale tensor is layout-independent."""
+    qb_kn = W.qdata.t().contiguous()  # (k, n) with N contiguous
+    return BlockScaledOperand.from_parts(qb_kn, W.scale, W.format, quant_dim=-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("fmt_a", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp6_e2m3_packed"])
+def test_sm120_b_n_major(fmt_a):
+    """N-major fp8 B (ldmatrix.m16n16.x2.trans.b8 through a hand-built TV
+    layout, see GemmSm120._nmajor_b_tiled_copy) under every A flavor that
+    pairs with fp8 B (same-dtype mxfp8, mixed e5m2 x e4m3, fp4 x fp8,
+    fp6 x fp8): must be bit-identical to the k-major B run on the same
+    quantized operands."""
+    m, n, k = 256, 320, 512
+    A = _mixed_operand(fmt_a, m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    out_kmaj = gemm(A, W.mT, tuned=False)
+    out = gemm(A, _n_major_b(W), tuned=False)
+    assert torch.equal(out, out_kmaj), (
+        f"{fmt_a} x n-major fp8 B != k-major: "
+        f"max_err={(out.float() - out_kmaj.float()).abs().max().item()}"
+    )
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "tile_mn,pingpong",
+    [((128, 128), True), ((256, 128), False), ((128, 256), False), ((256, 256), False)],
+)
+def test_sm120_b_n_major_tiles(tile_mn, pingpong):
+    """tile_n 256 splits the B fragment's N rest mode AROUND K (the copy view
+    regroup in _retile_b must follow the fragment layout, not assume plain
+    (V, N, K) col-major); pingpong exercises the within-warp-group tidx
+    remap."""
+    m, n, k = 512, 512, 512
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k)
+    config = _sm120_config(*tile_mn, pingpong=pingpong)
+    out_kmaj = _gemm_with_config(A, B, config=config)
+    W = B.mT  # undo the .mT from _quantized_operands
+    out = _gemm_with_config(A, _n_major_b(W), config=config)
+    assert torch.equal(out, out_kmaj), f"tile={tile_mn} pingpong={pingpong}: n-major != k-major"
+
+
+@requires_sm120
+def test_sm120_fp4_b_n_major_rejected():
+    """Packed fp4 cannot be n-major (nibbles pack along the quantized K axis;
+    no ldmatrix variant can transpose them) — the operand container rejects
+    the layout at construction, before any kernel is minted."""
+    W = _mixed_operand("mxfp4", 256, 512, seed=0)
+    with pytest.raises(ValueError, match="packed dim"):
+        BlockScaledOperand.from_parts(W.qdata.t().contiguous(), W.scale, W.format, quant_dim=-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
+def test_sm120_mxfp8_varlen_k_poisoned_sf_pad(seqlens_k):
+    """varlen_k (m-major A / n-major B, K-padded SF buffers): SF pad bytes are
+    TMA-loaded but must never be consumed — the mma loop skips the
+    instructions covering the ragged tail (GemmSm120.mma's
+    sf_valid_insts_last_tile). Poison
+    the pad with 0xFF (e8m0 NaN): any consumed pad byte NaNs whole output rows
+    via NaN-scale x 0-value products."""
+    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, qa, qb, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k, sf_pad_byte=0xFF
+    )
+    A_op = BlockScaledOperand.from_parts(qa, SFA, "mxfp8")
+    B_op = BlockScaledOperand.from_parts(qb.t(), SFB, "mxfp8", quant_dim=-2)
+    out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    assert not out.isnan().any(), "NaN leaked from poisoned SF pad into the output"
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (out[i].float() - ref_i).abs().max().item() / ref_i.abs().max().item()
+        assert err < 5e-3, f"poisoned pad seqlens_k={seqlens_k} expert={i} rel_err={err}"

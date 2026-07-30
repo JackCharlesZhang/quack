@@ -945,13 +945,18 @@ class TileStore(EpiOp):
             # SM120 halved postact: retile through an N-doubled permuted MMA so
             # each warp's STSM lanes cover the halved tile contiguously.
             copy_atom_postact_c = self._make_copy_atom_r2s(gemm, params, cutlass.Float16)
-            op = warp.MmaF16BF16Op(gemm.a_dtype, gemm.acc_dtype, gemm.mma_inst_mnk)
+            # dummy tiled mma: only its C-side (M, N) fragment geometry is
+            # consumed, which is identical for every mma.sync inst K and
+            # operand width — so build it 16-bit even for fp8/blockscaled
+            # GEMMs (MmaF16BF16Op rejects fp8 dtypes and inst K 32)
+            dummy_dtype = gemm.a_dtype if gemm.a_dtype.width == 16 else cutlass.BFloat16
+            op = warp.MmaF16BF16Op(dummy_dtype, gemm.acc_dtype, (16, 8, 16))
             tC = cute.make_layout(gemm.atom_layout_mnk)
             atom_m, atom_n, atom_k = gemm.atom_layout_mnk
             permutation_mnk = (
                 gemm.mma_inst_mnk[0] * atom_m,
                 gemm.mma_inst_mnk[1] * atom_n * 2,
-                gemm.mma_inst_mnk[2] * atom_k,
+                16 * atom_k,
             )
             tiled_mma_gated_postact = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
             tiled_copy_c_atom = cute.make_tiled_copy_C_atom(

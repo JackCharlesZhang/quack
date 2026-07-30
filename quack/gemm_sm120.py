@@ -251,6 +251,11 @@ class GemmSm120(GemmSm90):
         split_k_mode: int = SplitKMode.SERIAL,
         transform_a: Optional[Callable] = None,
         sf_vec_size: Optional[int] = None,
+        # Blackwell cluster-launch-control dynamic persistence (CLC is
+        # supported on sm_120a/121a, same as sm_100 — CUTLASS_ARCH_CLC_ENABLED
+        # covers the GeForce parts). The scheduler warp doubles as the load
+        # warp here, so no throttle barrier is needed (it self-paces).
+        use_clc_persistence: bool = False,
         # blockscaled MMA element types when they differ from the storage
         # dtypes (packed fp6 crosses the FFI boundary as raw bytes)
         a_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
@@ -260,11 +265,15 @@ class GemmSm120(GemmSm90):
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
         self.is_persistent = is_persistent
-        self.use_clc_persistence = False
+        self.use_clc_persistence = use_clc_persistence
+        if use_clc_persistence:
+            assert is_persistent and not pingpong, (
+                "CLC persistence requires the persistent non-pingpong scheduler"
+            )
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
-        # Blockscaled (real SFA/SFB operands loaded from gmem): MXFP8 only for
-        # now — fp8 e4m3/e5m2 with e8m0 scales, sf_vec_size 32, K-major A and B.
+        # Blockscaled (real SFA/SFB operands loaded from gmem): see
+        # _setup_tiled_mma for the supported dtype-pair / kind matrix.
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
         self.sfa_smem_layout_staged = None
@@ -486,14 +495,18 @@ class GemmSm120(GemmSm90):
                     f"sf_vec_size 32, got {self.sf_dtype} / {self.sf_vec_size}"
                 )
             assert self.acc_dtype == Float32, "SM120 blockscaled GEMM requires f32 accumulation"
-            # M-major A is supported for fp8 only (the byte-granularity
-            # transposing ldmatrix m16n16.trans.b8); sub-byte operands pack
-            # two/more MN-adjacent elements per byte when MN-major, which no
-            # ldmatrix variant can transpose. B is K-major only.
+            # MN-major operands are supported for fp8 only: both sides ride
+            # the byte-granularity transposing ldmatrix (m16n16.trans.b8) —
+            # A via make_tiled_copy_A, B via a hand-built TV layout (see
+            # _nmajor_b_tiled_copy). Sub-byte operands pack two/more
+            # MN-adjacent elements per byte when MN-major, which no ldmatrix
+            # variant can transpose.
             assert not self.a_layout.is_m_major_a() or self.mma_a_dtype.width == 8, (
                 "SM120 blockscaled GEMM supports M-major A for fp8 only"
             )
-            assert not self.b_layout.is_n_major_b(), "SM120 blockscaled GEMM requires K-major B"
+            assert not self.b_layout.is_n_major_b() or self.b_dtype.width == 8, (
+                "SM120 blockscaled GEMM supports N-major B for fp8 only"
+            )
             # one SF atom column covers 4 * sf_vec_size K elements
             assert tile_k_resolved % (4 * self.sf_vec_size) == 0, (
                 f"Blockscaled CTA tile K ({tile_k_resolved}) must be divisible by one SF atom "
@@ -734,13 +747,19 @@ class GemmSm120(GemmSm90):
             # Keep scheduler scratch out of SharedStorage. A small buffer before
             # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
             # responses also use i128 copies, so this stays 16-byte aligned.
-            # No drain-mailbox tail (+6 Int32, cf. gemm_sm100): this kernel never
-            # calls cancel_pending_tail — add the tail if that ever changes.
-            sched_data = smem.allocate_tensor(
+            # CLC needs a +6 Int32 tail after the response ring: the retirement
+            # drain's private response slot (16 B) + mbarrier (8 B) — see
+            # TileScheduler.cancel_pending_tail (same layout as gemm_sm100).
+            sched_smem_flat = smem.allocate_tensor(
                 Int32,
-                cute.make_layout((4, self.sched_stage)),
+                cute.make_layout(
+                    4 * self.sched_stage + (6 if const_expr(self.use_clc_persistence) else 0)
+                ),
                 byte_alignment=16,
                 partition=SmemPartition.RESERVED,
+            )
+            sched_data = cute.make_tensor(
+                sched_smem_flat.iterator, cute.make_layout((4, self.sched_stage))
             )
 
         # Cluster sync
@@ -915,9 +934,14 @@ class GemmSm120(GemmSm90):
                             dst_tensor=sSFA,
                             tma_multicast=a_tma_multicast,
                         )
-                        # (bN, bK, RestK); varlen_k is excluded (K-major only)
+                        # (bN, bK, RestK). SFB is K-padded for varlen_k (same
+                        # tile-offset formula as SFA); per-batch otherwise.
+                        if const_expr(varlen_k):
+                            mSFB_nk = varlen_manager.offset_batch_SFA(mSFB_nkl, batch_idx)
+                        else:
+                            mSFB_nk = mSFB_nkl[None, None, batch_idx]
                         gSFB_nk = cute.local_tile(
-                            mSFB_nkl[None, None, batch_idx],
+                            mSFB_nk,
                             cute.select(self.cta_tile_shape_mnk, [1, 2]),
                             (tile_coord_mnkl[1], None),
                         )
@@ -962,6 +986,10 @@ class GemmSm120(GemmSm90):
                 ab_pipeline.producer_tail(ab_producer_state)
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
+                    if const_expr(self.use_clc_persistence):
+                        # Serial-observed drain of the pending padding tail
+                        # (see TileScheduler.cancel_pending_tail).
+                        tile_scheduler.cancel_pending_tail()
 
         # =====================================================================
         # MMA warps
@@ -980,18 +1008,26 @@ class GemmSm120(GemmSm90):
 
             # ldmatrix copy atom for SMEM → RMEM (B side; A goes through the
             # copy_block seam below)
-            if const_expr(self.use_mxf8f6f4_op and self.b_dtype.width < 8):
-                # sub-byte B of a kind::mxf8f6f4 pair: padded ALIGN smem +
-                # unpacking ldmatrix (see canonical_a_load; k-major only).
-                # (Same-dtype fp4 kinds keep packed smem and take the plain
-                # 16-bit ldmatrix below.)
-                atom_copy_ldmatrix_B = _subbyte_ldmatrix_atom(self.b_dtype)
+            if const_expr(
+                self.blockscaled and self.b_dtype.width == 8 and self.b_layout.is_n_major_b()
+            ):
+                # n-major fp8 B: transposing b8 ldmatrix with a hand-built TV
+                # layout (make_tiled_copy_B's auto-derived pairing fetches the
+                # wrong k — see _nmajor_b_tiled_copy)
+                smem_tiled_copy_B = self._nmajor_b_tiled_copy()
             else:
-                atom_copy_ldmatrix_B = cute.make_copy_atom(
-                    warp.LdMatrix8x8x16bOp(self.b_layout.is_n_major_b(), 4),
-                    self.b_dtype,
-                )
-            smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
+                if const_expr(self.use_mxf8f6f4_op and self.b_dtype.width < 8):
+                    # sub-byte B of a kind::mxf8f6f4 pair: padded ALIGN smem +
+                    # unpacking ldmatrix (see canonical_a_load; k-major only).
+                    # (Same-dtype fp4 kinds keep packed smem and take the plain
+                    # 16-bit ldmatrix below.)
+                    atom_copy_ldmatrix_B = _subbyte_ldmatrix_atom(self.b_dtype)
+                else:
+                    atom_copy_ldmatrix_B = cute.make_copy_atom(
+                        warp.LdMatrix8x8x16bOp(self.b_layout.is_n_major_b(), 4),
+                        self.b_dtype,
+                    )
+                smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
             thr_copy_ldmatrix_B = smem_tiled_copy_B.get_slice(tidx)
             tCsB_copy_view = thr_copy_ldmatrix_B.partition_S(sB)
 
@@ -1188,6 +1224,21 @@ class GemmSm120(GemmSm90):
                         # hook — incl. the slot-0 preloads — is this tile's
                         self.transform_a.on_work_tile(tile_coord_mnkl)
                 acc.fill(0.0)
+                sf_valid_insts_last_tile = None
+                if const_expr(self.blockscaled and varlen_k):
+                    # MMA instructions covering valid K in the globally LAST
+                    # k-tile (the mma loop skips the rest — arbitrary SF pad,
+                    # see mma(); same scheme and name as GemmSm100.mma).
+                    # Splits not covering the last k-tile see a full tile.
+                    k_valid = len_k - (k_tile_total - 1) * self.cta_tile_shape_mnk[2]
+                    sf_valid_insts_last_tile = cute.ceil_div(k_valid, self.mma_inst_mnk[2])
+                    if (
+                        const_expr(self.split_k > 1)
+                        and k_tile_start_mma + k_tile_cnt != k_tile_total
+                    ):
+                        sf_valid_insts_last_tile = Int32(
+                            self.cta_tile_shape_mnk[2] // self.mma_inst_mnk[2]
+                        )
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 iket.range_push("mma")
@@ -1206,6 +1257,7 @@ class GemmSm120(GemmSm90):
                     tCrSFA=tCrSFA,
                     tCrSFB=tCrSFB,
                     copy_sf_block=copy_sf_block,
+                    sf_valid_insts_last_tile=sf_valid_insts_last_tile,
                 )
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
@@ -1370,6 +1422,55 @@ class GemmSm120(GemmSm90):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
 
+    def _nmajor_b_tiled_copy(self):
+        """Tiled copy for n-major fp8 B: ldmatrix.m16n16.x2.trans.b8 with a
+        hand-built TV layout, so partition_S / retile / cute.copy work exactly
+        like every other B copy.
+
+        ``make_tiled_copy_B`` auto-derives the TV pairing from the mma's B
+        fragment and puts the atom's x2-matrix mode on the wrong k (the atom
+        spans n16 x k32 = two n8 mma atoms x two k16 halves; the derivation
+        pairs the matrix mode with the n-atom pair instead of the k16 half).
+        The same atom composed for m-major A by ``make_tiled_copy_A`` is
+        correct, so the trait itself models the hardware faithfully — only
+        the B-side pairing needs to be spelled out. Measured semantics (per
+        SM100_U8x16_LDSM_T, cute/atom/copy_traits_sm100.hpp): lane l provides
+        the 16-byte n-row at k = l; lane (a, b) = (l%4, l//4) receives bytes
+        (kb, np, h) at n = wn*16 + b + 8*np, k = 4a + kb + 16h (h = the
+        x2-matrix mode = the k16 half). M-warps duplicate (stride 0)."""
+        atom = cute.make_copy_atom(
+            warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2), self.b_dtype
+        )
+        atom_m, atom_n, _ = self.atom_layout_mnk
+        n_span = 16 * atom_n  # the tiled-mma N span (16 consecutive N per warp)
+        layout_tv = cute.make_layout(
+            ((4, 8, atom_m, atom_n), (4, 2, 2)),
+            stride=((4 * n_span, 1, 0, 16), (n_span, 8, 16 * n_span)),
+        )
+        return cute.make_tiled_copy(atom, layout_tv, (n_span, 32))
+
+    def _retile_b(self, smem_tiled_copy_B, tCrB):
+        """``smem_tiled_copy_B.retile(tCrB)``, except for the hand-built
+        n-major fp8 B copy: the DSL retile assumes the trait's canonical value
+        grouping and mis-groups a custom TV (it pairs the copy's 16-value mode
+        with (fragment-V x next-K-BLOCK) instead of (fragment-V x n-pair)).
+        Regroup the fragment by its own modes instead: (V=(kb,h), N=(np,g...),
+        K) -> ((kb, np, h), (g...), K) — value order per _nmajor_b_tiled_copy's
+        TV. Strides come from the fragment layout itself, so the tile_n 256
+        N-rest split around K carries through untouched."""
+        if const_expr(
+            not (self.blockscaled and self.b_dtype.width == 8 and self.b_layout.is_n_major_b())
+        ):
+            return smem_tiled_copy_B.retile(tCrB)
+        (kb_s, h_s), n_shp, k_shp = tCrB.layout.shape
+        (kb_d, h_d), n_std, k_std = tCrB.layout.stride
+        # profile ((V, rest_v), N, K), congruent with partition_S's ((16,1), N, K)
+        layout = cute.make_layout(
+            (((kb_s, n_shp[0], h_s), 1), n_shp[1:] if len(n_shp) > 1 else (1,), k_shp),
+            stride=(((kb_d, n_std[0], h_d), 0), n_std[1:] if len(n_std) > 1 else (0,), k_std),
+        )
+        return cute.make_tensor(tCrB.iterator, layout)
+
     @cute.jit
     def mma(
         self,
@@ -1387,6 +1488,7 @@ class GemmSm120(GemmSm90):
         tCrSFA: Optional[cute.Tensor] = None,
         tCrSFB: Optional[cute.Tensor] = None,
         copy_sf_block: Optional[Callable] = None,
+        sf_valid_insts_last_tile: Optional[Int32] = None,
     ) -> cutlass.pipeline.PipelineState:
         """Warp-level MMA mainloop: A produced per k16 block through the
         ``copy_block(stage_idx, b, k_tile)`` seam (canonical ldmatrix s2r, or
@@ -1400,8 +1502,14 @@ class GemmSm120(GemmSm90):
 
         For real blockscaled operands, ``copy_sf_block(stage_idx, k_block)``
         copies the SFA/SFB scale fragments smem->rmem alongside each A/B
-        k-block (same stage/slot rhythm)."""
-        tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
+        k-block (same stage/slot rhythm).
+
+        ``sf_valid_insts_last_tile`` (blockscaled varlen_k only) is the number
+        of MMA instructions covering valid K in the LAST k-tile — the rest are
+        skipped so the arbitrary SF pad bytes there (0xFF is e8m0 NaN) never
+        poison the accumulator via NaN * 0 against the TMA-zero-filled value
+        tail (same scheme as GemmSm100.mma)."""
+        tCrB_copy_view = self._retile_b(smem_tiled_copy_B, tCrB)
         load_sB = partial(cute.copy, smem_tiled_copy_B)
 
         num_k_blocks = cute.size(tCrA, mode=[2])
@@ -1485,13 +1593,18 @@ class GemmSm120(GemmSm90):
                     if const_expr(copy_sf_block is not None):
                         copy_sf_block(stage, k_next)
                 if const_expr(tCrSFA is not None):
-                    cute.gemm(
-                        tiled_mma,
-                        acc,
-                        [tCrA[None, None, k], tCrSFA[None, None, k]],
-                        [tCrB[None, None, k], tCrSFB[None, None, k]],
-                        acc,
-                    )
+                    # ragged K (varlen_k): skip the instructions covering the
+                    # zero-filled value tail — its SF pad bytes may be
+                    # arbitrary (0xFF is e8m0 NaN, and NaN * 0 would poison
+                    # the accumulator)
+                    if const_expr(sf_valid_insts_last_tile is None) or k < sf_valid_insts_last_tile:
+                        cute.gemm(
+                            tiled_mma,
+                            acc,
+                            [tCrA[None, None, k], tCrSFA[None, None, k]],
+                            [tCrB[None, None, k], tCrSFB[None, None, k]],
+                            acc,
+                        )
                 else:
                     cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 

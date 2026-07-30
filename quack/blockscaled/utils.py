@@ -584,8 +584,8 @@ def create_blockscaled_varlen_k_operands(
     Returns (a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k):
       a_ref_list: list of per-expert (m, k_i) fp32 dequantized A.
       b_ref_list: list of per-expert (n, k_i) fp32 dequantized B.
-      qa:  (m, total_k) K-major fp8 (stride (total_k, 1)).
-      qb:  (n, total_k) K-major fp8 (stride (total_k, 1)).
+      qa:  (m, total_k) M-major fp8 (stride (1, m)).
+      qb:  (n, total_k) N-major fp8 (stride (1, n)).
       a_sc_contig: (1, rm, total_padded_rk, 32, 4, 4) K-padded SFA (tile-aligned per batch).
       b_sc_contig: (1, rn, total_padded_rk, 32, 4, 4) K-padded SFB (tile-aligned per batch).
       cu_seqlens_k: (num_experts+1,) int32.

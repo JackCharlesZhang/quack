@@ -261,9 +261,8 @@ def _run_blockscaled(args):
     from quack.gemm_default_epi import GemmDefaultSm100
 
     sm_major = get_device_capacity(torch.device("cuda"))[0]
-    assert sm_major in (10, 11), (
-        f"Blockscaled GEMM requires SM100 (B200/B300) or SM110; got SM{sm_major}x. "
-        "MXFP8/MXFP4/NVFP4 use tcgen05 UMMA which is SM100+."
+    assert sm_major in (10, 11, 12), (
+        f"Blockscaled GEMM requires SM100 (B200/B300), SM110, or SM120 (RTX 50); got SM{sm_major}x."
     )
 
     if args.varlen_k or args.gather_A or args.pingpong:
