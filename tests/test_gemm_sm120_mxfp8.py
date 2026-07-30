@@ -2,15 +2,17 @@
 """SM120 block-scaled GEMM (warp-level kind::mxf8f6f4 with REAL e8m0 scale
 factors): numerics vs the dequantized reference, and bit-exact vs cuBLAS.
 
-Scope: K-major A and B, sf_vec_size 32, independent A/B dtypes across
-fp8 (e4m3/e5m2) / fp6 (e2m3/e3m2, packed) / fp4 (e2m1, packed) — same-dtype
-fp8 rides MmaMXF8Op, everything else MmaMXF8F6F4OpFull. Sub-byte operands
-are TMA-loaded via padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) and
-unpacked at s2r by ldsm.b4x16_p64 / b6x16_p32 (fp4 additionally shifted <<2
-into MMA position). Same-dtype fp4 (kind::mxf4 / mxf4nvf4) and varlen_k
-(m-major A) are rejected at validation. Unlike the plain-fp8 unit-scale fast
-path (which falls back to MmaFP8Op on the H100 CI proxy), these instructions
-REQUIRE an sm_120a target, so the tests run on SM120 only.
+Scope: independent A/B dtypes across fp8 (e4m3/e5m2) / fp6 (e2m3/e3m2,
+packed) / fp4 (e2m1, packed) — same-dtype fp8 rides MmaMXF8Op, same-dtype
+fp4 the packed kind::mxf4 (e8m0/vec32) / kind::mxf4nvf4 (e4m3/vec16) atoms,
+everything else MmaMXF8F6F4OpFull. Sub-byte sides of MIXED pairs are
+TMA-loaded via padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) and unpacked
+at s2r by ldsm.b4x16_p64 / b6x16_p32 (fp4 additionally shifted <<2 into MMA
+position); same-dtype fp4 stays packed throughout. B is K-major; A is
+K-major, or M-major for fp8 (transposing m16n16.trans.b8 ldmatrix).
+varlen_k (needs n-major B) is rejected at validation. Unlike the plain-fp8
+unit-scale fast path (which falls back to MmaFP8Op on the H100 CI proxy),
+these instructions REQUIRE an sm_120a target, so the tests run on SM120 only.
 """
 
 import pytest
@@ -349,11 +351,36 @@ def test_sm120_plain_mixed_fp8_gemm(tile_m):
 
 @requires_sm120
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
-def test_sm120_same_dtype_fp4_rejected(fmt):
-    """Same-dtype fp4 (kind::mxf4 / mxf4nvf4) is not implemented on SM120;
-    it must be rejected at validation with a legible error, not at kernel
-    compile."""
-    m, n, k = 256, 256, 256
+@pytest.mark.parametrize(
+    "shape_mnk",
+    [(256, 256, 256), (448, 320, 512), (256, 256, 8192)],
+)
+def test_sm120_same_dtype_fp4_gemm(fmt, shape_mnk):
+    """Same-dtype fp4 rides the dedicated packed kinds — kind::mxf4 (e8m0
+    scales, sf_vec 32) / kind::mxf4nvf4 (e4m3 scales, sf_vec 16) — with
+    inst K 64, regular packed fp4 smem/TMA, plain 16-bit ldmatrix, and no
+    register shift. NVFP4's per-tensor scale folds into alpha at the
+    interface."""
+    m, n, k = shape_mnk
     A, B = _quantized_operands(fmt, m, n, k)
-    with pytest.raises(AssertionError, match="same-dtype fp4"):
-        gemm(A, B, tuned=False)
+    out = gemm(A, B, tuned=False)
+    ref = gemm_blockscaled_ref(A, B)
+    rel = _rel_err(out, ref)
+    assert rel < 5e-3, f"{fmt} {shape_mnk}: rel_err={rel}"
+
+
+@requires_sm120
+@pytest.mark.parametrize("fmt_b", ["mxfp8_e4m3", "mxfp4"])
+def test_sm120_mxfp8_a_m_major(fmt_b):
+    """M-major fp8 A (byte-granularity transposing ldmatrix m16n16.trans.b8):
+    the scale tensor is layout-independent, only the qdata strides swap."""
+    m, n, k = 256, 320, 512
+    A, _ = _quantized_operands("mxfp8_e4m3", m, n, k)
+    W = _mixed_operand(fmt_b, n, k, seed=1)
+    ref = gemm_blockscaled_ref(A, W.mT)
+    qa_mm = A.qdata.t().contiguous().t()  # (m, k) with M contiguous
+    assert qa_mm.stride() == (1, m)
+    A_mm = BlockScaledOperand.from_parts(qa_mm, A.scale, A.format)
+    out = gemm(A_mm, W.mT, tuned=False)
+    rel = _rel_err(out, ref)
+    assert rel < 5e-3, f"m-major A x {fmt_b}: rel_err={rel}"

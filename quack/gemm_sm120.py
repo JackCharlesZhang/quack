@@ -270,13 +270,15 @@ class GemmSm120(GemmSm90):
         self.sfa_smem_layout_staged = None
         self.sfb_smem_layout_staged = None
         # Mixed-dtype pairs (kind::mxf8f6f4 with independent a/b dtype
-        # qualifiers): resolved in _setup_tiled_mma once b_dtype is known.
+        # qualifiers) and same-dtype fp4 (kind::mxf4/mxf4nvf4): resolved in
+        # _setup_tiled_mma once b_dtype is known.
         self.use_mxf8f6f4_op = False
+        self.use_mxf4_op = False
         self.a_fp4_in_mixed = False
         self.b_fp4_in_mixed = False
         if self.blockscaled:
-            assert sf_vec_size == 32, (
-                "SM120 blockscaled (MXFP8 / fp4 x fp8 mixed) requires sf_vec_size == 32"
+            assert sf_vec_size in (16, 32), (
+                "SM120 blockscaled requires sf_vec_size 32 (MX formats) or 16 (NVFP4)"
             )
             assert not gather_A, "Blockscaled SM120 GEMM does not support gather_A"
             assert transform_a is None, "Blockscaled SM120 GEMM does not support transform_a"
@@ -433,8 +435,8 @@ class GemmSm120(GemmSm90):
         matrix instantiates all 25 combinations of e4m3/e5m2/e2m3/e3m2/e2m1;
         the upstream DSL op only whitelists fp4 x fp8, relaxed by
         MmaMXF8F6F4OpFull); same-dtype fp8 keeps the dedicated MmaMXF8Op and
-        same-dtype fp4 (kind::mxf4 / mxf4nvf4) is not implemented.
-        Constraints for the unit-scale path: f32 accumulator,
+        same-dtype fp4 the packed kind::mxf4 / mxf4nvf4 atoms (blockscaled
+        only, inst K 64). Constraints for the unit-scale path: f32 accumulator,
         tile_M % 128 == 0 (the SF fragment partition helpers assume whole
         128-row SF blocks), tile_K % 128, and a sm_120/121 COMPILE TARGET —
         kind::mxf8f6f4 has no Hopper equivalent (MmaMXF8Op admits only
@@ -455,33 +457,51 @@ class GemmSm120(GemmSm90):
             # Real block-scaled operands: unlike the unit-scale fast path
             # below, there is no MmaFP8Op fallback — the SF operands are real
             # data, so every condition is a hard requirement. Same-dtype fp8
-            # rides the dedicated MmaMXF8Op; every other legal pair (any mix
-            # of e4m3/e5m2/e2m3/e3m2/e2m1, plus same-dtype fp6) rides
+            # rides the dedicated MmaMXF8Op; same-dtype fp4 rides the packed
+            # kind::mxf4 (e8m0 vec32) / kind::mxf4nvf4 (e4m3 vec16) atoms with
+            # inst K 64; every other legal pair (any mix of
+            # e4m3/e5m2/e2m3/e3m2/e2m1, plus same-dtype fp6) rides
             # kind::mxf8f6f4 with independent a/b dtypes (MmaMXF8F6F4OpFull).
-            # Same-dtype fp4 (kind::mxf4 / mxf4nvf4) is not implemented.
             assert self.mma_a_dtype in _MXF8F6F4_DTYPES and self.b_dtype in _MXF8F6F4_DTYPES, (
                 f"SM120 blockscaled GEMM operand dtypes must be one of "
                 f"{_MXF8F6F4_DTYPES}, got {self.mma_a_dtype} x {self.b_dtype}"
             )
-            assert not (self.mma_a_dtype.width == 4 and self.b_dtype.width == 4), (
-                "same-dtype fp4 (kind::mxf4 / mxf4nvf4) is not implemented on SM120; "
-                "supported: kind::mxf8f6f4 pairs (fp8/fp6/fp4 mixes) and same-dtype MXFP8"
-            )
-            assert self.sf_dtype == cutlass.Float8E8M0FNU, (
-                f"SM120 blockscaled (kind::mxf8f6f4) requires e8m0 scales, got {self.sf_dtype}"
-            )
+            self.use_mxf4_op = self.mma_a_dtype.width == 4 and self.b_dtype.width == 4
+            if const_expr(self.use_mxf4_op):
+                # Packed nibbles all the way (regular fp4 smem/TMA, no
+                # ALIGN8B unpack, no register shift); one instruction covers
+                # K 64.
+                self.mma_inst_mnk = (16, 8, 64)
+                if const_expr(self.sf_vec_size == 16):
+                    assert self.sf_dtype == cutlass.Float8E4M3FN, (
+                        f"NVFP4 (sf_vec_size=16) requires e4m3 scales, got {self.sf_dtype}"
+                    )
+                else:
+                    assert self.sf_dtype == cutlass.Float8E8M0FNU, (
+                        f"MXFP4 (sf_vec_size=32) requires e8m0 scales, got {self.sf_dtype}"
+                    )
+            else:
+                assert self.sf_vec_size == 32 and self.sf_dtype == cutlass.Float8E8M0FNU, (
+                    f"SM120 blockscaled (kind::mxf8f6f4) requires e8m0 scales at "
+                    f"sf_vec_size 32, got {self.sf_dtype} / {self.sf_vec_size}"
+                )
             assert self.acc_dtype == Float32, "SM120 blockscaled GEMM requires f32 accumulation"
-            assert not self.a_layout.is_m_major_a() and not self.b_layout.is_n_major_b(), (
-                "SM120 blockscaled GEMM requires K-major A and B"
+            # M-major A is supported for fp8 only (the byte-granularity
+            # transposing ldmatrix m16n16.trans.b8); sub-byte operands pack
+            # two/more MN-adjacent elements per byte when MN-major, which no
+            # ldmatrix variant can transpose. B is K-major only.
+            assert not self.a_layout.is_m_major_a() or self.mma_a_dtype.width == 8, (
+                "SM120 blockscaled GEMM supports M-major A for fp8 only"
             )
-            # one SF atom column covers 4 * sf_vec_size = 128 K elements
+            assert not self.b_layout.is_n_major_b(), "SM120 blockscaled GEMM requires K-major B"
+            # one SF atom column covers 4 * sf_vec_size K elements
             assert tile_k_resolved % (4 * self.sf_vec_size) == 0, (
                 f"Blockscaled CTA tile K ({tile_k_resolved}) must be divisible by one SF atom "
                 f"column (4 * sf_vec_size = {4 * self.sf_vec_size})"
             )
             assert mma_arch in warp.MmaMXF8Op.admissible_archs, (
                 "SM120 blockscaled GEMM needs an sm_120a/f or sm_121a/f compile target "
-                "(kind::mxf8f6f4 block_scale has no Hopper equivalent)"
+                "(the block_scale mma kinds have no Hopper equivalent)"
             )
             self.use_mxf8_mma = True
         else:
@@ -517,7 +537,7 @@ class GemmSm120(GemmSm90):
                 )
         # Pairs served by kind::mxf8f6f4 with independent a/b dtype qualifiers
         # (genuinely mixed, or same-dtype fp6 which has no dedicated op);
-        # same-dtype fp8 stays on MmaMXF8Op.
+        # same-dtype fp8 stays on MmaMXF8Op, same-dtype fp4 on MXF4/NVF4.
         self.use_mxf8f6f4_op = self.use_mxf8_mma and (
             self.mma_a_dtype != self.b_dtype or self.mma_a_dtype.width == 6
         )
@@ -527,10 +547,11 @@ class GemmSm120(GemmSm90):
         # bytes) — so smem storage and TMA-internal dtype are byte-domain
         # (Int8); ldsm.b4x16_p64 / b6x16_p32 expands into byte lanes at s2r
         # time. Only fp4 additionally needs the << 2 register shift (see
-        # FP4_SHIFT_BITS).
-        self.a_fp4_in_mixed = self.use_mxf8_mma and self.mma_a_dtype.width == 4
-        self.b_fp4_in_mixed = self.use_mxf8_mma and self.b_dtype.width == 4
-        if const_expr(self.use_mxf8_mma):
+        # FP4_SHIFT_BITS). Same-dtype fp4 (kind::mxf4/mxf4nvf4) stays PACKED
+        # throughout — regular fp4 smem, plain 16-bit ldmatrix, no shift.
+        self.a_fp4_in_mixed = self.use_mxf8f6f4_op and self.mma_a_dtype.width == 4
+        self.b_fp4_in_mixed = self.use_mxf8f6f4_op and self.b_dtype.width == 4
+        if const_expr(self.use_mxf8f6f4_op):
             if const_expr(self.mma_a_dtype.width < 8):
                 self.a_smem_dtype = cutlass.Int8
                 self.a_tma_internal_dtype = cutlass.Int8
@@ -539,6 +560,11 @@ class GemmSm120(GemmSm90):
                 self.b_tma_internal_dtype = cutlass.Int8
         if const_expr(self.mma_a_dtype.width == 16):
             op = warp.MmaF16BF16Op(self.mma_a_dtype, self.acc_dtype, self.mma_inst_mnk)
+        elif const_expr(self.use_mxf4_op):
+            if const_expr(self.sf_vec_size == 16):
+                op = warp.MmaMXF4NVF4Op(self.mma_a_dtype, self.acc_dtype, cutlass.Float8E4M3FN)
+            else:
+                op = warp.MmaMXF4Op(self.mma_a_dtype, self.acc_dtype, cutlass.Float8E8M0FNU)
         elif const_expr(self.use_mxf8f6f4_op):
             op = MmaMXF8F6F4OpFull(
                 self.mma_a_dtype, self.b_dtype, self.acc_dtype, cutlass.Float8E8M0FNU
@@ -589,7 +615,7 @@ class GemmSm120(GemmSm90):
         it is k-major only — enforced by the inherited __call__ checks."""
         atom = None
         position_independent = True
-        if const_expr(self.use_mxf8_mma and self.mma_a_dtype.width < 8):
+        if const_expr(self.use_mxf8f6f4_op and self.mma_a_dtype.width < 8):
             # Sub-byte side of a kind::mxf8f6f4 pair: smem holds padded
             # ALIGN8B/ALIGN16B groups; ldsm.b4x16_p64 / b6x16_p32 expands into
             # byte lanes (k-major only, no transposing variant). Plain
@@ -597,7 +623,16 @@ class GemmSm120(GemmSm90):
             # value layout.
             atom = _subbyte_ldmatrix_atom(self.mma_a_dtype)
             position_independent = False
-        elif const_expr(self.mma_a_dtype.width == 8):
+        elif const_expr(self.mma_a_dtype.width == 8 and self.a_layout.is_m_major_a()):
+            # M-major fp8: the byte-granularity transposing ldmatrix
+            # (m16n16.trans.b8, sm_100a/sm_120a)
+            atom = cute.make_copy_atom(
+                warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2), self.mma_a_dtype
+            )
+            position_independent = False
+        elif const_expr(self.mma_a_dtype.width < 16):
+            # K-major fp8, and the packed same-dtype fp4 kinds (a k-major
+            # nibble quartet is one 16-bit unit)
             atom = cute.make_copy_atom(
                 warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.mma_a_dtype
             )
@@ -945,9 +980,11 @@ class GemmSm120(GemmSm90):
 
             # ldmatrix copy atom for SMEM → RMEM (B side; A goes through the
             # copy_block seam below)
-            if const_expr(self.use_mxf8_mma and self.b_dtype.width < 8):
+            if const_expr(self.use_mxf8f6f4_op and self.b_dtype.width < 8):
                 # sub-byte B of a kind::mxf8f6f4 pair: padded ALIGN smem +
-                # unpacking ldmatrix (see canonical_a_load; k-major only)
+                # unpacking ldmatrix (see canonical_a_load; k-major only).
+                # (Same-dtype fp4 kinds keep packed smem and take the plain
+                # 16-bit ldmatrix below.)
                 atom_copy_ldmatrix_B = _subbyte_ldmatrix_atom(self.b_dtype)
             else:
                 atom_copy_ldmatrix_B = cute.make_copy_atom(
@@ -1006,9 +1043,12 @@ class GemmSm120(GemmSm90):
                     sSFB[None, None, 0], thr_mma, tidx
                 )
                 # Normalize to (V, MN, K) — same rest-mode walk as the
-                # unit-scale path below.
-                tCrSFA = _sf_group_vmk(tCrSFA, self.cta_tile_shape_mnk[2] // 32)
-                tCrSFB = _sf_group_vmk(tCrSFB, self.cta_tile_shape_mnk[2] // 32)
+                # unit-scale path below. K atoms = k-blocks per tile (one SF
+                # fragment slice per mma issue: inst K 32 for fp8/mixed, 64
+                # for the packed fp4 kinds).
+                k_atoms = self.cta_tile_shape_mnk[2] // self.mma_inst_mnk[2]
+                tCrSFA = _sf_group_vmk(tCrSFA, k_atoms)
+                tCrSFB = _sf_group_vmk(tCrSFB, k_atoms)
                 copy_sf_block = _make_sf_copy_block(
                     tiled_mma, self.sf_dtype, sSFA, sSFB, tCrSFA, tCrSFB, tidx
                 )

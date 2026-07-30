@@ -110,19 +110,13 @@ def validate_blockscaled_sf(
     assert SFB is not None, "SFA and SFB must be provided together"
     assert device_capacity[0] in [10, 11, 12], "Blockscaled GEMM requires SM100/SM110/SM120"
     if device_capacity[0] == 12:
-        # SM120 warp-MMA blockscaled: same-dtype MXFP8 (MmaMXF8Op), or any
-        # kind::mxf8f6f4 pair with independent a/b dtypes — fp8/fp6/fp4 mixes
-        # incl. e4m3 x e5m2 (sub-byte sides ride padded 16U4_ALIGN8B /
+        # SM120 warp-MMA blockscaled: same-dtype MXFP8 (MmaMXF8Op), same-dtype
+        # fp4 (packed kind::mxf4 / mxf4nvf4), or any kind::mxf8f6f4 pair with
+        # independent a/b dtypes — fp8/fp6/fp4 mixes incl. e4m3 x e5m2
+        # (sub-byte sides of mixed pairs ride padded 16U4_ALIGN8B /
         # 16U6_ALIGN16B tensormaps + ldsm.b4x16_p64/b6x16_p32 unpack).
-        # Same-dtype fp4 (kind::mxf4 / mxf4nvf4) and varlen_k's m-major A are
-        # not implemented.
-        pair_bits = (fmt_a.elem_bits, fmt_b.elem_bits)
-        assert pair_bits != (4, 4), (
-            f"SM120 blockscaled GEMM does not implement same-dtype fp4 "
-            f"(kind::mxf4 / mxf4nvf4); pair fp4 with an fp8/fp6 format, "
-            f"got {fmt_a.name} x {fmt_b.name}"
-        )
-        assert not varlen_k, "SM120 blockscaled GEMM does not support varlen_k (needs m-major A)"
+        # varlen_k (m-major A with n-major B) is not implemented.
+        assert not varlen_k, "SM120 blockscaled GEMM does not support varlen_k (needs n-major B)"
     # Per-instruction the scale config is shared: every legal pair has matching
     # scale dtype and vec size (nvfp4 only pairs with itself; all other formats
     # are e8m0 / vec 32).
