@@ -267,9 +267,9 @@ class GemmSm120(GemmSm90):
         self.is_persistent = is_persistent
         self.use_clc_persistence = use_clc_persistence
         if use_clc_persistence:
-            assert is_persistent and not pingpong, (
-                "CLC persistence requires the persistent non-pingpong scheduler"
-            )
+            # pingpong is fine: it consumes CLC responses one-at-a-time (both
+            # WGs read every sched slot — see pingpong_sched_skip in kernel())
+            assert is_persistent, "CLC persistence requires the persistent scheduler"
         self.use_pdl = use_pdl
         self.fp8_slow_accum = False
         # Blockscaled (real SFA/SFB operands loaded from gmem): see
@@ -737,12 +737,26 @@ class GemmSm120(GemmSm90):
             epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
         sched_pipeline = None
         sched_data = None
+        # Pingpong sched-slot SKIP mode: each math WG consumes only its own
+        # alternate sched slots (advance_count=2), and the producer hand-writes
+        # one extra invalid record after its loop for the trailing WG. That
+        # hand-off is STATIC-scheduler-only: under CLC the slots hold hardware
+        # CLC responses (a hand-written 4-int record would be misdecoded, and
+        # the trailing WG's tail slot has no producer), so CLC pingpong
+        # consumes work tiles one at a time instead — both WGs read every
+        # response, exactly like the varlen_k / split-k pingpong modes.
+        pingpong_sched_skip = const_expr(
+            self.pingpong and not varlen_k and self.split_k == 1 and not self.use_clc_persistence
+        )
         if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(
                 cluster_layout_mnk,
-                # split_k > 1 makes per-tile k-tile counts dynamic, so pingpong consumes
-                # work tiles one at a time, exactly like varlen_k.
-                varlen_k=varlen_k or self.split_k > 1,
+                # one-at-a-time consumption whenever pingpong is NOT in skip
+                # mode (the flag name is historical: varlen_k was the first
+                # such mode)
+                varlen_k=varlen_k
+                or self.split_k > 1
+                or (self.pingpong and not pingpong_sched_skip),
             )
             # Keep scheduler scratch out of SharedStorage. A small buffer before
             # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
@@ -978,7 +992,7 @@ class GemmSm120(GemmSm90):
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
-                if const_expr(self.pingpong and not varlen_k and self.split_k == 1):
+                if const_expr(pingpong_sched_skip):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
                     if is_scheduler_warp:
                         tile_scheduler.write_work_tile_to_smem(work_tile)
@@ -1180,22 +1194,30 @@ class GemmSm120(GemmSm90):
             if const_expr(self.pingpong):
                 if warp_idx >= 4:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
-                    if const_expr(not varlen_k and self.split_k == 1):
+                    if const_expr(pingpong_sched_skip):
                         epi_read_state.advance_iters(c_tile_cnt)
                         epi_producer_state.advance_iters(c_tile_cnt)
                         ab_read_state.advance_iters(k_tile_cnt_static)
+                        tile_scheduler.advance_to_next_work()
+                        work_tile = tile_scheduler.get_current_work()
                     else:
-                        # varlen_k and split_k > 1 both make the per-tile k-tile count dynamic
+                        # varlen_k and split_k > 1 both make the per-tile k-tile count
+                        # dynamic (CLC pingpong also lands here: one-at-a-time slot
+                        # consumption)
                         batch_idx_pp, split_idx_pp = (
                             work_tile.tile_idx[3],
                             work_tile.tile_idx[2],
                         )
+                        if not work_tile.is_valid_tile:
+                            # padding tile: the counts below are unused (the
+                            # validity guard skips the advances), but the
+                            # cu_seqlens read must stay in bounds
+                            batch_idx_pp = Int32(0)
                         len_k = varlen_manager.len_k(batch_idx=batch_idx_pp)
                         k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                         _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
                             k_tile_total, split_idx_pp
                         )
-                        ab_read_state.advance_iters(k_tile_cnt)
                         # Under split-K, only finalizer tiles run the epilogue (and thus
                         # produce/consume C stages); the peer advance must match.
                         c_cnt = Int32(c_tile_cnt)
@@ -1204,10 +1226,18 @@ class GemmSm120(GemmSm90):
                         ):
                             if split_idx_pp != self.split_k - 1:
                                 c_cnt = Int32(0)
-                        epi_read_state.advance_iters(c_cnt)
-                        epi_producer_state.advance_iters(c_cnt)
-                    tile_scheduler.advance_to_next_work()
-                    work_tile = tile_scheduler.get_current_work()
+                        # PADDING clusters must skip the bootstrap entirely: a
+                        # CLC grid may exceed the tile count (varlen_m sizes it
+                        # before cu_seqlens is known), and a padding cluster's
+                        # producer never issues a CLC query — a ring read here
+                        # would wait forever. (Static grids never exceed the
+                        # tile count, so this only bites under CLC.)
+                        if work_tile.is_valid_tile:
+                            ab_read_state.advance_iters(k_tile_cnt)
+                            epi_read_state.advance_iters(c_cnt)
+                            epi_producer_state.advance_iters(c_cnt)
+                            tile_scheduler.advance_to_next_work()
+                            work_tile = tile_scheduler.get_current_work()
             while work_tile.is_valid_tile:
                 # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                 tile_coord_mnkl = work_tile.tile_idx
@@ -1384,13 +1414,15 @@ class GemmSm120(GemmSm90):
                     work_tile = tile_scheduler.get_current_work()
                 else:  # Skip a tile for pingpong
                     # Update starting load/store/mainloop pipeline states for the next tile
-                    if const_expr(not varlen_k and self.split_k == 1):
+                    if const_expr(pingpong_sched_skip):
                         epi_read_state.advance_iters(c_tile_cnt)
                         epi_producer_state.advance_iters(c_tile_cnt)
                         ab_read_state.advance_iters(k_tile_cnt_static)
                         tile_scheduler.advance_to_next_work(advance_count=self.mma_warp_groups)
                         work_tile = tile_scheduler.get_current_work()
                     else:
+                        # one-at-a-time (varlen_k / split-k / CLC): read and
+                        # discard the peer WG's slot, then take the next
                         tile_scheduler.advance_to_next_work()
                         work_tile = tile_scheduler.get_current_work()
                         if work_tile.is_valid_tile:
@@ -1424,20 +1456,24 @@ class GemmSm120(GemmSm90):
 
     def _nmajor_b_tiled_copy(self):
         """Tiled copy for n-major fp8 B: ldmatrix.m16n16.x2.trans.b8 with a
-        hand-built TV layout, so partition_S / retile / cute.copy work exactly
-        like every other B copy.
+        hand-built TV layout, so partition_S / cute.copy work exactly like
+        every other B copy (only retile is replaced — see _retile_b).
 
-        ``make_tiled_copy_B`` auto-derives the TV pairing from the mma's B
-        fragment and puts the atom's x2-matrix mode on the wrong k (the atom
-        spans n16 x k32 = two n8 mma atoms x two k16 halves; the derivation
-        pairs the matrix mode with the n-atom pair instead of the k16 half).
-        The same atom composed for m-major A by ``make_tiled_copy_A`` is
-        correct, so the trait itself models the hardware faithfully — only
-        the B-side pairing needs to be spelled out. Measured semantics (per
-        SM100_U8x16_LDSM_T, cute/atom/copy_traits_sm100.hpp): lane l provides
-        the 16-byte n-row at k = l; lane (a, b) = (l%4, l//4) receives bytes
+        The DSL atom's trait describes the SOURCE correctly (lane l provides
+        the 16-byte n-row at k = l) but its DST value layout is provably wrong
+        vs hardware — 12 of 16 slots per lane; byte-level repro in
+        AI/cute_dsl_ldmatrix16x16x8b_trans_bug_report.md. Compositions that
+        consult the broken Dst therefore mis-place bytes unless the error
+        happens to cancel: ``make_tiled_copy_A`` for m-major A does cancel
+        (verified), ``make_tiled_copy_B`` does not (it fetches the wrong k).
+        This construction never consults the Dst: partition_S composes only
+        the (correct) Src side, and _retile_b's fragment regroup encodes the
+        MEASURED delivery (per the C++ SM100_U8x16_LDSM_T trait, cute/atom/
+        copy_traits_sm100.hpp): lane (a, b) = (l%4, l//4) receives bytes
         (kb, np, h) at n = wn*16 + b + 8*np, k = 4a + kb + 16h (h = the
-        x2-matrix mode = the k16 half). M-warps duplicate (stride 0)."""
+        x2-matrix mode = the k16 half). M-warps duplicate (stride 0). If a
+        DSL upgrade fixes the trait, the bit-exact n-major-vs-k-major tests
+        (test_sm120_b_n_major*) will catch any placement change."""
         atom = cute.make_copy_atom(
             warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2), self.b_dtype
         )
@@ -1451,13 +1487,14 @@ class GemmSm120(GemmSm90):
 
     def _retile_b(self, smem_tiled_copy_B, tCrB):
         """``smem_tiled_copy_B.retile(tCrB)``, except for the hand-built
-        n-major fp8 B copy: the DSL retile assumes the trait's canonical value
-        grouping and mis-groups a custom TV (it pairs the copy's 16-value mode
-        with (fragment-V x next-K-BLOCK) instead of (fragment-V x n-pair)).
-        Regroup the fragment by its own modes instead: (V=(kb,h), N=(np,g...),
-        K) -> ((kb, np, h), (g...), K) — value order per _nmajor_b_tiled_copy's
-        TV. Strides come from the fragment layout itself, so the tile_n 256
-        N-rest split around K carries through untouched."""
+        n-major fp8 B copy: the DSL retile consults the atom trait's Dst value
+        layout, which is wrong vs hardware (see _nmajor_b_tiled_copy) — with
+        the custom TV it pairs the copy's 16-value mode with (fragment-V x
+        next-K-BLOCK) instead of (fragment-V x n-pair). Regroup the fragment
+        by its own modes instead, in the MEASURED delivery order: (V=(kb,h),
+        N=(np,g...), K) -> ((kb, np, h), (g...), K). Strides come from the
+        fragment layout itself, so the tile_n 256 N-rest split around K
+        carries through untouched."""
         if const_expr(
             not (self.blockscaled and self.b_dtype.width == 8 and self.b_layout.is_n_major_b())
         ):

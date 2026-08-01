@@ -701,11 +701,11 @@ def compile_gemm_kernel(
                 split_k_kwargs["a_mma_dtype"] = a_mma_dtype
                 split_k_kwargs["b_mma_dtype"] = b_mma_dtype
             # SM120's dynamic persistence is CLC (cluster launch control, same
-            # Blackwell feature as sm100's) — no tile-count semaphore needed;
-            # pingpong keeps its static schedule.
-            split_k_kwargs["use_clc_persistence"] = (
-                is_dynamic_persistent and persistent and not pingpong
-            )
+            # Blackwell feature as sm100's) — no tile-count semaphore needed.
+            # Pingpong included: it consumes CLC responses one-at-a-time
+            # (128x128 pingpong + CLC is the best-measured mxfp8 config, see
+            # AI/sm120_blockscaled_gemm_worklog.md).
+            split_k_kwargs["use_clc_persistence"] = is_dynamic_persistent and persistent
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
