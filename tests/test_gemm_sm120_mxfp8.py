@@ -38,7 +38,14 @@ from quack.gemm_interface import (
 )
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
-requires_sm120 = pytest.mark.skipif(_ARCH != 12, reason="SM120 blockscaled warp-MMA path")
+# get_device_capacity honors the QUACK_ARCH proxy override, but the blockscaled
+# mma kinds exist on sm_120/121 silicon only and ptxas always targets the
+# physical GPU — so the H100 QUACK_ARCH=120 CI legs must skip these.
+_PHYSICAL_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+requires_sm120 = pytest.mark.skipif(
+    _ARCH != 12 or _PHYSICAL_ARCH != 12,
+    reason="SM120 blockscaled warp-MMA path (needs sm_120/121 silicon, no proxy)",
+)
 
 
 def _quantized_operands(fmt, m, n, k, batched=False, seed=0):
