@@ -224,6 +224,13 @@ class GemmBase:
     def epi_smem_warp_shape_mnk(self):
         return (self.num_epi_warps, 1, 1)
 
+    def epi_r2s_pair_xor(self) -> bool:
+        """Whether the D r2s copy uses the conflict-free pair-XOR STS.32 split
+        (see copy_utils.cvt_copy_pair_xor_sts32) instead of vectorized STS.64.
+        Only valid where the acc fragment holds contiguous column pairs and the
+        epi smem swizzle makes the vectorized store 2-way conflicted."""
+        return False
+
     def _init_split_k(self, split_k: int, split_k_mode: int):
         """Validate and store the constexpr split-K configuration. Call after self.gather_A."""
         assert split_k >= 1, "split_k must be >= 1"
@@ -430,6 +437,8 @@ class GemmBase:
                         num_prev_subtiles + epi_idx,
                     )
                     copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
+                elif const_expr(self.epi_r2s_pair_xor()):
+                    copy_utils.cvt_copy_pair_xor_sts32(tRS_rD, tRS_sD_cur, tidx)
                 else:
                     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
             # Copy each aux output from registers to shared memory. All share

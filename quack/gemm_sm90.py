@@ -1802,6 +1802,24 @@ class GemmSm90(GemmTmaBase):
         # (((2,2,2),1), MMA_M / epi_M, MMA_N / epi_N, (epi_M, epi_N))
         return tiled_copy_r2s.retile(tRS_rAcc)
 
+    def epi_r2s_pair_xor(self) -> bool:
+        # 32-bit D with n-major layout: the wgmma acc pairs are contiguous in
+        # smem and both the SW128 (epi_tile_n % 32 == 0) and SW64
+        # (epi_tile_n == 16, i.e. tile_n % 32 == 16 like 112/176) swizzle
+        # atoms make STS.64 uniformly 2-way bank conflicted; the pair-XOR
+        # STS.32 split is conflict-free under both (ncu-verified, no spills).
+        # epi_tile_n == 8 (SW32) is not verified, keep the default store.
+        # Gated off when C is present: the fp32-C epilogue sits exactly at the
+        # setmaxnreg cap and the split's few extra registers spill to local
+        # (measured ~150MB STL, a net loss; same for a mirrored LDS split).
+        return (
+            self.d_dtype is not None
+            and self.d_dtype.width == 32
+            and (self.d_layout is None or self.d_layout.is_n_major_c())
+            and self.epi_tile[1] % 16 == 0
+            and self.c_dtype is None
+        )
+
     def epilog_smem_copy_atom(self, tiled_mma: cute.TiledMma) -> cute.TiledCopy:
         copy_atom_C = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(
