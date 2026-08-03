@@ -235,6 +235,23 @@ class GemmSm120(GemmSm90):
     """
 
     arch = 120
+    # CUTLASS sm120_builder StagesC policy (sm120_get_tma_dispatch_policy):
+    # StagesC = StagesD = min(EpiTiles, 2) — "smaller stage counts in order to
+    # fit within the limited shared memory capacity". At 101376 B the SM90
+    # base of 4 upfront C stages costs a whole AB stage wherever the C/D
+    # footprint is large relative to the smem left over an AB-stage boundary:
+    # on the autotune grid that's f32 C or D at 128x128, bf16 C at
+    # 128x192/128x64/64x128, and fp4 with f32 C (the ubiquitous
+    # bf16-C-into-bf16-D 128x128 case lands on identical picks either way —
+    # the (64, 32) epi tile is small enough that the leftover refinement
+    # converges to the same fixed point). Measured on RTX 5090 at 8192x8192
+    # (settled interleaved medians, 2026-08-01): bf16 128x192coop+C
+    # (1,9,5)->(2,2,2) 196->234 TF, bf16 128x128pp+f32 C (1,6,5)->(2,2,3)
+    # 201->239 TF, fp8 128x128pp+f32 C 525->637 TF; no-flip controls flat.
+    # The leftover refinement still deepens C when smem is actually free.
+    # (CUTLASS's ReuseSmemC branch — StagesC = StagesD+1 sharing D's smem —
+    # is not implemented here.)
+    epi_c_stage_base = 2
 
     def __init__(
         self,

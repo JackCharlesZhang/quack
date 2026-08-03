@@ -123,8 +123,15 @@ class GemmBase:
         8-element-divisible fakes, so halves are 4-divisible)."""
         packed_dim = 1 if self.cd_packed == "n" else 0
         shape = tuple(s // 2 if i == packed_dim else s for i, s in enumerate(mT.shape))
+        # Halve every stride except the packed dim's unit stride. Static
+        # strides halve too (a fully-static tensor, e.g. a direct-compiled
+        # prototype, carries its real row stride statically); only the
+        # interface's dynamic fakes hit the assume branch.
         stride = tuple(
-            s if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4) for s in mT.stride
+            s
+            if const_expr(i == packed_dim)
+            else (s // 2 if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4))
+            for i, s in enumerate(mT.stride)
         )
         return cute.make_tensor(
             cute.recast_ptr(mT.iterator, dtype=cutlass.Float32),
@@ -268,6 +275,8 @@ class GemmBase:
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        from cutlass.cute.experimental import iket
+
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
@@ -363,7 +372,10 @@ class GemmBase:
             load_acc_subtile(tRS_rD, epi_coord)
             if const_expr(has_epi_load):
                 if const_expr(use_tma_c):
+                    iket.range_push("epi_c_wait")
                     epi_pipeline.consumer_wait(epi_read_state)
+                    iket.range_pop()
+                    iket.range_push("epi_c_s2r")
                     if const_expr(has_C):
                         cute.copy(
                             tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
@@ -372,6 +384,7 @@ class GemmBase:
                     cute.arch.fence_view_async_shared()
                     epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
+                    iket.range_pop()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
                     cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
@@ -395,7 +408,9 @@ class GemmBase:
             # Returns a tuple of register tensors — one per aux output.
             # Length matches ``aux_out_ctxs``. ``()`` for the default
             # epilogue (no aux output).
+            iket.range_push("epi_math")
             tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            iket.range_pop()
             self.epi_end_loop(
                 params,
                 epi_tensors,
@@ -420,6 +435,7 @@ class GemmBase:
                 )
                 for i in range(len(aux_out_ctxs))
             )
+            iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
                 if is_tma_warp:
                     epi_store_pipeline.producer_acquire()
@@ -427,7 +443,9 @@ class GemmBase:
                 epilogue_barrier.arrive_and_wait()
             if const_expr(use_tma_epi):
                 epilogue_barrier.arrive_and_wait()
+            iket.range_pop()
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            iket.range_push("epi_r2s")
             if const_expr(has_D):
                 tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
                 if const_expr(use_stochastic_rounding):
@@ -452,7 +470,9 @@ class GemmBase:
                     tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
+            iket.range_pop()
             if const_expr(use_tma_epi):
+                iket.range_push("epi_store_issue")
                 cute.arch.fence_view_async_shared()
                 epilogue_barrier.arrive_and_wait()
                 if is_tma_warp:
@@ -466,6 +486,7 @@ class GemmBase:
                             if store_pred:
                                 copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
+                iket.range_pop()
             else:
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
