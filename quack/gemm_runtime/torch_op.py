@@ -46,6 +46,13 @@ from quack.gemm_runtime.identity import (
 )
 from quack.rounding import RoundingMode
 
+# The compile-path body below runs under Dynamo, and default_config is host
+# plumbing whose result is fixed once the input device is guarded: run it
+# eagerly at trace time and bake the result, instead of letting Dynamo trace
+# through its lru_cache'd helpers (which it does with a UserWarning per
+# wrapper). Marks the function object itself; eager calls are unaffected.
+default_config = torch._dynamo.assume_constant_result(default_config)
+
 
 def _sf_encode(SF: torch.Tensor) -> torch.Tensor:
     """e8m0 -> uint8 view across the mutable custom-op boundary (the Inductor
