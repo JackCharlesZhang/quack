@@ -12,7 +12,7 @@ from cutlass.cute.runtime import make_ptr
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
 from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
@@ -705,7 +705,13 @@ def compile_gemm_kernel(
             # Pingpong included: it consumes CLC responses one-at-a-time
             # (128x128 pingpong + CLC is the best-measured mxfp8 config, see
             # AI/sm120_blockscaled_gemm_worklog.md).
-            split_k_kwargs["use_clc_persistence"] = is_dynamic_persistent and persistent
+            # Gate on the COMPILE TARGET, not the dispatch arch: CLC
+            # instructions are sm_100+, so the H100 CI proxy legs
+            # (QUACK_ARCH=120 compiled for sm_90a) must fall back to the
+            # static persistent scheduler or NVVM rejects the kernel.
+            split_k_kwargs["use_clc_persistence"] = (
+                is_dynamic_persistent and persistent and get_compile_target_capacity()[0] >= 10
+            )
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
