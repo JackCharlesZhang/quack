@@ -15,6 +15,7 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
+from quack import pipeline_checks
 from quack.cute_dsl_utils import ParamsBase
 from quack.epilogue.ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
@@ -1165,10 +1166,39 @@ class GemmTmaBase(GemmBase):
     ):
         # Threads/warps participating in this pipeline
         producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
+        # B's TMA warp contributes 1 (elect_one arrive_and_expect_tx); with gather_A the
+        # cp.async producer warps contribute all 32 lanes each (cp.async.mbarrier.arrive).
+        pipeline_checks.check_arrive_count(
+            "sm90 ab_pipeline.producer",
+            producer_cnt,
+            pipeline_checks.tma_producer_arrives(
+                num_tma_warps=1,
+                cpasync_warps=0 if const_expr(not self.gather_A) else self.num_ab_load_warps,
+            ),
+            gather_A=self.gather_A,
+            num_ab_load_warps=self.num_ab_load_warps,
+        )
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         consumer_arrive_cnt = mcast_size * tiled_mma.size // cute.arch.WARP_SIZE
+        # One arrive per consumer (mma) warp, delivered to every CTA in this CTA's A- and
+        # B-multicast groups (self counted once).
+        pipeline_checks.check_arrive_count(
+            "sm90 ab_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                tiled_mma.size // cute.arch.WARP_SIZE,
+                per_warp=True,
+                ctas_routed=pipeline_checks.mcast_peer_ctas(
+                    num_mcast_ctas_a=self.num_mcast_ctas_a,
+                    num_mcast_ctas_b=self.num_mcast_ctas_b,
+                ),
+            ),
+            num_mma_warps=tiled_mma.size // cute.arch.WARP_SIZE,
+            num_mcast_ctas_a=self.num_mcast_ctas_a,
+            num_mcast_ctas_b=self.num_mcast_ctas_b,
+        )
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1189,6 +1219,15 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         # Each warp will contribute 1 to the arrive count
         consumer_arrive_cnt = self.num_epi_warps
+        # One arrive per epilogue warp (elected lane), CTA-local barrier; per_warp bound
+        # to the elect_one_release flag passed to create below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "epi_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(self.num_epi_warps, per_warp=elect_one_release),
+            num_epi_warps=self.num_epi_warps,
+        )
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1198,7 +1237,7 @@ class GemmTmaBase(GemmBase):
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tx_count,
             defer_sync=True,
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
             syncwarp_before_release=True,
         )
 

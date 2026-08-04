@@ -44,6 +44,7 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
 from quack import layout_utils
+from quack import pipeline_checks
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
 from quack.layout_utils import tile_atom_to_shape_SF_strided
@@ -123,6 +124,37 @@ from quack.gemm_base import reinterpret_packed_fp6 as _reinterpret_packed_fp6  #
 class GemmSm100(GemmTmaBase):
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
+
+    Warp roles and pipeline schedule (arrive counts validated by quack.pipeline_checks
+    at construction; per-role acquire/work/commit timelines, one line per pipeline stage):
+
+    Roles per CTA: epilogue warps (num_epi_warps, ids 0..n-1) | MMA warp | AB-load warp(s)
+    (1, or 4 cp.async warps when gather_A) | C-load warp (when C) | scheduler warp |
+    A-prefetch warp (gather_A only).
+
+    Pipelines (producer role -> consumer role):
+      ab       TmaUmma:  AB-load -> MMA.       full: TMA tx bytes (+cp.async lane arrives
+               when gather_A); empty: 1 hw tcgen05.commit per A/B-mcast peer CTA.
+      acc      UmmaAsync: MMA -> epilogue.     full: 1 hw commit; empty: 1 arrive per epi
+               warp (elected lane), x2 CTAs routed to leader when 2-CTA MMA.
+      sched    Async:    scheduler -> all warps. full: armed as tx barrier by the producer
+               (CLC multicast try_cancel or STAS); empty: 1 arrive per consumer warp,
+               every CTA routed to CTA 0.
+      epi (C)  TmaAsync: C-load -> epilogue.   full: TMA tx; empty: 1 arrive per epi warp.
+      a_pref   CpAsync:  A-prefetch -> AB-load (gather_A only). full: 32 lane arrives;
+               empty: 1 arrive per AB-load warp.
+      epi_store TmaStore: epilogue TMA-store completion pacing (bulk-group, no mbarrier).
+
+    Per-role timeline (steady state, per scheduled tile / k-stage):
+      scheduler: [per tile]  sched.acquire -> CLC try_cancel (arms tx) -> (hw completes)
+      AB-load:   [per tile]  sched slot read -> sched.release
+                 [per k]     ab.acquire (wait empty + arm tx) -> TMA A,B[,SFA,SFB]
+      MMA:       [per tile]  acc.acquire (once, before k loop)
+                 [per k]     ab full wait -> tcgen05.mma (k-blocks) -> commit -> ab.release
+                 [tile end]  acc.commit (via tcgen05.commit)
+      epilogue:  [per tile]  acc.wait -> per epi subtile: tmem load -> epi_store.acquire
+                 -> smem -> TMA store -> acc.release (elected, after last read)
+      C-load:    [per tile]  per epi subtile: epi.acquire (arm tx) -> TMA load C
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
@@ -2440,10 +2472,33 @@ class GemmSm100(GemmTmaBase):
                 producer_cnt += 1
             else:
                 producer_cnt += Int32(2) if is_leader_cta else Int32(0)
+        # gather_A + 2cta leaves producer_cnt leader-dependent (Int32) — check skips there.
+        pipeline_checks.check_arrive_count(
+            "sm100 ab_pipeline.producer",
+            producer_cnt,
+            pipeline_checks.tma_producer_arrives(
+                num_tma_warps=1,
+                cpasync_warps=0
+                if const_expr(not self.gather_A or self.use_tma_gather)
+                else self.num_ab_load_warps,
+            ),
+            gather_A=self.gather_A,
+            num_ab_load_warps=self.num_ab_load_warps,
+        )
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         consumer_arrive_cnt = mcast_size
+        pipeline_checks.check_arrive_count(
+            "sm100 ab_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.mcast_peer_ctas(
+                num_mcast_ctas_a=self.num_mcast_ctas_a,
+                num_mcast_ctas_b=self.num_mcast_ctas_b,
+            ),
+            num_mcast_ctas_a=self.num_mcast_ctas_a,
+            num_mcast_ctas_b=self.num_mcast_ctas_b,
+        )
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -2470,6 +2525,21 @@ class GemmSm100(GemmTmaBase):
     def make_acc_pipeline(self, cluster_layout_vmnk: cute.Layout) -> pipeline.PipelineAsync:
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = self.num_epi_warps * (2 if self.use_2cta_instrs else 1)
+        # One arrive per epi warp (elected lane); with 2-CTA MMA both CTAs' epi warps
+        # route their arrives to the leader CTA's barrier. per_warp is bound to the
+        # elect_one_release flag passed to create below so flipping one trips the check.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "sm100 acc_pipeline.consumer",
+            num_acc_consumer_threads,
+            pipeline_checks.async_thread_arrives(
+                self.num_epi_warps,
+                per_warp=elect_one_release,
+                ctas_routed=2 if self.use_2cta_instrs else 1,
+            ),
+            num_epi_warps=self.num_epi_warps,
+            use_2cta_instrs=self.use_2cta_instrs,
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -2479,7 +2549,7 @@ class GemmSm100(GemmTmaBase):
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
             # TMEM load consumers are already ordered by fence_view_async_tmem_load()
             syncwarp_before_release=False,
         )
@@ -2500,6 +2570,18 @@ class GemmSm100(GemmTmaBase):
         if has_C:
             warps_per_cta += 1
         consumer_arrive_cnt = warps_per_cta * cluster_size
+        # One arrive per consumer warp (elected lane); consumer_mask=0 routes every CTA
+        # in the cluster to CTA 0's barrier. per_warp is bound to elect_one_release below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "sm100 sched_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                warps_per_cta, per_warp=elect_one_release, ctas_routed=cluster_size
+            ),
+            warps_per_cta=warps_per_cta,
+            cluster_size=cluster_size,
+        )
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -2519,14 +2601,31 @@ class GemmSm100(GemmTmaBase):
             defer_sync=True,
             # One arrive per consumer warp (consumer_arrive_cnt counts warps): syncwarp
             # so every lane's slot read is complete, then one elected lane signals.
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
         )
 
     @cute.jit
     def make_a_prefetch_pipeline(self) -> pipeline.PipelineAsync:
         producer_cnt = 32
+        # One cp.async producer warp, all-thread arrives (cp.async.mbarrier.arrive per lane).
+        pipeline_checks.check_arrive_count(
+            "sm100 a_prefetch_pipeline.producer",
+            producer_cnt,
+            pipeline_checks.async_thread_arrives(1, per_warp=False),
+            num_prefetch_warps=1,
+        )
         a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         consumer_arrive_cnt = self.num_ab_load_warps
+        # One arrive per AB-load consumer warp; per_warp bound to elect_one_release below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "sm100 a_prefetch_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                self.num_ab_load_warps, per_warp=elect_one_release
+            ),
+            num_ab_load_warps=self.num_ab_load_warps,
+        )
         a_prefetch_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -2535,7 +2634,7 @@ class GemmSm100(GemmTmaBase):
             producer_group=a_prefetch_producer_group,
             consumer_group=a_prefetch_consumer_group,
             defer_sync=True,
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
             syncwarp_before_release=True,
         )
 

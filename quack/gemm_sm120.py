@@ -232,6 +232,14 @@ class GemmSm120(GemmSm90):
     W4A8 fast-accum (int4smf) rides the fp8 warp MMA — the block-scaled 2x
     instruction when the tile qualifies; W4A8 promote (int4sm) stays
     SM90-only until this mainloop grows the per-k-tile promote seam.
+
+    Warp roles and pipeline schedule: inherited from GemmSm90 (see its docstring),
+    including the quack.pipeline_checks arrive-count validation at construction.
+    SM120 deltas to the facts: no thread-block clusters, so the A/B multicast peer
+    set is always 1 (ab empty barrier gets one arrive per mma warp, CTA-local) and
+    the scheduler barrier routes within a single CTA; the ab-pipeline consumers are
+    mma.sync warps fed by ldmatrix rather than WGMMA warpgroups (same per-warp
+    release counts via tiled_mma.size).
     """
 
     arch = 120

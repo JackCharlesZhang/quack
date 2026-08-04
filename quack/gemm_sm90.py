@@ -21,6 +21,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 
 
 from quack import layout_utils
+from quack import pipeline_checks
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
 from quack.gemm_config import SplitKMode
 from quack.operand_transform.transform import TransformAOperand
@@ -74,6 +75,34 @@ class GemmSm90(GemmTmaBase):
     """
     This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Hopper GPUs with persistent tile scheduling and warp specialization.
+
+    Warp roles and pipeline schedule (arrive counts validated by quack.pipeline_checks
+    at construction):
+
+    Roles per CTA: mma_warp_groups warpgroups (128 threads each) running WGMMA + epilogue
+    (cooperative: all on one tile; pingpong: two warpgroups alternate tiles), plus one
+    producer warpgroup containing the AB-load warp (or 4 cp.async warps when gather_A),
+    the C-load warp, and the scheduler warp.
+
+    Pipelines (producer role -> consumer role):
+      ab       TmaAsync: AB-load -> MMA warpgroups.  full: TMA tx bytes (+cp.async lane
+               arrives when gather_A); empty: 1 arrive per mma warp, delivered to every
+               CTA in this CTA's A/B-multicast peer set.
+      sched    Async:    scheduler -> mma + load warps. full: armed as tx barrier by the
+               producer; empty: 1 arrive per consumer warp, every CTA routed to CTA 0
+               (pingpong halves the participating mma warps unless varlen_k).
+      epi (C)  TmaAsync: C-load -> epilogue warps.   full: TMA tx; empty: 1 arrive per
+               epi warp (elected lane).
+      epi_store TmaStore: epilogue TMA-store completion pacing (bulk-group, no mbarrier).
+
+    Per-role timeline (steady state):
+      scheduler: [per tile]  sched.acquire -> produce next tile slot (arms tx)
+      AB-load:   [per tile]  sched slot read -> sched.release
+                 [per k]     ab.acquire (wait empty + arm tx) -> TMA A,B (+cp.async A if
+                 gather_A, committed via cp.async.mbarrier.arrive)
+      MMA wg:    [per k]     ab full wait -> wgmma -> ab.release (per warp, to mcast peers)
+                 [tile end]  epilogue: per subtile: epi wait (if C) -> regs -> smem ->
+                 epi_store.acquire -> TMA store -> epi.release
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
@@ -1903,10 +1932,22 @@ class GemmSm90(GemmTmaBase):
         # Each warp will contribute 1 to the arrive count
         # If pingpong and varlen_k, then all 8 mma warps will participate in the scheduler barrier
         # at each round. If pingpong and not varlen_k, then only 4 mma warp will participate.
-        consumer_arrive_cnt = (
-            (self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1) * 4
-            + self.num_ab_load_warps
-        ) * cluster_size
+        sched_consumer_warps_per_cta = (
+            self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1
+        ) * 4 + self.num_ab_load_warps
+        consumer_arrive_cnt = sched_consumer_warps_per_cta * cluster_size
+        # One arrive per consumer warp (elected lane); consumer_mask=0 routes every CTA
+        # in the cluster to CTA 0's barrier. per_warp is bound to elect_one_release below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "sm90 sched_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                sched_consumer_warps_per_cta, per_warp=elect_one_release, ctas_routed=cluster_size
+            ),
+            warps_per_cta=sched_consumer_warps_per_cta,
+            cluster_size=cluster_size,
+        )
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1919,7 +1960,7 @@ class GemmSm90(GemmTmaBase):
             defer_sync=True,
             # One arrive per consumer warp (consumer_arrive_cnt counts warps): syncwarp
             # so every lane's slot read is complete, then one elected lane signals.
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
         )
 
     @classmethod
