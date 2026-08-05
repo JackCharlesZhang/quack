@@ -516,12 +516,16 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
 
 
 @functools.lru_cache(maxsize=None)
-def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
-    """gemm_norm_act as a mod: x = (acc + C) * colvec * rowvec; D = x,
-    aux = act(x). Scale order: colvec then rowvec."""
+def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, has_alpha=False):
+    """gemm_norm_act as a mod: x = (alpha * acc + C) * colvec * rowvec; D = x,
+    aux = act(x). Scale order: colvec then rowvec. ``alpha`` scales the
+    accumulator ONLY (before C and the norm scales) — it exists to carry NVFP4
+    per-tensor dequant scales, which belong to the matmul product alone."""
     fn_map = gate_fn_map if gated else act_fn_map
     act = fn_map[activation]
     params, body = [], []
+    if has_alpha:
+        params.append("alpha")
     if has_c:
         params.append("c")
     if has_rowvec:
@@ -529,8 +533,11 @@ def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
     if has_colvec:
         params.append("mColVecBroadcast")
     expr = "acc"
+    if has_alpha:
+        body.append("x = acc * alpha")
+        expr = "x"
     if has_c:
-        body.append("x = acc + c")
+        body.append(f"x = {expr} + c")
         expr = "x"
     if has_colvec:
         body.append(f"x = {expr} * mColVecBroadcast")
@@ -545,26 +552,48 @@ def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
         body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
     else:
         body.append(f'return {{"D": {expr}, "mAuxOut": {expr}}}')
-    tag = f"norm_act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}v{int(has_colvec)}"
+    tag = (
+        f"norm_act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}"
+        f"v{int(has_colvec)}a{int(has_alpha)}"
+    )
     fn = _gen_epi_fn("norm_act_epi", tag, params, body, {"act": act})
+    ops = _vec_pins(params)
+    if has_alpha:
+        ops["alpha"] = Scalar("alpha")
     return gemm_epilogue(
         outputs=("mAuxOut",),
-        ops=_vec_pins(params),
+        ops=ops,
         mode="acc_pair" if gated else None,
         extra_ops=_SR_OPS if sr else (),
     )(fn)
 
 
 @functools.lru_cache(maxsize=None)
-def dact_mod(activation):
-    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c)."""
+def dact_mod(activation, *, has_scale=False, has_reduce=False):
+    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c).
+    Scale multiplies dout (dact is linear in it) and the postact; reduce
+    accumulates postact * unscaled dout, matching dgated_mod."""
     dact = dact_fn_map[activation]
+    params = ["c", "mColVecBroadcast"] if has_scale else ["c"]
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
     if dact is None:
-        body = ['return {"D": acc, "mAuxOut": c}']
+        body, dx, out = [], dout, "c"
     else:
-        body = ["dx, out = dact(c, acc)", 'return {"D": dx, "mAuxOut": out}']
-    fn = _gen_epi_fn("dact_epi", f"dact:{activation}", ["c"], body, {"dact": dact})
-    return gemm_epilogue(outputs=("mAuxOut",))(fn)
+        body, dx, out = [f"dx, out = dact(c, {dout})"], "dx", "out"
+    postact = f"{out} * mColVecBroadcast" if has_scale else out
+    if has_reduce:
+        body.append(f'return {{"D": {dx}, "mAuxOut": {postact}, "mColVecReduce": ({out}, acc)}}')
+    else:
+        body.append(f'return {{"D": {dx}, "mAuxOut": {postact}}}')
+    tag = f"dact:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dact_epi", tag, params, body, {"dact": dact})
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+    )(fn)
 
 
 @functools.lru_cache(maxsize=None)
@@ -600,17 +629,25 @@ def dgated_mod(activation, *, has_scale, has_reduce):
 
 
 @functools.lru_cache(maxsize=None)
-def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
-    """gemm_rms's sq-reduce as a mod: x = acc (+ C); reduce[m] += sum_n x^2 (before
-    the rowvec scale); optional aux = x; D = x * rowvec."""
+def sq_reduce_mod(*, has_c, has_rowvec, has_aux, has_alpha=False):
+    """gemm_rms's sq-reduce as a mod: x = alpha * acc (+ C); reduce[m] +=
+    sum_n x^2 (before the rowvec scale); optional aux = x; D = x * rowvec.
+    ``alpha`` scales the accumulator ONLY (NVFP4 per-tensor dequant scales);
+    it MUST land before the sq-reduce or the host rsqrt normalizes the wrong
+    magnitude (RMSNorm's scale invariance would hide most of the error)."""
     params, body = [], []
+    if has_alpha:
+        params.append("alpha")
     if has_c:
         params.append("c")
     if has_rowvec:
         params.append("mRowVecBroadcast")
     expr = "acc"
+    if has_alpha:
+        body.append("x = acc * alpha")
+        expr = "x"
     if has_c:
-        body.append("x = acc + c")
+        body.append(f"x = {expr} + c")
         expr = "x"
     d = f"{expr} * mRowVecBroadcast" if has_rowvec else expr
     # Scaled reduce: (x, x) folds as one fma(x, x, acc) per pair instead of
@@ -619,16 +656,19 @@ def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
     if has_aux:
         ret += f', "mAuxOut": {expr}'
     body.append(f"return {{{ret}}}")
-    tag = f"sq_reduce:c{int(has_c)}r{int(has_rowvec)}a{int(has_aux)}"
+    tag = f"sq_reduce:c{int(has_c)}r{int(has_rowvec)}a{int(has_aux)}s{int(has_alpha)}"
     fn = _gen_epi_fn("sq_reduce_epi", tag, params, body, {})
     # No host finalize: __call__ returns the RAW per-tile partials, and
     # gemm_rms fuses sum + rsqrt in rms_final_reduce (bitwise-equal to the
     # pre-object pipeline; a host torch.sum would reorder the fold).
     reduce = ColVecReduce("mColVecReduce", scaled=True)
     reduce.host_finalize = None
+    ops = _vec_pins(params)
+    if has_alpha:
+        ops["alpha"] = Scalar("alpha")
     return gemm_epilogue(
         outputs=("mAuxOut",) if has_aux else (),
-        ops=_vec_pins(params),
+        ops=ops,
         reduces={"mColVecReduce": reduce},
     )(fn)
 
