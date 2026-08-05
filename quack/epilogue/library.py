@@ -35,6 +35,7 @@ from quack.activation import (
     dgate_fn_map,
     dgelu_tanh_approx,
     dswiglu,
+    dswiglu_oai,
     gate_fn_map,
     gelu_tanh_approx,
     relu,
@@ -96,6 +97,14 @@ def dgelu_mod(acc, c):
     return {"D": dx, "postact": out}
 
 
+@gemm_epilogue(outputs=("postact",), reduces={"dbias": RowVecReduce("dbias")})
+def dgelu_dbias_mod(acc, c):
+    """dgelu_mod + fused bias grad: dbias[n] = sum_m dx, the post-act-grad
+    rowvec (the preact bias's gradient)."""
+    dx, out = dgelu_tanh_approx(c, acc)
+    return {"D": dx, "postact": out, "dbias": dx}
+
+
 @gemm_epilogue(outputs=("premult",), reduces={"sqsum": ColVecReduce("sqsum", scaled=True)})
 def rms_fused(acc, weight):
     """GemmSqReduce as a mod: sqsum accumulated on pre-scale acc, D = acc * weight.
@@ -110,6 +119,63 @@ def dswiglu_mod(acc, c):
     x, y = unpack(c)
     dx, dy, out = dswiglu(x, y, acc)
     return {"D": pack(dx, dy), "postact": out}
+
+
+def make_dgated_moe_mod(dgate):
+    """MoE-expert fc2-dgrad epilogue factory (the gpt-oss shape: biased FFN +
+    per-token router score on the expert output). acc = d(expert_out) @ W2^T
+    UNSCALED, score colvec = the router weight. Emits:
+      * D = packed dpreact with the score folded (dpreact = dgate(x, y, s*dout))
+        — both fc1 backward GEMMs stay plain;
+      * postact = score-scaled recomputed activation, so fc2-wgrad pairs it
+        with the plain dout;
+      * dscore[m] = sum_n(postact * unscaled dout) = <expert_out, d(final)>
+        per token — the router score grad, one fma via the scaled reduce;
+      * the fc1 bias grad as an N-wide rowvec PAIR (the preact is 2N-wide and
+        a rowvec slot is one f32): host interleaves db[0::2] = dbias_g,
+        db[1::2] = dbias_u, matching the packed (x, y) preact layout."""
+
+    @gemm_epilogue(
+        outputs=("postact",),
+        ops={"score": ColVecLoad("score")},
+        reduces={
+            "dscore": ColVecReduce("dscore", scaled=True),
+            "dbias_g": RowVecReduce("dbias_g"),
+            "dbias_u": RowVecReduce("dbias_u"),
+        },
+        mode="packed_cd_b16x2",
+    )
+    def dgated_moe_mod(acc, c, score):
+        x, y = unpack(c)
+        dx, dy, out = dgate(x, y, acc * score)
+        return {
+            "D": pack(dx, dy),
+            "postact": out * score,
+            "dscore": (out, acc),
+            "dbias_g": dx,
+            "dbias_u": dy,
+        }
+
+    return dgated_moe_mod
+
+
+dswiglu_moe_mod = make_dgated_moe_mod(dswiglu)
+
+
+# gpt-oss exact: swiglu_oai with the swiglu_limit=7.0 preact clamp (grads
+# zeroed where the clamp saturates).
+dswiglu_oai_moe_mod = make_dgated_moe_mod(lambda x, y, dout: dswiglu_oai(x, y, dout, limit=7.0))
+
+
+@gemm_epilogue(outputs=("postact",), reduces={"dsum": ColVecReduce("dsum")}, mode="packed_cd_b16x2")
+def dswiglu_dpreact_mod(acc, c):
+    """dswiglu_mod + the rstd-correction stat on the raw preact: dsum[m] =
+    sum over the full 2N preact dim of dpreact * preact (= dx*x + dy*y per
+    pair — dswiglu_rstd_preact_mod's dsum without the deferred rstd). A
+    two-product sum, so the scaled (val, scale) fma fold does not apply."""
+    x, y = unpack(c)
+    dx, dy, out = dswiglu(x, y, acc)
+    return {"D": pack(dx, dy), "postact": out, "dsum": dx * x + dy * y}
 
 
 @gemm_epilogue(

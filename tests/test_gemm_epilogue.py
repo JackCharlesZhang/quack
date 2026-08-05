@@ -35,11 +35,17 @@ from quack.epilogue.rotary import (
     rope_table_ldg_epi,
     xpos_posfreq_epi,
 )
+from quack.activation import dswiglu_oai_tanh
 from quack.epilogue.library import (
     amax_epi,
+    dgelu_dbias_mod,
     dgelu_mod,
+    dswiglu_dpreact_mod,
     dswiglu_mod,
+    dswiglu_moe_mod,
     dswiglu_norm_mod,
+    dswiglu_oai_moe_mod,
+    make_dgated_moe_mod,
     linear_epi,
     lse_partial_epi,
     norm_gelu,
@@ -514,6 +520,46 @@ def test_epi_mod_dact():
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
 
 
+@pytest.mark.parametrize("m", [448, 512])  # 448: ragged last M tile (OOB rows are zero)
+def test_epi_mod_dgelu_dbias(m):
+    """dact + fused bias grad: dbias rowvec partials = per-M-tile column sums of dx."""
+    device = "cuda"
+    torch.random.manual_seed(4)
+    l, n, k = 2, 1024, 736
+    tile_M, tile_N = 128, 256
+    dout = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    W = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    preact = torch.randn((l, m, n), device=device, dtype=torch.bfloat16)
+    dx = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    postact = torch.empty_like(dx)
+    m_tiles = (m + tile_M - 1) // tile_M
+    dbias = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+
+    dgelu_dbias_mod.gemm(
+        dout,
+        W,
+        dx,
+        preact,
+        epi_args=dict(postact=postact, dbias=dbias),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=2,
+        cluster_N=1,
+    )
+
+    x = preact.float()
+    g = torch.einsum("lmk,lnk->lmn", dout.float(), W.float())
+    xg = x.detach().requires_grad_()
+    torch.nn.functional.gelu(xg, approximate="tanh").backward(g)
+    _rel_check(dx, xg.grad, "dx")
+    _rel_check(postact, torch.nn.functional.gelu(x, approximate="tanh"), "postact")
+    dx_ref = xg.grad
+    pad = m_tiles * tile_M - m
+    if pad:
+        dx_ref = torch.nn.functional.pad(dx_ref, (0, 0, 0, pad))
+    _rel_check(dbias, dx_ref.unflatten(-2, (m_tiles, tile_M)).sum(dim=-2), "dbias", tol=1e-3)
+
+
 @pytest.mark.parametrize("tile_N", [192, 256])
 def test_epi_mod_rms_fused(tile_N):
     """GemmSqReduce as a mod (reduce output + aux + rowvec), cross-checked
@@ -753,6 +799,127 @@ def test_epi_mod_dgated_norm_reduce(tile_N):
     _rel_check(out_mod.float(), out_hand.float(), "D vs handwritten", tol=1e-3)
     _rel_check(postact, postact_hand.float(), "postact vs handwritten", tol=1e-3)
     _rel_check(dsum, dsum_hand, "dsum vs handwritten", tol=1e-4)
+
+
+def _dgated_moe_torch_ref(x, y, dout_scaled, activation):
+    """(dx, dy, unscaled postact) through autograd for the MoE mod's dgate."""
+    xg = x.detach().requires_grad_()
+    yg = y.detach().requires_grad_()
+    if activation == "swiglu":
+        out = torch.nn.functional.silu(xg) * yg
+    else:  # swiglu_oai (gpt-oss, limit=7): gate clamped above, up two-sided
+        xc = xg.clamp(max=7.0)
+        yc = yg.clamp(-7.0, 7.0)
+        out = xc * torch.sigmoid(1.702 * xc) * (yc + 1)
+    out.backward(dout_scaled)
+    return xg.grad, yg.grad, out.detach()
+
+
+# Clamped tanh-twin coverage: minted here, not in the library (the tanh
+# variants exist for SASS/accuracy comparison only).
+_dswiglu_oai_tanh_moe_mod = make_dgated_moe_mod(
+    lambda x, y, dout: dswiglu_oai_tanh(x, y, dout, limit=7.0)
+)
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "swiglu_oai-tanh"])
+@pytest.mark.parametrize("tile_N", [192, 256])
+def test_epi_mod_dgated_moe(tile_N, activation):
+    """MoE-expert fc2-dgrad: score-folded dpreact + scaled postact + dscore
+    colvec partials (router score grad) + the fc1 bias grad rowvec pair."""
+    mod = {
+        "swiglu": dswiglu_moe_mod,
+        "swiglu_oai": dswiglu_oai_moe_mod,
+        "swiglu_oai-tanh": _dswiglu_oai_tanh_moe_mod,
+    }[activation]
+    device = "cuda"
+    torch.random.manual_seed(9)
+    l, m, n, k = 2, 384, 1536, 512
+    tile_M = 128
+    dout_in = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    W = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    # sigma 5 for the oai cases so the limit=7 clamp actually saturates (~16%).
+    preact_scale = 1.0 if activation == "swiglu" else 5.0
+    preact = torch.randn((l, m, 2 * n), device=device, dtype=torch.bfloat16) * preact_scale
+    if activation != "swiglu":
+        assert (preact.abs() > 7.0).float().mean() > 0.05
+    score = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+    out_mod = torch.empty_like(preact)
+    postact = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = (n + tile_N - 1) // tile_N
+    m_tiles = (m + tile_M - 1) // tile_M
+    dscore = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+    dbias_g = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+    dbias_u = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+
+    mod.gemm(
+        dout_in,
+        W,
+        out_mod,
+        preact,
+        epi_args=dict(
+            score=score, postact=postact, dscore=dscore, dbias_g=dbias_g, dbias_u=dbias_u
+        ),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    dout = torch.einsum("lmk,lnk->lmn", dout_in.float(), W.float())
+    x, y = preact.float()[..., 0::2], preact.float()[..., 1::2]
+    dx_ref, dy_ref, out_ref = _dgated_moe_torch_ref(x, y, dout * score.unsqueeze(-1), activation)
+    _rel_check(out_mod[..., 0::2], dx_ref, "dx")
+    _rel_check(out_mod[..., 1::2], dy_ref, "dy")
+    _rel_check(postact, out_ref * score.unsqueeze(-1), "postact")
+    # dscore folds the UNSCALED dout: <expert_out, d(final)> per token.
+    prod = out_ref * dout
+    pad = n_tiles * tile_N - n
+    prod_n = torch.nn.functional.pad(prod, (0, pad)) if pad else prod
+    _rel_check(dscore, prod_n.unflatten(-1, (n_tiles, tile_N)).sum(dim=-1), "dscore", tol=1e-3)
+    _rel_check(dbias_g, dx_ref.unflatten(-2, (m_tiles, tile_M)).sum(dim=-2), "dbias_g", tol=1e-3)
+    _rel_check(dbias_u, dy_ref.unflatten(-2, (m_tiles, tile_M)).sum(dim=-2), "dbias_u", tol=1e-3)
+    # Host bias-grad recipe: finalize each rowvec and interleave to the 2N layout.
+    db = torch.stack([dbias_g.sum(-2), dbias_u.sum(-2)], dim=-1).flatten(-2)
+    db_ref = torch.stack([dx_ref.sum(-2), dy_ref.sum(-2)], dim=-1).flatten(-2)
+    _rel_check(db, db_ref, "db interleaved", tol=1e-3)
+
+
+def test_epi_mod_dswiglu_dpreact():
+    """dgated + the rstd-correction stat: dsum colvec partials accumulate
+    dpreact*preact over the full 2N preact dim (dx*x + dy*y per pair)."""
+    device = "cuda"
+    torch.random.manual_seed(9)
+    l, m, n, k = 2, 384, 1536, 512
+    tile_M, tile_N = 128, 256
+    dout_in = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    W = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    preact = torch.randn((l, m, 2 * n), device=device, dtype=torch.bfloat16)
+    out_mod = torch.empty_like(preact)
+    postact = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = (n + tile_N - 1) // tile_N
+    dsum = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+
+    dswiglu_dpreact_mod.gemm(
+        dout_in,
+        W,
+        out_mod,
+        preact,
+        epi_args=dict(postact=postact, dsum=dsum),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    dout = torch.einsum("lmk,lnk->lmn", dout_in.float(), W.float())
+    x, y = preact.float()[..., 0::2], preact.float()[..., 1::2]
+    dx_ref, dy_ref, out_ref = _dswiglu_torch_ref(x, y, dout)
+    _rel_check(out_mod[..., 0::2], dx_ref, "dx")
+    _rel_check(out_mod[..., 1::2], dy_ref, "dy")
+    _rel_check(postact, out_ref, "postact")
+    prod = dx_ref * x + dy_ref * y
+    _rel_check(dsum, prod.unflatten(-1, (n_tiles, tile_N)).sum(dim=-1), "dsum", tol=1e-3)
 
 
 def test_epi_mod_residual_tileload():
