@@ -325,57 +325,113 @@ def online_softmax_reduce(
 
 
 @cute.jit
+def swap_shuffle_reduce(
+    frags,
+    merge,
+    num_lanes: int,
+    lane_stride: int = 1,
+    slice_elems: int = 1,
+):
+    """Distributed intra-warp reduction (CUTLASS EVT's "swap shuffle").
+
+    Reduces every element of ``frags`` across the group of ``num_lanes``
+    lanes spaced ``lane_stride`` apart, leaving the results DISTRIBUTED
+    instead of replicated: viewing each fragment as ``num_slices =
+    size // slice_elems`` contiguous slices, the lane with group index
+    ``g = (lane_idx // lane_stride) % num_lanes`` ends OWNING slice
+    ``g % num_slices`` — its fully-reduced values sit in flat slots
+    ``[0, slice_elems)`` of the (mutated) fragments. Lanes with
+    ``g >= num_slices`` hold duplicates of slice ``g % num_slices``;
+    gate writers on ``g < num_slices``.
+
+    Vs the plain butterfly (every lane redundantly ends with every value):
+    ~``size`` shuffles+merges total instead of ``size * log2(num_lanes)``,
+    and the distributed ownership spreads subsequent smem/gmem stores
+    across all lanes instead of serializing them on group leaders.
+
+    The normal way to do reduction among threads is to use shuffle to let
+    the first half of threads have the whole data from the second half.
+    After each step, half the threads have no further work — efficiency
+    decays 1/2, 1/4, ..., 1/32. Swap+shuffle instead lets each half of
+    threads take responsibility for half of the DATA: swap so both halves
+    hold the half they will own, one xor-shuffle, one merge, then recurse
+    on independent sub-problems until each lane owns one slice.
+
+    :param frags: tuple of same-layout rmem fragments ("planes"), merged in
+        lockstep — e.g. OnlineLSE's coupled (max, sum). Mutated in place.
+    :param merge: fn(vals: tuple, others: tuple) -> tuple of the same arity;
+        associative + commutative, applied elementwise across planes.
+    :param slice_elems: elements that travel together as one slice (a lane's
+        owned unit); num_slices must be a power of 2 and <= num_lanes.
+    :return: (num_slices, slice_elems) as trace-time ints.
+    """
+    num_planes = const_expr(len(frags))
+    size = const_expr(cute.size(frags[0]))
+    assert (
+        lane_stride >= 1 and lane_stride <= 32 and lane_stride == 1 << int(math.log2(lane_stride))
+    )
+    assert (
+        num_lanes >= 1
+        and num_lanes * lane_stride <= 32
+        and num_lanes == 1 << int(math.log2(num_lanes))
+    )
+    assert size % slice_elems == 0
+    num_slices = size // slice_elems
+    assert num_slices == 1 << int(math.log2(num_slices)), "num_slices must be a power of 2"
+    assert num_slices <= num_lanes
+    group_idx = cute.arch.lane_idx() // lane_stride
+    # More lanes than slices: fold the far lanes with a plain butterfly
+    # first (their partners are beyond the swap recursion's span).
+    for i in cutlass.range_constexpr(int(math.log2(num_slices)), int(math.log2(num_lanes))):
+        for v in cutlass.range_constexpr(size):
+            others = tuple(
+                cute.arch.shuffle_sync_bfly(f[v], offset=(1 << i) * lane_stride) for f in frags
+            )
+            merged = merge(tuple(f[v] for f in frags), others)
+            for k in cutlass.range_constexpr(num_planes):
+                frags[k][v] = merged[k]
+    for logm in cutlass.range_constexpr(int(math.log2(num_slices)) - 1, -1, -1):
+        m = 1 << logm
+        for r in cutlass.range_constexpr(m):
+            # First half of threads swap fragments from the first half of
+            # data to the second (flat slice r = slots [r*slice_elems, ...)).
+            should_swap = not Boolean(group_idx & m)
+            for j in cutlass.range_constexpr(slice_elems):
+                a, b = r * slice_elems + j, (r + m) * slice_elems + j
+                # Step 1: swap
+                for k in cutlass.range_constexpr(num_planes):
+                    lower, upper = frags[k][a], frags[k][b]
+                    frags[k][a] = upper if should_swap else lower
+                    frags[k][b] = lower if should_swap else upper
+                # Step 2: shuffle — each half of threads gets a half of
+                # data from the other half of threads
+                others = tuple(
+                    cute.arch.shuffle_sync_bfly(f[a], offset=m * lane_stride) for f in frags
+                )
+                # Step 3: reduction
+                merged = merge(tuple(f[b] for f in frags), others)
+                for k in cutlass.range_constexpr(num_planes):
+                    frags[k][a] = merged[k]
+    return num_slices, slice_elems
+
+
+@cute.jit
 def sum_swap_shuffle(
     X: cute.Tensor, elem_per_lane: int = 1, subwarp_size: int = 1, warp_size: int = 32
 ) -> cute.Tensor:
-    """
-    For warp reduction, we use Swap Shuffle
-    The normal way to reduction among threads:
-    use shuffle to let *** the first half of threads *** have *** whole data *** from the second half of threads.
-    After each step of reduction, a half of threads won't work in the following steps.
-    That is, as the reduction progresses, the efficiency of shuffle & reduction instructions gradually change from 1/2, 1/4 to 1/32 (the worst case).
-    To overcome this shortcoming, for a NxN matrix to be reduced among N threads as a 1XN vectors,
-    we use swap & shuffle aiming to let *** each half of threads *** have *** a half of data *** from the other half of threads.
-    After reduction, each half of threads should deal with a (N/2)x(N/2) sub-matrix independently in the following step.
-    We can recursively do this until the problem size is 1.
-    """
-    assert (
-        subwarp_size >= 1
-        and subwarp_size <= 32
-        and subwarp_size == 1 << int(math.log2(subwarp_size))
+    """Sum-reduce X across the warp with swap shuffle (see
+    ``swap_shuffle_reduce`` for the algorithm and ownership contract).
+    Kept interface: X viewed as (elem_per_lane, M); lane group index g
+    (groups of ``subwarp_size`` lanes) ends owning the (elem_per_lane,)
+    slice ``g % M``, returned as a view."""
+    assert warp_size <= 32 and warp_size % subwarp_size == 0
+    X_div = cute.logical_divide(X, cute.make_layout(elem_per_lane))  # (elem_per_lane, M)
+    assert cute.size(X_div, mode=[1]) <= 32 // subwarp_size
+    swap_shuffle_reduce(
+        (X,),
+        lambda vals, others: (vals[0] + others[0],),
+        num_lanes=warp_size // subwarp_size,
+        lane_stride=subwarp_size,
+        slice_elems=elem_per_lane,
     )
-    assert (
-        warp_size <= 32
-        and warp_size % subwarp_size == 0
-        and warp_size == 1 << int(math.log2(warp_size))
-    )
-    lane_idx = cute.arch.lane_idx() // subwarp_size
-    X = cute.logical_divide(X, cute.make_layout(elem_per_lane))  # (elem_per_lane, M)
-    numvec = cute.size(X, mode=[1])
-    assert numvec <= 32 // subwarp_size
-    # If X has more values than warp_size // subwarp_size, we first do a normal warp reduction
-    # to sum up values held by lanes further than size(X) away
-    for i in cutlass.range(
-        int(math.log2(numvec)), int(math.log2(warp_size // subwarp_size)), unroll_full=True
-    ):
-        for v in cutlass.range(cute.size(X), unroll_full=True):
-            shfl_val = cute.arch.shuffle_sync_bfly(X[v], offset=(1 << i) * subwarp_size)
-            X[v] = X[v] + shfl_val
-    for logm in cutlass.range_constexpr(int(math.log2(cute.size(X, mode=[1]))) - 1, -1, -1):
-        m = 1 << logm
-        for r in cutlass.range(m, unroll_full=True):
-            frg_A = X[None, r]
-            frg_B = X[None, r + m]
-            #  First half of threads swap fragments from the first half of data to the second
-            should_swap = not Boolean(lane_idx & m)
-            for v in cutlass.range(cute.size(frg_A), unroll_full=True):
-                # Step 1: swap
-                lower, upper = frg_A[v], frg_B[v]
-                frg_A[v] = upper if should_swap else lower
-                frg_B[v] = lower if should_swap else upper
-                # Step 2: shuffle
-                # each half of threads get a half of data from the other half of threads
-                shfl_val = cute.arch.shuffle_sync_bfly(frg_A[v], offset=m * subwarp_size)
-                # Step 3: reduction
-                frg_A[v] = frg_B[v] + shfl_val
-    return X[None, 0]
+    return X_div[None, 0]

@@ -39,6 +39,7 @@ from quack.rounding import (
     convert_f32_to_f16_sr,
     epilogue_aux_out_sr_seed,
 )
+from quack.reduce import swap_shuffle_reduce
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
@@ -216,6 +217,33 @@ def _get_lane_warp_layouts(tiled_copy, reference_src=True):
     warp_layout_MN = layout_utils.concat_layout(warp_M, warp_N)  # (warp_M, warp_N) -> warp_idx
 
     return lane_layout_MN, warp_layout_MN
+
+
+def _mode_flat_stride(layout, mode):
+    """Trace-time introspection: the constant stride ``s`` if ``layout``
+    mode ``mode`` enumerates the flat arithmetic progression ``r -> r*s``
+    (the lane geometry ``swap_shuffle_reduce`` needs), else None. A nested
+    mode qualifies when its (shape, stride) pairs chain column-major
+    (stride[i+1] == stride[i] * shape[i])."""
+
+    def flat(x):
+        return sum((flat(e) for e in x), []) if isinstance(x, (tuple, list)) else [x]
+
+    try:
+        shapes = [int(v) for v in flat(layout.shape[mode])]
+        strides = [int(v) for v in flat(layout.stride[mode])]
+    except (TypeError, ValueError):  # dynamic layout: no static answer
+        return None
+    base, expected = None, None
+    for sh, st in zip(shapes, strides):
+        if sh == 1:
+            continue
+        if base is None:
+            base = st
+        elif st != expected:
+            return None
+        expected = st * sh
+    return base
 
 
 @cute.jit
@@ -439,7 +467,7 @@ class EpiOp:
         """Issue this op's tile-load smem->register copy for one epilogue stage."""
         pass
 
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -448,11 +476,21 @@ class EpiOp:
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
     ):
-        """Per-subtile cleanup after epi_visit_subtile."""
+        """Per-subtile flush, phase 1: intra-warp reduce + smem staging.
+
+        Returns None when this op has nothing to flush at this epi_coord,
+        else ``(needs_barrier, finish_state)``. The driver (epi_end_loop)
+        issues ONE shared epilogue barrier per subtile covering every op
+        that staged — a multi-sink epilogue syncs once per flush, not once
+        per sink (each sink stages into its own disjoint smem) — then calls
+        ``end_loop_finish(finish_state)``."""
+        return None
+
+    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+        """Per-subtile flush, phase 2 (after the driver's shared barrier):
+        merge the smem-staged partials + write gmem."""
         pass
 
     def needs_async_fence(self):
@@ -1537,7 +1575,7 @@ class ColVecReduce(VecReduce):
         return cute.math.abs(vals[0]) if const_expr(self.combine == "max_abs") else vals[0]
 
     @cute.jit
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -1546,11 +1584,12 @@ class ColVecReduce(VecReduce):
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
     ):
-        """Flush the current M stripe when the last N subtile has accumulated."""
+        """Stage the current M stripe (intra-warp reduce + smem write) when
+        its last N subtile has accumulated; merge/gmem-write run in
+        end_loop_finish after the driver's shared barrier."""
+        staged = None
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
@@ -1563,20 +1602,6 @@ class ColVecReduce(VecReduce):
                 tiled_copy, reference_src, tidx
             )
             num_vals = const_expr(len(vals_cur))
-
-            # Intra-warp butterfly across N lanes, tuple-valued.
-            if const_expr(lanes_in_N > 1):
-                flts = tuple(cute.filter_zeros(v) for v in vals_cur)
-                for i in cutlass.range(cute.size(flts[0]), unroll_full=True):
-                    off = lanes_in_N // 2
-                    while off > 0:
-                        others = tuple(cute.arch.shuffle_sync_bfly(f[i], offset=off) for f in flts)
-                        merged = self._merge(tuple(f[i] for f in flts), others)
-                        # range_constexpr: k indexes Python TUPLES, which
-                        # need trace-time ints (staged range vars can't).
-                        for k in cutlass.range_constexpr(num_vals):
-                            flts[k][i] = merged[k]
-                        off = off // 2
 
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
@@ -1594,15 +1619,100 @@ class ColVecReduce(VecReduce):
             )
             tDcD_m = layout_utils.convert_layout_zero_stride(tDcD_cur, ref_layout)[None, 0]
 
-            # Inter-warp exchange through smem (rows are absolute CTA-tile
-            # rows, so stripes write disjoint slots; one barrier suffices).
-            if const_expr(warps_in_N > 1):
-                if warp_n_idx > 0 and is_lane_n_leader:
-                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                        row_idx = tDcD_m[m][0]
+            # Intra-warp reduction across N lanes, tuple-valued. Swap shuffle
+            # when the geometry allows: ~E shuffles+merges instead of the
+            # butterfly's E*log2(lanes), and results end DISTRIBUTED (N-lane
+            # g owns slice g of this thread-group's rows) so the smem/gmem
+            # stores below spread across lanes instead of leader-serializing.
+            E = const_expr(cute.size(tDcD_m, mode=[0]))
+            num_slices = const_expr(min(lanes_in_N, E))
+            use_swap_shuffle = const_expr(
+                lanes_in_N > 1
+                and E % num_slices == 0
+                and num_slices == 1 << int(math.log2(num_slices))
+            )
+            slice_elems = const_expr(E // num_slices if use_swap_shuffle else E)
+            lane_g = cute.arch.lane_idx() % lanes_in_N
+            if const_expr(use_swap_shuffle):
+                swap_shuffle_reduce(
+                    vals_m,
+                    self._merge,
+                    num_lanes=lanes_in_N,
+                    lane_stride=1,
+                    slice_elems=slice_elems,
+                )
+            elif const_expr(lanes_in_N > 1):
+                flts = tuple(cute.filter_zeros(v) for v in vals_cur)
+                for i in cutlass.range(cute.size(flts[0]), unroll_full=True):
+                    off = lanes_in_N // 2
+                    while off > 0:
+                        others = tuple(cute.arch.shuffle_sync_bfly(f[i], offset=off) for f in flts)
+                        merged = self._merge(tuple(f[i] for f in flts), others)
+                        # range_constexpr: k indexes Python TUPLES, which
+                        # need trace-time ints (staged range vars can't).
                         for k in cutlass.range_constexpr(num_vals):
-                            sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][m]
-                gemm.epilogue_barrier.arrive_and_wait()
+                            flts[k][i] = merged[k]
+                        off = off // 2
+
+            # Stage the partials for the inter-warp merge (rows are absolute
+            # CTA-tile rows, so stripes write disjoint slots). The driver's
+            # SHARED barrier — one per epi_coord across ALL reduce ops —
+            # orders these writes before end_loop_finish.
+            if const_expr(warps_in_N > 1):
+                if const_expr(use_swap_shuffle):
+                    if warp_n_idx > 0 and lane_g < num_slices:
+                        for j in cutlass.range_constexpr(slice_elems):
+                            row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                            for k in cutlass.range_constexpr(num_vals):
+                                sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][j]
+                else:
+                    if warp_n_idx > 0 and is_lane_n_leader:
+                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                            row_idx = tDcD_m[m][0]
+                            for k in cutlass.range_constexpr(num_vals):
+                                sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][m]
+            staged = (
+                warps_in_N > 1,
+                (
+                    vals_m,
+                    tDcD_m,
+                    sExch,
+                    warps_in_N,
+                    warp_n_idx,
+                    is_lane_n_leader,
+                    use_swap_shuffle,
+                    num_slices,
+                    slice_elems,
+                    lane_g,
+                ),
+            )
+        return staged
+
+    @cute.jit
+    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+        """Inter-warp merge from smem + gmem write for a stripe staged by
+        end_loop_stage (runs after the driver's shared barrier). Under swap
+        shuffle each lane merges/writes only its OWNED slice."""
+        vals_m, tDcD_m, sExch = staged[0], staged[1], staged[2]
+        warps_in_N, warp_n_idx, is_lane_n_leader = staged[3], staged[4], staged[5]
+        use_swap_shuffle, num_slices, slice_elems, lane_g = (
+            staged[6],
+            staged[7],
+            staged[8],
+            staged[9],
+        )
+        num_vals = const_expr(len(vals_m))
+        if const_expr(warps_in_N > 1):
+            if const_expr(use_swap_shuffle):
+                if warp_n_idx == 0 and lane_g < num_slices:
+                    for j in cutlass.range_constexpr(slice_elems):
+                        row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            others = tuple(sExch[row_idx, warp_n - 1, k] for k in range(num_vals))
+                            merged = self._merge(tuple(v[j] for v in vals_m), others)
+                            for k in cutlass.range_constexpr(num_vals):
+                                vals_m[k][j] = merged[k]
+            else:
                 if warp_n_idx == 0 and is_lane_n_leader:
                     for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                         row_idx = tDcD_m[m][0]
@@ -1612,18 +1722,27 @@ class ColVecReduce(VecReduce):
                             for k in cutlass.range_constexpr(num_vals):
                                 vals_m[k][m] = merged[k]
 
-            # Write to gmem
-            batch_idx = tile_coord_mnkl[3]
-            limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
-            limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
-            if const_expr(not varlen_manager.varlen_m):
-                mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
-            else:
-                mColVec = cute.domain_offset(
-                    (varlen_manager.params.cu_seqlens_m[batch_idx],),
-                    param[None, tile_coord_mnkl[1]],
-                )
-            gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+        # Write to gmem
+        tile_M = gemm.cta_tile_shape_mnk[0]
+        batch_idx = tile_coord_mnkl[3]
+        limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
+        limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
+        if const_expr(not varlen_manager.varlen_m):
+            mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
+        else:
+            mColVec = cute.domain_offset(
+                (varlen_manager.params.cu_seqlens_m[batch_idx],),
+                param[None, tile_coord_mnkl[1]],
+            )
+        gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+        if const_expr(use_swap_shuffle):
+            in_warp0 = True if const_expr(warps_in_N == 1) else warp_n_idx == 0
+            if tile_coord_mnkl[1] < limit_n_tiles and in_warp0 and lane_g < num_slices:
+                for j in cutlass.range_constexpr(slice_elems):
+                    row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                    if row_idx < limit_m:
+                        gColVec[row_idx] = self._finalize(tuple(v[j] for v in vals_m))
+        else:
             should_write_gmem = (
                 is_lane_n_leader
                 if const_expr(warps_in_N == 1)
@@ -1648,7 +1767,7 @@ class RowVecReduce(VecReduce):
     epi_m_major_preference = 4
 
     @cute.jit
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -1657,11 +1776,12 @@ class RowVecReduce(VecReduce):
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
     ):
-        """Flush the current N stripe when the last M subtile has accumulated."""
+        """Stage the current N stripe (intra-warp reduce + smem write) when
+        its last M subtile has accumulated; merge/gmem-write run in
+        end_loop_finish after the driver's shared barrier."""
+        staged = None
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
@@ -1685,24 +1805,9 @@ class RowVecReduce(VecReduce):
                     "RowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
                 )
 
-            # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
-            # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
             tDrReduce_n = layout_utils.convert_layout_zero_stride(
                 tDrReduce_cur, tDrReduce_cur.layout
             )[None, 0]
-            if const_expr(lanes_in_M > 1):
-                for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
-                    reduction_rows = lanes_in_M // 2
-                    while reduction_rows > 0:
-                        tDrReduce_n[n] = _vec_reduce_combine(
-                            tDrReduce_n[n],
-                            cute.arch.shuffle_sync_bfly(
-                                tDrReduce_n[n],
-                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
-                            ),
-                            self.combine,
-                        )
-                        reduction_rows = reduction_rows // 2
 
             warp_M = warp_layout_MN[0]
             warps_in_M = const_expr(cute.size(warp_M))
@@ -1720,15 +1825,105 @@ class RowVecReduce(VecReduce):
                 None, 0
             ]
 
-            # Inter-warp reduction through smem
+            # Intra-warp reduction across M lanes (contiguous on SM100
+            # N-major output, strided by N lanes otherwise). Swap shuffle
+            # when the M lanes form a flat pow2-strided run and the slice
+            # count is pow2: ~E shuffles+merges instead of E*log2(lanes),
+            # results DISTRIBUTED (M-lane g owns col slice g) so the smem/
+            # gmem stores below spread across lanes.
+            E = const_expr(cute.size(tDcD_n, mode=[0]))
+            s_m_flat = _mode_flat_stride(lane_layout_MN, 0)
+            s_m = const_expr(s_m_flat if s_m_flat is not None else 1)
+            num_slices = const_expr(min(lanes_in_M, E))
+            use_swap_shuffle = const_expr(
+                lanes_in_M > 1
+                and s_m_flat is not None
+                and s_m == 1 << int(math.log2(s_m))
+                and E % num_slices == 0
+                and num_slices == 1 << int(math.log2(num_slices))
+            )
+            slice_elems = const_expr(E // num_slices if use_swap_shuffle else E)
+            lane_g = (cute.arch.lane_idx() // s_m) % lanes_in_M
+            if const_expr(use_swap_shuffle):
+                swap_shuffle_reduce(
+                    (tDrReduce_n,),
+                    lambda vals, others: (_vec_reduce_combine(vals[0], others[0], self.combine),),
+                    num_lanes=lanes_in_M,
+                    lane_stride=s_m,
+                    slice_elems=slice_elems,
+                )
+            elif const_expr(lanes_in_M > 1):
+                for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
+                    reduction_rows = lanes_in_M // 2
+                    while reduction_rows > 0:
+                        tDrReduce_n[n] = _vec_reduce_combine(
+                            tDrReduce_n[n],
+                            cute.arch.shuffle_sync_bfly(
+                                tDrReduce_n[n],
+                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                            ),
+                            self.combine,
+                        )
+                        reduction_rows = reduction_rows // 2
+
+            # Stage the partials for the inter-warp merge (cols are absolute
+            # CTA-tile cols, so stripes write disjoint slots). The driver's
+            # SHARED barrier — one per epi_coord across ALL reduce ops —
+            # orders these writes before end_loop_finish.
             warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
             warp_m_idx = warp_layout_MN.get_hier_coord(warp_idx)[0]
             if const_expr(warps_in_M > 1):
-                if warp_m_idx > 0 and is_lane_m_leader:
-                    for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
-                        col_idx = tDcD_n[n][1]
-                        sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[n]
-                gemm.epilogue_barrier.arrive_and_wait()
+                if const_expr(use_swap_shuffle):
+                    if warp_m_idx > 0 and lane_g < num_slices:
+                        for j in cutlass.range_constexpr(slice_elems):
+                            col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                            sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[j]
+                else:
+                    if warp_m_idx > 0 and is_lane_m_leader:
+                        for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
+                            col_idx = tDcD_n[n][1]
+                            sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[n]
+            staged = (
+                warps_in_M > 1,
+                (
+                    tDrReduce_n,
+                    tDcD_n,
+                    sDrReduce,
+                    warps_in_M,
+                    warp_m_idx,
+                    is_lane_m_leader,
+                    use_swap_shuffle,
+                    num_slices,
+                    slice_elems,
+                    lane_g,
+                ),
+            )
+        return staged
+
+    @cute.jit
+    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+        """Inter-warp merge from smem + gmem write for a stripe staged by
+        end_loop_stage (runs after the driver's shared barrier)."""
+        tDrReduce_n, tDcD_n, sDrReduce = staged[0], staged[1], staged[2]
+        warps_in_M, warp_m_idx, is_lane_m_leader = staged[3], staged[4], staged[5]
+        use_swap_shuffle, num_slices, slice_elems, lane_g = (
+            staged[6],
+            staged[7],
+            staged[8],
+            staged[9],
+        )
+        if const_expr(warps_in_M > 1):
+            if const_expr(use_swap_shuffle):
+                if warp_m_idx == 0 and lane_g < num_slices:
+                    for j in cutlass.range_constexpr(slice_elems):
+                        col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                        for warp_m in cutlass.range_constexpr(1, warps_in_M):
+                            tDrReduce_n[j] = _vec_reduce_combine(
+                                tDrReduce_n[j],
+                                sDrReduce[col_idx, warp_m - 1, 0],
+                                self.combine,
+                            )
+            else:
                 if warp_m_idx == 0 and is_lane_m_leader:
                     for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                         col_idx = tDcD_n[n][1]
@@ -1739,18 +1934,33 @@ class RowVecReduce(VecReduce):
                                 self.combine,
                             )
 
-            # Write to gmem
-            batch_idx = tile_coord_mnkl[3]
-            limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
-            if const_expr(not varlen_manager.varlen_m):
-                mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
-            else:
-                mRowVec = param[tile_coord_mnkl[0], None]
-            gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
-            limit_n = min(
-                cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
-                tile_N,
-            )
+        # Write to gmem
+        tile_N = gemm.cta_tile_shape_mnk[1]
+        batch_idx = tile_coord_mnkl[3]
+        limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
+        if const_expr(not varlen_manager.varlen_m):
+            mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
+        else:
+            mRowVec = param[tile_coord_mnkl[0], None]
+        gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
+        limit_n = min(
+            cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
+            tile_N,
+        )
+        # Two-input max.xorsign.abs leaves an XOR-derived sign; clear it once
+        # after the full reduction.
+        if const_expr(use_swap_shuffle):
+            in_warp0 = True if const_expr(warps_in_M == 1) else warp_m_idx == 0
+            if tile_coord_mnkl[0] < limit_m_tiles and in_warp0 and lane_g < num_slices:
+                for j in cutlass.range_constexpr(slice_elems):
+                    col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                    if col_idx < limit_n:
+                        gRowVec[col_idx] = (
+                            cute.math.abs(tDrReduce_n[j])
+                            if const_expr(self.combine == "max_abs")
+                            else tDrReduce_n[j]
+                        )
+        else:
             should_write_gmem = (
                 is_lane_m_leader
                 if const_expr(warps_in_M == 1)
@@ -1760,8 +1970,6 @@ class RowVecReduce(VecReduce):
                 for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                     col_idx = tDcD_n[n][1]
                     if col_idx < limit_n:
-                        # Two-input max.xorsign.abs leaves an XOR-derived sign;
-                        # clear it once after the full reduction.
                         gRowVec[col_idx] = (
                             cute.math.abs(tDrReduce_n[n])
                             if const_expr(self.combine == "max_abs")
@@ -2192,7 +2400,7 @@ class GroupedColStatsOut(EpiOp):
         return (smem_tensor, ctx.num_epi_threads)
 
     @cute.jit
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -2201,42 +2409,49 @@ class GroupedColStatsOut(EpiOp):
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
     ):
-        """First main-phase subtile: elect one writer per (row, group), fold
-        the sibling's raw warp_n planes, finalize, and write directly to gmem.
-        The value port uses rStats and never reads stats smem in the main pass."""
+        """First main-phase subtile: stage this op for the finish phase. No
+        barrier request — the sibling's prepass barrier already ordered the
+        raw warp_n stats planes this op reads."""
         if const_expr(epi_coord[0] == 0 and epi_coord[1] == 0):
-            sStats, num_epi_threads = state
-            rows, groups, warps_n = getattr(gemm, self.stats_op._stats_shape_attr())
-            group_cols = const_expr(gemm.cta_tile_shape_mnk[1] // groups)
-            combine = self.stats_op._combine_op()
-            batch_idx = tile_coord_mnkl[3]
-            limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * rows, rows)
-            # (l, m, G) batched; (m, G) dense-2D (batch_idx == 0) or varlen_m
-            # (total_m rows, segment offset via cu_seqlens).
-            if const_expr(cute.rank(param) == 3):
-                mOut = param[batch_idx, None, None]
-            elif const_expr(varlen_manager.varlen_m):
-                mOut = cute.domain_offset((varlen_manager.params.cu_seqlens_m[batch_idx],), param)
-            else:
-                mOut = param
-            limit_g = mOut.shape[1]
-            row0 = tile_coord_mnkl[0] * rows
-            g0 = tile_coord_mnkl[1] * groups
-            total_slots = const_expr(rows * groups)
-            for i0 in cutlass.range(0, total_slots, num_epi_threads, unroll_full=True):
-                i = i0 + tidx
-                if i < total_slots:
-                    r = i // groups
-                    g = i % groups
-                    if r < limit_m and g0 + g < limit_g:
-                        stat = sStats[r, g, 0]
-                        for w in cutlass.range_constexpr(1, warps_n):
-                            stat = combine(stat, sStats[r, g, w])
-                        mOut[row0 + r, g0 + g] = self.stats_op.stat_value(stat, group_cols)
+            return (False, (state, tidx))
+        return None
+
+    @cute.jit
+    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+        """Elect one writer per (row, group), fold the sibling's raw warp_n
+        planes, finalize, and write directly to gmem. The value port uses
+        rStats and never reads stats smem in the main pass."""
+        state, tidx = staged
+        sStats, num_epi_threads = state
+        rows, groups, warps_n = getattr(gemm, self.stats_op._stats_shape_attr())
+        group_cols = const_expr(gemm.cta_tile_shape_mnk[1] // groups)
+        combine = self.stats_op._combine_op()
+        batch_idx = tile_coord_mnkl[3]
+        limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * rows, rows)
+        # (l, m, G) batched; (m, G) dense-2D (batch_idx == 0) or varlen_m
+        # (total_m rows, segment offset via cu_seqlens).
+        if const_expr(cute.rank(param) == 3):
+            mOut = param[batch_idx, None, None]
+        elif const_expr(varlen_manager.varlen_m):
+            mOut = cute.domain_offset((varlen_manager.params.cu_seqlens_m[batch_idx],), param)
+        else:
+            mOut = param
+        limit_g = mOut.shape[1]
+        row0 = tile_coord_mnkl[0] * rows
+        g0 = tile_coord_mnkl[1] * groups
+        total_slots = const_expr(rows * groups)
+        for i0 in cutlass.range(0, total_slots, num_epi_threads, unroll_full=True):
+            i = i0 + tidx
+            if i < total_slots:
+                r = i // groups
+                g = i % groups
+                if r < limit_m and g0 + g < limit_g:
+                    stat = sStats[r, g, 0]
+                    for w in cutlass.range_constexpr(1, warps_n):
+                        stat = combine(stat, sStats[r, g, w])
+                    mOut[row0 + r, g0 + g] = self.stats_op.stat_value(stat, group_cols)
 
 
 class OnlineLSEReduce(ColVecReduce):

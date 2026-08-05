@@ -325,8 +325,16 @@ class ComposableEpiMixin:
         varlen_manager,
         tidx,
     ):
+        # Two-phase flush: every op stages its stripe first (intra-warp
+        # reduce + write to its own disjoint staging smem), then ONE shared
+        # barrier orders all the staging writes, then every op merges and
+        # writes gmem. A multi-sink epilogue pays a single arrive_and_wait
+        # per flush instead of one per sink — and the shared barrier is a
+        # strictly weaker sync than per-sink barriers.
+        pending = []
+        needs_barrier = False
         for op in self._epi_ops:
-            op.end_loop(
+            staged = op.end_loop_stage(
                 self,
                 getattr(params, op.name),
                 epi_tensors[op.name],
@@ -334,9 +342,20 @@ class ComposableEpiMixin:
                 epi_tile,
                 tiled_copy_t2r,
                 tiled_copy_r2s,
+                tidx,
+            )
+            if const_expr(staged is not None):
+                pending.append((op, staged))
+                needs_barrier = needs_barrier or staged[0]
+        if const_expr(needs_barrier):
+            self.epilogue_barrier.arrive_and_wait()
+        for entry in pending:
+            entry[0].end_loop_finish(
+                self,
+                getattr(params, entry[0].name),
+                entry[1][1],
                 tile_coord_mnkl,
                 varlen_manager,
-                tidx,
             )
 
     @cute.jit
