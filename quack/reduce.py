@@ -23,26 +23,58 @@ def warp_reduce(
     op: Callable,
     threads_in_group: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
     dtype: cutlass.Constexpr = None,
+    abs: cutlass.Constexpr[bool] = False,
+    nan: cutlass.Constexpr[bool] = False,
 ) -> cute.Numeric:
+    """Reduce across the aligned ``threads_in_group``-lane subgroup this thread
+    belongs to (all lanes receive the result). Lowers to one ``redux.sync``
+    where the hardware has it — Int32 everywhere, Float32 min/max on the SM100
+    family (redux fp32 does not exist on SM120) — with a per-subgroup member
+    mask for groups smaller than a warp; shuffle-butterfly otherwise.
+
+    ``abs``: reduce |val| (fp32 min/max only). Folded into the REDUX.MAXABS
+    instruction on the redux path, an explicit absf on the fallback.
+    ``nan``: propagate NaN (any NaN input poisons the result — the CUTLASS
+    amax semantics). Redux path only; the fallback butterfly's max.f32 drops
+    NaNs, so only rely on this where the SM100 family is guaranteed.
+    """
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-    if const_expr(threads_in_group == cute.arch.WARP_SIZE):
-        val_dtype = dtype if const_expr(dtype is not None) else getattr(val, "dtype", None)
-        if const_expr(val_dtype == Int32):
-            if const_expr(op is operator.add):
-                return cute.arch.warp_redux_sync(val, "add")
-            if const_expr(op is max or op is cutlass.max or op is _operator_max):
-                return cute.arch.warp_redux_sync(val, "max")
-            if const_expr(op is min or op is _cutlass_min or op is _operator_min):
-                return cute.arch.warp_redux_sync(val, "min")
-        if const_expr(val_dtype == Float32 and arch.is_family_of(Arch.sm_100f)):
-            if const_expr(
-                op is max or op is cutlass.max or op is cute.arch.fmax or op is _operator_max
-            ):
-                return cute.arch.warp_redux_sync(val, "fmax")
-            if const_expr(
-                op is min or op is _cutlass_min or op is cute.arch.fmin or op is _operator_min
-            ):
-                return cute.arch.warp_redux_sync(val, "fmin")
+    val_dtype = dtype if const_expr(dtype is not None) else getattr(val, "dtype", None)
+    is_max = const_expr(op is max or op is cutlass.max or op is _operator_max)
+    is_min = const_expr(op is min or op is _cutlass_min or op is _operator_min)
+    kind = None
+    if const_expr(val_dtype == Int32):
+        if const_expr(op is operator.add):
+            kind = "add"
+        elif const_expr(is_max):
+            kind = "max"
+        elif const_expr(is_min):
+            kind = "min"
+    elif const_expr(val_dtype == Float32 and arch.is_family_of(Arch.sm_100f)):
+        if const_expr(is_max or op is cute.arch.fmax):
+            kind = "fmax"
+        elif const_expr(is_min or op is cute.arch.fmin):
+            kind = "fmin"
+    if const_expr(kind is not None):
+        if const_expr(threads_in_group == cute.arch.WARP_SIZE):
+            mask = 0xFFFFFFFF
+        else:
+            # Aligned contiguous subgroup (same grouping as the butterfly
+            # below): this lane's group mask, shifted to its base lane
+            # (32 - g == the 5-bit ~(g - 1), kept positive for the DSL).
+            group_mask = (1 << threads_in_group) - 1
+            base_lane = cute.arch.lane_idx() & (cute.arch.WARP_SIZE - threads_in_group)
+            mask = cutlass.Uint32(group_mask) << base_lane
+        # Only forward the qualifiers when set: the dsl_user_op wrapper
+        # rejects explicit None keyword values.
+        kwargs = {}
+        if const_expr(abs):
+            kwargs["abs"] = True
+        if const_expr(nan):
+            kwargs["nan"] = True
+        return cute.arch.warp_redux_sync(val, kind, mask, **kwargs)
+    if const_expr(abs):
+        val = cute.math.absf(val)
     return cute.arch.warp_reduction(val, op, threads_in_group=threads_in_group)
 
 
