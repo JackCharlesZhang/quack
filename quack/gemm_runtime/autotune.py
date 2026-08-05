@@ -51,7 +51,12 @@ import torch
 
 from quack.autotuner import AutotuneConfig, Autotuner
 from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_config import blockscaled_config_ok, config_supports, get_all_configs
+from quack.gemm_config import (
+    blockscaled_config_ok,
+    config_supports,
+    cta_tile_shape_m,
+    get_all_configs,
+)
 
 __all__ = ["tuned_mod_gemm", "sink_arg_shapes", "TunedModGemm"]
 
@@ -110,7 +115,9 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     the tuner slices per config and TunedModGemm.sinks returns the live view."""
     cfgs = _config_space(mod, torch.device(device))
     min_tile_n = min(c.tile_n for c in cfgs)
-    min_tile_m = min(c.tile_m for c in cfgs)
+    # blockscaled=False halves whenever the config could run 2-CTA — the
+    # smallest possible per-CTA tile, so the buffer upper-bounds both modes.
+    min_tile_m = min(cta_tile_shape_m(c.tile_m, c.cluster_m, c.device_capacity) for c in cfgs)
     lead = (m,) if l is None else (l, m)
     shapes = {}
     for name, op in mod.sinks.items():
@@ -123,13 +130,16 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     return shapes
 
 
-def _slice_sinks(mod, epi_args, config, lead, n_gemm):
+def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False):
     views = {}
     for name, op in mod.sinks.items():
         alloc = getattr(op, "sink_alloc_shape", None)
         if alloc is None or name not in epi_args:
             continue
-        views[name] = _sink_slice(epi_args[name], alloc(lead, n_gemm, config.tile_m, config.tile_n))
+        cta_tile_m = cta_tile_shape_m(
+            config.tile_m, config.cluster_m, config.device_capacity, blockscaled
+        )
+        views[name] = _sink_slice(epi_args[name], alloc(lead, n_gemm, cta_tile_m, config.tile_n))
     return views
 
 
@@ -172,15 +182,16 @@ def _prune_for_mod(mod, transform_a, configs, named_args, **kwargs):
             if cap == 9 and has_out and c.tile_n % 32:
                 continue
         ok = True
+        cta_tile_m = cta_tile_shape_m(c.tile_m, c.cluster_m, c.device_capacity, blockscaled)
         for name, op in mod.sinks.items():
             if getattr(op, "check_oob", True) is False:
-                ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % c.tile_m
+                ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % cta_tile_m
                 if ragged:
                     ok = False
             buf = kwargs.get(name)
             alloc = getattr(op, "sink_alloc_shape", None)
             if buf is not None and alloc is not None:
-                need = alloc(_lead(A, A_idx, m_gemm), n_gemm, c.tile_m, c.tile_n)
+                need = alloc(_lead(A, A_idx, m_gemm), n_gemm, cta_tile_m, c.tile_n)
                 if any(b < s for b, s in zip(buf.shape, need)):
                     ok = False  # caller's partial buffer too small for this tiling
         if ok:
@@ -406,5 +417,7 @@ def tuned_mod_gemm(
     if A_idx is not None:
         m_gemm = A_idx.shape[0]
     return TunedModGemm(
-        plan, best, _slice_sinks(mod, epi_args, best, _lead(A, A_idx, m_gemm), n_gemm)
+        plan,
+        best,
+        _slice_sinks(mod, epi_args, best, _lead(A, A_idx, m_gemm), n_gemm, SFA is not None),
     )

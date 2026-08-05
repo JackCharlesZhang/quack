@@ -17,10 +17,9 @@ import quack.layout_utils as layout_utils
 import quack.utils as utils
 from quack import pipeline_checks
 from quack.cute_dsl_utils import ParamsBase
-from quack.epilogue.ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
+from quack.epilogue.ops import DStore, EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
-from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.sync import Semaphore
 from quack.tile_scheduler import (
     PersistenceMode,
@@ -284,18 +283,17 @@ class GemmBase:
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
         inline_epi_load = const_expr(copy_C is not None)
-        use_stochastic_rounding = const_expr(
-            self.rounding_mode == RoundingMode.RS
-            and self.acc_dtype == cutlass.Float32
-            and self.d_dtype in (cutlass.BFloat16, cutlass.Float16)
-        )
 
-        # Setup aux outputs. Returns a tuple of ``(tiled_copy_r2s,
-        # tRS_sAuxOut, copy_aux_out, store_pred)`` quadruples — one per active
-        # TileStore op (empty for the default epilogue). ``store_pred`` is
-        # None for an unconditional store, else a per-CTA-tile Boolean (e.g.
-        # GemmSymmetric skips the mirrored write on diagonal tiles).
-        aux_out_ctxs = self.epi_setup_aux_out(
+        # Store contexts — one per stored output, D first (when present), then
+        # the aux TileStore outputs. Each is ``(op, quant, tiled_copy, tRS_s,
+        # copy_fn, store_pred)``: the op owns the storage-dtype convert
+        # (store_convert) and the register->smem copy (store_r2s); ``quant``
+        # is the output's optional quantize codec (BlockScaleFactorStore),
+        # run by this driver on the final fragment right before the convert;
+        # ``store_pred`` is None for an unconditional store, else a
+        # per-CTA-tile Boolean (e.g. GemmSymmetric skips the mirrored write
+        # on diagonal tiles). D's host pieces stay kernel-built (see DStore).
+        store_ctxs = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
             tiled_copy_r2s,
@@ -304,6 +302,10 @@ class GemmBase:
             varlen_manager,
             tidx,
         )
+        if const_expr(has_D):
+            store_ctxs = (
+                (DStore(), self._epi_store_quant("D"), tiled_copy_r2s, tRS_sD, copy_D, None),
+            ) + store_ctxs
 
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
@@ -412,10 +414,13 @@ class GemmBase:
             iket.range_push("epi_math")
             tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             iket.range_pop()
+            # end_loop sees the final D fragment and may mutate it in place
+            # before the dtype convert below.
             self.epi_end_loop(
                 params,
                 epi_tensors,
                 epi_coord,
+                tRS_rD,
                 epi_tile,
                 tiled_copy_t2r,
                 tiled_copy_r2s,
@@ -423,19 +428,29 @@ class GemmBase:
                 varlen_manager,
                 tidx,
             )
-            # Convert each output to its storage dtype.
-            tRS_rAuxOuts_out = tuple(
-                self.epi_convert_aux_out(
-                    i,
-                    tRS_rAuxOuts[i],
-                    epi_loop_tensors.get("sr_seed"),
-                    tidx,
-                    tile_coord_mnkl,
-                    num_prev_subtiles,
-                    epi_idx,
+            # Quantize (optional per-output codec) + convert each stored
+            # output to its storage dtype. The quantize rescales the final
+            # fragment in place and collects the SF bytes (flushed in the
+            # codec's end), so the convert below emits the quantized values.
+            store_frags = ((tRS_rD,) if has_D else ()) + tRS_rAuxOuts
+            store_frags_out = []
+            # range_constexpr: store_ctxs/store_frags are static Python
+            # tuples — a staged loop var cannot index them.
+            for i in cutlass.range_constexpr(len(store_ctxs)):
+                op, quant, _, _, _, _ = store_ctxs[i]
+                if const_expr(quant is not None):
+                    quant.quantize(self, epi_loop_tensors[quant.name], store_frags[i])
+                store_frags_out.append(
+                    op.store_convert(
+                        self,
+                        store_frags[i],
+                        epi_loop_tensors.get("sr_seed"),
+                        tidx,
+                        tile_coord_mnkl,
+                        num_prev_subtiles,
+                        epi_idx,
+                    )
                 )
-                for i in range(len(aux_out_ctxs))
-            )
             iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
                 if is_tma_warp:
@@ -446,30 +461,18 @@ class GemmBase:
                 epilogue_barrier.arrive_and_wait()
             iket.range_pop()
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            # Copy each output from registers to shared memory. All share the
+            # same ``epi_buffer`` index so the s2g TMA stores below happen in
+            # lockstep after the fence.
             iket.range_push("epi_r2s")
-            if const_expr(has_D):
-                tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
-                if const_expr(use_stochastic_rounding):
-                    seed = epilogue_sr_seed(
-                        epi_loop_tensors.get("sr_seed"),
-                        tile_coord_mnkl,
-                        num_prev_subtiles + epi_idx,
-                    )
-                    copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
-                elif const_expr(self.epi_r2s_pair_xor()):
-                    copy_utils.cvt_copy_pair_xor_sts32(tRS_rD, tRS_sD_cur, tidx)
-                else:
-                    copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
-            # Copy each aux output from registers to shared memory. All share
-            # the same ``epi_buffer`` index so the s2g TMA stores below happen
-            # in lockstep after the fence.
-            for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                tiled_copy_aux_out_r2s, tRS_sAuxOut, _, _ = aux_out_ctxs[i]
-                cute.copy(
-                    tiled_copy_aux_out_r2s,
-                    # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
-                    tRS_sAuxOut[None, None, None, epi_buffer],
+            for i in cutlass.range_constexpr(len(store_ctxs)):
+                op, _, tiled_copy_st, tRS_s, _, _ = store_ctxs[i]
+                op.store_r2s(
+                    self,
+                    tiled_copy_st,
+                    store_frags_out[i],
+                    tRS_s[None, None, None, epi_buffer],
+                    tidx,
                 )
             iket.range_pop()
             if const_expr(use_tma_epi):
@@ -477,28 +480,24 @@ class GemmBase:
                 cute.arch.fence_view_async_shared()
                 epilogue_barrier.arrive_and_wait()
                 if is_tma_warp:
-                    if const_expr(has_D):
-                        copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                    for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                        _, _, copy_aux_out, store_pred = aux_out_ctxs[i]
+                    for i in cutlass.range_constexpr(len(store_ctxs)):
+                        _, _, _, _, copy_out, store_pred = store_ctxs[i]
                         if const_expr(store_pred is None):
-                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                            copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                         else:
                             if store_pred:
-                                copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                                copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
                 iket.range_pop()
             else:
                 epilogue_barrier.arrive_and_wait()
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                    _, _, copy_aux_out, store_pred = aux_out_ctxs[i]
+                for i in cutlass.range_constexpr(len(store_ctxs)):
+                    _, _, _, _, copy_out, store_pred = store_ctxs[i]
                     if const_expr(store_pred is None):
-                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     else:
                         if store_pred:
-                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                            copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
 
         self.epi_end(
@@ -899,6 +898,7 @@ class GemmBase:
         params: EpilogueParams,
         epi_tensors: Tuple[cute.Tensor, ...],
         epi_coord: cute.Coord,
+        tRS_rD: cute.Tensor,
         epi_tile: cute.Tile,
         tiled_copy_t2r: Optional[cute.TiledCopy],
         tiled_copy_r2s: cute.TiledCopy,
@@ -972,30 +972,19 @@ class GemmBase:
         varlen_manager,
         tidx,
     ):
-        """Return a tuple of ``(tiled_copy_r2s, tRS_sAuxOut, copy_aux_out,
-        store_pred)`` quadruples — one per aux output (see
-        TileStore.store_setup; ComposableEpiMixin provides the generic op-driven
-        implementation). The default epilogue has no aux output, so the tuple
-        is empty.
+        """Return a tuple of ``(op, quant, tiled_copy, tRS_sAuxOut,
+        copy_aux_out, store_pred)`` store contexts — one per aux output (see
+        TileStore.store_setup; ComposableEpiMixin provides the generic
+        op-driven implementation). The default epilogue has no aux output, so
+        the tuple is empty.
         """
         return ()
 
-    @cute.jit
-    def epi_convert_aux_out(
-        self,
-        output_idx: cutlass.Constexpr[int],
-        tRS_rAuxOut,
-        sr_seed,
-        tidx,
-        tile_coord_mnkl,
-        num_prev_subtiles,
-        epi_idx,
-    ):
-        """Convert one aux output register tensor from acc_dtype to its storage
-        dtype. ``output_idx`` selects which aux output this call is for
-        (single-output mixins can ignore it).
-        """
-        return tRS_rAuxOut
+    def _epi_store_quant(self, output_name):
+        """The quantize codec op attached to the named stored output ("D" =
+        the main output), or None (ComposableEpiMixin provides the generic
+        implementation)."""
+        return None
 
 
 class GemmTmaBase(GemmBase):

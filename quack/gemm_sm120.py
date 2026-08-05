@@ -374,6 +374,11 @@ class GemmSm120(GemmSm90):
             raise ValueError(
                 f"SM120 CTA tile N must be divisible by {16 * self.atom_layout_mnk[1]}"
             )
+        # Consecutive N columns each warp owns in the tiled-MMA permutation.
+        # 16 is the default (STSM / gated-epilogue layout). _setup_attributes
+        # widens it to 32 when a vec-32 row SFD is active so a whole SF vector
+        # sits inside one warp and the cross-warp amax exchange compiles away.
+        self.mma_n_warp_run = 16
         # num_mma_warps = total warps doing MMA (both warp groups in pingpong)
         self.num_mma_warps = math.prod(self.atom_layout_mnk) * (1 if not self.pingpong else 2)
         # For compatibility with SM90 code that uses warp groups
@@ -442,7 +447,65 @@ class GemmSm120(GemmSm90):
         # One 8-bit scale per sf_vec_size K elements, for both SFA and SFB.
         return (tile_m + tile_n) * tile_k // self.sf_vec_size
 
+    def _sfd_row_reqs(self, epilogue_args):
+        """(vec_acc, epi_n_min) of the active row-direction SFD codecs —
+        the shared scan (quack.epilogue.quantize_out.active_row_sfd_reqs)
+        also used by GemmSm100's epi-tile widening."""
+        from quack.epilogue.quantize_out import active_row_sfd_reqs
+
+        return active_row_sfd_reqs(type(self)._epi_ops, epilogue_args)
+
     def _setup_attributes(self, epilogue_args):
+        # Row-direction SFD wider than the 16-column warp run (vec-32
+        # mxfp8/mxfp4 quantized D, or a gated postact whose SF vector covers
+        # up to 64 acc columns): widen the per-warp N run to 32 so as much of
+        # the vector as possible is warp-local (the quantize amax stays a
+        # lane butterfly; wider vectors fold their warp_N neighbors through
+        # the sExch exchange). EXCEPT when the quantized target is a gated
+        # aux output: the halved postact store rides the dummy-MMA STSM
+        # retile contract (TileStore._make_tiled_copy_r2s), which encodes the
+        # 16-column run — under a widened run its warp N offsets misplace
+        # whole 8-column groups (verified empirically: a [0,2,1,3] block
+        # permutation of the stored postact). The run stays 16 there and the
+        # exchange covers the quantize instead. Decided BEFORE super() so
+        # _setup_tiled_mma sees it; _compute_tile_shape_or_override widens
+        # the epi tile N to cover both the 32 * atom_n permutation span and
+        # whole SF vectors. Every B path follows the permutation:
+        # make_tiled_copy_B / the SF fragment TV helpers derive from the
+        # tiled MMA (blockscaled verified bitwise vs the 16-run kernel), the
+        # hand-built n-major fp8 B ldmatrix is parametrized by the run (see
+        # _nmajor_b_tiled_copy), and the plain fp8 path's unit ue8m0
+        # fragments are permutation-insensitive constants. tile_n that the
+        # 32 * atom_n permutation period does not divide falls back to the
+        # sExch exchange, correct for any layout.
+        from quack.epilogue.quantize_out import BlockScaleFactorStore
+
+        ops = getattr(type(self), "_epi_ops", ())
+        sfd_vec_acc, sfd_epi_n_min = self._sfd_row_reqs(epilogue_args)
+        gated_aux_quant = any(
+            isinstance(op, BlockScaleFactorStore)
+            and op.direction == "row"
+            and op.quant_output != "D"
+            and getattr(epilogue_args, op.name, None) is not None
+            and next(o for o in ops if o.is_tile_store() and o.name == op.quant_output).gated
+            for op in ops
+        )
+        if (
+            sfd_vec_acc > 16
+            and not gated_aux_quant
+            and self.atom_layout_mnk[1] > 1
+            and self.cta_tile_shape_mnk[1] % (32 * self.atom_layout_mnk[1]) == 0
+        ):
+            self.mma_n_warp_run = 32
+        # Epi tile N must cover whole SF vectors (asserted in to_params);
+        # consumed by _compute_tile_shape_or_override, only when it divides
+        # the CTA tile (otherwise leave the default and let the trace assert
+        # report the unsupported tile).
+        self._sfd_epi_n_min = (
+            sfd_epi_n_min
+            if sfd_epi_n_min and self.cta_tile_shape_mnk[1] % sfd_epi_n_min == 0
+            else 0
+        )
         super()._setup_attributes(epilogue_args)
         if self.blockscaled:
             self.sfa_smem_layout_staged = blockscaled_layout.sm120_make_smem_layout_sfa(
@@ -618,9 +681,13 @@ class GemmSm120(GemmSm90):
             op = warp.MmaFP8Op(self.mma_a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
         atom_m, atom_n, atom_k = self.atom_layout_mnk
-        # We want each warp to have 16 consecutive elements in the N direction, for STSM
-        # and for gated epilogue.
-        permutation_n = cute.make_ordered_layout((self.mma_inst_mnk[1], atom_n, 2), order=(0, 2, 1))
+        # Each warp owns mma_n_warp_run consecutive N columns: 16 by default
+        # (for STSM and for gated epilogue), 32 when a vec-32 row SFD wants
+        # whole SF vectors warp-local (see _setup_attributes).
+        permutation_n = cute.make_ordered_layout(
+            (self.mma_inst_mnk[1], atom_n, self.mma_n_warp_run // self.mma_inst_mnk[1]),
+            order=(0, 2, 1),
+        )
         permutation_mnk = (
             atom_m * self.mma_inst_mnk[0],
             permutation_n,
@@ -1495,19 +1562,31 @@ class GemmSm120(GemmSm90):
         the (correct) Src side, and _retile_b's fragment regroup encodes the
         MEASURED delivery (per the C++ SM100_U8x16_LDSM_T trait, cute/atom/
         copy_traits_sm100.hpp): lane (a, b) = (l%4, l//4) receives bytes
-        (kb, np, h) at n = wn*16 + b + 8*np, k = 4a + kb + 16h (h = the
-        x2-matrix mode = the k16 half). M-warps duplicate (stride 0). If a
-        DSL upgrade fixes the trait, the bit-exact n-major-vs-k-major tests
-        (test_sm120_b_n_major*) will catch any placement change."""
+        (kb, np, h) at n = wn*n_run + b + 8*np, k = 4a + kb + 16h (h = the
+        x2-matrix mode = the k16 half). M-warps duplicate (stride 0). A
+        widened warp run (mma_n_warp_run 32, vec-32 SFD) issues the atom
+        n_run/16 times per warp, each repetition 16 columns further along N.
+        If a DSL upgrade fixes the trait, the bit-exact n-major-vs-k-major
+        tests (test_sm120_b_n_major*) will catch any placement change."""
         atom = cute.make_copy_atom(
             warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2), self.b_dtype
         )
         atom_m, atom_n, _ = self.atom_layout_mnk
-        n_span = 16 * atom_n  # the tiled-mma N span (16 consecutive N per warp)
-        layout_tv = cute.make_layout(
-            ((4, 8, atom_m, atom_n), (4, 2, 2)),
-            stride=((4 * n_span, 1, 0, 16), (n_span, 8, 16 * n_span)),
-        )
+        n_run = self.mma_n_warp_run  # consecutive N per warp (16, or 32 for SFD)
+        n_span = n_run * atom_n  # the tiled-mma N span
+        if n_run == 16:
+            layout_tv = cute.make_layout(
+                ((4, 8, atom_m, atom_n), (4, 2, 2)),
+                stride=((4 * n_span, 1, 0, 16), (n_span, 8, 16 * n_span)),
+            )
+        else:
+            # Two atom invocations per warp along N, 16 columns apart; the
+            # value modes stay atom-major so each invocation's 16 bytes are
+            # contiguous in mode order.
+            layout_tv = cute.make_layout(
+                ((4, 8, atom_m, atom_n), ((4, 2, 2), n_run // 16)),
+                stride=((4 * n_span, 1, 0, n_run), ((n_span, 8, 16 * n_span), 16)),
+            )
         return cute.make_tiled_copy(atom, layout_tv, (n_span, 32))
 
     def _retile_b(self, smem_tiled_copy_B, tCrB):
@@ -1526,11 +1605,30 @@ class GemmSm120(GemmSm90):
             return smem_tiled_copy_B.retile(tCrB)
         (kb_s, h_s), n_shp, k_shp = tCrB.layout.shape
         (kb_d, h_d), n_std, k_std = tCrB.layout.stride
-        # profile ((V, rest_v), N, K), congruent with partition_S's ((16,1), N, K)
-        layout = cute.make_layout(
-            (((kb_s, n_shp[0], h_s), 1), n_shp[1:] if len(n_shp) > 1 else (1,), k_shp),
-            stride=(((kb_d, n_std[0], h_d), 0), n_std[1:] if len(n_std) > 1 else (0,), k_std),
+        np_size, np_d = n_shp[0], n_std[0]
+        assert np_size == self.mma_n_warp_run // 8, (
+            f"n-major fp8 B fragment np mode ({np_size}) != warp run {self.mma_n_warp_run} / 8"
         )
+        if const_expr(self.mma_n_warp_run == 16):
+            # profile ((V, rest_v), N, K), congruent with partition_S's
+            # ((16,1), N, K)
+            layout = cute.make_layout(
+                (((kb_s, np_size, h_s), 1), n_shp[1:] if len(n_shp) > 1 else (1,), k_shp),
+                stride=(((kb_d, np_d, h_d), 0), n_std[1:] if len(n_std) > 1 else (0,), k_std),
+            )
+        else:
+            # Widened run: congruent with partition_S's ((16, n_run/16), N, K).
+            # V = one atom invocation's (kb, np-pair, h) bytes; rest_v = the
+            # per-warp atom repetitions along N — np splits (in-atom pair,
+            # repetition) with strides (np_d, 2 * np_d).
+            layout = cute.make_layout(
+                (((kb_s, 2, h_s), np_size // 2), n_shp[1:] if len(n_shp) > 1 else (1,), k_shp),
+                stride=(
+                    ((kb_d, np_d, h_d), 2 * np_d),
+                    n_std[1:] if len(n_std) > 1 else (0,),
+                    k_std,
+                ),
+            )
         return cute.make_tensor(tCrB.iterator, layout)
 
     @cute.jit
@@ -1672,8 +1770,8 @@ class GemmSm120(GemmSm90):
 
         return ab_read_state
 
-    @staticmethod
     def _compute_tile_shape_or_override(
+        self,
         cta_tile_shape_mnk: Tuple[int, int, int],
         atom_layout_mnk: Tuple[int, int, int],
         element_type: Optional[Type[cutlass.Numeric]] = None,
@@ -1694,11 +1792,17 @@ class GemmSm120(GemmSm90):
         if epi_tile_override is not None:
             return epi_tile_override
         n_perf = 64 if element_type is not None and element_type.width == 8 else 32
-        # The epilogue tile must cover the tiled MMA's M span (atom_m * 16
-        # rows): a subtile smaller than the warp footprint makes the r2s
-        # partition wrap across warps (row-permuted/duplicated corruption —
-        # hit by the (8,1,1) W4 layout whose span is 128 > the default 64).
+        # The epilogue tile must cover the tiled MMA's warp spans, or the r2s
+        # partition wraps across warps (permuted/duplicated corruption): M is
+        # atom_m * 16 rows (hit by the (8,1,1) W4 layout whose span is 128 >
+        # the default 64), N is mma_n_warp_run * atom_n columns (64 when the
+        # run is widened to 32 for vec-32 SFD; a 32-column subtile then holds
+        # a single warp's columns while the copy's N period is 64 — caught as
+        # a cute.copy size mismatch in epi_load_acc_subtile). An active row
+        # SFD additionally needs the subtile to cover whole SF vectors
+        # (_sfd_epi_n_min, up to 64 acc columns for a gated postact vector).
         m_span = atom_layout_mnk[0] * 16
+        n_span = max(self.mma_n_warp_run * atom_layout_mnk[1], getattr(self, "_sfd_epi_n_min", 0))
         tile_m = max(math.gcd(64, cute.size(cta_tile_shape_mnk, mode=[0])), m_span)
-        tile_n = math.gcd(n_perf, cute.size(cta_tile_shape_mnk, mode=[1]))
+        tile_n = max(math.gcd(n_perf, cute.size(cta_tile_shape_mnk, mode=[1])), n_span)
         return (tile_m, tile_n)

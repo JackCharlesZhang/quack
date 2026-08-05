@@ -441,6 +441,26 @@ def test_sm120_b_n_major_tiles(tile_mn, pingpong):
 
 
 @requires_sm120
+def test_sm120_b_n_major_quant_out():
+    """N-major fp8 B under the widened 32-column warp run (vec-32 mxfp8 SFD
+    output widens mma_n_warp_run to 32): the generalized _nmajor_b_tiled_copy
+    issues two 16-column atom invocations per warp and _retile_b splits the
+    fragment's np mode into (in-atom pair, repetition) — the quantized values
+    and SF bytes must be bit-identical to the k-major B run."""
+    m, n, k = 256, 320, 512
+    A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    out_kmaj = gemm(A, W.mT, out_dtype="mxfp8_e4m3", tuned=False)
+    out = gemm(A, _n_major_b(W), out_dtype="mxfp8_e4m3", tuned=False)
+    assert torch.equal(out.qdata.view(torch.uint8), out_kmaj.qdata.view(torch.uint8)), (
+        "n-major quantized values != k-major"
+    )
+    assert torch.equal(out.scale.view(torch.uint8), out_kmaj.scale.view(torch.uint8)), (
+        "n-major SF bytes != k-major"
+    )
+
+
+@requires_sm120
 def test_sm120_fp4_b_n_major_rejected():
     """Packed fp4 cannot be n-major (nibbles pack along the quantized K axis;
     no ldmatrix variant can transpose them) — the operand container rejects

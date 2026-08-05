@@ -54,6 +54,20 @@ class GemmConfig:
     use_tma_gather: bool = False
 
 
+def cta_tile_shape_m(
+    tile_m: int, cluster_m: int, device_capacity: int, blockscaled: bool = False
+) -> int:
+    """Per-CTA M tile. Mirrors GemmSm100.use_2cta_instrs (keep in sync): on
+    SM100/SM103 an even cluster_m with MMA tiler M in {128, 256} ({256} only
+    when blockscaled) selects the 2-CTA MMA, which splits tile_m across the
+    CTA pair. Tile schedulers, OOB limits, and reduce-sink partial slots all
+    count M in this unit — host-side buffers sized per M tile must use it too."""
+    if device_capacity not in (10, 11) or cluster_m % 2:
+        return tile_m
+    valid_2cta_m = (256,) if blockscaled else (128, 256)
+    return tile_m // 2 if tile_m in valid_2cta_m else tile_m
+
+
 def blockscaled_config_ok(c: GemmConfig) -> bool:
     """Can this config run a blockscaled GEMM (SM100 tcgen05 MMA, or SM120
     warp MMA)? THE single statement of the constraint set — both autotune

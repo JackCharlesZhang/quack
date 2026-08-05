@@ -38,6 +38,7 @@ from quack.rounding import (
     convert_f32_to_bf16_sr,
     convert_f32_to_f16_sr,
     epilogue_aux_out_sr_seed,
+    epilogue_sr_seed,
 )
 from quack.reduce import swap_shuffle_reduce
 from quack.sm90_utils import partition_for_epilogue
@@ -814,9 +815,16 @@ class TileStore(EpiOp):
         store_pred_fn: optional ``(gemm, tile_coord_mnkl) -> Boolean``
             evaluated once per CTA tile; False skips this op's gmem store
             (e.g. GemmSymmetric skips the mirrored write on diagonal tiles)
+        quant: optional quantize codec (BlockScaleFactorStore) for this
+            output, declared where the output is declared. Declaration sugar:
+            the EpiMod frontend lifts it into the op set (extra_ops), and the
+            driver runs it on the final fragment right before store_convert
+            (see gemm_base.epilogue and ComposableEpiMixin._epi_store_quant).
     """
 
-    def __init__(self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None):
+    def __init__(
+        self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None, quant=None
+    ):
         super().__init__(name)
         if gated and epi_tile_fn is None:
             epi_tile_fn = _gated_epi_tile_fn
@@ -824,6 +832,11 @@ class TileStore(EpiOp):
         self.gated = gated
         self.rounding = rounding
         self.store_pred_fn = store_pred_fn
+        if quant is not None:
+            assert getattr(quant, "quant_output", None) == name, (
+                f"quantize codec for output {name!r} must declare output={name!r}"
+            )
+        self.quant = quant
 
     def config_key(self):
         return (
@@ -831,6 +844,7 @@ class TileStore(EpiOp):
             self.gated,
             self.rounding,
             _callable_config_key(self.store_pred_fn),
+            self.quant.cache_key() if self.quant is not None else None,
         )
 
     def is_tile_store(self):
@@ -868,8 +882,13 @@ class TileStore(EpiOp):
         dtype, major = key
         # A halved/reshaped tile (epi_tile_fn, e.g. gated postact) has an N
         # extent unrelated to the GEMM's n: use a fresh sym. Such tiles are
-        # n-major by construction (asserted in to_params).
-        n = cute.sym_int() if self.epi_tile_fn is not None else fctx.n
+        # n-major by construction (asserted in to_params). Sub-byte (fp4)
+        # tiles also need a fresh sym: their packed contiguous extent must be
+        # statically divisible (the FFI packing check).
+        if self.epi_tile_fn is not None or dtype.width < 8:
+            n = cute.sym_int(divisibility=div_for_dtype(dtype))
+        else:
+            n = fctx.n
         leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
         batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
         if fctx.swapped:
@@ -895,7 +914,15 @@ class TileStore(EpiOp):
         tensor = getattr(args, self.name)
         layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
         if self.gated:
-            assert tensor.element_type.width == 16, "gated aux output must be 16-bit for now"
+            # The smem store path degrades to a universal SIMT copy for
+            # narrow dtypes (get_smem_store_atom / SM100's get_smem_store_op),
+            # so fp8/fp4 gated postact (quantized output) works on SM100 and
+            # SM120 (the SM120 halved retile lays the narrow atom over the
+            # 16-bit C-atom geometry, same as the fp8/fp4 D store); SM90's
+            # STSM path remains 16-bit only.
+            assert tensor.element_type.width == 16 or (
+                gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
+            ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
             assert gemm.d_layout is None or gemm.d_layout.is_n_major_c()
             assert layout.is_n_major_c()
             if gemm.arch == 90:
@@ -922,7 +949,8 @@ class TileStore(EpiOp):
         # epi_tile may contain Layout entries (from SM100's compute_epilogue_tile_shape
         # fixup path), so extract the int shape first.
         return EpiSmemBytes(
-            d_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+            # multiply before dividing: sub-byte dtypes (fp4) would floor to 0
+            d_stage=cute.size(cute.shape(epi_tile)) * arg_tensor.element_type.width // 8
         )
 
     def smem_struct_field(self, gemm, params):
@@ -960,9 +988,11 @@ class TileStore(EpiOp):
 
     # --- Device-side store path (driven by gemm_base.epilogue) ---
 
-    def _make_copy_atom_r2s(self, gemm, params, tiled_copy_t2r):
+    def _make_copy_atom_r2s(self, gemm, params, tiled_copy_t2r, dtype_override=None):
         """Build the register-to-shared copy atom for this output."""
-        dtype = getattr(gemm, self._dtype_gemm_attr())
+        dtype = (
+            dtype_override if dtype_override is not None else getattr(gemm, self._dtype_gemm_attr())
+        )
         layout = getattr(gemm, self._layout_gemm_attr())
         if gemm.arch == 100:
             return blackwell_helpers.get_smem_store_op(
@@ -981,8 +1011,14 @@ class TileStore(EpiOp):
         copy_atom_r2s = self._make_copy_atom_r2s(gemm, params, tiled_copy_t2r)
         if self.gated and gemm.arch == 120:
             # SM120 halved postact: retile through an N-doubled permuted MMA so
-            # each warp's STSM lanes cover the halved tile contiguously.
-            copy_atom_postact_c = self._make_copy_atom_r2s(gemm, params, cutlass.Float16)
+            # each warp's STSM lanes cover the halved tile contiguously. The
+            # C-side atom is always the 16-bit STSM one — for narrow (fp8/fp4)
+            # quantized postact it only provides the source-layout geometry
+            # while copy_atom_r2s is the universal narrow atom, exactly like
+            # the D path's tiled_copy_C_atom (see epilog_smem_copy_atom).
+            copy_atom_postact_c = self._make_copy_atom_r2s(
+                gemm, params, cutlass.Float16, dtype_override=cutlass.Float16
+            )
             # dummy tiled mma: only its C-side (M, N) fragment geometry is
             # consumed, which is identical for every mma.sync inst K and
             # operand width — so build it 16-bit even for fp8/blockscaled
@@ -1014,9 +1050,10 @@ class TileStore(EpiOp):
         varlen_manager,
         tidx,
     ):
-        """Per-CTA-tile setup. Returns the driver's store context quadruple
+        """Per-CTA-tile setup. Returns the tail of the driver's store context
         ``(tiled_copy_r2s, tRS_sAux, copy_fn, store_pred)`` where store_pred
-        is None (always store) or a per-tile Boolean."""
+        is None (always store) or a per-tile Boolean (the mixin prepends the
+        op itself and its quantize codec — see gemm_base.epilogue)."""
         tiled_copy_aux_r2s = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         tRS_sAux = tiled_copy_aux_r2s.get_slice(tidx).partition_D(smem_tensor)
         batch_idx = tile_coord_mnkl[3]
@@ -1059,11 +1096,81 @@ class TileStore(EpiOp):
                 raw_vec = convert_f32_to_f16_sr(src_vec, seed, tidx)
             tRS_rAuxOut_out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
         else:
+            if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):
+                # The store TV follows the 16-bit STSM C-atom contract (see
+                # _make_tiled_copy_r2s); narrow (fp8/fp4) quantized postact
+                # applies the same register permute at fp32 granularity
+                # BEFORE the convert (after quantize — placement only).
+                layout_utils.permute_gated_Cregs_f32(tRS_rAuxOut)
             tRS_rAuxOut_out = tRS_rAuxOut.to(dtype)
-        if const_expr(self.gated and gemm.arch in (90, 120)):
-            # Only needed where the store uses STSM
+        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width == 16):
+            # The STSM store contract's register permute (16-bit prmt form).
             layout_utils.permute_gated_Cregs_b16(tRS_rAuxOut_out)
         return tRS_rAuxOut_out
+
+    @cute.jit
+    def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
+        """Copy one converted subtile from registers to this op's smem stage."""
+        # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
+        cute.copy(tiled_copy, tiled_copy.retile(frag_out).contiguous(), tRS_s_stage)
+
+
+class DStore(EpiOp):
+    """The main D output's device store path, as a store op.
+
+    D's host plumbing stays kernel-owned — the TMA atom, the staged smem
+    layout, and the ``sD`` struct field feed tile/stage sizing, split-K's
+    workspace re-pointing, and ``add_to_output`` — so unlike TileStore this op
+    has no host hooks and does not live in ``_epi_ops``. The driver
+    (gemm_base.epilogue) assembles its store context directly from the
+    kernel-built pieces (tiled_copy_r2s, tRS_sD, copy_D); this op owns the
+    convert (kernel-global rounding, D's stochastic-rounding seed) and the
+    register-to-smem copy (including SM90's fp32 pair-XOR STS.32 path), so
+    every stored output — D included — flows through the same
+    store_convert / store_r2s hooks and the same quantize seam.
+    """
+
+    def __init__(self):
+        super().__init__("D")
+
+    @cute.jit
+    def store_convert(
+        self, gemm, tRS_rD, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert one subtile of tRS_rD from acc_dtype to d_dtype."""
+        dtype = gemm.d_dtype
+        if const_expr(
+            gemm.rounding_mode == RoundingMode.RS
+            and tRS_rD.element_type == cutlass.Float32
+            and dtype in (cutlass.BFloat16, cutlass.Float16)
+        ):
+            from cutlass.cute.tensor import TensorSSA
+
+            seed = epilogue_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
+            tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD, dtype)
+            src_vec = tRS_rD.load()
+            if const_expr(dtype == cutlass.BFloat16):
+                raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
+            else:
+                raw_vec = convert_f32_to_f16_sr(src_vec, seed, tidx)
+            tRS_rD_out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
+        elif const_expr(tRS_rD.element_type != dtype):
+            tRS_rD_out = tRS_rD.to(dtype)
+        else:
+            tRS_rD_out = tRS_rD
+        return tRS_rD_out
+
+    @cute.jit
+    def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
+        if const_expr(gemm.epi_r2s_pair_xor()):
+            # fp32 n-major D whose smem swizzle 2-way-conflicts vectorized
+            # STS.64: pair-exchanged STS.32 (frag_out is the unconverted f32
+            # fragment — pair_xor implies d_dtype == acc_dtype).
+            copy_utils.cvt_copy_pair_xor_sts32(frag_out, tRS_s_stage, tidx)
+        else:
+            # frag_out is tRS_rD (already retiled by the kernel) or its
+            # converted same-layout copy: no retile needed.
+            cute.copy(tiled_copy, frag_out, tRS_s_stage)
 
 
 class _TileLoadState(NamedTuple):
@@ -1163,7 +1270,8 @@ class TileLoad(EpiOp):
         # epi_tile may contain Layout entries from SM100's compute_epilogue_tile_shape
         # fixup; extract the int shape first.
         return EpiSmemBytes(
-            c_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+            # multiply before dividing: sub-byte dtypes (fp4) would floor to 0
+            c_stage=cute.size(cute.shape(epi_tile)) * arg_tensor.element_type.width // 8
         )
 
     def smem_struct_field(self, gemm, params):
@@ -1392,7 +1500,9 @@ class VecReduce(EpiOp):
         (tile_m, tile_n): per-CTA-tile partials along the reduce dim. THE
         single statement of the sink tiling rule — validation (EpiMod.gemm),
         eager allocation (_alloc_sinks), the torch-op fakes, and the autotune
-        worst-case/slicing all call this."""
+        worst-case/slicing all call this. ``tile_m`` is the PER-CTA M tile
+        (``cta_tile_shape_m``: half the config tile under the SM100 2-CTA
+        MMA) — the kernel indexes partial slots by the per-CTA tile coord."""
         if self.dim == 0:
             return (*lead, -(-n // tile_n))
         return (*lead[:-1], -(-lead[-1] // tile_m), n)

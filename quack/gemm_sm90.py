@@ -651,6 +651,10 @@ class GemmSm90(GemmTmaBase):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        # Stash for epilogue ops (epi_to_underlying_arguments runs later and
+        # SFD needs the varlen mode to shape its logical scale layout).
+        self.varlen_m = varlen_m
+        self.varlen_k = varlen_k
 
         self._setup_attributes(epilogue_args)
 

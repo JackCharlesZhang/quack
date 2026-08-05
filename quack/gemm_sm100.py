@@ -47,6 +47,7 @@ from quack import layout_utils
 from quack import pipeline_checks
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
+from quack.epilogue.quantize_out import active_row_sfd_reqs
 from quack.layout_utils import tile_atom_to_shape_SF_strided
 
 # TOMBSTONE — AllGather+GEMM arrival-gate placement experiment (2026-07-15,
@@ -514,6 +515,26 @@ class GemmSm100(GemmTmaBase):
                 (epi_tile_n // warp_n, warp_n), stride=(1, self.cta_tile_shape_mnk[1] // warp_n)
             )
             self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
+        # Quantized-output SF vectors must be produced within one epi subtile.
+        # Widen the epi tile N when an active BlockScaleFactorStore needs a
+        # larger run (e.g. fp4 D with a small tile may default to epi N below
+        # the SF vector); column-direction vectors run along M and put no
+        # requirement on the epi tile N. The stage computation below
+        # re-budgets smem. Shared scan with GemmSm120._setup_attributes.
+        _, sfd_min_n = active_row_sfd_reqs(getattr(self, "_epi_ops", ()), epilogue_args)
+        if sfd_min_n:
+            epi_tile_n = self.epi_tile[1]
+            # Only widen a contiguous N tile (an int or a trivial n:1 layout);
+            # the strided non-pow2 fixup layout can't be widened.
+            contiguous = not isinstance(epi_tile_n, cute.Layout) or (
+                cute.coalesce(epi_tile_n).stride == 1
+            )
+            if (
+                contiguous
+                and cute.size(epi_tile_n) < sfd_min_n
+                and self.cta_tile_shape_mnk[1] % sfd_min_n == 0
+            ):
+                self.epi_tile = (self.epi_tile[0], cute.make_layout(sfd_min_n))
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
@@ -750,6 +771,10 @@ class GemmSm100(GemmTmaBase):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        # Stash for epilogue ops (epi_to_underlying_arguments runs later and
+        # SFD needs the varlen mode to shape its logical scale layout).
+        self.varlen_m = varlen_m
+        self.varlen_k = varlen_k
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -2854,6 +2879,7 @@ class GemmSm100(GemmTmaBase):
                 cutlass.BFloat16,
                 cutlass.Float8E4M3FN,
                 cutlass.Float8E5M2,
+                cutlass.Float4E2M1FN,
                 Int32,
                 cutlass.Int8,
                 cutlass.Uint8,
@@ -2974,6 +3000,7 @@ class GemmSm100(GemmTmaBase):
             cutlass.BFloat16,
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
+            cutlass.Float4E2M1FN,
         }:
             is_valid = False
 

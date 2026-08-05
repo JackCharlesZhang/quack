@@ -538,7 +538,10 @@ def make_fake_gemm_tensors(
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
     c_leading = 1 if c_major == "n" else 0
-    m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    m, l = cute.sym_int(), cute.sym_int()
+    # Sub-byte (fp4) D is n-major with a statically packed contiguous extent.
+    n_div = div_for_dtype(d_dtype) if d_dtype is not None and d_dtype.width < 8 else 1
+    n = cute.sym_int(divisibility=n_div)
     a_packed_f6 = a_mma_dtype is not None and a_mma_dtype.width == 6
     b_packed_f6 = b_mma_dtype is not None and b_mma_dtype.width == 6
     # Sub-byte tensors need their contiguous extent statically divisible; sub-byte

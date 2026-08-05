@@ -50,8 +50,10 @@ from quack.epilogue.ops import (
     RowVecLoad,
     RowVecReduce,
     Scalar,
+    TileStore,
 )
 from quack.epilogue.head_rmsnorm import HeadRstd
+from quack.epilogue.quantize_out import BlockScaleFactorStore
 from quack.epilogue.rotary import rotary_cos_sin_load
 from quack.epilogue.math import pack, pexp, unpack
 from quack.epilogue.frontend import gemm_epilogue
@@ -197,6 +199,39 @@ def swiglu_mod(acc):
     postact buffer is half of GEMM-N."""
     gate, up = unpack(acc)
     return {"postact": swiglu(gate, up)}
+
+
+@functools.lru_cache(maxsize=None)
+def gated_quant_mod(activation):
+    """gemm + gated activation + QUANTIZED postact (the MoE FC1 fusion):
+    ``postact`` is fp8 e4m3 or packed fp4 values (its dtype picks
+    mxfp8/mxfp4/nvfp4 together with the SF dtype), ``postact_sf`` the blocked
+    (l?, rm, rk, 32, 4, 4) scale-factor tensor the kernel writes (rk over the
+    HALF-width postact N), and the optional ``sfd_norm_const`` scalar folds
+    1/per_tensor_scale into the SFs (nvfp4). SM100 only. SF vectors live in
+    accumulator space — one vector of ``vec`` postact values spans 2*vec acc
+    columns — see BlockScaleFactorStore(output=...)."""
+    act = gate_fn_map[activation]
+
+    @gemm_epilogue(
+        outputs=(
+            TileStore(
+                "postact",
+                gated=True,
+                quant=BlockScaleFactorStore("postact_sf", output="postact"),
+            ),
+        ),
+        extra_ops=(Scalar("sfd_norm_const"),),
+        mode="acc_pair",
+    )
+    def gated_quant_epi(acc):
+        gate, up = unpack(acc)
+        return {"postact": act(gate, up)}
+
+    return gated_quant_epi
+
+
+swiglu_quant_mod = gated_quant_mod("swiglu")
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
@@ -850,46 +885,49 @@ def ln_partial_epi(acc, c, bias, weight):
 
 
 @functools.lru_cache(maxsize=None)
-def dact_ln_stats_mod(activation):
+def dact_ln_stats_mod(activation, sinks="full"):
     """SigLIP/ViT fc2-dgrad: acc = dpostact, c = saved bf16 preact z. dz
     through act' (dact_fn_map key); D = s*dz (the boundary's sig folded so
     fc1-dgrad AND fc1-wgrad stay plain). Boundary-bwd stats: r1 = per-row sum
     dz*z (feeds dsig with the wb-dot host correction), dwb = column-sum dz
     (dbeta + linear-bias grad + rank-1 dW term), dwg = column-sum t*dz
-    (dgamma's W-path + rank-1 dW term)."""
+    (dgamma's W-path + rank-1 dW term).
+
+    ``sinks`` trades in-kernel rowvec sinks for host GEMVs off the stored D
+    (iket: the VecReduce end-loop flush is ~60% of epilogue time at K~1152;
+    every colsum is recoverable because D = s*dz is bijective per row):
+      * "full": r1 + dwb + dwg in-kernel (the original).
+      * "dwb":  r1 + dwb; host dwg = mu^T @ D with mu = t/s (one GEMV).
+      * "r1":   r1 only;  host dwb = (1/s)^T @ D, dwg = mu^T @ D — one
+        (2, m) @ (m, n) GEMM re-reading D once.
+    The dropped ``t`` colvec leaves the signature entirely (compiled out)."""
     dact = dact_fn_map[activation]
-    body = [
-        "dz, _ = dact(c, acc)",
-        'return {"D": dz * s, "r1": (dz, c), "dwb": dz, "dwg": (dz, t)}',
-    ]
+    ret = {
+        "full": 'return {"D": dz * s, "r1": (dz, c), "dwb": dz, "dwg": (dz, t)}',
+        "dwb": 'return {"D": dz * s, "r1": (dz, c), "dwb": dz}',
+        "r1": 'return {"D": dz * s, "r1": (dz, c)}',
+    }[sinks]
+    params = ["c", "s", "t"] if sinks == "full" else ["c", "s"]
+    body = ["dz, _ = dact(c, acc)", ret]
     fn = _gen_epi_fn(
-        "dact_ln_stats_epi", f"dact_ln_stats:{activation}", ["c", "s", "t"], body, {"dact": dact}
+        "dact_ln_stats_epi", f"dact_ln_stats:{activation}:{sinks}", params, body, {"dact": dact}
     )
-    return gemm_epilogue(
-        ops={"s": ColVecLoad("s"), "t": ColVecLoad("t")},
-        reduces={
-            "r1": ColVecReduce("r1", scaled=True),
-            "dwb": RowVecReduce("dwb"),
-            "dwg": RowVecReduce("dwg", scaled=True),
-        },
-    )(fn)
+    ops = {"s": ColVecLoad("s")}
+    if sinks == "full":
+        ops["t"] = ColVecLoad("t")
+    reduces = {"r1": ColVecReduce("r1", scaled=True)}
+    if sinks in ("full", "dwb"):
+        reduces["dwb"] = RowVecReduce("dwb")
+    if sinks == "full":
+        reduces["dwg"] = RowVecReduce("dwg", scaled=True)
+    return gemm_epilogue(ops=ops, reduces=reduces)(fn)
 
 
 dgelu_ln_stats_epi = dact_ln_stats_mod("gelu_tanh_approx")
 
 
-@gemm_epilogue(
-    ops={
-        "w": RowVecLoad("w"),
-        "corr_mul": ColVecLoad("corr_mul"),
-        "corr_add": ColVecLoad("corr_add"),
-    },
-    reduces={
-        "dw": RowVecReduce("dw", scaled=True),
-        "dbias": RowVecReduce("dbias"),
-    },
-)
-def ln_bwd_apply_epi(acc, c, y, w, corr_mul, corr_add):
+@functools.lru_cache(maxsize=None)
+def ln_bwd_apply_mod(sinks="full"):
     """LayerNorm-bwd apply around a dgrad GEMM (SigLIP fc1-dgrad/qkv-dgrad):
     acc = da (grad of a = h*gamma), c = residual grad, y = saved residual h.
     D = dh_total = acc*w + c + y*corr_mul + corr_add, with the two correction
@@ -897,9 +935,39 @@ def ln_bwd_apply_epi(acc, c, y, w, corr_mul, corr_add):
       dsig = (r1 - sum_j dz*wb)/sig ; dmu = -sig * sum_j dz*wg
       corr_mul = -dsig*sig^3/d ; corr_add = (dmu + dsig*sig^3*mu)/d.
     dw partials = dgamma's a-path (sum_m da*h); dbias = column-sums of the
-    OUTPUT dh (the producing linear's bias grad lives downstream)."""
-    dh = acc * w + c + y * corr_mul + corr_add
-    return {"D": dh, "dw": (acc, y), "dbias": dh}
+    OUTPUT dh (the producing linear's bias grad lives downstream).
+
+    ``sinks``: "full" = dw + dbias in-kernel; "dw" drops the dbias
+    RowVecReduce — dbias is the column-sum of the STORED D, recoverable
+    host-side (ones GEMV / fold into a downstream read of D). dw = sum_m
+    acc*y is NOT recoverable (acc unsaved)."""
+    body = [
+        "dh = acc * w + c + y * corr_mul + corr_add",
+        'return {"D": dh, "dw": (acc, y), "dbias": dh}'
+        if sinks == "full"
+        else 'return {"D": dh, "dw": (acc, y)}',
+    ]
+    fn = _gen_epi_fn(
+        "ln_bwd_apply_gen_epi",
+        f"ln_bwd_apply:{sinks}",
+        ["c", "y", "w", "corr_mul", "corr_add"],
+        body,
+        {},
+    )
+    reduces = {"dw": RowVecReduce("dw", scaled=True)}
+    if sinks == "full":
+        reduces["dbias"] = RowVecReduce("dbias")
+    return gemm_epilogue(
+        ops={
+            "w": RowVecLoad("w"),
+            "corr_mul": ColVecLoad("corr_mul"),
+            "corr_add": ColVecLoad("corr_add"),
+        },
+        reduces=reduces,
+    )(fn)
+
+
+ln_bwd_apply_epi = ln_bwd_apply_mod("full")
 
 
 @functools.lru_cache(maxsize=None)

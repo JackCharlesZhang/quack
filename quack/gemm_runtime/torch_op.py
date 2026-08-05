@@ -39,7 +39,7 @@ from typing import Optional
 import torch
 
 from quack.blockscaled.operand import BlockScaledFormat
-from quack.gemm_config import GemmConfig, default_config
+from quack.gemm_config import GemmConfig, cta_tile_shape_m, default_config
 from quack.gemm_runtime.identity import (
     TORCH_OP_EPI_MODS as _EPI_REGISTRY,
     TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
@@ -164,8 +164,11 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     if m["sink_names"]:
         cfg, lead = m["config"], mod._lead_shape(A, cu, A_idx)
         n = B.shape[-1] if n_ov is None else n_ov
+        cta_tile_m = cta_tile_shape_m(
+            cfg["tile_m"], cfg["cluster_m"], cfg["device_capacity"], named.get("SFA") is not None
+        )
         for name in m["sink_names"]:
-            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg["tile_m"], cfg["tile_n"])
+            shape = mod.sinks[name].sink_alloc_shape(lead, n, cta_tile_m, cfg["tile_n"])
             outs.append(torch.empty(shape, dtype=torch.float32, device=A.device))
     return outs
 
@@ -283,8 +286,11 @@ def compile_call(
         lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
         n = B.shape[-1] if n_override is None else n_override
         partials = {}
+        cta_tile_m = cta_tile_shape_m(
+            cfg.tile_m, cfg.cluster_m, cfg.device_capacity, SFA is not None
+        )
         for name in sink_names:
-            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg.tile_m, cfg.tile_n)
+            shape = mod.sinks[name].sink_alloc_shape(lead, n, cta_tile_m, cfg.tile_n)
             partials[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
         outs = []
         if store_d:

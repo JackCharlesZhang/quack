@@ -907,18 +907,18 @@ def test_fp6_k_granule_rejected():
 
 
 def test_blockscaled_out_dtype_reserved():
-    """out_dtype accepting a BlockScaledFormat (blockscaled D output) is a
-    reserved API: it validates the format and raises pointing at the
-    SF-generation epilogue milestone."""
+    """out_dtype accepting a BlockScaledFormat (blockscaled D output) is shipped
+    for `gemm` (returns a BlockScaledOperand, tested in test_gemm_quant_out.py);
+    the other entry points still reserve it, and unknown format names raise."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
     from quack.blockscaled.operand import MXFP8_E4M3
 
     for out_dtype in (MXFP8_E4M3, "mxfp8_e4m3"):
-        with pytest.raises(NotImplementedError, match="SF-generation"):
-            gemm(A, B, out_dtype=out_dtype, tuned=False)
-    with pytest.raises(NotImplementedError, match="SF-generation"):
+        res = gemm(A, B, out_dtype=out_dtype, tuned=False)
+        assert isinstance(res, BlockScaledOperand) and res.format.name == "mxfp8_e4m3"
+    with pytest.raises(NotImplementedError, match="only supported by quack.gemm"):
         gemm_act(A, B, activation="relu", postact_dtype="mxfp8_e4m3", tuned=False)
     with pytest.raises(ValueError, match="unknown blockscaled format"):
         gemm(A, B, out_dtype="fp8", tuned=False)
