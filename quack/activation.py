@@ -248,6 +248,106 @@ def dgelu_tanh_approx(
 
 
 @dsl_user_op
+def gelu_erf(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    """Exact GELU (torch approximate='none', timm/torchvision ViT default):
+    gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+    inv_sqrt_2 = 1.0 / math.sqrt(2.0)
+    if const_expr(not isinstance(x, tuple)):
+        u = cute.math.erf(x * inv_sqrt_2, fastmath=True, loc=loc, ip=ip)
+        return 0.5 * (x * u + x)
+    else:
+        x_scaled = cute.arch.mul_packed_f32x2(x, (inv_sqrt_2, inv_sqrt_2))
+        u = (
+            cute.math.erf(x_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.erf(x_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        x_u_plus_x = cute.arch.fma_packed_f32x2(u, x, x)
+        return cute.arch.mul_packed_f32x2((0.5, 0.5), x_u_plus_x)
+
+
+@dsl_user_op
+def dgelu_erf(
+    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    """Exact-GELU backward: computes gradient w.r.t. x and recomputes forward.
+    d/dx[gelu(x)] = Phi(x) + x * phi(x), with Phi(x) = 0.5 * (1 + erf(x/sqrt(2)))
+    (the standard normal CDF) and phi(x) = exp(-x^2/2) / sqrt(2*pi) (the PDF).
+    Returns: (dx, gelu_out)
+    """
+    inv_sqrt_2 = 1.0 / math.sqrt(2.0)
+    inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
+    neg_half_log2_e = -0.5 * math.log2(math.e)  # exp(-x^2/2) = exp2(x^2 * this)
+    if const_expr(not isinstance(x, tuple)):
+        u = cute.math.erf(x * inv_sqrt_2, fastmath=True, loc=loc, ip=ip)
+        cdf = 0.5 + 0.5 * u
+        gelu_out = x * cdf
+        pdf_exp = cute.math.exp2(x * x * neg_half_log2_e, fastmath=True, loc=loc, ip=ip)
+        dgelu = x * (inv_sqrt_2pi * pdf_exp) + cdf
+        dx = dout * dgelu
+        return dx, gelu_out
+    else:
+        x_scaled = cute.arch.mul_packed_f32x2(x, (inv_sqrt_2, inv_sqrt_2))
+        u = (
+            cute.math.erf(x_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.erf(x_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        cdf = cute.arch.fma_packed_f32x2(u, (0.5, 0.5), (0.5, 0.5))
+        gelu_out = cute.arch.mul_packed_f32x2(x, cdf)
+        x_sq_scaled = cute.arch.mul_packed_f32x2(
+            cute.arch.mul_packed_f32x2(x, x), (neg_half_log2_e, neg_half_log2_e)
+        )
+        pdf_exp = (
+            cute.math.exp2(x_sq_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.exp2(x_sq_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        x_pdf = cute.arch.mul_packed_f32x2(
+            cute.arch.mul_packed_f32x2(x, (inv_sqrt_2pi, inv_sqrt_2pi)), pdf_exp
+        )
+        dgelu = cute.arch.add_packed_f32x2(x_pdf, cdf)
+        dx = cute.arch.mul_packed_f32x2(dout, dgelu)
+        return dx, gelu_out
+
+
+@dsl_user_op
+def quick_gelu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    """QuickGELU (CLIP lineage): x * sigmoid(1.702 * x)."""
+    alpha = 1.702
+    if const_expr(not isinstance(x, tuple)):
+        return x * sigmoid(alpha * x, loc=loc, ip=ip)
+    else:
+        s = sigmoid(cute.arch.mul_packed_f32x2(x, (alpha, alpha)), loc=loc, ip=ip)
+        return cute.arch.mul_packed_f32x2(x, s)
+
+
+@dsl_user_op
+def dquick_gelu(
+    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    """QuickGELU backward: computes gradient w.r.t. x and recomputes forward.
+    With s = sigmoid(1.702 * x) and out = x * s:
+    d/dx = s + 1.702 * x * s * (1 - s) = s + 1.702 * out * (1 - s)
+    Returns: (dx, out)
+    """
+    alpha = 1.702
+    if const_expr(not isinstance(x, tuple)):
+        s = sigmoid(alpha * x, loc=loc, ip=ip)
+        out = x * s
+        dgelu = alpha * (out * (1.0 - s)) + s
+        dx = dout * dgelu
+        return dx, out
+    else:
+        s = sigmoid(cute.arch.mul_packed_f32x2(x, (alpha, alpha)), loc=loc, ip=ip)
+        out = cute.arch.mul_packed_f32x2(x, s)
+        one_minus_s = sub_packed_f32x2((1.0, 1.0), s)
+        dgelu = cute.arch.fma_packed_f32x2(
+            cute.arch.mul_packed_f32x2(out, one_minus_s), (alpha, alpha), s
+        )
+        dx = cute.arch.mul_packed_f32x2(dout, dgelu)
+        return dx, out
+
+
+@dsl_user_op
 @cute.jit
 def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
@@ -895,6 +995,8 @@ act_fn_map = {
     "relu": relu,
     "relu_sq": relu_sq,
     "gelu_tanh_approx": gelu_tanh_approx,
+    "gelu_erf": gelu_erf,
+    "quick_gelu": quick_gelu,
     "tanh": tanh,
 }
 
@@ -905,6 +1007,8 @@ dact_fn_map = {
     "relu": drelu,
     "relu_sq": drelu_sq,
     "gelu_tanh_approx": dgelu_tanh_approx,
+    "gelu_erf": dgelu_erf,
+    "quick_gelu": dquick_gelu,
     "tanh": dtanh,
 }
 
