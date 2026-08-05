@@ -21,7 +21,7 @@ def resolve_blockscaled_formats(bs_format_a, bs_format_b):
     """Resolve a blockscaled GEMM's per-operand format names into descriptors,
     checking presence and hardware pair legality. Single owner of this step for
     both the gemm_interface path and direct kernel-layer callers
-    (quack.gemm.gemm / quack.gemm_act.gemm_act)."""
+    (quack.gemm.gemm / epilogue-mod .gemm)."""
     if bs_format_a is None or bs_format_b is None:
         raise ValueError(
             "blockscaled GEMM requires bs_format_a and bs_format_b (BlockScaledFormat "

@@ -325,7 +325,7 @@ def _build_gemm_symmetric_plan(
     )
     batched = A.ndim == 3
     if not batched:
-        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        # Dense 2D (unbatched) operands: trace-time batch append, see quack.gemm.
         # No b_kn here — symmetric B is operand-shaped (m, k) like A, never (K, N).
         assert B.ndim == 2 and D.ndim == 2 and (C is None or C.ndim == 2), (
             "2D (unbatched) A requires 2D B, D, and C"

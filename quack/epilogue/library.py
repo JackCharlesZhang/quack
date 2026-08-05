@@ -415,10 +415,10 @@ def rms_bwd_entry_epi(acc, c, y, rstd, w):
 
 
 # --- Variant mod factories ----------------------------------------------------
-# The public gemm_act / gemm_dact / gemm_norm_act / gemm_sq_reduce wrappers
-# ride these. The operand names (mAuxOut, mRowVecBroadcast, mColVecBroadcast,
-# mColVecReduce, sr_seed) are the wire names shared with run_*_plan epi_values
-# and concat_layout keys.
+# The gemm_interface entry points (gemm_act / gemm_dact / gemm_norm_act /
+# gemm_rms) ride these. The operand names (mAuxOut, mRowVecBroadcast,
+# mColVecBroadcast, mColVecReduce, sr_seed) are the wire names shared with
+# run_gemm_epi_plan epi_values and concat_layout keys.
 #
 # The frontend derives a fn's operands from its SIGNATURE, and an absent
 # operand must not exist in the signature at all (that is what compiles the
@@ -601,7 +601,7 @@ def dgated_mod(activation, *, has_scale, has_reduce):
 
 @functools.lru_cache(maxsize=None)
 def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
-    """gemm_sq_reduce as a mod: x = acc (+ C); reduce[m] += sum_n x^2 (before
+    """gemm_rms's sq-reduce as a mod: x = acc (+ C); reduce[m] += sum_n x^2 (before
     the rowvec scale); optional aux = x; D = x * rowvec."""
     params, body = [], []
     if has_c:

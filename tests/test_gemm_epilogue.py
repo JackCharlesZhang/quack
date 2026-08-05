@@ -14,10 +14,13 @@ import pickle
 import torch
 import cutlass.cute as cute
 from cutlass import Float32, Int32
-from quack.gemm_act import gemm_act
-from quack.gemm_dact import gemm_dact
-from quack.gemm_norm_act import gemm_norm_act_fn
-from quack.gemm_sq_reduce import gemm_sq_reduce
+from quack.epilogue.library import (
+    dact_mod,
+    dgated_mod,
+    linear_act_mod,
+    norm_act_mod,
+    sq_reduce_mod,
+)
 from quack.epilogue.head_rmsnorm import HeadRstd  # noqa: F401
 from quack.epilogue.scaled_exp import LOG2E, scaled_exp_epi
 from quack.epilogue.rotary import (
@@ -221,20 +224,18 @@ def test_epi_mod_norm_gelu(batched):
     if batched:
         D2 = torch.empty_like(D)
         postact2 = torch.empty_like(postact)
-        gemm_norm_act_fn(
+        norm_act_mod(
+            "gelu_tanh_approx", gated=False, has_c=False, has_rowvec=True, has_colvec=True
+        ).gemm(
             A,
             B,
             D2,
             None,
-            postact2,
-            None,
-            "gelu_tanh_approx",
-            128,
-            256,
-            2,
-            1,
-            rowvec=weight,
-            colvec=rstd,
+            epi_args=dict(mAuxOut=postact2, mRowVecBroadcast=weight, mColVecBroadcast=rstd),
+            tile_M=128,
+            tile_N=256,
+            cluster_M=2,
+            cluster_N=1,
         )
         _rel_check(D, D2.float(), "D vs handwritten", tol=1e-3)
         _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
@@ -498,19 +499,16 @@ def test_epi_mod_dact():
 
     dx2 = torch.empty_like(dx)
     postact2 = torch.empty_like(postact)
-    gemm_dact(
+    dact_mod("gelu_tanh_approx").gemm(
         dout,
         W,
         dx2,
         preact,
-        postact2,
-        None,
-        "gelu_tanh_approx",
-        128,
-        256,
-        2,
-        1,
-        pingpong=False,
+        epi_args=dict(mAuxOut=postact2),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
     )
     _rel_check(dx, dx2.float(), "dx vs handwritten", tol=1e-3)
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
@@ -554,19 +552,16 @@ def test_epi_mod_rms_fused(tile_N):
     D2 = torch.empty_like(D)
     premult2 = torch.empty_like(premult)
     sqsum2 = torch.empty_like(sqsum)
-    gemm_sq_reduce(
+    sq_reduce_mod(has_c=False, has_rowvec=True, has_aux=True).gemm(
         A,
         B,
         D2,
         None,
-        sqsum2,
-        None,
-        tile_M,
-        tile_N,
-        cluster_M,
-        cluster_N,
-        rowvec=weight,
-        aux_out=premult2,
+        epi_args=dict(mColVecReduce=sqsum2, mRowVecBroadcast=weight, mAuxOut=premult2),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=cluster_M,
+        cluster_N=cluster_N,
     )
     _rel_check(D, D2.float(), "D vs handwritten", tol=1e-3)
     _rel_check(premult, premult2.float(), "premult vs handwritten", tol=1e-3)
@@ -602,7 +597,17 @@ def test_epi_mod_gated_swiglu():
     _rel_check(postact, ref, "postact")
 
     postact2 = torch.empty_like(postact)
-    gemm_act(A, B, None, None, postact2, None, "swiglu", 128, 256, 1, 1)
+    linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False).gemm(
+        A,
+        B,
+        None,
+        None,
+        epi_args=dict(mAuxOut=postact2),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
 
 
@@ -676,19 +681,16 @@ def test_epi_mod_dgated():
 
     out_hand = torch.empty_like(preact)
     postact_hand = torch.empty_like(postact)
-    gemm_dact(
+    dgated_mod("swiglu", has_scale=False, has_reduce=False).gemm(
         dout_in,
         W,
         out_hand,
         preact,
-        postact_hand,
-        None,
-        "swiglu",
-        128,
-        256,
-        1,
-        1,
-        pingpong=False,
+        epi_args=dict(mAuxOut=postact_hand),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
     )
     _rel_check(out_mod.float(), out_hand.float(), "D vs handwritten", tol=1e-3)
     _rel_check(postact, postact_hand.float(), "postact vs handwritten", tol=1e-3)
@@ -737,21 +739,16 @@ def test_epi_mod_dgated_norm_reduce(tile_N):
     out_hand = torch.empty_like(preact)
     postact_hand = torch.empty_like(postact)
     dsum_hand = torch.empty_like(dsum)
-    gemm_dact(
+    dgated_mod("swiglu", has_scale=True, has_reduce=True).gemm(
         dout_in,
         W,
         out_hand,
         preact,
-        postact_hand,
-        None,
-        "swiglu",
-        tile_M,
-        tile_N,
-        1,
-        1,
-        pingpong=False,
-        colvec_scale=rstd,
-        colvec_reduce=dsum_hand,
+        epi_args=dict(mAuxOut=postact_hand, mColVecBroadcast=rstd, mColVecReduce=dsum_hand),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
     )
     _rel_check(out_mod.float(), out_hand.float(), "D vs handwritten", tol=1e-3)
     _rel_check(postact, postact_hand.float(), "postact vs handwritten", tol=1e-3)

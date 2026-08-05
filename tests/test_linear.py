@@ -920,7 +920,7 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
 def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
     """Regression test for https://github.com/Dao-AILab/quack/issues/135:
 
-    Passing both colvec (rstd) and rowvec (norm_weight) to gemm_norm_act_fn
+    Passing both colvec (rstd) and rowvec (norm_weight) to norm_act_mod
     produced corrupted output for tile shapes where the vec smem region was
     smaller than the tiled cp_async partition tile. cp_async with pred=False
     zero-fills the destination instead of skipping the write, which corrupted
@@ -929,7 +929,7 @@ def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
     device = "cuda"
     if get_device_capacity(torch.device(device))[0] != 9:
         pytest.skip("This regression test targets SM90.")
-    from quack.gemm_norm_act import gemm_norm_act_fn
+    from quack.epilogue.library import norm_act_mod
 
     torch.manual_seed(0)
     A = torch.randn(1, M, K, device=device, dtype=input_dtype)
@@ -940,20 +940,16 @@ def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
         input_dtype
     )
     out = torch.empty(1, M, N, dtype=input_dtype, device=device)
-    gemm_norm_act_fn(
+    norm_act_mod(None, gated=False, has_c=False, has_rowvec=True, has_colvec=True).gemm(
         A,
         B,
-        D=None,
-        C=None,
-        PostAct=out,
-        tile_count_semaphore=None,
-        activation=None,
+        None,
+        None,
+        epi_args=dict(mAuxOut=out, mRowVecBroadcast=rowvec, mColVecBroadcast=colvec),
         tile_M=tile_M,
         tile_N=tile_N,
         cluster_M=1,
         cluster_N=1,
-        colvec=colvec,
-        rowvec=rowvec,
     )
     # Bf16 dot-product noise tolerance: pre-fix this same test saw absolute
     # errors of >1e3 because some output tiles were entirely zeroed out.

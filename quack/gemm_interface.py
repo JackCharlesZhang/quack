@@ -671,7 +671,8 @@ def _gemm_execute(
 # quack.epilogue.library.linear_act_mod owns canonicalization, plan caching, and
 # tuning (incl. varlen/gather, blockscaled, concat_layout, and swap-at-trace
 # for the element-mode forms; the gated config space never had swap_ab).
-# SR (rounding_mode/sr_seed) stays on the raw dispatch (quack.gemm_act).
+# SR (rounding_mode/sr_seed) is not exposed here; call
+# linear_act_mod(..., sr=True).gemm(rounding_mode=...) directly.
 
 
 def _gemm_act_call(
