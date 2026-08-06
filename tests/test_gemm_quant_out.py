@@ -18,11 +18,20 @@ import torch
 from quack.gemm_interface import gemm
 from quack.blockscaled import BlockScaledFormat, BlockScaledOperand
 from quack.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
-from quack.cute_dsl_utils import get_device_capacity
+from quack.cute_dsl_utils import get_compile_target_capacity, get_device_capacity
 
 
 if get_device_capacity()[0] not in (10, 11, 12):
     pytest.skip(reason="Quantized-output GEMM requires SM100/SM110/SM120", allow_module_level=True)
+
+# Dispatch arch (QUACK_ARCH) is not enough: the SFD epilogue's f32->e8m0 and
+# f32->e2m1 cvts have no pre-SM100 encoding, so the H100 proxy legs
+# (QUACK_ARCH=120 compiled for sm_90a) fail in NVVM, not at dispatch.
+if get_compile_target_capacity()[0] < 10:
+    pytest.skip(
+        reason="Quantized-output cvts (f32->e8m0/e2m1) need an sm_100+/sm_120+ compile target",
+        allow_module_level=True,
+    )
 
 # SM120 (SM90-style register epilogue): full parity — both directions and
 # aux-target (minted-mod postact) quantization run.
