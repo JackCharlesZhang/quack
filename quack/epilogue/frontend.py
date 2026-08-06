@@ -975,11 +975,24 @@ class EpiMod:
                     varlen_m=varlen_m,
                     epi_args=epi_args,
                 )
+            if varlen_m and getattr(op, "dim", 0) == 1 and getattr(op, "combine", "add") != "add":
+                # Zero-filled OOB rows (the varlen ragged-load contract) are
+                # the identity for add only; a segment-max finalize would also
+                # break graph-safety.
+                raise ValueError(
+                    f"sink '{sink_name}': combine={op.combine!r} M-fold reduces are not "
+                    "supported under varlen_m"
+                )
             alloc = getattr(op, "sink_alloc_shape", None)
             if alloc is not None:
                 lead_k = (m,) if varlen_m or batch is None else (batch, m)
+                num_seqs_k = (
+                    cu_seqlens_m.shape[0] - 1 if varlen_m and getattr(op, "dim", 0) == 1 else None
+                )
                 _require_shape(
-                    sink_name, epi_args[sink_name], alloc(lead_k, n_gemm, cta_tile_M, tile_N)
+                    sink_name,
+                    epi_args[sink_name],
+                    alloc(lead_k, n_gemm, cta_tile_M, tile_N, num_seqs=num_seqs_k),
                 )
             if getattr(op, "check_oob", True) is False:
                 # The reduce dim must be tile-divisible: dim 0 (colvec) reduces
@@ -1173,10 +1186,11 @@ class EpiMod:
                 out[name] = torch.empty((*lead, n_store), dtype=dt, device=A.device)
         return out
 
-    def _alloc_sinks(self, epi_args, lead, n, config, device, blockscaled=False):
+    def _alloc_sinks(self, epi_args, lead, n, config, device, blockscaled=False, num_seqs=None):
         """Reduce partials are config-shaped scratch, not outputs: allocated
         per call (stream-safe, graph-pool friendly). A caller-provided buffer
-        (same name in operands) is used as-is and returned raw."""
+        (same name in operands) is used as-is and returned raw. ``num_seqs``
+        (varlen_m only): dim==1 partials are per-sequence tile-prefix rows."""
         import torch
 
         bufs = {}
@@ -1189,9 +1203,29 @@ class EpiMod:
             cta_tile_m = cta_tile_shape_m(
                 config.tile_m, config.cluster_m, config.device_capacity, blockscaled
             )
-            shape = op.sink_alloc_shape(lead, n, cta_tile_m, config.tile_n)
+            shape = op.sink_alloc_shape(
+                lead,
+                n,
+                cta_tile_m,
+                config.tile_n,
+                num_seqs=num_seqs if getattr(op, "dim", 0) == 1 else None,
+            )
             bufs[name] = epi_args[name] = torch.empty(shape, dtype=torch.float32, device=device)
         return bufs
+
+    def _finalize_sink(self, name, buf, cu_seqlens_m, plan):
+        """Fold a sink's partial buffer to the user-visible value. Under
+        varlen_m, M-fold (dim==1) sinks use per-sequence segment finalization
+        (rows grouped by the cu_tiles_m prefix, -> (num_seqs, n)); everything
+        else keeps the op's plain host_finalize."""
+        op = self.sinks[name]
+        tile_m = getattr(plan, "cu_tiles_tile_m", None)
+        if cu_seqlens_m is not None and tile_m is not None:
+            finalize_varlen = getattr(op, "host_finalize_varlen", None)
+            if finalize_varlen is not None:
+                return finalize_varlen(buf, cu_seqlens_m, tile_m)
+        finalize = getattr(op, "host_finalize", None)
+        return finalize(buf) if finalize is not None else buf
 
     def _iface_execute(self, config, dynamic_scheduler, ctx, _launch=True):
         import torch
@@ -1202,8 +1236,15 @@ class EpiMod:
         for name in self.outputs:
             epi_args[name] = ctx["out"][name]
         blockscaled = ctx.get("SFA") is not None
+        cu_seqlens_m_ctx = ctx.get("cu_seqlens_m")
         sink_bufs = self._alloc_sinks(
-            epi_args, ctx["lead"], ctx["n"], config, A.device, blockscaled
+            epi_args,
+            ctx["lead"],
+            ctx["n"],
+            config,
+            A.device,
+            blockscaled,
+            num_seqs=None if cu_seqlens_m_ctx is None else cu_seqlens_m_ctx.shape[0] - 1,
         )
         semaphore = (
             torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -1447,8 +1488,7 @@ class EpiMod:
                 )
                 result = dict(outs) if store_d else {kk: v for kk, v in outs.items() if kk != "D"}
                 for name, buf in sink_bufs.items():
-                    finalize = getattr(self.sinks[name], "host_finalize", None)
-                    result[name] = finalize(buf) if finalize is not None else buf
+                    result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan)
                 return result
 
         varlen_m = cu_seqlens_m is not None
@@ -1482,11 +1522,14 @@ class EpiMod:
                 # sink_arg_shapes walks the full config space — cache the
                 # worst-case shapes per metadata (it's on the warm path).
                 l = lead[0] if len(lead) == 2 else None
-                shape_key = (lead[-1], n, l, str(A.device))
+                num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
+                shape_key = (lead[-1], n, l, str(A.device), num_seqs)
                 cache = self.__dict__.setdefault("_sink_shape_cache", {})
                 shapes = cache.get(shape_key)
                 if shapes is None:
-                    shapes = sink_arg_shapes(self, lead[-1], n, l=l, device=A.device)
+                    shapes = sink_arg_shapes(
+                        self, lead[-1], n, l=l, device=A.device, num_seqs=num_seqs
+                    )
                     cache[shape_key] = shapes
                 for name, shape in shapes.items():
                     if epi_args.get(name) is None:
@@ -1575,8 +1618,7 @@ class EpiMod:
             )
         result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
         for name, buf in sink_bufs.items():
-            finalize = getattr(self.sinks[name], "host_finalize", None)
-            result[name] = finalize(buf) if finalize is not None else buf
+            result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan_used)
         return result
 
     def plan(

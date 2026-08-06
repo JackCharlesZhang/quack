@@ -1495,16 +1495,24 @@ class VecReduce(EpiOp):
     def config_key(self):
         return (self.combine, self.scaled, self.check_oob)
 
-    def sink_alloc_shape(self, lead, n, tile_m, tile_n):
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n, num_seqs=None):
         """Buffer shape for a (lead=(batch?, m) or (total_m,), n) problem at
         (tile_m, tile_n): per-CTA-tile partials along the reduce dim. THE
         single statement of the sink tiling rule — validation (EpiMod.gemm),
         eager allocation (_alloc_sinks), the torch-op fakes, and the autotune
         worst-case/slicing all call this. ``tile_m`` is the PER-CTA M tile
         (``cta_tile_shape_m``: half the config tile under the SM100 2-CTA
-        MMA) — the kernel indexes partial slots by the per-CTA tile coord."""
+        MMA) — the kernel indexes partial slots by the per-CTA tile coord.
+
+        ``num_seqs`` (varlen_m only, dim==1): partial rows are per-sequence
+        tile-prefix slots — sum(ceil(len_b / tile_m)) is bounded by
+        total_m // tile_m + num_seqs (the host can't see device seqlens);
+        rows past the live prefix are never read by the cu_tiles-segment
+        finalize (host_finalize_varlen)."""
         if self.dim == 0:
             return (*lead, -(-n // tile_n))
+        if num_seqs is not None:
+            return (lead[-1] // tile_m + num_seqs, n)
         return (*lead[:-1], -(-lead[-1] // tile_m), n)
 
     def host_finalize(self, partials):
@@ -1870,11 +1878,32 @@ class RowVecReduce(VecReduce):
     then reduces across M lanes/warps and writes to gmem per completed N stripe.
 
     Output shape is (L, ceildiv(M, tile_M), N): one partial sum per CTA-M tile per
-    N column. This mirrors ColVecReduce with M/N swapped.
+    N column. This mirrors ColVecReduce with M/N swapped. Under varlen_m the
+    partial rows are per-sequence tile-prefix slots (see sink_alloc_shape's
+    num_seqs form and host_finalize_varlen).
     """
 
     dim = 1
     epi_m_major_preference = 4
+
+    def host_finalize_varlen(self, partials, cu_seqlens_m, tile_m_cta):
+        """Per-sequence fold of a varlen partial buffer into (num_seqs, n).
+
+        Rows are grouped by the cu_tiles_m prefix (sequence b owns rows
+        [cu_tiles[b], cu_tiles[b+1])); rows past the prefix total (the buffer
+        is an upper bound) are never read. Device-only ops, graph-safe.
+        Non-add combines are rejected under varlen at plan time (zero-filled
+        OOB rows are not a max identity, and a segment-max is not graph-safe),
+        so only the add fold appears here.
+        """
+        import torch
+
+        assert self.combine == "add"
+        seqlens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
+        tiles = torch.div(seqlens + (tile_m_cta - 1), tile_m_cta, rounding_mode="floor").long()
+        cu_tiles = torch.cat([tiles.new_zeros(1), tiles.cumsum(0)])
+        csum = torch.cat([partials.new_zeros((1, partials.shape[-1])), partials.cumsum(0)])
+        return csum[cu_tiles[1:]] - csum[cu_tiles[:-1]]
 
     @cute.jit
     def end_loop_stage(
@@ -2047,11 +2076,21 @@ class RowVecReduce(VecReduce):
         # Write to gmem
         tile_N = gemm.cta_tile_shape_mnk[1]
         batch_idx = tile_coord_mnkl[3]
-        limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
         if const_expr(not varlen_manager.varlen_m):
+            limit_m_tiles = param.shape[1]
             mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
         else:
-            mRowVec = param[tile_coord_mnkl[0], None]
+            # The scheduler's m-tile index is sequence-local: offset by the
+            # per-sequence tile prefix (cu_tiles_m) so sequences' partial rows
+            # stay disjoint, and bound by this sequence's own tile count. The
+            # host sizes the buffer as total_m // tile_M_cta + num_seqs (upper
+            # bound on the prefix total) and finalizes per cu_tiles_m segment.
+            assert varlen_manager.params.cu_tiles_m is not None, (
+                "varlen_m RowVecReduce requires the cu_tiles_m prefix (host passes it "
+                "whenever an M-fold sink is active)"
+            )
+            limit_m_tiles = varlen_manager.len_m_tiles(batch_idx)
+            mRowVec = param[varlen_manager.tile_m_offset(batch_idx) + tile_coord_mnkl[0], None]
         gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
         limit_n = min(
             cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
@@ -2881,7 +2920,7 @@ class ColVecSelect(EpiOp):
     def to_params(self, gemm, args):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
-    def sink_alloc_shape(self, lead, n, tile_m, tile_n):
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n, num_seqs=None):
         # Full colvec, not per-tile partials: config-independent (tiles
         # ignored), and there is no host_finalize — the buffer IS the result.
         return tuple(lead)

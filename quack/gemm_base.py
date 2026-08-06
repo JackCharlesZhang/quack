@@ -1051,6 +1051,20 @@ class GemmTmaBase(GemmBase):
         )
         return cute.make_tiled_copy_tv(atom_async_copy, thread_layout, value_layout)
 
+    def epilogue_zero_fill_varlen_m(self, epilogue_args):
+        """True when an active M-fold (dim==1) reduce sink demands zero-filled
+        OOB rows from every varlen_m TMA load (A, C): the fold across a tile's
+        M rows is unpredicated, so rows past a sequence end must read as zero
+        (identity for add), not as the next sequence's data. Without such a
+        sink, garbage rows die at the (predicated) stores and the loads keep
+        their plain 2-D descriptors."""
+        return any(
+            getattr(op, "fn_port", None) == "sink"
+            and getattr(op, "dim", None) == 1
+            and getattr(epilogue_args, op.name, None) is not None
+            for op in getattr(self, "_epi_ops", ())
+        )
+
     def make_tma_load_atoms_and_tensors(
         self,
         mA: cute.Tensor,
@@ -1060,13 +1074,21 @@ class GemmTmaBase(GemmBase):
         varlen_k: bool,
         a_internal_type: Optional[Type[cutlass.Numeric]] = None,
         b_internal_type: Optional[Type[cutlass.Numeric]] = None,
+        varlen_m_zero_fill: bool = False,
     ):
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
+            if const_expr(varlen_m_zero_fill):
+                # varlen_m + M-fold sink: zero-fill rows past the sequence end
+                # (see epilogue_zero_fill_varlen_m). 2-extra-dim wraparound —
+                # ptr_shift is store-only.
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=0, ptr_shift=False)
+            elif const_expr(varlen_k):
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1)
+            else:
+                mA_tma = mA
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-                copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1)
-                if varlen_k and not self.gather_A
-                else mA,
+                mA_tma,
                 a_smem_layout,
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
@@ -1106,8 +1128,15 @@ class GemmTmaBase(GemmBase):
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
+            # Same zero-fill contract as A: with an active M-fold sink, C rows
+            # past a sequence end must load as zero, not the next sequence's.
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, self.epi_tile, op_type="load"
+                copy_utils.create_ragged_tensor_for_tma(mC, ragged_dim=0, ptr_shift=False)
+                if varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)
+                else mC,
+                self.epi_c_smem_layout_staged,
+                self.epi_tile,
+                op_type="load",
             )
         return (
             tma_atom_d,

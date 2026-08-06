@@ -670,6 +670,7 @@ class GemmSm90(GemmTmaBase):
                     varlen_k,
                     a_internal_type=self.a_tma_internal_dtype,
                     b_internal_type=self.b_tma_internal_dtype,
+                    varlen_m_zero_fill=varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args),
                 )
             )
         else:

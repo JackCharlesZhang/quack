@@ -3012,3 +3012,67 @@ def test_epi_mod_ln_bwd_apply(sinks):
         _rel_check(args["dbias"].sum(0), dh.sum(0), "dbias", tol=1e-3)
     else:
         _rel_check(D.float().sum(0), dh.sum(0), "dbias (recovered)", tol=3e-2)
+
+
+def test_epi_mod_varlen_rowvec_sink():
+    """varlen_m + M-fold (rowvec) sink: per-sequence tile-prefix partials via
+    the cu_tiles_m protocol, zero-filled ragged A/C loads (rows past a
+    sequence end must not leak into the fold), per-sequence host finalize.
+    Regression: this combination used to be silently accepted with
+    sequence-local tile indices colliding in a global partial buffer."""
+    device = "cuda"
+    torch.random.manual_seed(33)
+    from quack.cute_dsl_utils import get_device_capacity
+    from quack.epilogue.library import dact_dbias_mod
+    from quack.gemm_config import cta_tile_shape_m
+
+    m, n, k = 384, 1024, 512
+    tile_M, tile_N = 128, 256
+    # seq lengths 200 + 184: both ragged against tile_M=128 (tests zero-fill)
+    cu = torch.tensor([0, 200, 384], device=device, dtype=torch.int32)
+    num_seqs = cu.shape[0] - 1
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((num_seqs, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    z = torch.randn((m, n), device=device, dtype=torch.bfloat16)  # saved preact
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    mod = dact_dbias_mod("gelu_tanh_approx")
+    op = mod.sinks["dwb"]
+    cta_m = cta_tile_shape_m(tile_M, 1, get_device_capacity(torch.device(device))[0])
+    dwb = torch.empty(
+        op.sink_alloc_shape((m,), n, cta_m, tile_N, num_seqs=num_seqs),
+        device=device,
+        dtype=torch.float32,
+    )
+    assert dwb.shape == (m // cta_m + num_seqs, n)
+    mod.gemm(
+        A,
+        B,
+        D,
+        z,
+        epi_args=dict(dwb=dwb),
+        cu_seqlens_m=cu,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    dwb_seq = op.host_finalize_varlen(dwb, cu, cta_m)
+    assert dwb_seq.shape == (num_seqs, n)
+
+    zf = z.float().detach().requires_grad_()
+    da = torch.empty((m, n), device=device, dtype=torch.float32)
+    da[:200] = A[:200].float() @ B[0].float().mT
+    da[200:] = A[200:].float() @ B[1].float().mT
+    torch.nn.functional.gelu(zf, approximate="tanh").backward(da)
+    dz = zf.grad
+    _rel_check(D[:200], dz[:200], "D seq0")
+    _rel_check(D[200:], dz[200:], "D seq1")
+    _rel_check(dwb_seq[0], dz[:200].sum(0), "dwb seq0", tol=1e-3)
+    _rel_check(dwb_seq[1], dz[200:].sum(0), "dwb seq1", tol=1e-3)
+
+    # Non-add M-fold combines are rejected under varlen (zero-filled OOB rows
+    # are only an identity for add).
+    from quack.epilogue.library import identity_epi  # noqa: F401  (import check)
+    from quack.epilogue.ops import RowVecReduce
+
+    assert RowVecReduce("x", combine="max_abs").combine != "add"

@@ -821,11 +821,21 @@ class GemmSm100(GemmTmaBase):
             )
         )
         if const_expr(not self.gather_A):
+            # varlen_m + an active M-fold reduce sink: rag A (2-extra-dim
+            # wraparound; loads can't ptr_shift) so rows past the sequence end
+            # zero-fill instead of reading the next sequence — restores the
+            # "OOB accumulator lanes are zero" invariant that the unpredicated
+            # M-fold relies on. Without such a sink, garbage rows are masked at
+            # every store, so plain domain_offset keeps the descriptor 2-D.
+            if const_expr(varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)):
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=0, ptr_shift=False)
+            elif const_expr(varlen_k):
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
+            else:
+                mA_tma = mA
             tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
                 a_op,
-                copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
-                if varlen_k and not self.gather_A
-                else mA,
+                mA_tma,
                 a_smem_layout,
                 self.mma_tiler,
                 self.tiled_mma,

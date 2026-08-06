@@ -109,10 +109,11 @@ def _sink_slice(buf, shape):
     return buf[tuple(slice(0, s) for s in shape)]
 
 
-def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
+def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda", num_seqs=None):
     """Worst-case (over the tuning sweep) buffer shapes for the mod's reduce
     sinks, keyed by sink name. Allocate these f32 and pass them in epi_args;
-    the tuner slices per config and TunedModGemm.sinks returns the live view."""
+    the tuner slices per config and TunedModGemm.sinks returns the live view.
+    ``num_seqs`` (varlen_m): dim==1 sinks size per-sequence tile-prefix rows."""
     cfgs = _config_space(mod, torch.device(device))
     min_tile_n = min(c.tile_n for c in cfgs)
     # blockscaled=False halves whenever the config could run 2-CTA — the
@@ -126,11 +127,17 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
             continue
         # cdiv is monotone in the tile size, so the min tiles give the sweep's
         # worst case (config-independent sinks ignore the tiles).
-        shapes[name] = alloc(lead, n_gemm, min_tile_m, min_tile_n)
+        shapes[name] = alloc(
+            lead,
+            n_gemm,
+            min_tile_m,
+            min_tile_n,
+            num_seqs=num_seqs if getattr(op, "dim", 0) == 1 else None,
+        )
     return shapes
 
 
-def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False):
+def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False, num_seqs=None):
     views = {}
     for name, op in mod.sinks.items():
         alloc = getattr(op, "sink_alloc_shape", None)
@@ -139,7 +146,16 @@ def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False):
         cta_tile_m = cta_tile_shape_m(
             config.tile_m, config.cluster_m, config.device_capacity, blockscaled
         )
-        views[name] = _sink_slice(epi_args[name], alloc(lead, n_gemm, cta_tile_m, config.tile_n))
+        views[name] = _sink_slice(
+            epi_args[name],
+            alloc(
+                lead,
+                n_gemm,
+                cta_tile_m,
+                config.tile_n,
+                num_seqs=num_seqs if getattr(op, "dim", 0) == 1 else None,
+            ),
+        )
     return views
 
 
@@ -231,12 +247,23 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
         if A_idx is not None:
             m_gemm = A_idx.shape[0]
         lead = _lead(A, A_idx, m_gemm)
+        num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
         epi_args = {}
         for name in epi_names:
             v = epi_flat[name]
             alloc = sink_allocs.get(name)
             if alloc is not None and isinstance(v, torch.Tensor):
-                v = _sink_slice(v, alloc(lead, n_gemm, c.tile_m, c.tile_n))
+                op_dim = getattr(mod.sinks.get(name), "dim", 0)
+                v = _sink_slice(
+                    v,
+                    alloc(
+                        lead,
+                        n_gemm,
+                        c.tile_m,
+                        c.tile_n,
+                        num_seqs=num_seqs if op_dim == 1 else None,
+                    ),
+                )
             epi_args[name] = v
         dyn = c.is_dynamic_persistent or dynamic_scheduler
         # SM90 dynamic-persistent scheduling consumes a semaphore; a fresh
@@ -419,5 +446,13 @@ def tuned_mod_gemm(
     return TunedModGemm(
         plan,
         best,
-        _slice_sinks(mod, epi_args, best, _lead(A, A_idx, m_gemm), n_gemm, SFA is not None),
+        _slice_sinks(
+            mod,
+            epi_args,
+            best,
+            _lead(A, A_idx, m_gemm),
+            n_gemm,
+            SFA is not None,
+            num_seqs=None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1,
+        ),
     )
