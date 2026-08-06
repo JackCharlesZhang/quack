@@ -1055,9 +1055,10 @@ def gemm(
     out_sf = None
     if fmt_d is not None:
         assert out_quant_dim in (-1, -2), f"out_quant_dim must be -1 or -2, got {out_quant_dim}"
-        assert not concat_layout and rounding_mode == RoundingMode.RN, (
-            "quantized output supports neither concat_layout nor stochastic rounding"
-        )
+        # rounding_mode composes: RS quantizes the rescaled values through
+        # cvt.rs (hw fp8x4/e2m1x4 on sm_100a/103a, sw emulation elsewhere);
+        # the SF bytes themselves stay RN/ceil either way.
+        assert not concat_layout, "quantized output does not support concat_layout"
         assert split_k in (1, None), "quantized output does not support split_k yet"
         split_k = 1
         if out_quant_dim == -2:
@@ -1231,6 +1232,9 @@ def gemm(
             SFB=SFB,
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
+            rounding_mode=rounding_mode,
+            sr_seed=sr_seed if isinstance(sr_seed, int) else 0,
+            sr_seed_tensor=sr_seed if isinstance(sr_seed, Tensor) else None,
         )
         return out_op
     if torch.compiler.is_compiling():
@@ -1406,11 +1410,15 @@ def gemm_quant_out(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
+    sr_seed_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with quantized output: fp8/fp4 values in ``out``, block scale
     factors in ``SFD`` (vectors along N for sfd_dim="n", along M for "m")."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = _merge_tensor(alpha, alpha_tensor)
+    sr_seed_arg = _merge_tensor(sr_seed, sr_seed_tensor)
     sfd_norm_const_arg = _merge_tensor(sfd_norm_const, sfd_norm_const_tensor)
     if isinstance(sfd_norm_const_arg, float) and sfd_norm_const_arg == 1.0:
         sfd_norm_const_arg = None
@@ -1429,6 +1437,8 @@ def gemm_quant_out(
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed_arg,
         SFA=SFA,
         SFB=SFB,
         bs_format_a=bs_format_a,

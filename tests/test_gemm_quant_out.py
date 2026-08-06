@@ -478,6 +478,68 @@ def test_quant_out_regression_no_sfd():
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
+def test_quant_out_stochastic_rounding(fmt):
+    """RS quantized output: SF bytes stay RN/ceil (bit-equal to the RN run);
+    values are stochastically rounded through cvt.rs (hw fp8x4/e2m1x4 on
+    sm_100a/103a, sw emulation elsewhere) — deterministic per seed,
+    seed-sensitive, within one full quantization bin of the reference, and
+    unbiased (the seed-average converges to the reference, unlike RN whose
+    error is parked at up to half a bin)."""
+    from quack.rounding import RoundingMode
+
+    torch.manual_seed(0)
+    m, n, k = 256, 256, 256
+    device = "cuda"
+    val_dtype, _, vec = fmt_props(fmt)
+    A = torch.randn(m, k, dtype=torch.bfloat16, device=device) / k**0.25
+    B = torch.randn(k, n, dtype=torch.bfloat16, device=device) / k**0.25
+
+    def run_rs(seed):
+        return gemm(A, B, out_dtype=fmt, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=seed)
+
+    res_rn = gemm(A, B, out_dtype=fmt, tuned=False)
+    res1, res1b, res2 = run_rs(7), run_rs(7), run_rs(8)
+    # The SF/rescale path is rounding-mode invariant: bytes bit-equal to RN.
+    assert torch.equal(res1.scale.view(torch.uint8), res_rn.scale.view(torch.uint8))
+    assert torch.equal(res1.qdata.view(torch.uint8), res1b.qdata.view(torch.uint8))
+    assert not torch.equal(res1.qdata.view(torch.uint8), res2.qdata.view(torch.uint8))
+    assert not torch.equal(res1.qdata.view(torch.uint8), res_rn.qdata.view(torch.uint8))
+
+    ref = A.float() @ B.float()
+    sf_2d = unpack_scale_blocked_to_2d(res1.scale.unsqueeze(0), m, ceil_div(n, vec))[0].float()
+    scale = sf_2d.repeat_interleave(vec, -1)[:, :n]
+    # SR picks the floor or ceil neighbor: error within one FULL bin gap
+    # (RN is within half), in units of the scale.
+    full_gap = 32.0 if val_dtype == torch.float8_e4m3fn else 2.0
+    bound = scale * full_gap * 1.05 + 1e-2
+    deq1 = out_values(res1.qdata) * scale
+    assert ((deq1 - ref).abs() <= bound).all(), (
+        f"max err {(deq1 - ref).abs().max().item()} vs bound {bound.max().item()}"
+    )
+    # Unbiasedness: the mean over seeds converges to ref. Normalized by the
+    # local bin gap, the mean of n_seeds samples has std <= 0.5/sqrt(n_seeds)
+    # ~ 0.055; RN's deterministic error is uniform in [-0.5, 0.5] (mean |err|
+    # ~ 0.25), so the thresholds separate the two cleanly. The local gap is
+    # bounded below by ulp(q): for e4m3 that's q/8 at the wide end of a
+    # binade, for e2m1 the {0.5, 1} gaps; use the reference-magnitude bin.
+    n_seeds = 80
+    acc = torch.zeros_like(ref)
+    for s in range(n_seeds):
+        acc += out_values(run_rs(1000 + s).qdata)
+    mean_deq = (acc / n_seeds) * scale
+    if val_dtype == torch.float8_e4m3fn:
+        gap = (2.0 ** torch.floor(torch.log2((ref / scale).abs().clamp(min=2**-6)))) / 8
+        gap = gap.clamp(min=2**-9)
+    else:
+        grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=device)
+        idx = torch.searchsorted(grid, (ref / scale).abs().clamp(max=6.0)).clamp(1, 7)
+        gap = grid[idx] - grid[idx - 1]
+    bias = ((mean_deq - ref) / (gap * scale)).abs()
+    assert bias.mean() < 0.12, f"mean bias {bias.mean():.3f} bins (SR should be ~0.045)"
+    assert bias.max() < 0.6, f"max bias {bias.max():.3f} bins"
+
+
 # --- Quantized gated postact (swiglu FC1 fusion) via the minted-mod path ------
 
 

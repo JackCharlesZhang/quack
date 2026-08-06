@@ -34,9 +34,9 @@ from quack.compile_utils import div_for_dtype, fake_batched, make_fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 import quack.sm90_utils as sm90_utils
 from quack.rounding import (
+    SR_STORE_DTYPES,
     RoundingMode,
-    convert_f32_to_bf16_sr,
-    convert_f32_to_f16_sr,
+    convert_f32_frag_sr,
     epilogue_aux_out_sr_seed,
     epilogue_sr_seed,
 )
@@ -1080,28 +1080,20 @@ class TileStore(EpiOp):
         dtype (per-op rounding), plus the gated STSM register permute."""
         dtype = getattr(gemm, self._dtype_gemm_attr())
         rounding = self.rounding if self.rounding is not None else gemm.rounding_mode
+        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):
+            # The store TV follows the 16-bit STSM C-atom contract (see
+            # _make_tiled_copy_r2s); narrow (fp8/fp4) quantized postact
+            # applies the same register permute at fp32 granularity
+            # BEFORE the convert (after quantize — placement only).
+            layout_utils.permute_gated_Cregs_f32(tRS_rAuxOut)
         if const_expr(
             rounding == RoundingMode.RS
             and tRS_rAuxOut.element_type == cutlass.Float32
-            and dtype in (cutlass.BFloat16, cutlass.Float16)
+            and dtype in SR_STORE_DTYPES
         ):
-            from cutlass.cute.tensor import TensorSSA
-
             seed = epilogue_aux_out_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
-            tRS_rAuxOut_out = cute.make_rmem_tensor_like(tRS_rAuxOut, dtype)
-            src_vec = tRS_rAuxOut.load()
-            if const_expr(dtype == cutlass.BFloat16):
-                raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
-            else:
-                raw_vec = convert_f32_to_f16_sr(src_vec, seed, tidx)
-            tRS_rAuxOut_out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
+            tRS_rAuxOut_out = convert_f32_frag_sr(tRS_rAuxOut, dtype, seed, tidx)
         else:
-            if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):
-                # The store TV follows the 16-bit STSM C-atom contract (see
-                # _make_tiled_copy_r2s); narrow (fp8/fp4) quantized postact
-                # applies the same register permute at fp32 granularity
-                # BEFORE the convert (after quantize — placement only).
-                layout_utils.permute_gated_Cregs_f32(tRS_rAuxOut)
             tRS_rAuxOut_out = tRS_rAuxOut.to(dtype)
         if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width == 16):
             # The STSM store contract's register permute (16-bit prmt form).
@@ -1142,18 +1134,10 @@ class DStore(EpiOp):
         if const_expr(
             gemm.rounding_mode == RoundingMode.RS
             and tRS_rD.element_type == cutlass.Float32
-            and dtype in (cutlass.BFloat16, cutlass.Float16)
+            and dtype in SR_STORE_DTYPES
         ):
-            from cutlass.cute.tensor import TensorSSA
-
             seed = epilogue_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
-            tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD, dtype)
-            src_vec = tRS_rD.load()
-            if const_expr(dtype == cutlass.BFloat16):
-                raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
-            else:
-                raw_vec = convert_f32_to_f16_sr(src_vec, seed, tidx)
-            tRS_rD_out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
+            tRS_rD_out = convert_f32_frag_sr(tRS_rD, dtype, seed, tidx)
         elif const_expr(tRS_rD.element_type != dtype):
             tRS_rD_out = tRS_rD.to(dtype)
         else:
