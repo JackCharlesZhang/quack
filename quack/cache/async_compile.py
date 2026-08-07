@@ -182,11 +182,12 @@ def _install_gpu_blind_device_attrs() -> None:
     instead: SM total = per-CTA capacity + the 1 KiB reserved slice
     (233472 on sm_90, verified against the driver), keyed by the pinned
     ``CUTE_DSL_ARCH`` — so worker ``.o`` files stay bit-identical to
-    in-process compiles for the target arch. Unknown arch or any other
-    attribute keeps the original driver path (fails in the worker, consumer
-    falls back, as designed)."""
+    in-process compiles for the target arch. Any other attribute keeps the
+    original driver path (fails in the worker, consumer falls back, as
+    designed); an arch outside the table raises ValueError, which fails the
+    worker the same way."""
     from cutlass.base_dsl.runtime import cuda as cuda_helpers
-    from cutlass.utils.smem_allocator import SMEM_CAPACITY_MAP
+    from cutlass.utils import get_smem_capacity_in_bytes
 
     smem_attr = cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
     orig = cuda_helpers.get_device_attribute
@@ -194,9 +195,8 @@ def _install_gpu_blind_device_attrs() -> None:
     def get_device_attribute(attribute, device_id: int = 0):
         if attribute == smem_attr:
             sm = os.environ.get("CUTE_DSL_ARCH", "").removesuffix("a")
-            capacity = SMEM_CAPACITY_MAP.get(sm)
-            if capacity is not None:
-                return capacity + 1024  # per-CTA capacity + reserved = SM total
+            capacity = get_smem_capacity_in_bytes(sm)
+            return capacity + 1024  # per-CTA capacity + reserved = SM total
         return orig(attribute, device_id)
 
     cuda_helpers.get_device_attribute = get_device_attribute
