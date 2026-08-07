@@ -202,6 +202,30 @@ def _install_gpu_blind_device_attrs() -> None:
     cuda_helpers.get_device_attribute = get_device_attribute
 
 
+def _pin_dsl_arch(cute_dsl_arch: Optional[str]) -> None:
+    """Force the ptxas target onto the already-built DSL singleton.
+
+    cutlass-dsl >= 4.6.2 snapshots ``CUTE_DSL_ARCH`` when its env manager is
+    constructed (4.6.0 read the env lazily) — and construction happens while
+    ``quack``'s import chain pulls in ``cutlass``, before the pool's env
+    pinning has run. ``envar.arch`` is the DSL's supported override point;
+    without the re-latch, a GPU-blind worker's first ``.arch`` read falls
+    back to ``detect_gpu_arch()``'s sm_100a default and every pool ``.o``
+    silently targets the wrong arch — cudaErrorNoKernelImageForDevice at
+    load time on any other GPU.
+    """
+    if cute_dsl_arch is None:
+        return
+    try:
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        CuTeDSL._get_dsl().envar.arch = cute_dsl_arch
+    except Exception:
+        # Singleton not built yet: its constructor reads CUTE_DSL_ARCH from
+        # the env (already pinned by the caller), so nothing to re-latch.
+        pass
+
+
 def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     # GPU-blind compilation: hide devices and pin the target arch via the
     # same overrides the CPU-only compile workflow uses. Forked workers must
@@ -215,6 +239,11 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     # Pay the heavy torch/cutlass import at worker start (no-op under
     # forkserver: the preload already imported it before the fork).
     import quack.cache  # noqa: F401
+
+    # The import above may have constructed the DSL singleton before the env
+    # pinning (spawn: no; forkserver: yes, in the sidecar) — re-latch either
+    # way, it is idempotent.
+    _pin_dsl_arch(cute_dsl_arch)
 
     if quack_arch is not None:
         # GPU-blind: the driver can never answer, so the one trace-time

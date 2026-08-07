@@ -391,3 +391,48 @@ def test_gpu_blind_device_attr_shim():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0 and "shim-ok" in result.stdout, result.stderr
+
+
+def test_pool_arch_pin_survives_early_dsl_construction():
+    """The worker's ptxas target must land on a DSL singleton that was built
+    BEFORE the pool's env pinning ran.
+
+    Regression (cutlass-dsl 4.6.2 CI image): importing
+    ``quack.cache._pool_preload`` executes the parent packages first, and
+    ``quack/__init__`` pulls in cutlass — constructing the DSL env manager
+    before ``CUTE_DSL_ARCH`` is set. 4.6.2 snapshots the env var at
+    construction (4.6.0 read it lazily), so env pinning alone left the
+    singleton unlatched; a GPU-blind worker's first ``.arch`` read then fell
+    back to ``detect_gpu_arch()``'s sm_100a default, and every pool ``.o``
+    on the B300 runner (sm_103a) failed to load with
+    cudaErrorNoKernelImageForDevice — which the 4.6.2 runtime escalated into
+    a permanent spinlock hang on the process's next launch. The explicit
+    ``_pin_dsl_arch`` re-latch in ``_pool_initializer`` / ``_pool_preload``
+    is what this test protects.
+    """
+    code = textwrap.dedent(
+        """
+        import os
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ.pop("CUTE_DSL_ARCH", None)
+        # Simulate the parent-package import chain: cutlass (and the DSL
+        # env-manager singleton) come up with no CUTE_DSL_ARCH in sight.
+        import quack.cache  # noqa: F401
+
+        # The pool's env pinning + re-latch, as _pool_initializer runs them.
+        from quack.cache.async_compile import _pool_initializer
+
+        _pool_initializer("90", "sm_90a")
+
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        arch = CuTeDSL._get_dsl().envar.arch
+        assert arch == "sm_90a", f"worker would compile for {arch}, not sm_90a"
+        print("arch-pin-ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0 and "arch-pin-ok" in result.stdout, result.stderr
