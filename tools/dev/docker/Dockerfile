@@ -19,7 +19,7 @@
 #   docker build -f tools/dev/docker/Dockerfile -t kernel-dev:cu133 .
 #
 # Useful build args:
-#   --build-arg CUTLASS_DSL_VERSION=4.6.2
+#   --build-arg CUTLASS_DSL_VERSION=4.7.0
 #   --build-arg TILELANG_VERSION=0.1.13
 #   --build-arg CUDA_APT_SUFFIX=13-3
 #   --build-arg CUDNN_VERSION=9.24.0.43
@@ -51,7 +51,7 @@ ARG MATMUL_HEURISTICS_VERSION=0.1.0.27
 ARG NSIGHT_PYTHON_VERSION=1.0.0
 ARG COMPILEIQ_VERSION=1.0.2
 ARG UV_VERSION=0.11.22
-ARG CUTLASS_DSL_VERSION=4.6.2
+ARG CUTLASS_DSL_VERSION=4.7.0
 ARG TILELANG_VERSION=0.1.13
 ARG GH_VERSION=2.95.0
 
