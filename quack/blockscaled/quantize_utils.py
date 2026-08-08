@@ -24,7 +24,7 @@ byte.
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 
 import quack.utils as utils
 import quack.copy_utils as copy_utils

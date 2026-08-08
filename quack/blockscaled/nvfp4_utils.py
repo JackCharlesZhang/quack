@@ -712,7 +712,7 @@ def _arch_has_bf16_narrow_cvt():
     convert decodes e2m1 at 2.0x the prmt-LUT sequence's rate (2.45x with
     the fused scale) and e4m3 at 1.6x the f16-route — both are shorter AND
     faster, so the arch check is the only gate."""
-    from cutlass.base_dsl.arch import Arch
+    from cutlass.base_dsl.enums import Arch
 
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     # Arch orders by (major, minor, suffix): everything from sm_100 up has

@@ -7,7 +7,7 @@ from typing import Callable, Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 
 import quack.utils as utils
 

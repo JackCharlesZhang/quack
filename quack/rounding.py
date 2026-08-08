@@ -30,7 +30,7 @@ from enum import IntEnum
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Uint32, Uint64
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass._mlir_helpers.arith import bitcast as _bitcast
