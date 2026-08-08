@@ -33,18 +33,18 @@ from cutlass import Float32, Uint32, Uint64
 from cutlass.base_dsl.enums import Arch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
-from cutlass._mlir_helpers.arith import bitcast as _bitcast
 from cutlass.cutlass_dsl import dsl_user_op, Int32, T
+from cutlass.experimental import primitives as prims
 
 
 def _f32_bits(x: Float32) -> Uint32:
     """Reinterpret an f32 as its u32 bit pattern (no instruction generated)."""
-    return Uint32(_bitcast(Float32(x).ir_value(), T.i32()))
+    return prims.mov_b32(Float32(x), target_type=Uint32)
 
 
 def _bits_f32(x: Uint32) -> Float32:
     """Reinterpret a u32 bit pattern as f32 (no instruction generated)."""
-    return Float32(_bitcast(Uint32(x).ir_value(), T.f32()))
+    return prims.mov_b32(Uint32(x), target_type=Float32)
 
 
 def _asm(res_type, ptx: str, constraints: str, args):
@@ -320,7 +320,7 @@ def cvt_f32x2_bf16x2_rs_sw(
     # ideal @P1 LEA.HI exists in SASS but ptxas never emits LEA.HI
     # predicated). r_lo has no such trap: LOP3 has no and+add fusion, so its
     # predicated add is always a single IADD3.
-    r_hi = Uint32(cute.arch.prmt(rand_bits, 0, 0x4432, loc=loc, ip=ip))
+    r_hi = Uint32(prims.prmt(rand_bits, 0x4432, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
     ua = add_u32_if(_f32_bits(a), r_lo, a_in_range, loc=loc, ip=ip)
     ub = add_u32_if(_f32_bits(b), r_hi, b_in_range, loc=loc, ip=ip)
     return cvt_f32x2_bf16x2_rz_satfinite(_bits_f32(ua), _bits_f32(ub), loc=loc, ip=ip)
@@ -574,7 +574,7 @@ def _cvt_f32x2_f8x2_rs_sw(a, b, rand_bits, f8_kind, loc, ip):
     kind = _F8_KINDS[f8_kind]
     a, b, rand_bits = Float32(a), Float32(b), Uint32(rand_bits)
     # place rand bytes 0/1 into u16 halves: {0, r.b1, 0, r.b0}, then I2F.U16
-    p01 = Uint32(cute.arch.prmt(rand_bits, 0, 0x4140, loc=loc, ip=ip))
+    p01 = Uint32(prims.prmt(rand_bits, 0x4140, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
     rf_a = u16x2_to_f32(p01, 0, loc=loc, ip=ip)
     rf_b = u16x2_to_f32(p01, 1, loc=loc, ip=ip)
     if kind["prescale"] is not None:
@@ -844,8 +844,8 @@ def cvt_f32x4_e2m1x4_rs_direct(
     """
     vals = [Float32(v) for v in (v0, v1, v2, v3)]
     rand_bits = Uint32(rand_bits)
-    p01 = Uint32(cute.arch.prmt(rand_bits, 0, 0x4140, loc=loc, ip=ip))
-    p23 = Uint32(cute.arch.prmt(rand_bits, 0, 0x4342, loc=loc, ip=ip))
+    p01 = Uint32(prims.prmt(rand_bits, 0x4140, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
+    p23 = Uint32(prims.prmt(rand_bits, 0x4342, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
     rfs = [
         u16x2_to_f32(p01, 0, loc=loc, ip=ip),
         u16x2_to_f32(p01, 1, loc=loc, ip=ip),
@@ -938,8 +938,8 @@ def cvt_f32x4_e2m1x4_rs_sw(
     vals = [Float32(v) for v in (v0, v1, v2, v3)]
     rand_bits = Uint32(rand_bits)
     # place rand bytes into u16 halves for I2F.U16: {0, b1, 0, b0} / {0, b3, 0, b2}
-    p01 = Uint32(cute.arch.prmt(rand_bits, 0, 0x4140, loc=loc, ip=ip))
-    p23 = Uint32(cute.arch.prmt(rand_bits, 0, 0x4342, loc=loc, ip=ip))
+    p01 = Uint32(prims.prmt(rand_bits, 0x4140, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
+    p23 = Uint32(prims.prmt(rand_bits, 0x4342, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
     rfs = [
         u16x2_to_f32(p01, 0, loc=loc, ip=ip),
         u16x2_to_f32(p01, 1, loc=loc, ip=ip),
@@ -955,10 +955,12 @@ def cvt_f32x4_e2m1x4_rs_sw(
     hs01 = max_f16x2(min_f16x2(h01, hi_bound, loc=loc, ip=ip), lo_bound, loc=loc, ip=ip)
     hs23 = max_f16x2(min_f16x2(h23, hi_bound, loc=loc, ip=ip), lo_bound, loc=loc, ip=ip)
     # byte 1 of each half = sign<<7 | code<<1 | junk; gather all four values
-    r = Uint32(cute.arch.prmt(hs01, hs23, 0x7531, loc=loc, ip=ip))
+    r = Uint32(prims.prmt(hs01, 0x7531, prims.PermuteMode.DEFAULT, hi=hs23, loc=loc, ip=ip))
     nib = ((r >> 1) & Uint32(0x07070707)) | ((r >> 4) & Uint32(0x08080808))
     t = nib | (nib >> 4)  # byte0 = nib1<<4|nib0, byte2 = nib3<<4|nib2
-    return cutlass.Uint16(Uint32(cute.arch.prmt(t, 0, 0x4420, loc=loc, ip=ip)))
+    return cutlass.Uint16(
+        Uint32(prims.prmt(t, 0x4420, prims.PermuteMode.DEFAULT, hi=0, loc=loc, ip=ip))
+    )
 
 
 @dsl_user_op

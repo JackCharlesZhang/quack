@@ -607,7 +607,16 @@ class GemmBase:
                 if const_expr(op == "store"):
                     cute.copy(thr_copy, chunk, tCgWs[None, v])
                 elif const_expr(op == "red_add"):
-                    cute.arch.atomic_add(tCgWs[None, v].iterator, chunk.load())
+                    # relaxed.gpu == PTX's default for an unqualified red/atom;
+                    # cute.arch.red requires them spelled out
+                    cute.arch.red(
+                        tCgWs[None, v].iterator,
+                        chunk.load().ir_value(),
+                        op="add",
+                        dtype="f32",
+                        sem="relaxed",
+                        scope="gpu",
+                    )
                 else:
                     cute.copy(thr_copy, tCgWs[None, v], chunk)
         else:
@@ -617,7 +626,14 @@ class GemmBase:
                 if const_expr(op == "store"):
                     copy_utils.store(utils.elem_pointer(tRS_gWs, (tidx, v)), frag[v])
                 elif const_expr(op == "red_add"):
-                    cute.arch.atomic_add(utils.elem_pointer(tRS_gWs, (tidx, v)), frag[v])
+                    cute.arch.red(
+                        utils.elem_pointer(tRS_gWs, (tidx, v)),
+                        frag[v],
+                        op="add",
+                        dtype=self.acc_dtype,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
                 else:
                     frag[v] = tRS_gWs[tidx, v]
         if const_expr(op == "load_add"):

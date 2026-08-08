@@ -2,23 +2,15 @@
 
 import math
 from typing import Tuple
-from functools import partial
 
 import cutlass.cute as cute
 from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import arith, nvvm
+from cutlass._mlir.dialects import arith
 from cutlass._mlir_helpers import math as mlir_math
 
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
-
-
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-)
 
 
 @dsl_user_op
@@ -339,7 +331,7 @@ def dquick_gelu(
     else:
         s = sigmoid(cute.arch.mul_packed_f32x2(x, (alpha, alpha)), loc=loc, ip=ip)
         out = cute.arch.mul_packed_f32x2(x, s)
-        one_minus_s = sub_packed_f32x2((1.0, 1.0), s)
+        one_minus_s = cute.arch.sub_packed_f32x2((1.0, 1.0), s)
         dgelu = cute.arch.fma_packed_f32x2(
             cute.arch.mul_packed_f32x2(out, one_minus_s), (alpha, alpha), s
         )
@@ -892,7 +884,7 @@ def dglu(
         sigmoid_x_dout = cute.arch.mul_packed_f32x2(sigmoid_x, dout)
         glu_out = cute.arch.mul_packed_f32x2(sigmoid_x, y)
         # dx = (y - glu_out) * sigmoid_x_dout
-        y_minus_glu_out = sub_packed_f32x2(y, glu_out)
+        y_minus_glu_out = cute.arch.sub_packed_f32x2(y, glu_out)
         dx = cute.arch.mul_packed_f32x2(y_minus_glu_out, sigmoid_x_dout)
         dy = sigmoid_x_dout
         return dx, dy, glu_out

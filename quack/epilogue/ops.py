@@ -27,6 +27,7 @@ from cutlass import Boolean, Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+from cutlass.experimental import primitives as prims
 
 import torch
 
@@ -2778,17 +2779,7 @@ def _dup_s16sat_from_s32(x: Int32, *, loc=None, ip=None) -> Uint32:
     is zero), and f16 compares never flush denormals. This replaces a
     cvt.rn.f16.s32 (quarter-rate XU pipe) whose exactness needed a rounding
     argument."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int32(x).ir_value(loc=loc, ip=ip)],
-            "cvt.pack.sat.s16.s32 $0, $1, $1;",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
+    return Uint32(prims.convert_and_pack_integer(x, x, T.i16(), is_signed=True, loc=loc, ip=ip))
 
 
 @dsl_user_op

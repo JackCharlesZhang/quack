@@ -15,7 +15,9 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum, block_copy
 import cutlass.pipeline
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass.experimental import primitives as prims
 
 from quack import layout_utils
 from quack.utils import make_vector
@@ -803,36 +805,43 @@ def _cpasync_reduction_kind_name(reduction_kind: Any) -> str:
     return name
 
 
-def _cpasync_bulk_reduce_suffix(
+def _cpasync_bulk_reduce_args(
     reduction_kind: Any,
     dtype: Type[cutlass.Numeric],
-) -> str:
+) -> Tuple[prims.CpReduceOp, prims.CpReduceType, bool]:
+    """Map (kind, dtype) to cp.reduce.async.bulk (op, type, noftz), enforcing the
+    PTX-ISA legality rules (fp is add-only except f16/bf16 min/max; bitwise ops
+    take b32/b64; inc/dec are u32-only)."""
     op = _cpasync_reduction_kind_name(reduction_kind)
-    if dtype is cutlass.Float16:
-        assert op in {"add", "min", "max"}, f"{op} is not supported for f16 bulk reduce"
-        return f"{op}.noftz.f16" if op == "add" else f"{op}.f16"
-    if dtype is cutlass.BFloat16:
-        assert op in {"add", "min", "max"}, f"{op} is not supported for bf16 bulk reduce"
-        return f"{op}.noftz.bf16" if op == "add" else f"{op}.bf16"
+    if dtype in (cutlass.Float16, cutlass.BFloat16):
+        assert op in {"add", "min", "max"}, f"{op} is not supported for f16/bf16 bulk reduce"
+        reduce_type = (
+            prims.CpReduceType.F16 if dtype is cutlass.Float16 else prims.CpReduceType.BF16
+        )
+        return prims.CpReduceOp(op), reduce_type, op == "add"
     if dtype is cutlass.Float32:
         assert op == "add", f"{op} is not supported for f32 bulk reduce"
-        return "add.f32"
+        return prims.CpReduceOp.ADD, prims.CpReduceType.F32, False
     if dtype is cutlass.Float64:
         assert op == "add", f"{op} is not supported for f64 bulk reduce"
-        return "add.f64"
+        return prims.CpReduceOp.ADD, prims.CpReduceType.F64, False
 
     signed = getattr(dtype, "signed", None)
     width = getattr(dtype, "width", None)
     if signed is not None:
         assert width in (32, 64), f"Unsupported integer bulk-reduce width: {width}"
         if op in {"and", "or", "xor"}:
-            return f"{op}.b{width}"
+            return prims.CpReduceOp(op), prims.CpReduceType(f"b{width}"), False
         if op in {"min", "max", "add"}:
-            return f"{op}.{'s' if signed else 'u'}{width}"
+            return (
+                prims.CpReduceOp(op),
+                prims.CpReduceType(f"{'s' if signed else 'u'}{width}"),
+                False,
+            )
         assert op in {"inc", "dec"} and dtype is cutlass.Uint32, (
             f"{op} bulk reduce is only supported for u32"
         )
-        return f"{op}.u32"
+        return prims.CpReduceOp(op), prims.CpReduceType.U32, False
 
     raise TypeError(f"Unsupported cp.reduce.async.bulk dtype: {dtype}")
 
@@ -848,22 +857,31 @@ def cpasync_bulk_s2g(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
-    if reduction_kind is None:
-        ptx = "cp.async.bulk.global.shared::cta.bulk_group [{$r0}], [{$r1}], {$r2};"
-    else:
-        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
-        ptx = (
-            "cp.reduce.async.bulk.global.shared::cta.bulk_group."
-            f"{_cpasync_bulk_reduce_suffix(reduction_kind, dtype)} "
-            "[{$r0}], [{$r1}], {$r2};"
-        )
-    cute.arch.inline_ptx(
-        ptx,
-        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
+    # The NVVM ops want a global-space dst; quack gmem pointers are generic-addressed.
+    gmem_global_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(cutlass.AddressSpace.gmem.value),
+        gmem_ptr.to_llvm_ptr(loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
+    smem_llvm_ptr = smem_ptr.to_llvm_ptr(loc=loc, ip=ip)
+    if reduction_kind is None:
+        prims.cp_async_bulk_global_shared_cta(
+            gmem_global_ptr, smem_llvm_ptr, store_bytes, loc=loc, ip=ip
+        )
+    else:
+        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
+        op, reduce_type, noftz = _cpasync_bulk_reduce_args(reduction_kind, dtype)
+        prims.cp_reduce_async_bulk_global_shared_cta(
+            gmem_global_ptr,
+            smem_llvm_ptr,
+            store_bytes,
+            op=op,
+            type=reduce_type,
+            noftz=noftz,
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dsl_user_op

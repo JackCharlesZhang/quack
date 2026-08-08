@@ -32,7 +32,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op, target_version
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm
+from cutlass._mlir.dialects import llvm
+from cutlass.experimental import primitives as prims
 
 from quack.cute_dsl_utils import get_compile_target_capacity
 
@@ -527,16 +528,8 @@ def prmt(a: Int32, b: Int32, sel: Int32, *, loc=None, ip=None) -> Int32:
     # LLVM: constant selectors fold, and an immediate selector stays an
     # immediate in SASS instead of burning a register on the "=r,r,r,r"
     # constraint. prmt.b32 d, a, b, c reads {b:a} bytes selected by c,
-    # which is nvvm.prmt(lo=a, hi=b, selector=c).
-    res = nvvm.prmt(
-        Int32(a).ir_value(loc=loc, ip=ip),
-        Int32(sel).ir_value(loc=loc, ip=ip),
-        nvvm.PermuteMode.DEFAULT,
-        hi=Int32(b).ir_value(loc=loc, ip=ip),
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(res)
+    # which is prims.prmt(lo=a, hi=b, selector=c).
+    return prims.prmt(a, sel, prims.PermuteMode.DEFAULT, hi=b, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -1047,17 +1040,8 @@ def decode_i4smx8_scaled_e4m3x8(x: Int32, ta_r, tb_r, ta_r8, tb_r8) -> Tuple[Int
 
 @dsl_user_op
 def i32_as_f32(v: Int32, *, loc=None, ip=None):
-    """Bitcast an Int32 register to Float32 (a plain mov)."""
-    res = llvm.inline_asm(
-        T.f32(),
-        [Int32(v).ir_value(loc=loc, ip=ip)],
-        "mov.b32 $0, $1;",
-        "=f,r",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(res)
+    """Bitcast an Int32 register to Float32 (arith.bitcast, zero instructions)."""
+    return prims.mov_b32(Int32(v), target_type=Float32, loc=loc, ip=ip)
 
 
 @dsl_user_op

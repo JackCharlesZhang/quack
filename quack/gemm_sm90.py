@@ -17,6 +17,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
+from cutlass.experimental import primitives as prims
 from cutlass.utils import LayoutEnum, SmemPartition
 
 
@@ -1036,7 +1037,7 @@ class GemmSm90(GemmTmaBase):
             ):
                 # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ sm90 mainloop producer)
                 if const_expr(self.use_pdl):
-                    cute.arch.griddepcontrol_wait()
+                    prims.griddepcontrol(prims.GridDepAction.WAIT)
                 # block_copy's lowering wants the coordinate held fixed by the
                 # multicast mask: A is same-M across N peers, while B is
                 # same-N across M peers. Degenerate cluster dimensions are
@@ -1488,7 +1489,7 @@ class GemmSm90(GemmTmaBase):
 
             # PDL: hint next kernel to launch (matches cutlass C++ sm90 consumer)
             if const_expr(self.use_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
+                prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
             # Wait for D store complete
             if const_expr(not self.pingpong):

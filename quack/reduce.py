@@ -8,6 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 from cutlass.base_dsl.enums import Arch
+from cutlass.experimental import primitives as prims
 
 import quack.utils as utils
 
@@ -72,7 +73,17 @@ def warp_reduce(
             kwargs["abs"] = True
         if const_expr(nan):
             kwargs["nan"] = True
-        return cute.arch.warp_redux_sync(val, kind, mask, **kwargs)
+        # prims.redux_sync models Float32 fmin/fmax (incl. .abs/.NaN) as the
+        # Pure nvvm.redux_sync dialect op; cute.arch.warp_redux_sync routes
+        # f32 through effectful inline asm instead.
+        redux_kind = {
+            "add": prims.ReductionKind.ADD,
+            "max": prims.ReductionKind.MAX,
+            "min": prims.ReductionKind.MIN,
+            "fmax": prims.ReductionKind.FMAX,
+            "fmin": prims.ReductionKind.FMIN,
+        }[kind]
+        return prims.redux_sync(val, redux_kind, mask, **kwargs)
     if const_expr(abs):
         val = cute.math.absf(val)
     return cute.arch.warp_reduction(val, op, threads_in_group=threads_in_group)
